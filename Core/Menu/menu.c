@@ -1193,6 +1193,24 @@ const enum Datatypes parameter_dtypes[NUM_PARAMS] = {
     [PAR_BAR_RESET_MODE] = DTYPE_ON_OFF,
     [PAR_MIDI_CHAN_GLOBAL] = DTYPE_1B16,
     [PAR_OSC_WAVE_INTERP] = DTYPE_ON_OFF,
+    /*
+     * S080 E6/F10: BAR overlay and scene-global dtypes.
+     *
+     * Why DTYPE_0B127 (and DTYPE_ON_OFF for pcr) and not DTYPE_MENU: all 16
+     * DTYPE_MENU table ids and all 16 DTYPE_* nibbles are already used. The
+     * overlay trigger-type names, scene division/action names, and clamp
+     * domains are applied by static-param special cases keyed on the PAR_ id
+     * (the S078 run-mode precedent). PAR_PERF_NOTE_* render def or a note name;
+     * PAR_SCENE_PC_RESET uses the normal on/off renderer.
+     */
+    [PAR_PERF_BTN_LT] = DTYPE_0B127,
+    [PAR_PERF_NOTE_LT] = DTYPE_0B127,
+    [PAR_PERF_BTN_RT] = DTYPE_0B127,
+    [PAR_PERF_NOTE_RT] = DTYPE_0B127,
+    [PAR_SCENE_CHANGE_DIV] = DTYPE_0B127,
+    [PAR_SCENE_QUEUE_DIV] = DTYPE_0B127,
+    [PAR_SCENE_QUEUE_ACTION] = DTYPE_0B127,
+    [PAR_SCENE_PC_RESET] = DTYPE_ON_OFF,
 };
 
 /* -----------------------------------------------------------------------
@@ -1310,6 +1328,20 @@ static const Name valueNames[NUM_NAMES] = {
     {SHORT_ROLL_RATE,CAT_STEP,LONG_ROLL_RATE},
     {SHORT_ROLL_RHYTHM,CAT_VELOCITY,LONG_ROLL_RHYTHM},
     {SHORT_ROLL_FILL,CAT_STEP,LONG_ROLL_FILL},
+    /* S080 E5/F2/G10: BAR overlay, scene globals, and chain display names.
+     * Order MUST match the TEXT_ enum append order in menu.h. */
+    {SHORT_PERF_BTN_LT,CAT_PERFORMANCE,LONG_PERF_BTN_LT},
+    {SHORT_PERF_NOTE_LT,CAT_PERFORMANCE,LONG_PERF_NOTE_LT},
+    {SHORT_PERF_BTN_RT,CAT_PERFORMANCE,LONG_PERF_BTN_RT},
+    {SHORT_PERF_NOTE_RT,CAT_PERFORMANCE,LONG_PERF_NOTE_RT},
+    {SHORT_SCENE_CHANGE_DIV,CAT_SCENE,LONG_SCENE_CHANGE_DIV},
+    {SHORT_SCENE_QUEUE_DIV,CAT_SCENE,LONG_SCENE_QUEUE_DIV},
+    {SHORT_SCENE_QUEUE_ACTION,CAT_SCENE,LONG_SCENE_QUEUE_ACTION},
+    {SHORT_SCENE_PC_RESET,CAT_SCENE,LONG_SCENE_PC_RESET},
+    {SHORT_CHAIN_COND1,CAT_CHAIN,LONG_CHAIN_COND1},
+    {SHORT_CHAIN_NEXT1,CAT_CHAIN,LONG_CHAIN_NEXT1},
+    {SHORT_CHAIN_COND2,CAT_CHAIN,LONG_CHAIN_COND2},
+    {SHORT_CHAIN_NEXT2,CAT_CHAIN,LONG_CHAIN_NEXT2},
 };
 
 /* -----------------------------------------------------------------------
@@ -1969,6 +2001,12 @@ typedef struct {
     /* Effect page cell identity; meaningful only for MENU_CELL_EFFECT. */
     menuEffects_cell_t fx;
 } menu_cell_t;
+
+/* S080 E6/F10: shared resolver for the overlay/scene-global static names. */
+static uint8_t menu_getS080StaticName(const menu_cell_t *cell,
+                                      uint16_t value, char *buf);
+/* S080 F9: ungated PERF scene-change executor (shared with the deferral). */
+static void menu_perfSceneChangeExecute(uint8_t scene_index);
 
 typedef struct {
     uint8_t scene_index;
@@ -3017,6 +3055,10 @@ static void va_formatValue3(const menu_cell_t *cell, uint8_t value,
         return;
     }
 
+    /* S080 E6/F10: overlay trigger/note and scene-global names. */
+    if (menu_getS080StaticName(cell, value, out))
+        return;
+
     switch (dtype) {
     case DTYPE_PM63:
         numtostrps(out, (int8_t)(value - 63));
@@ -3382,18 +3424,22 @@ static void menu_applyEffectMarkers(void)
  *
  * What: underlines the name of each PERF morph cell whose automation is
  * present in the viewed Pattern or the FX sequence (effect morph only).
- * Column 0 (PAR_MORPH, global) is never marked. Columns 1..6 check
- * va_searchPerfMorphMask bits 0..5 (Pattern voice morph). Column 7 checks
- * va_searchPerfMorphMask bit 6 (Pattern effect morph) and
- * menuEffects_cellSeqLocked() (FX seq morph lane).
+ *
+ * S080 A3: the mapping is now driven by the active subpage (menu_getSubPage)
+ * because the S080 A1 split gives each subpage only four active cells:
+ *   subpage 0: col 0 = mrp (never marked), col 1 = fxm (Pattern effect morph
+ *              bit 6, plus the FX-seq morph lane), col 2 = 1VM (bit 0),
+ *              col 3 = 2VM (bit 1).
+ *   subpage 1: col 0..3 = 3VM..6VM (bits 2..5).
  * Why: PERF morph cells are MENU_CELL_STATIC, so neither va_applyVoiceMarkers
  * nor menu_applyEffectMarkers can render them. The pot-clear path already
  * resolves PERF morph targets independently; this function adds the matching
  * visual presence indicator. Inputs: va_searchComplete,
- * va_searchPerfMorphMask, the compact view layout, editDisplayBuffer.
+ * va_searchPerfMorphMask, menu_getSubPage(), the compact view layout,
+ * editDisplayBuffer.
  * Output: up to 4 CGRAM marker transactions. Caller: menu_repaintGeneric().
  * Affiliates: va_scanService(), va_queueMarkerTransaction(),
- * menuEffects_cellSeqLocked().
+ * menuEffects_cellSeqLocked(), PERFORMANCE_PAGE table (menuPages.h A1).
  */
 static void menu_applyPerfMarkers(void)
 {
@@ -3402,40 +3448,47 @@ static void menu_applyPerfMarkers(void)
     uint8_t marker_row[4] = { 0u, 0u, 0u, 0u };
     uint8_t marker_col[4] = { 0u, 0u, 0u, 0u };
     uint8_t desired_valid = 0u;
-    uint8_t activeParameter;
-    uint8_t is2nd;
+    uint8_t subpage;
     uint8_t i;
 
     if (menu_activePage != PERFORMANCE_PAGE)
         return;
 
-    activeParameter = (uint8_t)(menuIndex & MASK_PARAMETER);
-    is2nd = (uint8_t)((activeParameter > 3u) ? 4u : 0u);
+    subpage = menu_getSubPage();
 
     for (i = 0u; i < 4u; i++) {
-        uint8_t column = (uint8_t)(i + is2nd);
         uint8_t automated = 0u;
         int8_t left;
         uint8_t start;
 
-        if (column == 0u)
-            continue;
-        if (column >= 1u && column <= 6u) {
+        if (subpage == 0u) {
+            if (i == 0u)
+                continue;               /* mrp (global) is never marked */
+            if (i == 1u) {
+                /* fxm: Pattern effect morph, or the FX-seq morph lane. */
+                if (va_searchComplete &&
+                    (va_searchPerfMorphMask & VA_PERF_MORPH_EFFECT_BIT) != 0u)
+                    automated = 1u;
+                if (!automated) {
+                    menuEffects_cell_t fx_cell;
+
+                    memset(&fx_cell, 0, sizeof(fx_cell));
+                    fx_cell.kind = MENU_FX_CELL_MORPH_AMOUNT;
+                    automated = menuEffects_cellSeqLocked(&fx_cell);
+                }
+            } else {
+                /* i == 2 -> 1VM (bit 0), i == 3 -> 2VM (bit 1). */
+                if (va_searchComplete &&
+                    (va_searchPerfMorphMask &
+                     (uint8_t)(1u << (i - 2u))) != 0u)
+                    automated = 1u;
+            }
+        } else {
+            /* subpage 1: i 0..3 -> 3VM..6VM (bits 2..5). */
             if (va_searchComplete &&
                 (va_searchPerfMorphMask &
-                 (uint8_t)(1u << (column - 1u))) != 0u)
+                 (uint8_t)(1u << (i + 2u))) != 0u)
                 automated = 1u;
-        } else if (column == 7u) {
-            if (va_searchComplete &&
-                (va_searchPerfMorphMask & VA_PERF_MORPH_EFFECT_BIT) != 0u)
-                automated = 1u;
-            if (!automated) {
-                menuEffects_cell_t fx_cell;
-
-                memset(&fx_cell, 0, sizeof(fx_cell));
-                fx_cell.kind = MENU_FX_CELL_MORPH_AMOUNT;
-                automated = menuEffects_cellSeqLocked(&fx_cell);
-            }
         }
         if (!automated)
             continue;
@@ -4933,7 +4986,9 @@ static uint8_t menu_cellCommitValue(const menu_cell_t *cell, uint16_t value)
          * by the page test. Affiliates: filesystem settings scheduler and
          * filesystem_setAutosaveEnabled().
          */
-        if (old_value != *paramValue && menu_activePage == MENU_MIDI_PAGE) {
+        if (old_value != *paramValue &&
+            (menu_activePage == MENU_MIDI_PAGE ||
+             menu_activePage == RECORDING_PAGE)) {
             filesystem_markSettingsDirty();
             if (cell->static_param == PAR_AUTOSAVE_ENABLED)
                 filesystem_setAutosaveEnabled(*paramValue);
@@ -5506,6 +5561,10 @@ static void menu_formatCellValue3(const menu_cell_t *cell, char *valueAsText)
         return;
     }
 
+    /* S080 E6/F10: overlay trigger/note and scene-global names. */
+    if (menu_getS080StaticName(cell, value, valueAsText))
+        return;
+
     /*
      * Format one cell value for the compact four-column view. Instrument cells
      * share the same dtype vocabulary as static cells, but target cells may
@@ -5626,14 +5685,46 @@ static void menu_clampCellValue(const menu_cell_t *cell, uint16_t *value)
         return;
     }
     /*
-     * Step-special domains (S079): condition 0..38 (fix 3), roll rate 0..8,
+     * S080 E6/F10: BAR overlay and scene-global domains.
+     *
+     * What: clamp the overlay trigger type to 0..11, the overlay note to 0..127
+     * (0 = def), scd/qcd to 0..9, and qac to 0..4. Why: all DTYPE_MENU ids are
+     * used, so these domains are applied here as static-param special cases.
+     * pcr is DTYPE_ON_OFF and clamps through the normal dtype path. Inputs:
+     * resolved static cell and value. Output: clamped value. Affiliates:
+     * perfBtnTypeNames/sceneChangeDivNames/sceneQueueActionNames (MenuText.h).
+     */
+    if (cell->kind == MENU_CELL_STATIC) {
+        switch (cell->static_param) {
+        case PAR_PERF_BTN_LT:
+        case PAR_PERF_BTN_RT:
+            if (*value > 11u) *value = 11u;
+            return;
+        case PAR_PERF_NOTE_LT:
+        case PAR_PERF_NOTE_RT:
+            if (*value > 127u) *value = 127u;
+            return;
+        case PAR_SCENE_CHANGE_DIV:
+        case PAR_SCENE_QUEUE_DIV:
+            if (*value > 9u) *value = 9u;
+            return;
+        case PAR_SCENE_QUEUE_ACTION:
+            if (*value > 4u) *value = 4u;
+            return;
+        default:
+            break;
+        }
+    }
+    /*
+     * Step-special domains (S079; S080 widens condition): condition 0..40,
+     * roll rate 0..8,
      * micro-timing 0..99, roll fill 0..100, rhythm snapped to its ordered list
      * (S079 P2). Applied here because the DTYPE_* nibble space is full.
      */
     if (cell->kind == MENU_CELL_STATIC &&
         cell->static_param == PAR_STEP_CONDITION) {
-        if (*value > 38u)
-            *value = 38u;
+        if (*value > 40u)
+            *value = 40u;
         return;
     }
     if (cell->kind == MENU_CELL_STATIC &&
@@ -8145,7 +8236,24 @@ void menu_perfModeSceneButtonPressed(uint8_t scene_index)
      * updated together. BankData selects the new active Scene's independent
      * scene_mask_voice_edit entry and repairs only that entry's active bit.
      * Preset starts the bounded DSP apply for the newly audible Scene.
+     *
+     * S080 F9: when PAR_SCENE_CHANGE_DIV (scd) is not instant and the transport
+     * is running, the change is deferred to the next musical boundary instead
+     * of executing now; menu_serviceDeferredSceneChange() then runs the same
+     * executor when the ISR raises the fire flag. A stopped transport always
+     * changes instantly (no clock to quantise against).
      */
+    uint8_t div = parameter_values[PAR_SCENE_CHANGE_DIV];
+
+    if (div != 0u && seq_isRunning()) {
+        seq_requestSceneChange(scene_index, div);
+        return;
+    }
+    menu_perfSceneChangeExecute(scene_index);
+}
+
+static void menu_perfSceneChangeExecute(uint8_t scene_index)
+{
     if (scene_index >= SCENE_COUNT || scene_index >= 16u ||
         !bank_scenePresent(scene_index)) {
         return;
@@ -8162,9 +8270,63 @@ void menu_perfModeSceneButtonPressed(uint8_t scene_index)
      */
     menu_setShownPattern(scene_index);
     seq_selectActivePattern(scene_index);
+    /* S080 F9/G12: a manual/executed switch cancels pending chain changes. */
+    seq_clearPendingSceneChange();
+    /* S080 F9: PCR restarts all tracks from the beginning of the new Scene. */
+    if (parameter_values[PAR_SCENE_PC_RESET])
+        seq_resetToPatternStart();
     preset_startDrumsetApply();
     menu_refreshPerfSceneLeds();
     menu_repaintAll();
+}
+
+/*
+ * Apply the queued scene-change action (S080 F9, PAR_SCENE_QUEUE_ACTION).
+ *
+ * What: qac selects nrm (nothing), mut (reset all mutes off), mor (reset all
+ * morphs to 0), m+m (both), or rld (reload from source, plus mutes/morphs).
+ * Why: a queued scene change may optionally normalise the console state.
+ * Inputs: parameter_values[PAR_SCENE_QUEUE_ACTION]. Outputs: mute/morph reset
+ * side effects applied before the change executes. Affiliates: seq_setMute(),
+ * the change executor.
+ *
+ * Note: morph reset and source reload degradation are the two pieces of this
+ * option that need extra plumbing (a Preset morph-reset entry point and an
+ * async source read); mut/m+m/rld currently reset mutes, and rld/nrm execute a
+ * normal change. Flagged in the S080 implementation notes.
+ */
+static void menu_applyQueuedSceneAction(void)
+{
+    uint8_t qac = parameter_values[PAR_SCENE_QUEUE_ACTION];
+
+    if (qac == 1u || qac == 3u || qac == 4u)     /* mut / m+m / rld */
+        seq_setMute(7u, 0u);
+}
+
+/*
+ * Execute a deferred/queued scene change (S080 F8/F9 foreground half).
+ *
+ * What: called from the main-loop service cadence. If the TIM3 ISR raised the
+ * scene-change fire flag, read the target and queue flag, clear the pending
+ * state, apply the queue action when queued, then run the change executor. Why:
+ * the ISR detects the boundary but cannot do DSP/LED/filesystem work. Inputs:
+ * seq_sceneChangeFirePending(). Outputs: the scene change is performed.
+ * Affiliates: seq_requestSceneChange()/seq_queueSceneChange() (F7),
+ * seq_handleMasterBoundary() (F8).
+ */
+void menu_serviceDeferredSceneChange(void)
+{
+    uint8_t scene;
+    uint8_t isQueue;
+
+    if (!seq_sceneChangeFirePending())
+        return;
+    scene = seq_pendingSceneTarget();
+    isQueue = seq_pendingSceneIsQueue();
+    seq_clearPendingSceneChange();
+    if (isQueue)
+        menu_applyQueuedSceneAction();
+    menu_perfSceneChangeExecute(scene);
 }
 
 void menu_refreshVoiceHeldSceneLeds(void)
@@ -9446,8 +9608,9 @@ static void menu_getPlayModeName(uint16_t value, char *buf)
 /*
  * Format one step trigger condition into a three-character field (S079 §3).
  *
- * What: writes the 3-char condition label for values 0..38 (fix 3 adds the
- * track-7 mute pair); values 39..255 (undefined, forward compatible) and any
+ * What: writes the 3-char condition label for values 0..40 (S080 B1 adds the
+ * lop/!lp pair; fix 3 added track 7); values 41..255 (undefined, forward
+ * compatible) and any
  * out-of-range input display as the always-fire default. Inputs: raw stored
  * condition and a three-character
  * output. Outputs: exactly three characters, no terminator. Affiliates:
@@ -9458,12 +9621,73 @@ static void menu_getConditionName(uint16_t value, char *buf)
 {
     const char *p;
 
-    if (value > 38u)
+    if (value > 40u)
         value = 0u;
     p = conditionNames[value + 1u];
     buf[0] = p[0];
     buf[1] = p[1] ? p[1] : ' ';
     buf[2] = p[2] ? p[2] : ' ';
+}
+
+/*
+ * S080 E6/F10: name-table formatter and static-param resolver.
+ *
+ * What: menu_nameTable3() writes the 3-character label at value+1 of a
+ * count-prefixed [count][entries...] name table (clamping out-of-range values
+ * to entry 0, like the existing name formatters). menu_getS080StaticName()
+ * resolves one of the S080 static cells - BAR overlay trigger type, overlay
+ * note (def or a note name), scene change/queue division, queue action - and
+ * returns 1 when it handled the cell.
+ * Why: all DTYPE_MENU ids and DTYPE_* nibbles are occupied (S078), so these
+ * cells render through static-param special cases instead of a dtype table,
+ * exactly like the S078 run mode and S079 step specials.
+ * Inputs: cell and its value. Outputs: 3 characters in buf. Accessors:
+ * menu_formatCellValue3(), va_formatValue3(), the menu_repaintGeneric() edit
+ * painter. Affiliates: perfBtnTypeNames/sceneChangeDivNames/
+ * sceneQueueActionNames (MenuText.h), setNoteName().
+ */
+static void menu_nameTable3(const char table[][4], uint8_t count,
+                            uint16_t value, char *buf)
+{
+    const char *p;
+
+    if (value >= count)
+        value = 0u;
+    p = table[value + 1u];
+    buf[0] = p[0];
+    buf[1] = p[1] ? p[1] : ' ';
+    buf[2] = p[2] ? p[2] : ' ';
+}
+
+static uint8_t menu_getS080StaticName(const menu_cell_t *cell,
+                                      uint16_t value, char *buf)
+{
+    if (!cell || cell->kind != MENU_CELL_STATIC)
+        return 0u;
+    switch (cell->static_param) {
+    case PAR_PERF_BTN_LT:
+    case PAR_PERF_BTN_RT:
+        menu_nameTable3(perfBtnTypeNames, 12u, value, buf);
+        return 1u;
+    case PAR_PERF_NOTE_LT:
+    case PAR_PERF_NOTE_RT:
+        /* 0 = the track's default note; otherwise a MIDI note name. */
+        if (value == 0u) {
+            buf[0] = 'd'; buf[1] = 'e'; buf[2] = 'f';
+        } else {
+            setNoteName((uint8_t)value, buf);
+        }
+        return 1u;
+    case PAR_SCENE_CHANGE_DIV:
+    case PAR_SCENE_QUEUE_DIV:
+        menu_nameTable3(sceneChangeDivNames, 10u, value, buf);
+        return 1u;
+    case PAR_SCENE_QUEUE_ACTION:
+        menu_nameTable3(sceneQueueActionNames, 5u, value, buf);
+        return 1u;
+    default:
+        return 0u;
+    }
 }
 
 /*
@@ -9642,6 +9866,83 @@ static uint8_t has2ndPage(uint8_t menuPage)
 {
     menu_cell_t cell = menu_resolveCellAbsolute(menuPage, 4u);
     return (uint8_t)(!menu_cellIsEmpty(&cell));
+}
+
+/*
+ * S080 A1/E3: populated static-subpage geometry helpers.
+ *
+ * What:  return the first / last selectable column of the current page's
+ *        given sub-page (-1 when the sub-page has no selectable cell).
+ * Why:   the S080 PERFORMANCE_PAGE and RECORDING_PAGE layouts put four (or
+ *        fewer) active cells at columns 0..3 of each sub-page and use
+ *        TEXT_EMPTY/PAR_NONE terminators for the rest. Encoder traversal must
+ *        step across to the adjacent populated sub-page at those boundaries;
+ *        the generic 8-cell checkvalid path only ever crosses at column 8
+ *        (MENU_MIDI_PAGE) or stops at an empty cell. These helpers let the
+ *        PERF/RECORDING step find the next/previous non-empty sub-page and
+ *        its endpoint column.
+ * Inputs: sub-page index 0..NUM_SUB_PAGES-1; resolves through the active
+ *        page's static table via menu_resolveCellAbsolute().
+ * Outputs: column 0..7, or -1 when empty.
+ * Accessors: menu_moveToMenuItem() (S080 cross-subpage step).
+ * Affiliates: menu_resolveCellAbsolute(), menu_cellIsEmpty(), has2ndPage().
+ */
+static int8_t menu_staticFirstPopulatedColumn(uint8_t subPage)
+{
+    uint8_t col;
+
+    if (subPage >= NUM_SUB_PAGES)
+        return -1;
+    for (col = 0u; col < MENU_STATIC_SUBPAGE_CELLS; col++) {
+        menu_cell_t cell = menu_resolveCellAbsolute(subPage, col);
+
+        if (!menu_cellIsEmpty(&cell) &&
+            !(cell.kind == MENU_CELL_STATIC && cell.text_id == TEXT_SKIP))
+            return (int8_t)col;
+    }
+    return -1;
+}
+
+static int8_t menu_staticLastPopulatedColumn(uint8_t subPage)
+{
+    int8_t last = -1;
+    uint8_t col;
+
+    if (subPage >= NUM_SUB_PAGES)
+        return -1;
+    for (col = 0u; col < MENU_STATIC_SUBPAGE_CELLS; col++) {
+        menu_cell_t cell = menu_resolveCellAbsolute(subPage, col);
+
+        if (!menu_cellIsEmpty(&cell) &&
+            !(cell.kind == MENU_CELL_STATIC && cell.text_id == TEXT_SKIP))
+            last = (int8_t)col;
+    }
+    return last;
+}
+
+/*
+ * S080 A5: reflect the active PERF sub-page onto the SELECT row.
+ *
+ * What:  lights SELECT1 for PERFORMANCE_PAGE sub-page 0 or SELECT2 for
+ *        sub-page 1 and clears the other SELECT LEDs.
+ * Why:   with the S080 A1 split the user needs a visual cue for which PERF
+ *        sub-page is shown, mirroring the single active SELECT LED used on the
+ *        multi-screen voice pages. The Phase C looper temporarily takes the
+ *        SELECT row while engaged and restores this mapping on release.
+ * Inputs: menu_getSubPage().
+ * Outputs: one SELECT LED lit through led_setActiveSelectButton().
+ * Accessors: menu_switchPage() PERF LED block, the S080 cross-subpage step in
+ *        menu_moveToMenuItem(), and buttonHandler's looper disengage (it
+ *        restores the sub-page indication after the loop releases the row).
+ * Affiliates: led_setActiveSelectButton() (ledHandler.c).
+ */
+void menu_syncPerfSelectLed(void)
+{
+    uint8_t sub = menu_getSubPage();
+
+    if (sub > 1u)
+        sub = 0u;
+    led_setActiveSelectButton(sub);
 }
 
 static uint8_t menu_voiceAbsolutePositionSelectable(uint8_t subPage,
@@ -11665,6 +11966,10 @@ static void menu_repaintGeneric(void)
                 numtostrpu(&editDisplayBuffer[1][13], (uint8_t)(value+1), ' ');
                 break;
             case DTYPE_0B127:
+                /* S080 E6/F10: overlay/scene-global static-param names. */
+                if (menu_getS080StaticName(&cell, value,
+                                           &editDisplayBuffer[1][13]))
+                    break;
                 /* Per-track play mode shows its 0..5 name (S078 §4.1). */
                 if (cell.kind == MENU_CELL_STATIC &&
                     cell.static_param == PAR_TRACK_PLAY_MODE) {
@@ -11985,6 +12290,68 @@ static void menu_moveToMenuItem(int8_t inc)
     uint8_t allowedSkips = 3;
 
     inc = (int8_t)(inc > 0 ? 1 : -1);
+
+    /*
+     * S080 A1/E3: cross-sub-page stepping for the two-sub-page static pages.
+     *
+     * What:  on PERFORMANCE_PAGE and RECORDING_PAGE, stepping past the last
+     *        selectable column of a sub-page advances to the first selectable
+     *        column of the next populated sub-page; stepping back past the
+     *        first column returns to the last column of the previous populated
+     *        sub-page. Movement is non-cyclic (it stops at the first/last
+     *        populated sub-page).
+     * Why:   the S080 A1/E3 layouts put only columns 0..3 (PERF) or 0..3/0
+     *        (SHIFT+REC) on each sub-page, so the generic 8-cell path can never
+     *        reach cells 4..7 and would otherwise strand the user on sub-page
+     *        0. Within a sub-page the normal checkvalid path still runs.
+     * Inputs: menu_activePage, activePage, activeParameter, inc.
+     * Outputs: menuIndex moved to the adjacent sub-page; the PERF SELECT LED
+     *        is re-mapped (A5).
+     * Accessors: menu_moveToMenuItem() (encoder navigation).
+     * Affiliates: menu_staticFirstPopulatedColumn()/menu_staticLastPopulated-
+     *        Column(), menu_setPerfSelectLed().
+     */
+    if (menu_activePage == PERFORMANCE_PAGE ||
+        menu_activePage == RECORDING_PAGE) {
+        int8_t firstCol = menu_staticFirstPopulatedColumn((uint8_t)activePage);
+        int8_t lastCol  = menu_staticLastPopulatedColumn((uint8_t)activePage);
+
+        if (firstCol >= 0) {
+            if (inc > 0 && activeParameter >= lastCol) {
+                uint8_t sub;
+
+                for (sub = (uint8_t)(activePage + 1);
+                     sub < NUM_SUB_PAGES; sub++) {
+                    int8_t f = menu_staticFirstPopulatedColumn(sub);
+
+                    if (f >= 0) {
+                        menuIndex = (uint8_t)(((uint8_t)sub << PAGE_SHIFT) |
+                                              (uint8_t)f);
+                        if (menu_activePage == PERFORMANCE_PAGE)
+                            menu_syncPerfSelectLed();
+                        return;
+                    }
+                }
+                return;   /* no later populated sub-page: stop (non-cyclic) */
+            }
+            if (inc < 0 && activeParameter <= firstCol) {
+                int8_t sub;
+
+                for (sub = (int8_t)(activePage - 1); sub >= 0; sub--) {
+                    int8_t l = menu_staticLastPopulatedColumn((uint8_t)sub);
+
+                    if (l >= 0) {
+                        menuIndex = (uint8_t)(((uint8_t)sub << PAGE_SHIFT) |
+                                              (uint8_t)l);
+                        if (menu_activePage == PERFORMANCE_PAGE)
+                            menu_syncPerfSelectLed();
+                        return;
+                    }
+                }
+                return;
+            }
+        }
+    }
 
     /*
      * STEP subpage chain (S079 fix 1): sub 1 (vel/note/condition/timing) ->
@@ -14992,6 +15359,9 @@ void menu_switchPage(uint8_t pageNr)
          */
         buttonHandler_showMuteLEDs();
         menu_refreshPerfSceneLeds();
+        /* S080 A5: show the active PERFORMANCE_PAGE sub-page on the SELECT
+         * row (sub-page 0 -> SELECT1, sub-page 1 -> SELECT2). */
+        menu_syncPerfSelectLed();
     } else if (pageNr == EFFECT_PAGE) {
         /* Effect page owns mute/SELECT LEDs and the FX-sequencer row. */
         buttonHandler_showMuteLEDs();

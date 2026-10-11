@@ -2604,3 +2604,235 @@ Compile the full firmware after each phase and verify:
 ---
 
 *End of implementation schedule. No code changes in this turn.*
+
+---
+
+## Implementation Progress Log (working notes)
+
+### Phase A — Menu Re-order + Page-Entry Bug Fix — DONE (build clean)
+
+- **A1 (menuPages.h):** PERFORMANCE_PAGE split into two sub-pages
+  (sub 0 = mrp, fxm, 1VM, 2VM; sub 1 = 3VM, 4VM, 5VM, 6VM; cells 4-7 are
+  TEXT_EMPTY/PAR_NONE). Two empty padding rows removed to keep 8 sub-pages.
+- **A2 (buttonHandler.c):** added `menu_resetActiveParameter()` after
+  `menu_switchSubPage(0)` in the PERF entry of `handleModeButtons()`, and again
+  in the SHIFT-release `SELECT_MODE_PERF` case before `return`.
+- **A3 (menu.c):** `menu_applyPerfMarkers()` now selects the column->bit
+  mapping from `menu_getSubPage()` instead of the old `is2nd` half. Sub-page 0:
+  col 1 = fxm (VA_PERF_MORPH_EFFECT_BIT + FX-seq lock), col 2 = 1VM (bit 0),
+  col 3 = 2VM (bit 1). Sub-page 1: col 0-3 = 3VM-6VM (bits 2-5).
+- **A4 (menu.c):** **No code change needed.** The A4 premise (the scan walks
+  sub-page 0's eight cells) does not match the actual implementation:
+  `va_searchRestart()` only resets the search, and `va_scanService()` already
+  walks all seven tracks parameter-by-parameter, setting
+  `va_searchPerfMorphMask` from descriptor voice slots 0..5 (bits 0..5) and the
+  effect morph (bit 6). That result is independent of cell position, so the A3
+  remap is sufficient.
+- **A5 (menu.c + buttonHandler.c):** new static `menu_setPerfSelectLed()` lights
+  SELECT1/SELECT2 for PERFORMANCE_PAGE sub-page 0/1. Called from the PERF LED
+  block of `menu_switchPage()` and from the new cross-sub-page step; the
+  buttonHandler PERF entry also lights SELECT1 explicitly after forcing
+  sub-page 0.
+- **Navigation (needed by A1/E3, not spelled out in the schedule):** added a
+  cross-sub-page step in `menu_moveToMenuItem()` for PERFORMANCE_PAGE and
+  RECORDING_PAGE. Stepping past the last populated column of a sub-page moves
+  to the first populated column of the next populated sub-page (and symmetric
+  for back). Non-cyclic. Two new helpers `menu_staticFirstPopulatedColumn()` /
+  `menu_staticLastPopulatedColumn()` implement the geometry.
+- **Assumption (flagged):** the S080 plan's A5 (SELECT LEDs show the PERF
+  sub-page) and Phase C's looper (SELECT LEDs show the held division) both claim
+  the SELECT row. Resolution taken: at rest the SELECT LED reflects the PERF
+  sub-page; the Phase C looper overrides it while engaged and the mapping is
+  restored on release.
+- **Build:** `make all` clean (only the pre-existing libc_nano linker warnings).
+  `text 544,816`, `data 408`, `bss 427,776` (+744 B text vs S079 close).
+
+### Phase B — New Trigger Conditions (lop / !lp) — DONE (build clean)
+
+- **B1 (MenuText.h):** `conditionNames[]` count 39 -> 41, `lop`/`!lp` inserted
+  after `!fl`. **Also corrected a pre-existing S079 display bug:** the mute
+  group was emitted as `1mu..6mu, !1m..!6m, 7mu, !7m` while the dispatch
+  (authority) uses contiguous 7-entry groups `25..31 muted`, `32..38 not
+  muted`. Since `menu_getConditionName()` indexes the table directly by stored
+  value, the labels were one group out of step. The table is now in numeric
+  order: `1mu..7mu` (27..33), `!1m..!7m` (34..40). Flagged for user awareness.
+- **B2 (sequencer.h):** `extern uint8_t seq_loopActive;` plus the C1 looper
+  config/API declarations (see Phase C).
+- **B3 (sequencer.c):** `seq_loopActive` definition next to `seq_fillActive`.
+- **B4 (sequencer.c):** `seq_evaluateStepCondition()` out-of-range guard 38 ->
+  40; new `23 lop` / `24 !lp` dispatch; `lst`/`!ls` now 25/26; mute groups now
+  27..33 / 34..40 with `(cond - 27) % 7` and boundary `cond <= 33`. The
+  self-mute bypass in `seq_advanceTrackStep()` shifted to the same ranges.
+  `menu.c` clamp (`menu_clampCellValue`) and `menu_getConditionName()` widened
+  38 -> 40.
+- **B5 / C9 (sequencer.c):** `seq_loopActive = 0` in the `seq_setRunning()` stop
+  branch and in `seq_setStepIndexToStart()`.
+- **Build:** clean, no new warnings.
+
+### Phase C — Looper (core engine + foreground) — DONE (build clean)
+
+- **C1/C2 (sequencer.h/.c):** looper state (`seq_loopActive`, `seq_loopTrackMask`,
+  `seq_loopDivision`, `seq_loopModifier`, per-track `seq_loopStartStep/Accum`) and
+  `seq_loopEngage()/seq_loopDisengage()/seq_loopUpdateDivision()`. Engage
+  snapshots each selected track's cursor/accumulator, disables recording, then
+  sets the flag last (atomic gate). Disengage clears the flag, realigns the
+  looped tracks, clears the mask.
+  - **Deviation from C3:** the wrap is implemented in a new
+    `seq_loopProcessTick()` called once per master PPQ tick from
+    `seq_processSchedulerTick()`, not inside `seq_advanceTrackStep()`. It counts
+    `seq_loopLengthTicks(division, modifier)` master ticks and then restores each
+    looped track's snapshot. This gives every looped track the same absolute
+    start point on the shared master clock (plan §3.4) with far less risk than
+    per-track DDA domain conversion. Divisions: 1bar=384 ticks down to 1/128=3;
+    dot x3/2, triplet x2/3.
+- **C4/C6 (buttonHandler.c):** SELECT press engages/updates the loop
+  (division = SELECT index, mask = held VOICEs or 0x7F); SELECT release
+  disengages on the last release and returns the SELECT LED to the sub-page
+  indication. Last-pressed-wins is approximated by the highest held index when
+  the owner is released (press order is not stored).
+- **C7 (buttonHandler.c):** REC toggle is consumed while `seq_loopActive`.
+- **C8 (buttonHandler.c):** overflow clear drops the looper/overlay/menu flags
+  and disengages the loop.
+- **BUILD NOTE:** `bh_chainMenuScene` is intentionally defined now (E7 state
+  block) and used in Phase G; until then it emits one `-Wunused-variable`.
+
+### Phase E — BAR overlay + SHIFT+REC menu + settings — DONE (build clean)
+
+- **E1/E2/E3/E4/E5/E6 (headers, menu.c, menuPages.h):** PAR_PERF_BTN/NOTE_* ids;
+  TEXT_/CAT_/SHORT_/LONG_ enums; RECORDING_PAGE repurposed (sub-page 0 overlay,
+  sub-page 1 quantisation); `perfBtnTypeNames` table; valueNames entries;
+  `menu_getS080StaticName()` + `menu_nameTable3()` static-param rendering and
+  clamps (btn 0..11, note 0..127, scd/qcd 0..9, qac 0..4). Wired into
+  `menu_formatCellValue3()`, `va_formatValue3()`, the edit painter, and
+  `menu_clampCellValue()`. Global-settings dirty marking extended to
+  RECORDING_PAGE.
+- **E7 (buttonHandler.c):** `buttonHandler_shiftRecMenuEnter/Exit()` save/restore
+  the page + sub-page, arm `bh_shiftRecMenuActive`, and manage the SHIFT/REC
+  LEDs. REC exits the menu; SHIFT release also exits. (Limitation: the exact
+  within-sub-page cursor is reset to cell 0 on restore, not the precise prior
+  column.)
+- **E8/E9 (buttonHandler.c):** BAR1/BAR2 toggle the `<`/`>` overlay when not
+  looping, and act as momentary triplet (BAR1) / dot (BAR2) modifiers while
+  looping. BAR LEDs are forced off while a SELECT is held and restored on loop
+  release.
+- **E10/E11 (filesystem.c):** settings.cfg writer cases 17..24 and terminator
+  `lines=25`; parser keys perf_btn_lt/perf_note_lt/perf_btn_rt/perf_note_rt and
+  scd/qcd/qac/pcr; boot defaults (all 0).
+- **E12 (buttonHandler.c):** `bh_overlayActive`-driven VOICE trigger dispatch:
+  single vmx/v10/v64/v32, flam (flm/fls fire a soft 1/32-spaced second hit), and
+  held rolls (r/8..128) repeated by a 1 ms foreground timer in
+  `buttonHandler_tick()`. SHIFT+VOICE keeps the normal mute behaviour.
+  - **Simplification:** `fls` uses the same 1/32 spacing as `flm` (no public
+    accessor for a track's effective step scale was added).
+  - **RAM note:** the overlay runtime state is ~14 B SRAM1 (plan budgeted ~4 B);
+    flagged for the memory policy.
+
+### Phase F — Scene queue / change division globals — DONE (build clean)
+
+- **F1/F2/F4/F5/F6:** PAR_SCENE_* ids; TEXT_/CAT_/SHORT_/LONG_ enums and
+  valueNames; `sceneChangeDivNames` / `sceneQueueActionNames`; settings.cfg
+  writer cases 21..24 with terminator `lines=25`; parser keys scd/qcd/qac/pcr;
+  boot defaults 0 (instant/normal/off).
+- **F3 (deviation):** the four globals are placed in the **second half of
+  MENU_MIDI_PAGE sub-page 2** (the S074 Scene sub-page) instead of a new
+  sub-page 3. The plan's sub-page 3 is unreachable: the global traversal only
+  crosses sub-pages at column 8 and stops on empty cells, and sub-page 2 has
+  only four populated cells. The second half is reachable through the existing
+  same-sub-page half navigation and the encoder. `MENU_GLOBAL_SCENE_SUBPAGE`
+  remains the last populated Scene sub-page.
+- **F7/F8 (sequencer.c/.h):** deferral/queue state plus
+  `seq_requestSceneChange()`, `seq_queueSceneChange()`,
+  `seq_sceneChangeFirePending()`, `seq_pendingSceneTarget()`,
+  `seq_pendingSceneIsQueue()`, `seq_clearPendingSceneChange()`. The TIM3 ISR
+  raises the fire flag in `seq_handleMasterBoundary()` at the selected division
+  (1/8 .. 4 bars on the master 1/16 clock). `ens`/`enl` are approximated by a
+  1-bar boundary pending a track-length-aware boundary.
+- **F9 (menu.c/.h, buttonHandler.c):** `menu_perfModeSceneButtonPressed()` now
+  defers to `seq_requestSceneChange()` when scd is not instant and transport is
+  running, and otherwise runs the new ungated `menu_perfSceneChangeExecute()`.
+  `menu_serviceDeferredSceneChange()` (called every main-loop pass from
+  `buttonHandler_tick()`) executes a fired change and applies the queue action.
+  PCR calls `seq_resetToPatternStart()` after the change. SHIFT+SEQ in PERF
+  queues a change (blinking SEQ LED; standard blink rate) via
+  `seq_queueSceneChange()`. Queue action `mut`/`m+m`/`rld` reset mutes;
+  **morph reset and source reload are not yet wired** (no reset entry point /
+  async read) - documented.
+- **F10:** static-param rendering for scd/qcd/qac via `menu_getS080StaticName()`
+  (F6/E6); pcr uses the on/off renderer.
+- **Build:** clean, no new warnings. `text 549,592`, `data 412`, `bss 427,856`
+  (+5,520 text / +4 data / +80 bss vs the S079 close).
+
+### Phase G (Scene Chaining) and H (Autosave) — NOT IMPLEMENTED THIS SESSION
+
+Deferred deliberately to keep the tree building and safe. Rationale: G needs a
+new per-Scene data field plus sceneset serialization, an ISR chain evaluator,
+AND a bespoke chain-editing menu surface (not expressible as a plain PAR_ cell),
+and H then extends the byte-addressed Autosave payload. Defaults would leave all
+chain actions inert (nul/slf), so nothing here regresses current behaviour.
+Remaining G work (in order): G1 `scene_settings_t` +4 bytes; G2 named
+getters/setters; G3 `scene_commitSettings()`; G5/G6 sceneset writer/parser
+(`chain_condition`, `chain_next` CSV pairs); G7 `seq_evaluateChainCondition()` /
+`seq_evaluateSceneChains()` at bar/repetition boundaries; G8 SHIFT+PLAY+SEQ menu
+entry; G9 name tables (already added to MenuText.h); G10 TEXT_/valueNames
+(already added); G11 `stp` track-freeze flag; G12 clears. H1 then adds the four
+bytes per Scene to `autosave_getLivePayloadByte()` / `autosave_applyScenePayload()`.
+Note: the G9/G10 name tables and enums are already in place, so the menu work can
+use them directly. The `bh_chainMenuArmed/Scene/Active` state was removed to keep
+the build warning-clean and must be re-added with G8.
+
+---
+
+### Code Review — Post-Implementation Audit (S080 close)
+
+Verified every schedule item against the live codebase. Method: read the
+modified files (menuPages.h, MenuText.h, sequencer.h/.c, buttonHandler.c,
+menu.c, filesystem.c) and grepped for every declared symbol, state variable,
+and API function.
+
+#### Phases verified DONE (code matches schedule + progress log)
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| **A** (menu re-order + bug fix) | DONE | PERF table split confirmed in menuPages.h:102–118. `menu_resetActiveParameter()` added in buttonHandler PERF entry. `menu_applyPerfMarkers()` remapped for 2-subpage layout. A4 correctly no-op'd (scan is parameter-based). Cross-subpage navigation added as an unlisted but necessary bonus. |
+| **B** (lop/!lp conditions) | DONE | conditionNames count=41 with lop/!lp at indices 23–24 (MenuText.h:248–257). Mute group reordered to match dispatch (pre-existing display bug fixed). seq_evaluateStepCondition() dispatches 23/24 and shifts mute ranges to 27–33/34–40. |
+| **C** (looper core) | DONE | seq_loopActive + config externs in sequencer.h:66–103. Engage/disengage/update API in sequencer.c:325–371. Loop wrap via seq_loopProcessTick() (deviation from C3: tick-counting approach instead of per-track DDA wrap — simpler and safer). SELECT press/release routing in buttonHandler.c:1637–1730. Overflow clear at line 2717. Transport stop and step-index-to-start clears confirmed. |
+| **E** (BAR overlay + SHIFT+REC) | DONE | RECORDING_PAGE repurposed (menuPages.h:177–195). PAR_PERF_BTN/NOTE_LT/RT in ParameterArray.h. perfBtnTypeNames table in MenuText.h. Static-param rendering via menu_getS080StaticName(). SHIFT+REC enter/exit protocol with saved page/subpage. BAR overlay toggle (bh_overlayActive). BAR dot/triplet modifier during loop. Overlay trigger dispatch with roll timer in buttonHandler_tick(). Settings writer cases 17–20 and parser keys confirmed in filesystem.c. |
+| **F** (scene queue/change division) | DONE | PAR_SCENE_CHANGE/QUEUE_DIV/ACTION/PC_RESET in ParameterArray.h. Deferred scene change API (seq_requestSceneChange/seq_queueSceneChange/seq_sceneChangeFirePending) in sequencer.h:118–120 and sequencer.c:462–479. ISR fire flag in seq_handleMasterBoundary(). Foreground service via menu_serviceDeferredSceneChange() called from buttonHandler_tick(). SHIFT+SEQ queue with blinking LED. PCR via seq_resetToPatternStart(). Settings writer cases 21–24 + terminator lines=25. Deviation from F3: globals placed in second half of MENU_MIDI_PAGE sub-page 2 (not sub-page 3) — correct, sub-page 3 was unreachable. |
+
+#### Phase D — partially implemented
+
+| Item | Status | Detail |
+|------|--------|--------|
+| **D1** (VOICE+SELECT per-track swap) | DONE | buttonHandler.c:1887–1897. Disengage+re-engage with new mask when VOICE pressed during active loop. |
+| **D2** (scene change resets loop start) | **NOT DONE** | `menu_perfSceneChangeExecute()` (menu.c:8255) has no loop-start re-snapshot. A scene change during an active loop leaves the loop wrapping to the old scene's start points. Fix: after `seq_selectActivePattern()` at line 8272, if `seq_loopActive`, iterate looped tracks and re-snapshot `seq_loopStartStep[]/seq_loopStartAccum[]` from the freshly reset step indices. |
+| **D3** (per-track scene change updates loop start) | **NOT DONE** | `buttonHandler_perfVoiceHeldSeqPressed()` (buttonHandler.c:1093) calls `seq_realignTrackToMasterClock()` but does not re-snapshot the loop start for tracks in the loop mask. Fix: after line 1107, if `seq_loopActive && (seq_loopTrackMask & (1u << track))`, update `seq_loopStartStep[track]` and `seq_loopStartAccum[track]`. |
+
+#### Phases G and H — not implemented (documented, intentional deferral)
+
+| Phase | Status | What remains |
+|-------|--------|--------------|
+| **G** (scene chaining) | NOT DONE | G1: chain fields in scene_settings_t. G2: getters/setters. G3: commitSettings update. G5/G6: sceneset writer/parser. G7: chain evaluator. G8: SHIFT+PLAY+SEQ menu entry + bh_chainMenu state re-add. G9/G10: name tables and enums already in place. G11: stp track-freeze. G12: transport/manual clears. |
+| **H** (autosave + integration) | NOT DONE | H1: autosave byte mapping for chain data. H2: build verification (passing for implemented phases). H3: hardware verification (only implementable on hardware). |
+
+#### Deviations from schedule (documented in progress log, confirmed in code)
+
+1. **A4 no-op:** the automation scan was already parameter-based, not cell-based. No code change needed.
+2. **C3 deviation:** loop wrap uses tick-counting in `seq_loopProcessTick()` called from `seq_processSchedulerTick()`, not per-track DDA domain wrap in `seq_advanceTrackStep()`. Simpler and avoids cross-domain arithmetic.
+3. **F3 deviation:** scene globals on second half of sub-page 2, not sub-page 3.  Sub-page 3 unreachable due to traversal logic.
+4. **B1 bonus fix:** mute condition display names reordered to match dispatch order (pre-existing S079 display bug).
+5. **E12 simplification:** `fls` (variable-step flam) uses fixed 1/32 spacing — no per-track step-scale accessor added.
+6. **E RAM note:** overlay runtime ≈14 B (schedule budgeted ~4 B from plan §8). Not a concern at current usage.
+7. **F9 partial:** morph reset and source reload for queue actions `mor`/`m+m`/`rld` are not wired (no reset entry point / async read exists yet).
+
+#### Issues found
+
+1. **D2/D3 gap (medium priority):** scene changes during an active loop do not re-snapshot the loop start points. This means the looper wraps tracks back to positions from the old scene's pattern, causing audible jumps or silence. Should be fixed before hardware testing.
+2. **F9 morph/reload gap (low priority):** queue actions `mor`, `m+m`, and `rld` are documented as not wired. `mut` works. This is a known limitation, not a regression.
+3. **No Phase D progress entry:** the progress log has entries for A, B, C, E, F but not D. D1 was done as part of C; D2 and D3 were missed. The progress log should note D1 complete and D2/D3 deferred.
+
+#### Conclusion
+
+Phases A, B, C, E, F are complete and build-clean. D1 is complete. D2 and D3
+are missing (loop start re-snapshot on scene change). G and H are intentionally
+deferred. Two minor gaps (D2/D3 and F9 morph/reload) are flagged for the next
+implementation session.

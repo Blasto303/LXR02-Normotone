@@ -50,6 +50,79 @@ extern uint8_t seq_eraseActive;
 extern uint8_t seq_fillActive;
 
 /*
+ * Loop-active flag (S080 B2/C1).
+ *
+ * What: single-byte ISR gate, 0 = no loop, 1 = the PERF looper is engaged.
+ * Written by the foreground looper (buttonHandler/Preset) as the final atomic
+ * step after every loop config field below is published. Read by the TIM3 ISR
+ * in seq_evaluateStepCondition() (the lop/!lp conditions) and by the loop-wrap
+ * logic in seq_processSchedulerTick(). Why: single-byte reads/writes are atomic
+ * on Cortex-M7, exactly like seq_fillActive above, so the ISR never observes a
+ * partially published config; it ignores all loop config while this is 0.
+ * Inputs: seq_loopEngage()/seq_loopDisengage(). Outputs: ISR condition and
+ * wrap paths. Affiliates: seq_fillActive (above), seq_loopTrackMask and
+ * friends below.
+ */
+extern uint8_t seq_loopActive;
+
+/*
+ * Looper configuration and start-point snapshot (S080 C1).
+ *
+ * What: seq_loopTrackMask is a 7-bit mask (bit N = track N) selecting which
+ * tracks loop. seq_loopDivision is the SELECT-button division index (0 = 1 bar
+ * .. 7 = 1/128). seq_loopModifier is 0 = none, 1 = dot (+50%), 2 = triplet
+ * (x2/3). seq_loopStartStep[]/seq_loopStartAccum[] record each looped track's
+ * step cursor and Q8.8 DDA accumulator at engage time, so the ISR can wrap the
+ * track back to the same absolute position each loop period.
+ * Why: the foreground publishes a complete, coherent snapshot before setting
+ * seq_loopActive; the ISR reads these fields only while the flag is set.
+ * Inputs: buttonHandler SELECT/VOICE handlers (S080 C4/C6/D1). Outputs: the
+ * loop-wrap path in seq_processSchedulerTick(). Accessors: seq_loopEngage()/
+ * seq_loopDisengage()/seq_loopUpdateDivision(). Affiliates: seq_stepIndex[],
+ * seq_trackAccumulator[], seq_realignTrackToMasterClock().
+ */
+extern uint8_t  seq_loopTrackMask;
+extern uint8_t  seq_loopDivision;
+extern uint8_t  seq_loopModifier;
+extern int16_t  seq_loopStartStep[NUM_TRACKS];
+extern uint16_t seq_loopStartAccum[NUM_TRACKS];
+
+/*
+ * Looper control API (S080 C1).
+ *
+ * What: seq_loopEngage() snapshots the selected tracks' DDA state, publishes
+ * the config, and arms the loop atomically. seq_loopDisengage() clears the flag
+ * then realigns the looped tracks to the master clock. seq_loopUpdateDivision()
+ * hot-swaps division/modifier while the loop runs (no flag toggle). Why: the
+ * foreground owns button gestures, the TIM3 ISR owns step timing; the flag is
+ * the only cross-context gate. Inputs: trackMask 7-bit, division 0..7,
+ * modifier 0..2. Callers: buttonHandler.c PERF SELECT/VOICE handlers.
+ */
+void seq_loopEngage(uint8_t trackMask, uint8_t division, uint8_t modifier);
+void seq_loopDisengage(void);
+void seq_loopUpdateDivision(uint8_t division, uint8_t modifier);
+
+/*
+ * Deferred / queued scene change API (S080 F7/F8/F9).
+ *
+ * What: seq_requestSceneChange() arms a direct Scene change at a musical
+ * division (division 0 = instant, applied by the caller instead);
+ * seq_queueSceneChange() arms a queued (SHIFT+SEQ) change. The TIM3 ISR raises
+ * the fire flag at the boundary; the foreground polls seq_sceneChangeFirePending()
+ * and then reads seq_pendingSceneTarget()/seq_pendingSceneIsQueue() and calls
+ * seq_clearPendingSceneChange(). Why: scene changes can be quantised to the
+ * master clock without doing DSP/LED work in the ISR. Inputs: scene index and
+ * division (scd/qcd option value). Outputs: the pending state and fire flag.
+ * Affiliates: menu_serviceDeferredSceneChange(), buttonHandler SHIFT+SEQ.
+ */
+void seq_requestSceneChange(uint8_t scene_index, uint8_t division);
+void seq_queueSceneChange(uint8_t scene_index, uint8_t division);
+uint8_t seq_sceneChangeFirePending(void);
+uint8_t seq_pendingSceneIsQueue(void);
+uint8_t seq_pendingSceneTarget(void);
+void seq_clearPendingSceneChange(void);
+
+/*
  * Per-track Pattern assignment stub for the unified stack service.
  *
  * What: seven resident Scene indices, one per sequencer track. Why: S067

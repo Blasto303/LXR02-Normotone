@@ -166,6 +166,10 @@ static const char shortNames[][4] = {
     {"run"},
     /* S079 step-special compact labels: cdn/tim/rol/rtm/rfl (fix 2, P2). */
     {"cdn"},{"tim"},{"rol"},{"rtm"},{"rfl"},
+    /* S080 E4/G10: BAR overlay, scene globals, and chain labels. */
+    {"pb<"},{"pn<"},{"pb>"},{"pn>"},
+    {"scd"},{"qcd"},{"qac"},{"pcr"},
+    {"cn1"},{"nx1"},{"cn2"},{"nx2"},
 };
 
 static const char catNames[][16] = {
@@ -184,6 +188,10 @@ static const char catNames[][16] = {
      * "FX Seq  RunMode". Accessor: valueNames[TEXT_TRACK_PLAY_MODE].
      */
     {"Track"},
+    /* S080 E4: BAR overlay settings category. */
+    {"Prfrmnc"},
+    /* S080 G10: scene chain settings category. */
+    {"Chain"},
 };
 
 static const char longNames[][16] = {
@@ -215,28 +223,117 @@ static const char longNames[][16] = {
     {"RunMode"},
     /* S079 step-special long names (fix 2: Conditin, % Delay; P2: Rhythm). */
     {"Conditin"},{"% Delay"},{"RollRate"},{"Rhythm"},{"RollFill"},
+    /* S080 E4/F4/G10: overlay, scene-global, and chain long names. */
+    {"BtnStat<"},{"BtnNote<"},{"BtnStat>"},{"BtnNote>"},
+    {"ChngDiv"},{"QueDiv"},{"QueActn"},{"PCReset"},
+    {"Conditn1"},{"NxtScn1"},{"Conditn2"},{"NxtScn2"},
 };
 
 /*
- * Trigger condition display names (S079 §3; fix 3 extends to track 7).
- * [0]=count; [1..39] = condition indices 0..38.
+ * Trigger condition display names (S079 §3; fix 3 extends to track 7;
+ * S080 B1 adds the loop-active pair).
+ *
+ * S080 B1: insert `lop` (loop active) and `!lp` (loop inactive) after `!fl`;
+ * the count grows 39 -> 41 and every later condition shifts up by two.
+ * The table is indexed directly by the stored condition value
+ * (menu_getConditionName() reads conditionNames[value + 1]), so it must stay
+ * in numeric order. The mute group is therefore emitted in the dispatch's
+ * order - 1mu..7mu (indices 27..33) then !1m..!7m (34..40) - matching
+ * seq_evaluateStepCondition()'s (cond - 27) % 7 / boundary cond <= 33 rule.
+ * (S079 fix 3 had appended 7mu/!7m at the end of the old 6-track grouping,
+ * leaving the displayed labels one group out of step; this corrects it.)
+ *
+ * [0]=count; [1..41] = condition indices 0..40.
  */
 static const char conditionNames[][4] = {
-    {39},
+    {41},
     {"  -"},{"r10"},{"r20"},{"r30"},{"r40"},{"r50"},{"r60"},{"r70"},
     {"r80"},{"r90"},{"r95"},
     {"1:2"},{"2:2"},{"1:3"},{"2:3"},{"3:3"},{"1:4"},{"2:4"},{"3:4"},
     {"4:4"},{"1:-"},
-    {"fil"},{"!fl"},{"lst"},{"!ls"},
-    {"1mu"},{"2mu"},{"3mu"},{"4mu"},{"5mu"},{"6mu"},
-    {"!1m"},{"!2m"},{"!3m"},{"!4m"},{"!5m"},{"!6m"},
-    {"7mu"},{"!7m"},
+    {"fil"},{"!fl"},{"lop"},{"!lp"},{"lst"},{"!ls"},
+    {"1mu"},{"2mu"},{"3mu"},{"4mu"},{"5mu"},{"6mu"},{"7mu"},
+    {"!1m"},{"!2m"},{"!3m"},{"!4m"},{"!5m"},{"!6m"},{"!7m"},
 };
 
 /* Per-step roll rate display names (S079 §4.1). [0]=count; [1..9] = 0..8. */
 static const char stepRollRateNames[][4] = {
     {9},
     {"off"},{"1/8"},{"8tr"},{" 16"},{"16t"},{" 32"},{"32t"},{" 48"},{" 64"},
+};
+
+/*
+ * S080 E4: PERF BAR overlay trigger-type names.
+ *
+ * [0]=count; [1..12] = stored value 0..11. Rendered by the static-param
+ * special case in menu.c (S080 E6) because all 16 DTYPE_MENU ids are taken.
+ * Order: vmx, v10, v64, v32, flm, fls, then the held roll rates r/8..128.
+ * Affiliates: PAR_PERF_BTN_LT/RT, the overlay trigger dispatch (E12).
+ */
+static const char perfBtnTypeNames[][4] = {
+    {12},
+    {"vmx"},{"v10"},{"v64"},{"v32"},{"flm"},{"fls"},
+    {"r/8"},{"r16"},{"r32"},{"r64"},{"r6t"},{"128"},
+};
+
+/*
+ * S080 F4: scene change/queue division names (shared by scd and qcd).
+ * [0]=count; [1..10] = stored value 0..9: instant, 1/8, 1/4, 1/2, 1-bar,
+ * 2/3/4-bar, end-of-shortest-track, end-of-longest-track.
+ */
+static const char sceneChangeDivNames[][4] = {
+    {10},
+    {"ins"},{"1/8"},{"1/4"},{"1/2"},{"1b"},
+    {"2b"},{"3b"},{"4b"},{"ens"},{"enl"},
+};
+
+/*
+ * S080 F4: queued scene-change action names.
+ * [0]=count; [1..5] = 0..4: normal, reset mutes, reset morphs, both, reload.
+ */
+static const char sceneQueueActionNames[][4] = {
+    {5},
+    {"nrm"},{"mut"},{"mor"},{"m+m"},{"rld"},
+};
+
+/*
+ * S080 G9: scene chain condition names.
+ * [0]=count; [1..79] = condition index 0..78 (nul, always-rep, always-bar,
+ * repeat counts, bar counts, probabilities, bar positions, from-scene, fill
+ * and loop conditions). Rendered by the chain menu static-param path (G8/G10).
+ */
+static const char chainConditionNames[][4] = {
+    {79},
+    {"nul"},{"xal"},{"bal"},
+    {"x01"},{"x02"},{"x03"},{"x04"},{"x05"},{"x06"},{"x07"},{"x08"},
+    {"x16"},{"x32"},{"x64"},
+    {"b01"},{"b02"},{"b03"},{"b04"},{"b05"},{"b06"},{"b07"},{"b08"},
+    {"b16"},{"b32"},{"b64"},
+    {"r1x"},{"r2x"},{"r3x"},{"r4x"},{"r5x"},{"r6x"},{"r7x"},{"r8x"},{"r9x"},
+    {"r1b"},{"r2b"},{"r3b"},{"r4b"},{"r5b"},{"r6b"},{"r7b"},{"r8b"},{"r9b"},
+    {"1:4"},{"2:4"},{"3:4"},{"4:4"},
+    {"1:8"},{"2:8"},{"3:8"},{"4:8"},{"5:8"},{"6:8"},{"7:8"},{"8:8"},
+    {">01"},{">02"},{">03"},{">04"},{">05"},{">06"},{">07"},{">08"},
+    {">09"},{">10"},{">11"},{">12"},{">13"},{">14"},{">15"},{">16"},
+    {"fix"},{"fib"},{"!fx"},{"!fb"},
+    {"lox"},{"lob"},{"!lx"},{"!lb"},
+};
+
+/*
+ * S080 G9: scene chain next-scene names.
+ * [0]=count; [1..44] = value 0..43 (self, next, previous, absolute s01..s16,
+ * random up to r01..r16, relative random r+1..r+4 / r-1..r-4, stop playback).
+ */
+static const char chainNextNames[][4] = {
+    {44},
+    {"slf"},{"nxt"},{"prv"},
+    {"s01"},{"s02"},{"s03"},{"s04"},{"s05"},{"s06"},{"s07"},{"s08"},
+    {"s09"},{"s10"},{"s11"},{"s12"},{"s13"},{"s14"},{"s15"},{"s16"},
+    {"r01"},{"r02"},{"r03"},{"r04"},{"r05"},{"r06"},{"r07"},{"r08"},
+    {"r09"},{"r10"},{"r11"},{"r12"},{"r13"},{"r14"},{"r15"},{"r16"},
+    {"r+1"},{"r+2"},{"r+3"},{"r+4"},
+    {"r-1"},{"r-2"},{"r-3"},{"r-4"},
+    {"stp"},
 };
 
 #endif /* MENUTEXT_H_ */

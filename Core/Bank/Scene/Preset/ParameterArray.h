@@ -210,6 +210,41 @@ enum ParamEnums
 	PAR_BUS_COMP_TIME,
 	PAR_BUS_COMP_SIDECHAIN,
 
+	/*
+	 * S080 BAR overlay settings (perf_btn_lt/rt, perf_note_lt/rt).
+	 *
+	 * What: four persisted global parameters for the SHIFT+REC overlay page.
+	 * The *_BTN ids select a trigger type (vmx, v10, v64, v32, flm, fls, r/8,
+	 * r16, r32, r64, r6t, 128); the *_NOTE ids select a MIDI note (0 = def, else
+	 * 0..127). Why: the overlay behaviour must survive power cycles, so it is
+	 * written to settings.cfg alongside the existing globals. Inputs: SHIFT+REC
+	 * edits and settings load/default. Outputs: parameter_values[] reads by
+	 * buttonHandler's VOICE trigger dispatch. Affiliates: filesystem settings
+	 * writer/parser (S080 E10/E11), RECORDING_PAGE (S080 E3).
+	 */
+	PAR_PERF_BTN_LT,
+	PAR_PERF_NOTE_LT,
+	PAR_PERF_BTN_RT,
+	PAR_PERF_NOTE_RT,
+
+	/*
+	 * S080 scene queue / change division globals (scd, qcd, qac, pcr).
+	 *
+	 * What: PAR_SCENE_CHANGE_DIV (scd) is the musical division at which direct
+	 * scene changes take effect; PAR_SCENE_QUEUE_DIV (qcd) is the same for queued
+	 * (SHIFT+SEQ) changes; PAR_SCENE_QUEUE_ACTION (qac) selects the action on a
+	 * queued fire (normal / reset mutes / reset morphs / both / reload);
+	 * PAR_SCENE_PC_RESET (pcr) forces tracks to restart on scene change. Why:
+	 * adds musical timing and options to scene changes. Inputs: global settings
+	 * page edits and settings load/default. Outputs: sequencer scene-change
+	 * deferral and the foreground scene-change executor. Affiliates: filesystem
+	 * settings writer/parser (S080 F5/F6), MENU_MIDI_PAGE sub-page 3 (S080 F3).
+	 */
+	PAR_SCENE_CHANGE_DIV,
+	PAR_SCENE_QUEUE_DIV,
+	PAR_SCENE_QUEUE_ACTION,
+	PAR_SCENE_PC_RESET,
+
 	NUM_PARAMS = 384,
 };
 

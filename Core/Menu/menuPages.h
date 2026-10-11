@@ -46,8 +46,20 @@ const Page menuPages[NUM_PAGES][NUM_SUB_PAGES] = {
    * settings page; the empty second half terminates encoder traversal.
    * Values are active-Scene mirrors committed by menu.c's dedicated path.
    */
-  {TEXT_BUS_COMP_MODE,TEXT_BUS_COMP_AMOUNT,TEXT_BUS_COMP_TIME,TEXT_BUS_COMP_SIDECHAIN,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,
-    PAR_BUS_COMP_MODE,PAR_BUS_COMP_AMOUNT,PAR_BUS_COMP_TIME,PAR_BUS_COMP_SIDECHAIN,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
+  /*
+   * S080 F3: the Scene sub-page keeps the S074 bus compressor in its first
+   * half and adds the scene change/queue division globals (scd, qcd, qac) plus
+   * PCR in the second half, which the existing same-sub-page half navigation
+   * and encoder already reach. (The plan proposed a dedicated sub-page 3, but
+   * the global traversal only crosses sub-pages at column 8 and stops on the
+   * empty cells, so sub-page 3 would be unreachable without changing global
+   * navigation semantics.) MENU_GLOBAL_SCENE_SUBPAGE stays the last populated
+   * Scene sub-page.
+   */
+  {TEXT_BUS_COMP_MODE,TEXT_BUS_COMP_AMOUNT,TEXT_BUS_COMP_TIME,TEXT_BUS_COMP_SIDECHAIN,
+    TEXT_SCENE_CHANGE_DIV,TEXT_SCENE_QUEUE_DIV,TEXT_SCENE_QUEUE_ACTION,TEXT_SCENE_PC_RESET,
+    PAR_BUS_COMP_MODE,PAR_BUS_COMP_AMOUNT,PAR_BUS_COMP_TIME,PAR_BUS_COMP_SIDECHAIN,
+    PAR_SCENE_CHANGE_DIV,PAR_SCENE_QUEUE_DIV,PAR_SCENE_QUEUE_ACTION,PAR_SCENE_PC_RESET},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
@@ -67,10 +79,37 @@ const Page menuPages[NUM_PAGES][NUM_SUB_PAGES] = {
  * `srt` decimation cell). Roll is intentionally absent from PERF; later
  * performance/recording work will re-home roll behavior with the new pattern
  * stack instead of keeping it beside Morph.
+ *
+ * S080 A1: split into two subpages, four active cells each.
+ *
+ * What: subpage 0 = mrp (overall Morph), fxm (Effect Morph), 1VM, 2VM;
+ * subpage 1 = 3VM, 4VM, 5VM, 6VM. Cells 4-7 on both subpages are
+ * TEXT_EMPTY/PAR_NONE terminators.
+ * Why: the prior 8-cell single page reached the per-voice Morph cells only by
+ * scrolling the within-subpage second half, which also caused the PERF
+ * page-entry cursor bug (see buttonHandler.c A2). Splitting into subpages
+ * groups the two global controls (mrp, fxm) on the landing subpage and puts
+ * the six per-voice Morph controls on a second subpage.
+ * Inputs: static compile-time table consumed by menu_repaintGeneric() and
+ * encoder/subpage traversal.
+ * Outputs: the generic page renderer reads cells 0-3 of the active subpage;
+ * the TEXT_EMPTY terminator signals the end of the subpage.
+ * Accessors: menu_resolveCell(), menu_switchSubPage(), menu_getSubPage(),
+ * menu_moveToMenuItem() (S080 cross-subpage step).
+ * Affiliates: menu_applyPerfMarkers() (A3), buttonHandler handleModeButtons
+ * (A2), the PERF automation scan (va_scanService).
  */
 /* PERFORMANCE_PAGE */ {
-  {TEXT_X_FADE,TEXT_VOICE1_MORPH,TEXT_VOICE2_MORPH,TEXT_VOICE3_MORPH,TEXT_VOICE4_MORPH,TEXT_VOICE5_MORPH,TEXT_VOICE6_MORPH,TEXT_EFFECT_MORPH, PAR_MORPH,PAR_VOICE1_MORPH,PAR_VOICE2_MORPH,PAR_VOICE3_MORPH,PAR_VOICE4_MORPH,PAR_VOICE5_MORPH,PAR_VOICE6_MORPH,PAR_EFFECT_MORPH},
-  {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
+  /* Subpage 0: mrp, fxm, 1VM, 2VM. Cells 4-7 are terminators. */
+  {TEXT_X_FADE,TEXT_EFFECT_MORPH,TEXT_VOICE1_MORPH,TEXT_VOICE2_MORPH,
+   TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,
+   PAR_MORPH,PAR_EFFECT_MORPH,PAR_VOICE1_MORPH,PAR_VOICE2_MORPH,
+   PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
+  /* Subpage 1: 3VM, 4VM, 5VM, 6VM. Cells 4-7 are terminators. */
+  {TEXT_VOICE3_MORPH,TEXT_VOICE4_MORPH,TEXT_VOICE5_MORPH,TEXT_VOICE6_MORPH,
+   TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,
+   PAR_VOICE3_MORPH,PAR_VOICE4_MORPH,PAR_VOICE5_MORPH,PAR_VOICE6_MORPH,
+   PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
@@ -123,11 +162,30 @@ const Page menuPages[NUM_PAGES][NUM_SUB_PAGES] = {
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
 },
+/* RECORDING_PAGE — repurposed as the SHIFT+REC performance settings menu (S080 E3).
+ *
+ * What: sub-page 0 holds the PERF BAR overlay settings (pb</pn</pb>/pn>,
+ * category Prfrmnc); sub-page 1 holds the existing quantisation parameter
+ * (category Record). Sub-pages 2-7 are reserved for the future live-record
+ * options. Why: SHIFT+REC now opens a single performance/settings surface; the
+ * overlay controls are shown first so they are reachable immediately. Inputs:
+ * static table read by menu_repaintGeneric(). Accessors: menu_switchPage(
+ * RECORDING_PAGE), the S080 cross-sub-page encoder step, buttonHandler's
+ * SHIFT+REC enter/exit (E7). Affiliates: PAR_PERF_BTN_LT/RT (E1),
+ * TEXT_PERF_BTN_LT/RT (E2).
+ */
 /* RECORDING_PAGE */ {
-  /* Recording retains only quantisation; the retired automation-track row is
-   * intentionally absent from the static recording page. */
-  {TEXT_QUANTISATION,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_QUANTISATION,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
-  {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
+  /* Sub-page 0: BAR overlay trigger types and notes. */
+  {TEXT_PERF_BTN_LT,TEXT_PERF_NOTE_LT,TEXT_PERF_BTN_RT,TEXT_PERF_NOTE_RT,
+   TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,
+   PAR_PERF_BTN_LT,PAR_PERF_NOTE_LT,PAR_PERF_BTN_RT,PAR_PERF_NOTE_RT,
+   PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
+  /* Sub-page 1: recording quantisation. */
+  {TEXT_QUANTISATION,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,
+   TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,
+   PAR_QUANTISATION,PAR_NONE,PAR_NONE,PAR_NONE,
+   PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
+  /* Sub-pages 2-7: reserved for future live-record options. */
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},

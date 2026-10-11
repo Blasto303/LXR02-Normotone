@@ -2589,6 +2589,21 @@ static void filesystem_resetGlobalsToDefaults(void)
     memset(parameter_values + PAR_BEGINNING_OF_GLOBALS, 0, globals_len);
     parameter_values[PAR_BPM] = 120u;
     parameter_values[PAR_OSC_WAVE_INTERP] = 0u;
+    /*
+     * S080 E11/F6: defaults for the new persistent globals. Overlay defaults
+     * are vmx trigger / def note (0). Scene globals default to instant change
+     * (scd/qcd = 0), normal queue action (qac = 0), and PCR off (pcr = 0), which
+     * preserves the pre-S080 instant-switch behaviour when a settings.cfg from
+     * older firmware omits these keys.
+     */
+    parameter_values[PAR_PERF_BTN_LT] = 0u;
+    parameter_values[PAR_PERF_NOTE_LT] = 0u;
+    parameter_values[PAR_PERF_BTN_RT] = 0u;
+    parameter_values[PAR_PERF_NOTE_RT] = 0u;
+    parameter_values[PAR_SCENE_CHANGE_DIV] = 0u;
+    parameter_values[PAR_SCENE_QUEUE_DIV] = 0u;
+    parameter_values[PAR_SCENE_QUEUE_ACTION] = 0u;
+    parameter_values[PAR_SCENE_PC_RESET] = 0u;
 }
 
 static void filesystem_sanitizeLoadedGlobals(void)
@@ -2768,6 +2783,16 @@ static uint8_t filesystem_settingsParamForKey(const char *key,
     else if (strcmp(key, "follow") == 0) *param = PAR_FOLLOW;
     else if (strcmp(key, "osc_wave_interp") == 0) *param = PAR_OSC_WAVE_INTERP;
     else if (strcmp(key, "autosave") == 0) *param = PAR_AUTOSAVE_ENABLED;
+    /* S080 E11: PERF BAR overlay settings. */
+    else if (strcmp(key, "perf_btn_lt") == 0) *param = PAR_PERF_BTN_LT;
+    else if (strcmp(key, "perf_note_lt") == 0) *param = PAR_PERF_NOTE_LT;
+    else if (strcmp(key, "perf_btn_rt") == 0) *param = PAR_PERF_BTN_RT;
+    else if (strcmp(key, "perf_note_rt") == 0) *param = PAR_PERF_NOTE_RT;
+    /* S080 F6: scene queue / change division globals. */
+    else if (strcmp(key, "scd") == 0) *param = PAR_SCENE_CHANGE_DIV;
+    else if (strcmp(key, "qcd") == 0) *param = PAR_SCENE_QUEUE_DIV;
+    else if (strcmp(key, "qac") == 0) *param = PAR_SCENE_QUEUE_ACTION;
+    else if (strcmp(key, "pcr") == 0) *param = PAR_SCENE_PC_RESET;
     else return 0u;
     return 1u;
 }
@@ -17429,19 +17454,56 @@ static uint8_t filesystem_nextSettingsLine(char *dst, uint16_t cap,
         return filesystem_formatAssignmentU16Line(
             dst, cap, "autosave", parameter_values[PAR_AUTOSAVE_ENABLED]);
     case 17u:
+        /* S080 E10: PERF BAR overlay trigger type/note (left overlay). */
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "perf_btn_lt", parameter_values[PAR_PERF_BTN_LT]);
+    case 18u:
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "perf_note_lt", parameter_values[PAR_PERF_NOTE_LT]);
+    case 19u:
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "perf_btn_rt", parameter_values[PAR_PERF_BTN_RT]);
+    case 20u:
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "perf_note_rt", parameter_values[PAR_PERF_NOTE_RT]);
+    /*
+     * S080 F5: scene queue / change division globals.
+     *
+     * What: scd (direct scene-change division), qcd (queued change division),
+     * qac (queued change action), pcr (pattern-change reset). Why: these
+     * controls add musical timing and reset options to scene changes and must
+     * persist across power cycles. Together with the four overlay keys above
+     * the settings data lines grow from 17 to 25; the terminator count moves
+     * with them. Affiliates: filesystem_settingsParamForKey() (E11/F6), the
+     * global settings page (F3).
+     */
+    case 21u:
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "scd", parameter_values[PAR_SCENE_CHANGE_DIV]);
+    case 22u:
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "qcd", parameter_values[PAR_SCENE_QUEUE_DIV]);
+    case 23u:
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "qac", parameter_values[PAR_SCENE_QUEUE_ACTION]);
+    case 24u:
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "pcr", parameter_values[PAR_SCENE_PC_RESET]);
+    case 25u:
         /*
-         * Self-checking terminator for future format expansion.
+         * Self-checking terminator for format expansion.
          *
-         * What: emits "lines=17\n" as the final line, where 17 is the count
-         * of preceding data lines (cases 0u..16u). Why: gives any future
-         * consumer a cheap completeness signal that distinguishes a genuine
-         * end-of-file from a clean-but-early EOF after a crash. Adding a new
-         * settings key in the future requires incrementing both the key's own
-         * case and this declared count. The boot recovery prelude validates
-         * this count; the normal load path ignores it as an unknown key.
-         * Affiliates: §6 of S057_SETTINGS_WRITE_SAFE.md.
+         * What: emits "lines=25\n" as the final line, where 25 is the count
+         * of preceding data lines (cases 0u..24u: 17 original + 4 overlay
+         * (S080 E10) + 4 scene globals (S080 F5)). Why: gives consumers a
+         * cheap completeness signal that distinguishes a genuine end-of-file
+         * from a clean-but-early EOF after a crash. Adding a settings key
+         * requires incrementing both its own case and this declared count.
+         * The boot recovery prelude validates this count; the normal load path
+         * ignores it as an unknown key. Affiliates: §6 of
+         * S057_SETTINGS_WRITE_SAFE.md.
          */
-        return filesystem_formatAssignmentU16Line(dst, cap, "lines", 17u);
+        return filesystem_formatAssignmentU16Line(dst, cap, "lines", 25u);
     default:
         return 0u;
     }

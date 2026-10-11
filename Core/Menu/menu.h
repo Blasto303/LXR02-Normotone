@@ -152,6 +152,16 @@ enum NamesEnum {
     /* S079 STEP step-special labels: condition, micro-timing, roll family. */
     TEXT_CONDITION, TEXT_MICROTIMING, TEXT_ROLL_RATE, TEXT_ROLL_RHYTHM,
     TEXT_ROLL_FILL,
+    /*
+     * S080 E2: BAR overlay settings on the SHIFT+REC page (BtnStat</-
+     * BtnNote</BtnStat>/BtnNote>).
+     */
+    TEXT_PERF_BTN_LT, TEXT_PERF_NOTE_LT, TEXT_PERF_BTN_RT, TEXT_PERF_NOTE_RT,
+    /* S080 F2: scene change/queue division, queue action, PCR globals. */
+    TEXT_SCENE_CHANGE_DIV, TEXT_SCENE_QUEUE_DIV, TEXT_SCENE_QUEUE_ACTION,
+    TEXT_SCENE_PC_RESET,
+    /* S080 G10: per-Scene chain parameter labels (cn1/nx1/cn2/nx2). */
+    TEXT_CHAIN_COND1, TEXT_CHAIN_NEXT1, TEXT_CHAIN_COND2, TEXT_CHAIN_NEXT2,
     NUM_NAMES
 };
 
@@ -166,7 +176,11 @@ enum catNamesEnum {
     CAT_SCENE,
     /* S078 P4: per-track Pattern settings category ("Track"); parallel to
      * catNames[] in MenuText.h, which must stay index-aligned. */
-    CAT_TRACK
+    CAT_TRACK,
+    /* S080 E4: "Prfrmnc" category for the BAR overlay settings. */
+    CAT_PERFORMANCE,
+    /* S080 G10: "Chain" category for the scene chain parameters. */
+    CAT_CHAIN
 };
 
 enum longNamesEnum {
@@ -205,6 +219,11 @@ enum longNamesEnum {
     /* S079 step-special long names (condition, micro-timing, roll family). */
     LONG_CONDITION, LONG_MICROTIMING, LONG_ROLL_RATE, LONG_ROLL_RHYTHM,
     LONG_ROLL_FILL,
+    /* S080 overlay/scene/chain long names (parallel to TEXT_ additions). */
+    LONG_PERF_BTN_LT, LONG_PERF_NOTE_LT, LONG_PERF_BTN_RT, LONG_PERF_NOTE_RT,
+    LONG_SCENE_CHANGE_DIV, LONG_SCENE_QUEUE_DIV, LONG_SCENE_QUEUE_ACTION,
+    LONG_SCENE_PC_RESET,
+    LONG_CHAIN_COND1, LONG_CHAIN_NEXT1, LONG_CHAIN_COND2, LONG_CHAIN_NEXT2,
 };
 
 enum shortNamesEnum {
@@ -240,7 +259,12 @@ enum shortNamesEnum {
     SHORT_PLAY_MODE,
     /* S079 step-special compact labels. */
     SHORT_CONDITION, SHORT_MICROTIMING, SHORT_ROLL_RATE, SHORT_ROLL_RHYTHM,
-    SHORT_ROLL_FILL
+    SHORT_ROLL_FILL,
+    /* S080 overlay/scene/chain compact labels (parallel to TEXT_ additions). */
+    SHORT_PERF_BTN_LT, SHORT_PERF_NOTE_LT, SHORT_PERF_BTN_RT, SHORT_PERF_NOTE_RT,
+    SHORT_SCENE_CHANGE_DIV, SHORT_SCENE_QUEUE_DIV, SHORT_SCENE_QUEUE_ACTION,
+    SHORT_SCENE_PC_RESET,
+    SHORT_CHAIN_COND1, SHORT_CHAIN_NEXT1, SHORT_CHAIN_COND2, SHORT_CHAIN_NEXT2
 };
 
 #define PAR_RUNTIME_CPU_USE 0xFFFEu
@@ -425,6 +449,14 @@ void menu_loadInstrumentExit(void);
  */
 uint8_t menu_loadSceneButtonPressed(uint8_t scene_index);
 void    menu_perfModeSceneButtonPressed(uint8_t scene_index);
+/*
+ * Run a deferred/queued scene change when the sequencer raises its fire flag
+ * (S080 F8/F9). Input: none. Output: the pending change is executed (queue
+ * action applied first). Client: buttonHandler_tick() on the main-loop
+ * cadence, so a queued change fires regardless of the current menu.
+ * Affiliates: seq_sceneChangeFirePending().
+ */
+void    menu_serviceDeferredSceneChange(void);
 void    menu_refreshPerfSceneLeds(void);
 /*
  * Repaint the temporary MODE VOICE held Scene edit-mask view.
@@ -619,6 +651,15 @@ void menu_toggleStepEditSubpage(void);
 void menu_enterStepTrackAutomationOverlay(uint8_t voiceNr);
 void menu_resetActiveParameter(void);
 uint8_t menu_getSubPage(void);
+/*
+ * Re-assert the PERFORMANCE_PAGE SELECT-LED sub-page indication (S080 A5).
+ *
+ * Input: none. Output: SELECT1/SELECT2 lit for PERF sub-page 0/1 (clears the
+ * other SELECT LEDs). Client: buttonHandler when the PERF looper disengages and
+ * returns the SELECT row to sub-page display. Affiliates: menu_switchPage()
+ * PERF LED block, the PERF cross-sub-page step.
+ */
+void menu_syncPerfSelectLed(void);
 /*
  * Parameter buffer resolution for voice morph mode.
  *
