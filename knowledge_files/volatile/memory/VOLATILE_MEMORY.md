@@ -31,25 +31,47 @@ Do not recommend bumping `AUTOSAVE_PARAMETER_GETS_PER_WRITE` or adjusting
 capture timing unless the user explicitly asks. The section-based CRC
 format redesign is the chosen path for write performance.
 
-## Current carryover after Session 078
+## Current carryover after Session 080
 
-Session 078 (2026-10-08/10, `dev-ph6-cleanup`) implemented per-track timing
-(continuous 128-position step scale with Q8.8 DDA, FX sequencer on the same
-curve, shuffle, run modes, morphable/automatable length/scale/shuffle), STEP
-multi-step editing and the held-step track automation overlay, the STEP
-underline/pot-clear fix, and the run-mode remediation.
+Session 080 (2026-10-10/11, `dev-ph6-cleanup`) built the PERF performance
+surface: PERF page split, `lop`/`!lp` conditions, the master-clock-anchored
+looper with per-track Loopable flag, the BAR VOICE-trigger overlay, the
+latched SHIFT+REC settings menu, scene change / queued change divisions and
+queue actions (one PC reset `pcr`; queued reset in `qac`), scene chaining
+with the SHIFT+PLAY+SEQ editor, and the queued-Scene fast blink.
 
-- **Commits:** P1 `0c23def`, P2+P3 `b537e6f`; P4 and the close-out docs are
-  uncommitted. The user manages commits.
-- **Final link (DEV):** `text=539,856`, `data=416`, `bss=427,616`; payload
-  540,272 B of 753,664 (213,392 B free).
-- **Durable authorities:** `078_SESSION_HANDOFF_LOG.md`;
-  `PATTERN_DYNAMIC_STACK.md` §6.3a/§6.4; `BANK_PRESET_ARCHITECTURE.md` §5/§8;
-  `MODULE_INTERCHANGE_SPEC.md`.
-- **Next session (079):** carry-over list in
-  `knowledge_files/volatile/S078_WORKING_NOTES.md` (STEP marker retry
-  decision, remaining retest rows, production build). S078 P1–P4 are all
-  hardware PASS.
+- **Commits:** code at `4869a98`; close-out docs uncommitted. The user
+  manages commits.
+- **Final link (DEV):** `text=556,008`, `data=412`, `bss=427,976`; payload
+  556,420 B of 753,664 (197,244 B free).
+- **Durable authorities:** `080_SESSION_HANDOFF_LOG.md`;
+  `PATTERN_DYNAMIC_STACK.md` §6.5/§6.6; `MODULE_INTERCHANGE_SPEC.md` "PERF
+  performance surface".
+- **Next session (081):** carry-over list in
+  `knowledge_files/volatile/S078_WORKING_NOTES.md` (S080 matrix row by row,
+  S079 P2 checklist, reload/live-record decisions, STEP marker retry,
+  production build).
+
+### Working preferences confirmed in Session 080
+
+- **Hardware failure → trace before planning.** When an implementation
+  fails on hardware the user asks for the important implementation
+  decisions piece by piece, then a full schedule from a code deep-dive. Trace
+  each reported symptom to concrete code causes (several causes can stack;
+  list them all), and say when the written plan itself is wrong (the
+  Defect 7 realign rule, the chain menu's "SHIFT release exits").
+- **Plan text is not always the user's intent.** The user corrects
+  misstated requirements in the plan (S080 Defect 14 loop start on scene
+  change) and adds options late (Defect 15 queue actions). Fold such
+  changes into both the plan and the reference, mark them as corrections,
+  and keep follow-up questions explicit.
+- **Decisions from the written plan win over a recommendation the user has
+  not answered.** When applying recommendations the user has not answered,
+  list them as "decisions applied" so the user can veto them.
+- **No new files without a named filename** (still binding): S080 put the
+  PERF reference into existing specs rather than a new document.
+- **Close-out includes `SCOPING_TARGETS.md`** (accomplished/open) and
+  marking hardware results in the schedule when the user reports them.
 
 ### Working preferences confirmed in Session 078
 

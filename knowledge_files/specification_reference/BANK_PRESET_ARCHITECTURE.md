@@ -4,7 +4,7 @@
 
 This is the authoritative reference for how parameters are stored in resident
 memory across the Bank, Scene, Kit, Instrument, and Effect hierarchy, current
-as of the **Session 078 close** (2026-10-10). S073 changed nothing here. S074
+as of the **Session 080 close** (2026-10-11). S073 changed nothing here. S074
 added the bus compressor Scene settings and the fourth fader mode. S075
 added:
 
@@ -63,6 +63,26 @@ S078 added:
   in any SHIFT Morph view a non-morphable parameter shows and edits its
   Normal value, never blanked or locked (§5 "Morph view");
 - AutoSave Scene cells 51..71 (§10; format in `AUTOSAVE.md`).
+
+S079 changed nothing here. S080 added:
+
+- **Scene chain settings** `chain_condition[2]` / `chain_next[2]` (§3):
+  per-Scene condition-driven automatic scene changes, edited in the PERF
+  SHIFT+PLAY+SEQ chain editor, AutoSave Scene cells 72..75 (§10), sceneset
+  `chain_condition` / `chain_next` keys; copied and cleared with the Scene,
+  **never** fanned out through the VOICE edit mask (§2 rules do not apply);
+- new `parameter_values[]` mirrors and Globals (§9): BAR overlay settings,
+  scene change / queue division and queue action Globals, chain editor and
+  STEP Loopable mirrors; the single PC reset stays `PAR_BAR_RESET_MODE`;
+- the queued-change morph reset `preset_morphScene(target, 0)` (qac `mrp`,
+  `o+r`, `mmr`, `rld`, `r+r`): a Scene-local write of overall, six voice and
+  Effect Morph amounts, not an edit-mask fan-out;
+- the Pattern-side Loopable flag (`track_loop_exclude`) is Pattern data
+  (`PATTERN_DYNAMIC_STACK.md` §1), not a Scene setting.
+
+The PERF behaviours that read these settings are in
+`MODULE_INTERCHANGE_SPEC.md` ("PERF performance surface") and
+`PATTERN_DYNAMIC_STACK.md` §6.5/§6.6.
 
 How a stored value reaches the DSP
 (descriptor writers, special-writer tags, LFO adapters) is in
@@ -232,6 +252,7 @@ data, which lives in `pat_regions[16]` (168,304 bytes) in PatternData.
 | Bus compressor (S074) | `bus_comp[4]`: `cmp` 0..2 (off/St1/St2), `cam` 0..127, `ctm` 0..127, `csc` 0..6 | 4 bytes; defaults off/0/0/off; AutoSave Scene parameters 41..44; `sceneset.scg` `bus_comp_*` keys; edited on the last settings page and fanned out to the VOICE edit mask; not modulatable |
 | Effect | Type, 64 normal cells, 64 Morph cells, 16-step sequence | 420-byte Scene-owned record; saved as named `.fx` v2 child |
 | Effect Morph | Scene `effect_morph_amount` | AutoSave Scene setting index 40; serialized in `sceneset.scg` when present; edited on PERF as `fxm` (S075) and on the Effect page as `mrp` |
+| Scene chain (S080) | `chain_condition[2]` (cn1/cn2, 0..78) and `chain_next[2]` (nx1/nx2, 0..43; 43 = `stp`) | 4 bytes; defaults 0/0 = `nul`/`slf` = no chaining; AutoSave Scene parameters 72..73 and 74..75; `sceneset.scg` `chain_condition` / `chain_next` CSV pairs; edited in the PERF chain editor through `PAR_CHAIN_*` mirrors of the viewed Scene; `scene_setChainCondition/Next()` clamp and mark AutoSave; carried by `scene_commitSettings()` (copy/clear); no edit-mask fan-out; read by the TIM3 chain engine through the ISR-safe getters |
 | Track Morph endpoints (S078) | `track_morph_length[7]` (1..128), `track_morph_scale[7]` (step-scale CC 0..127), `track_morph_shuffle[7]` (0..127) | 21 bytes; the Morph ("B") endpoints of the Pattern's per-track length/scale/shuffle, whose Normal values stay in the Pattern region; defaults 16/76/0 (equal to the Normal defaults, so Morph changes nothing until edited); AutoSave Scene parameters 51..57, 58..64, 65..71; `sceneset.scg` `track_morph_*` keys; edited on the STEP page with SHIFT held; `scene_setTrackMorphLength/Scale/Shuffle()` clamp and mark AutoSave; carried by `scene_commitSettings()` |
 
 Fresh, cleared and default-staged Scenes (`scene_initAll()`,
@@ -239,7 +260,9 @@ Fresh, cleared and default-staged Scenes (`scene_initAll()`,
 `filesystem_initSceneStage()`, the boot empty-Scene reset) all use the same
 defaults: MIDI channel track + 1, note 63, St1 routes, FX send Normal and
 Morph 0, fader `pre`, Morph amounts 0, Effect Morph 0, compressor
-off/0/0/off, track Morph endpoints 16/76/0 (S078).
+off/0/0/off, track Morph endpoints 16/76/0 (S078), chain 0/0 = no chaining
+(S080; supplied by the `memset` in `scene_settingsDefaults()` and
+`filesystem_initSceneStage()`).
 
 The Effect record is initialized to the registry's `off` defaults and is
 replaced only through a complete SceneData transaction. EffectsManager owns
@@ -706,6 +729,18 @@ for PERF display purposes, but it is not the source of truth.
 - the bus compressor page mirrors `PAR_BUS_COMP_MODE..SIDECHAIN` (ids
   58..61, S074). They are refreshed from the active Scene by
   `preset_syncBusCompMirrors()` and never serialized as Globals.
+- S080 Globals (serialized in settings.cfg): `PAR_PERF_BTN_LT/RT` (overlay
+  trigger type 0..11), `PAR_PERF_NOTE_LT/RT` (0 = track note, else 1..127),
+  `PAR_SCENE_CHANGE_DIV` (scd 0..9), `PAR_SCENE_QUEUE_DIV` (qcd 0..17),
+  `PAR_SCENE_QUEUE_ACTION` (qac 0..8). The PC reset is the pre-existing
+  `PAR_BAR_RESET_MODE` (pcr; the S080 P1 duplicate `PAR_SCENE_PC_RESET` was
+  removed).
+- S080 display mirrors (never serialized): `PAR_CHAIN_COND1/NEXT1/COND2/NEXT2`
+  (the chain editor's viewed Scene) and `PAR_TRACK_LOOPABLE` (the STEP
+  track's Loopable flag). They are appended after the Globals, so the bulk
+  Global apply replays them; `menu_parseGlobalParam()` treats them as no-ops
+  and page edits commit in `menu_cellCommitValue()` — the same refresh-only
+  pattern as the bus compressor ids.
 
 **Bulk Global apply hazard (S074 observation O1, not fixed).**
 `menu_tickGlobalApply()` and `menu_sendAllGlobals()` replay
@@ -749,6 +784,10 @@ for the older ids could use the same refresh-only pattern.
 | Bus compressor edit (S074) | Scene parameter 41 + field, for every Scene in the VOICE edit mask | Scalar HCPR mask (`scene_setBusCompSetting()`) |
 | Fader mode edit (incl. `xfd`) | Scene parameter 20 + slot | Scalar HCPR mask |
 | Track Morph endpoint edit (S078, STEP + SHIFT) | Scene parameter 51..71 (length/scale/shuffle × track) | Scalar HCPR mask (`scene_setTrackMorph*()`) |
+| Scene chain edit (S080, chain editor) | Scene parameter 72..75 of the viewed Scene only | Scalar HCPR mask (`scene_setChainCondition/Next()`) |
+| Queued-change morph reset (S080 qac) | Morph amount cells of the incoming Scene only | Scalar HCPR mask (`preset_morphScene()`) |
+| Track Loopable edit (S080, STEP `lop`) | Pattern track setting | Pattern dirty mask (`pat_setTrackLoopable()`) |
+| Looper / chain / queue runtime | Transient sequencer state | NOT marked dirty |
 | Track run mode edit (S078) | Pattern track setting | Pattern dirty mask (`pat_setTrackPlayMode()`) |
 | Track timing Morph/step automation | Transient effective cache | NOT marked dirty |
 

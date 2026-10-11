@@ -1,8 +1,8 @@
 # Helicase SD Card Filesystem Specification
 
 This is the authoritative product-level filesystem and instrument-file
-reference through Session 078 (Session 069 for every phase before Phase 5;
-the Session 072, 073, 074, 075 and 078 additions are noted below). It includes the Session 058 Bank
+reference through Session 080 (Session 069 for every phase before Phase 5;
+the Session 072, 073, 074, 075, 078 and 080 additions are noted below). It includes the Session 058 Bank
 I/O and stopped-playback speedups, the Session 059 typed Instrument-index
 repair, and Session 060's `.hcnames` atomic safe-write/refreshed flag, the boot
 Instrument `.hcindex` generation fix, and system-wide macOS AppleDouble
@@ -68,6 +68,22 @@ Session 078 (per-track timing, `PATTERN_DYNAMIC_STACK.md` §6.4):
   the same curve, and also accepts a decimal CC 0..127 (see "`.fx` Effect
   files"). Old `.fx` files load at the same musical division with no
   migration.
+
+Session 080 (PERF performance surface, `MODULE_INTERCHANGE_SPEC.md` "PERF
+performance surface"):
+
+- `settings.cfg` gains seven Global keys — `perf_btn_lt`, `perf_note_lt`,
+  `perf_btn_rt`, `perf_note_rt` (BAR overlay trigger type 0..11 / note
+  0..127, 0 = the track's note), `scd` (direct scene change division 0..9),
+  `qcd` (queued change division 0..17), `qac` (queue action 0..8) — and the
+  terminator becomes `lines=24` (see "settings.cfg"). A P1-era file's `pcr=`
+  line (a duplicate PC reset, removed) is skipped as an unknown key; the PC
+  reset stays `bar_reset_mode`;
+- `sceneset.scg` lines 18/19 add `chain_condition` and `chain_next` (Scene
+  chaining, 2 values each); missing keys load 0 = no chaining;
+- PAT4 track header **byte 4 carries the looper exclusion** (1 = track not
+  loopable; older files carry 0 = loopable). Version, size, layout and CRC are
+  unchanged; no card conversion is needed.
 
 - AsyncFATFS stores a cluster-rounded size while a file is open for writing,
   so an interrupted write leaves an overlong file;
@@ -651,8 +667,17 @@ The current writer emits keyed text with:
 The remaining accepted/written keys are bpm, ext_sync, quantisation,
 midi_chan_global, midi_filt_tx, midi_filt_rx, midi_routing,
 screensaver_on_off, bar_reset_mode, prescaler_clock_in,
-prescaler_clock_out1, prescaler_clock_out2, follow, and osc_wave_interp.
-The complete writer schema is 17 lines. Legacy `scene_source_NN` keys are
+prescaler_clock_out1, prescaler_clock_out2, follow, and osc_wave_interp, and
+since Session 080 `perf_btn_lt`, `perf_note_lt`, `perf_btn_rt`,
+`perf_note_rt`, `scd`, `qcd`, `qac` (writer cases 17..23; defaults 0). The
+complete writer schema is 24 data lines plus the `lines=24` terminator (17
+before S080). Load sanitizes out-of-range S080 values to 0: `qac` > 8,
+`qcd` > 17, `scd` > 9. Value meanings: `scd` 0..9 = ins 1/8 1/4 1/2 1b 2b 3b
+4b ens enl; `qcd` 0..17 = ins 1/8 1/4 1/2 1b..9b 12b 15b 16b ens enl; `qac`
+0..8 = nrm mut mrp res u+r o+r mmr rld r+r. P1-era files storing qac 3/4 or
+qcd 8/9 read with the new meanings (no migration). `bar_reset_mode` is the
+one PC reset (pcr): with it on, direct and chain-fired scene changes restart
+the tracks. Legacy `scene_source_NN` keys are
 accepted and ignored so an existing settings file migrates without becoming an
 error; provenance is now owned only by HCNAMES.
 Unknown or out-of-scope keys are not a way to restore Scene state. In
@@ -666,7 +691,8 @@ make it durable, then removes the old `settings.cfg` and renames the temp
 file into place. A boot-time recovery prelude runs before the normal settings
 load: a leftover `settings.tmp` is validated with the same
 `filesystem_parseSettingsLine()` parser plus a self-checking terminator line
-(`lines=17`, the 18th emitted line) and either promoted (valid) or discarded
+(`lines=N` with N = the number of data lines before it; 24 since Session 080,
+17 before) and either promoted (valid) or discarded
 (invalid), leaving the prior `settings.cfg` untouched either way. Hardware-
 tested via a deliberate mid-promotion power-cut simulation
 (`057_SESSION_HANDOFF_LOG.md` §6). This is the same temp+sync+promote pattern
@@ -993,6 +1019,8 @@ The writer emits one `key=value` line per field, in this order:
 | 15 | `track_morph_length` | 7 × 1..128 | S078; missing keeps the staged default 16 |
 | 16 | `track_morph_scale` | 7 × 0..127 (step-scale CC) | S078; missing keeps 76 (`1/16`) |
 | 17 | `track_morph_shuffle` | 7 × 0..127 | S078; missing keeps 0 |
+| 18 | `chain_condition` | 2 × 0..78 (cn1, cn2) | S080; missing loads 0 (`nul`) |
+| 19 | `chain_next` | 2 × 0..43 (nx1, nx2; 43 = `stp`) | S080; missing loads 0 (`slf`) |
 
 - **`voice_decimation_all` retired (S075).** Global `srt` is no longer a
   parameter: the key is not written, and an existing file that contains it
@@ -1052,8 +1080,10 @@ listed in `PATTERN_DYNAMIC_STACK.md` §6.4) and is played per track. Bytes are
 preserved on load with no automatic card rewrite; files written before S078
 hold the old 14-entry index (0..13) and play near `1/64` until converted with
 `tools/convert_scene_scale.py`. Byte 3 is the run mode (0..5; ≥ 6 plays as
-`fwd`). All three Pattern readers (root Pattern Load, Scene Load Pattern,
-AutoSave Pattern boot) and the writer handle both bytes.
+`fwd`). Byte 4 is the looper exclusion (S080; written 0/1 per track from
+`track_loop_exclude`, any nonzero byte reads as "not loopable"; older files
+hold 0 = loopable). All three Pattern readers (root Pattern Load, Scene Load
+Pattern, AutoSave Pattern boot) and the writer handle bytes 1, 3 and 4.
 
 CRC32C is Castagnoli, computed over the entire file while treating the 4 bytes
 at offset 14 as zero. This matches the HCPR AutoSave record CRC contract.

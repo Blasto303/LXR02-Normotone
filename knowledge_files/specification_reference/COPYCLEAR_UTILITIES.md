@@ -5,7 +5,10 @@ children on the LXR-02: what the user can do, what each operation changes,
 and how the code does it. Written for a developer who has to read, fix or
 extend `Core/Menu/CopyClear/`.
 
-- **Current as of:** Session 078 close (2026-10-10, `dev-ph6-cleanup`).
+- **Current as of:** Session 080 close (2026-10-11, `dev-ph6-cleanup`).
+  S080 added the per-track Loopable flag to track copy/clear and the Scene
+  chain settings to Scene settings copy/clear (no copy/clear code path
+  changed shape).
   Built in S075 (base pass, F1 follow-up, F2 follow-up); S076 P3 added morph
   reset/copy operations and P4 added reload scene; S077 P1 migrated copy
   snapshot to `pat_background_region`, P4 corrected Scene morph fan-out, and
@@ -307,8 +310,9 @@ navigation, not a paste. The job kind is `CC_KIND_BAR_TO_STEP`.
 ### 6.4 Track
 
 - `copy track` (`CC_COPY_TRACK`): all 128 steps as `… -> repl`, plus the
-  track's length, scale, shuffle and (S078) run mode. Early triggers. Never
-  fans out. The track Morph endpoints are Scene settings and are not copied
+  track's length, scale, shuffle, (S078) run mode and (S080) Loopable flag
+  (`pat_setTrackLoopable(dst, pat_trackLoopable(src))`). Early triggers.
+  Never fans out. The track Morph endpoints are Scene settings and are not copied
   by `copy track`; `copy inst -> morph` handles them.
 - `copy instrument` (`CC_COPY_INSTRUMENT`): the source track's slot (type,
   Normal and Morph images) replaces the destination track's slot **and fans
@@ -328,7 +332,7 @@ navigation, not a paste. The job kind is `CC_KIND_BAR_TO_STEP`.
 | Selection | Copies | Fans out | Also |
 |---|---|---|---|
 | `copy scene` | settings, Effect, Kit, Pattern | no; the destination's edit-mask entry is set by the **exchange** below | makes the Scene present; names |
-| `copy scene settings` | all of `scene_settings_t` (everything in `sceneset.scg`, Effect Morph included) | no; mask exchange | — |
+| `copy scene settings` | all of `scene_settings_t` (everything in `sceneset.scg`, Effect Morph and, since S080, the Scene chain `chain_condition`/`chain_next` included) | no; mask exchange | — |
 | `copy kit` | `kit_t` (six slots + Kit settings) | yes | makes each written Scene present; names |
 | `copy effect` | `effect_record_t` (may change the destination's type) | yes | names |
 | `copy pattern` | the whole region including the Pattern globals; automation retargeted when the Instrument or Effect types differ | no | names |
@@ -399,7 +403,7 @@ paste is dropped (`FX_TYPE_MISMATCH`).
 | Selection | Effect | Fans out |
 |---|---|---|
 | `step` / `bar` | trigger off, block released | no |
-| `track` | as above for 128 steps; length, scale, shuffle, run mode to defaults (16, scale CC 76 = 1/16, 0, `fwd`) | no |
+| `track` | as above for 128 steps; length, scale, shuffle, run mode to defaults (16, scale CC 76 = 1/16, 0, `fwd`); Loopable back to on (S080) | no |
 | `… auto` | automation removed; trigger and specials kept | no |
 | `… notes` | trigger off; note and velocity specials removed; **probability kept** (it gates the step's automation); automation kept | no |
 | `send` (EFFECTS TRACK) | the track's slot (track 7 → slot 6): **both** FX-send endpoints 0, fader `pre` | yes |
@@ -1218,6 +1222,13 @@ block, and keep per-tick work bounded.
   STEP track-settings pot clears (§8: `menu_knobClearTarget()` SEQ arm for
   the whole Scene; held steps only from the STEP held-step overlay through
   `copyClear_isClearMode()` and `sa_clearAutomationFromKnob()`).
+- **S080 (2026-10-10/11):** `copy track` carries and `clear track` resets
+  the per-track Loopable flag (`copyClearService.c`); the Scene chain
+  settings travel with `copy scene` / `copy scene settings` and reset with
+  `clear scene` / `clear scene settings` through `scene_commitSettings()` /
+  `scene_settingsDefaults()` (chain is copied Scene-to-Scene and never
+  fanned out through the VOICE edit mask); `copy pattern` carries the
+  Loopable mask through `pat_rawRegionCopyBody()`.
 - **S077 P5 (2026-10-08):** bar-to-step cross-kind paste. A bar/bar-range
   copy source can be pasted to a step destination (SEQ press in VOICE/STEP
   mode). New kind `CC_KIND_BAR_TO_STEP`, new request function

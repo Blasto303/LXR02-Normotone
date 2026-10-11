@@ -35,7 +35,12 @@ and the deferred Phase 4 track work: copy/clear (S075), Morph copy/reset,
 reload scene, bar chaselight and SHIFT+SELECT pattern length (S076),
 per-track Scene playback and PERF Morph underlines (S077), and per-track step
 scale, shuffle, run modes, track Morph/automation and STEP held-step editing
-(S078; see "Sessions 076–078 summary and carry-forward" at the end). The post-Phase-4
+(S078; see "Sessions 076–078 summary and carry-forward" at the end). Session
+079 added step trigger conditions, per-step roll and micro-timing; Session
+080 built the PERF performance surface — looper (§6.6), BAR VOICE-trigger
+overlay, SHIFT+REC settings menu, scene change/queue divisions and queue
+actions, scene chaining (see "Sessions 079–080 summary and carry-forward" at
+the end). The post-Phase-4
 bugfix/refactor work is tracked in
 `AUTOSAVE_TEST_CASES_LOAD_SAVE_REVISIONS.md`. Phase 5 now establishes Effect
 files, the audio bus and shared buffer, its fixed sequencer, and the related
@@ -1518,7 +1523,15 @@ remaining item:
 
 - ~~**Per-track scene assignment:** hold a voice button and press a `SEQ` (scene) button to assign that individual track to play from a different scene than the rest — same gesture as the old "per-track pattern assignment" idea, retargeted at scenes.~~ **Done in S077 P2** (`seq_perTrackPattern[7]`, hold VOICE + press SEQ, double-click realign; hardware PASS at the S078 close, retest rows 6.1–6.42). Known limitation: Scene-namespace LFO/velocity target tokens resolve through the active Scene.
 
-### 6.6 Looper
+### ~~6.6 Looper~~ — DONE (S080)
+
+Implemented in Session 080 on the PERF SELECT buttons: 1 bar down to 1/128
+(SELECT1..8, 384..3 master ticks), BAR2 dot / BAR1 triplet, all tracks or the
+held VOICE tracks, per-track Loopable opt-out, master-clock-anchored per-track
+loop starts, resume where the track would have been, loop kept across scene
+changes. Reference: `PATTERN_DYNAMIC_STACK.md` §6.5 and
+`MODULE_INTERCHANGE_SPEC.md` "PERF performance surface"; record
+`080_SESSION_HANDOFF_LOG.md`. Original scoping text kept below for history.
 
 Moves to the `SELECT` buttons (confirmed correction from your round-2 answer — the original `putting it together` draft used `SEQ` 9–16, which conflicts with `SEQ` now meaning scene-select in PERF mode). The original spec describes 8 divisions from a half-bar down to 1/64th note, halving at each button, with holding one additional button ("button 9" in the original 16-button numbering) adding a dotted 50% to whichever other loop button is held, and releasing all loop buttons returning the sequencer to the position it would have reached without looping.
 
@@ -1538,7 +1551,7 @@ From "notes from others" in `putting it together`: doubling the sequencer's trac
 
 ### Open Engineering Questions
 
-- **Looper division mapping without sub-steps.** Needs a concrete answer before 6.6 can be built: is 1/64th represented via a track-scale-style subdivision (Phase 4.7's `/2`..`×16` scale applied to a virtual "loop track"), or is the shortest loop division now coarser (e.g., 1/16th, one full step) given sub-steps no longer exist? This changes both the encoding and the UI.
+- ~~**Looper division mapping without sub-steps.**~~ Resolved in S080: divisions are master-clock tick counts (96 PPQ; 1 bar = 384 ticks, 1/128 = 3 ticks), independent of track scale. Original question: is 1/64th represented via a track-scale-style subdivision (Phase 4.7's `/2`..`×16` scale applied to a virtual "loop track"), or is the shortest loop division now coarser (e.g., 1/16th, one full step) given sub-steps no longer exist? This changes both the encoding and the UI.
 - **Manual roll trigger gesture** (carried over from Phase 4) needs a home in this UI redesign — likely a `SHIFT`+something on the step buttons or a dedicated control.
 
 ### Suggested Complementary Features
@@ -2082,3 +2095,43 @@ Records: `076_SESSION_HANDOFF_LOG.md`, `077_SESSION_HANDOFF_LOG.md`,
 - Carried from S074/S075: Pattern Load fan-out tear; O1; F4 trace priorities;
   boot timeout; `cpu` with `cmp`; BC11; saturator α; stale comments;
   production build re-measurement.
+
+---
+
+## Sessions 079–080 summary and carry-forward
+
+Records: `079_SESSION_HANDOFF_LOG.md`, `080_SESSION_HANDOFF_LOG.md`.
+
+### Accomplished
+
+- **S079:** step trigger conditions (39 entries), per-step roll / rhythm /
+  fill with the roll fill duck, micro-timing; PAT4 v2 and
+  `tools/convert_pattern_specials.py`. P1 hardware tested with addendum
+  fixes; P2 checklist pending.
+- **S080:** PERF performance surface — PERF page split and entry fix;
+  `lop`/`!lp` conditions (41 entries); the PERF looper (§6.6) with per-track
+  Loopable flag; BAR `<`/`>` VOICE-trigger overlay (12 trigger types);
+  SHIFT+REC latched settings menu; scene change division `scd`, queued
+  changes `qcd` (up to 16 bars) with queue actions `qac` (mute / morph /
+  queued PC reset; reload deferred); the single PC reset `pcr`; scene
+  chaining (79 conditions, 44 next values, SHIFT+PLAY+SEQ editor); queued
+  Scene double-rate flash; compressor alone on the last settings page.
+  Hardware: "seems ok so far" (user), follow-up PASS (2026-10-11).
+
+### Open
+
+- Hardware: S080 matrix row by row (`080_SESSION_HANDOFF_LOG.md` §12); S079
+  P2 checklist and P1 addendum fix 3; S077 rows 3.10/3.14/3.15, C1–C6.
+- Deferred from S080: reload from source for queue actions `rld`/`r+r`;
+  live record on RECORDING_PAGE (sub-pages 2+ reserved) and live recording
+  of overlay triggers; `ens`/`enl` track-length-aware boundaries; `fls`
+  variable flam spacing; edit lock during scene changeover.
+- Decision still open: STEP-page deferred CGRAM marker retry (one-line fix).
+- Still deferred (unchanged): live record of automation and FX moves (A22),
+  roll overhaul / manual roll trigger (§4.8), Patgen/Euklid revert (§4.9),
+  `12a`/`12b` scale mode (§4.10), automation `hold` reconciliation,
+  `/Effect/` browser (A35), MIDI mapping (A20), one-shot LFOs (§6.2),
+  external MIDI tracks (§6.8).
+- Carried from S074/S075: Pattern Load fan-out tear; O1; F4 trace
+  priorities; boot timeout; `cpu` with `cmp`; BC11; saturator α; stale
+  comments; production build re-measurement.

@@ -3,13 +3,32 @@
 ## Authority and status
 
 This is the authoritative live-memory, allocator, PAT4 interchange, Pattern
-Stack Service, and Pattern AutoSave reference, **current as of the Session 079
-close** (2026-10-10, `dev-ph6-cleanup`). Session 073 changed
+Stack Service, and Pattern AutoSave reference, **current as of the Session 080
+close** (2026-10-11, `dev-ph6-cleanup`). Session 073 changed
 nothing. Session 074 changed no Pattern storage or allocator code; it added a
 second reader of step automation (the Effect-page underline search reads every
 step of every track of the viewed Pattern through
 `pat_readStepAutomations()`, 4 steps per foreground pass) and saw a torn PAT4
 file repair itself exactly as designed (§9).
+
+**Session 080 changed this area in five ways** (record:
+`080_SESSION_HANDOFF_LOG.md`; PERF UI side: `MODULE_INTERCHANGE_SPEC.md`
+"PERF performance surface"):
+
+- **Trigger conditions** (§6): `lop` (23) / `!lp` (24) inserted after `!fl`;
+  the table is 41 entries; `lst`/`!ls` move to 25/26 and the mute groups to
+  27..33 / 34..40. No PAT4 migration (stored values ≥ 23 shift meaning).
+- **PERF looper** (§6.5): a master-clock-anchored per-track loop engine in the
+  TIM3 scheduler, driven by the PERF SELECT/VOICE/BAR buttons.
+- **Scene change timing, queue and chaining** (§6.6): direct and queued
+  scene changes at musical divisions, queue actions, the one PC reset, and
+  per-Scene condition-driven chaining evaluated in TIM3.
+- **Per-track looper exclusion** (§1, §7): `track_loop_exclude` region byte
+  (bit N = track N not loopable), stored in PAT4 track header byte 4 (was
+  reserved zero; PAT4 version unchanged). Region 10,526 → **10,527 B**.
+- **Cursor reset no longer ends the looper** (§6.5): `seq_setStepIndexToStart()`
+  rebases an engaged loop instead of clearing it; transport stop still ends
+  it.
 
 **Session 079 changed this area in five ways:**
 
@@ -97,7 +116,7 @@ Implemented and hardware accepted:
   up to 63 per step) with uniqueness invariant and dtype-aware editing;
 - first-fit bit-packed pool allocator and block reclamation;
 - Pattern/track settings storage, Menu edit, and PAT4 persistence; Sequencer
-  condition playback (39-entry dispatch since S079); per-track step-length playback (Session 068) and,
+  condition playback (39-entry dispatch since S079, 41 since S080); per-track step-length playback (Session 068) and,
   since Session 078, per-track continuous step scale, shuffle and run modes
   with Morph and step automation (§6.4);
 - sequencer automation playback: TIM3 copies to 32-entry debounced
@@ -133,28 +152,38 @@ typedef struct __attribute__((packed)) {
     uint8_t  track_scale[7];        /* 7 B */
     uint8_t  track_shuffle[7];      /* 7 B */
     uint8_t  track_play_mode[7];    /* 7 B, S078: 0 fwd .. 5 1fr */
+    uint8_t  track_loop_exclude;    /* 1 B, S080: bit N = track N not loopable */
     uint8_t  pattern_change_bar;    /* 1 B */
     uint8_t  pattern_next;          /* 1 B */
-} pat_scene_region_t;               /* 10,526 B */
+} pat_scene_region_t;               /* 10,527 B */
 ```
 
-The header `_Static_assert` pins the size as address + pool + bitmap + 30
-(the 30-byte parameter tail: four 7-byte track arrays + 2 Pattern bytes;
-it was 23 before S078). `track_scale` holds a step-scale **CC 0..127**
+The header `_Static_assert` (and its copy in PatternData.c) pins the size as
+address + pool + bitmap + 31 (the parameter tail: four 7-byte track arrays,
+the S080 loop-exclude mask and 2 Pattern bytes; 23 before S078, 30 before
+S080). `track_loop_exclude` is stored inverted so a zero-filled region or an
+older PAT4 file means "every track loopable"; accessors
+`pat_setTrackLoopable(scene, track, loopable)` (marks the Pattern dirty only
+on change) and `pat_trackLoopable(scene, track)` (1 for invalid
+coordinates); `pat_applyTrackSettingsToMenu()` mirrors the active track into
+`PAR_TRACK_LOOPABLE`; `pat_rawRegionCopyBody()` copies it; copy/clear track
+copy carries it and track clear sets loopable again. `pattern_change_bar` /
+`pattern_next` are retired (no playback use) but still persisted. `track_scale` holds a step-scale **CC 0..127**
 (S078; 76 = 1/16, §6.4), not the pre-S078 14-entry index.
 `track_play_mode` values ≥ 6 are treated as `fwd`.
 
-`pat_regions[16]` is exactly 168,416 bytes. Pattern storage is not embedded in
-`scene_t`; `scenes[16]` is a separate 26,432-byte SceneData object (S078:
-1,652 B per Scene, +21 B track Morph endpoints and alignment).
+`pat_regions[16]` is exactly 168,432 bytes (S080). Pattern storage is not
+embedded in `scene_t`; `scenes[16]` is a separate 26,496-byte SceneData object
+(S080: 1,656 B per Scene after the +4 B Scene chain settings; S078 had added
+the 21 B track Morph endpoints).
 `pat_sceneRegion(scene)` returns
 read-only access and `pat_sceneRegionMut(scene)` is reserved for bounded owner
 paths such as validated filesystem application. Ordinary clients use the
 public operations so mutation tracking cannot be bypassed.
 
-One additional `pat_background_region` is exactly 10,526 bytes (S077; it
+One additional `pat_background_region` is exactly 10,527 bytes (S077; it
 replaces the former standalone `pat_autosave_snapshot` at identical size, and
-grew with the region type in S078). It
+grew with the region type in S078 and S080). It
 is not a playable Scene: every Scene-indexed bound (scene_indexValid(),
 pat_patternValid(), the sequencer, the UI, PERF and Bank) stays at
 `SCENE_COUNT` (16), and it is reached only through its accessors. It serves
@@ -325,12 +354,14 @@ boundary (§12.17).
 
 The Sequencer obtains trigger/special state through PatternData. For a
 triggered step it evaluates the trigger condition via
-`seq_evaluateStepCondition()` — a 39-entry dispatch table covering
-probability (r10–r95 via hardware RNG), repeat-count X:Y conditions
-(`seq_trackRepeatCount[7]`, modulo comparison), fill/!fill
-(`seq_fillActive`, armed by PERF hold past `DOUBLE_CLICK_TIMEOUT`),
-last/!last chaining (`seq_trackLastConditionFired[7]`), and mute/!mute
-across all 7 tracks (with self-mute bypass: a step on a muted track whose
+`seq_evaluateStepCondition()` — a 41-entry dispatch table (S080) covering
+probability (r10–r95 via hardware RNG, 1..10), repeat-count X:Y conditions
+(11..20, `seq_trackRepeatCount[7]`, modulo comparison), fill/!fill (21/22,
+`seq_fillActive`, armed by PERF hold past `DOUBLE_CLICK_TIMEOUT`),
+loop/!loop (23/24 `lop`/`!lp`, S080: `seq_loopActive`, §6.5), last/!last
+chaining (25/26, `seq_trackLastConditionFired[7]`), and mute/!mute (27..33
+`1mu..7mu`, 34..40 `!1m..!7m`; dispatch `(cond − 27) % 7`, boundary
+`cond <= 33`) across all 7 tracks (with self-mute bypass: a step on a muted track whose
 condition tests its own track's mute state bypasses the mute gate). Condition
 0 (default/absent) always passes. A failed condition suppresses both trigger
 and automation. The sequencer then triggers with the resolved note and
@@ -364,7 +395,7 @@ PatternTrace overflow witness (`H`). Effect step markers (identity bit 11)
 share the queue. The ISR is the sole writer.
 
 Trigger condition gates the complete step: trigger and automation together,
-for any step that has a condition special set (value 1–38), whether or not the
+for any step that has a condition special set (value 1–40), whether or not the
 step has an active trigger (bit 15). The condition is read from the dynamic
 block before the trigger-active check so it applies to non-trigger steps with
 automation. Default condition (0, or absent special) always passes — a step
@@ -646,6 +677,190 @@ endpoint, AutoSave cell, `sceneset.scg` key, effective cache entry, getter
 in presetMorphEngine.c, and a Scene target kind. Read timing only through the
 effective cache in ISR code.
 
+### 6.5 PERF looper engine (S080)
+
+The PERF SELECT buttons loop tracks over a musical division while held
+(gesture rules: `MODULE_INTERCHANGE_SPEC.md` "PERF performance surface").
+The engine lives in `Core/Sequencer/sequencer.c`; it reuses the DDA,
+effective cache and realign mapping of §6.4 and never touches Pattern data.
+
+**State** (67 B SRAM1, runtime-only, file-static except the gate):
+
+| Symbol | Meaning |
+|---|---|
+| `seq_loopActive` (extern) | ISR gate: 1 while the looper is engaged (sustained by a SELECT, a looped VOICE or a BAR); may be 1 with an empty mask. Read by `lop`/`!lp` and the chain conditions `lox`/`lob`/`!lx`/`!lb` |
+| `seq_loopTrackMask` | tracks currently looping |
+| `seq_loopDivision` / `seq_loopModifier` | SELECT index 0..7 (1 bar..1/128); 0 none, 1 dot ×3/2, 2 triplet ×2/3 |
+| `seq_loopAnchor[7]` | per track, the master tick (`seq_elapsedPpqTicks` units) where its loop window starts |
+| `seq_loopStartStep/StartAccum/StartPlayState[7]` | per track, the snapshot: cursor, Q8.8 accumulator and play-state bits **just before** the anchor tick's DDA advance |
+
+Loop length `seq_loopLengthTicks()`: 384, 192, 96, 48, 24, 12, 6, 3 ticks for
+divisions 0..7 (96 PPQ, 1 bar = 16 × 24), ×3/2 dot, ×2/3 triplet, minimum 1.
+
+**Wrap** (`seq_loopProcessTick()`, TIM3, every tick, **before** the DDA
+advance and after deferred triggers): for each looped track with
+`elapsed > anchor` and `(elapsed − anchor) % length == 0`, restore the
+snapshot. The DDA advance in the same tick then replays the anchor tick's
+step, so the step that sounded at the loop start repeats on every wrap.
+Wraps stay on each track's own anchor grid; changing the division or
+modifier never moves an anchor (a shrinking length takes effect at the next
+multiple). The wrap and the DDA are both skipped while a chain `stp` freeze
+is active (§6.6).
+
+**Position maths** (`seq_loopShiftPosition(track, pos, ticks)`, foreground
+only, 64-bit): moves a position image (cursor, accumulator, play state) by a
+signed tick count: accumulator ± ticks·256, floor-divided by the effective
+Q8.8 interval into step advances, then the cursor walked per run mode:
+fwd/rev modulo the effective length (from the pre-start cursor −1 the first
+forward step is 0 and the first reverse step is L−1), pip along its 2L cycle
+setting `SEQ_PLAY_STATE_PIP_REV`, rnd a fresh random step, onc/1fr clamped
+with `SEQ_PLAY_STATE_STOPPED` set past the end and cleared when rewound
+inside. It uses the current effective scale and length for the whole span,
+so a Morph/automation change during the span is approximated.
+
+**Loop start** (`seq_loopEventAnchor(mask)`): one anchor per gesture. With
+recording quantisation on (`seq_quantisation` 8/16/32/64 → 48/24/12/6 ticks)
+it is the last quantise boundary `now − now % q` (may be more than one loop
+length back; the track then jumps back at the next wrap). With it off it is
+the tick at which the fastest track of the gesture last advanced,
+`now − (accumulator >> 8)` (after an advance the residual is < 256, so the
+whole ticks in the accumulator are the ticks since that step). Before the
+first scheduler tick the anchor is 0.
+
+**Snapshot** (`seq_loopSnapshotTracks(mask)`): each track's live state
+(post-advance at `now`) rewound by `now − anchor + 1` ticks = pre-advance at
+the anchor (0 ticks before the first scheduler tick, whose seeded state is
+already pre-advance at tick 0).
+
+**Resume** (`seq_loopResumeTrack(track)`): the snapshot projected forward by
+`now − anchor + 1` ticks and written to `seq_stepIndex`,
+`seq_trackAccumulator`, `seq_trackPlayState`, `seq_lastMasterStep` (chase
+LED for the selected voice). This is exactly where the track would have been
+without the loop, whether or not it was on its canonical master-clock
+position — the reason the looper does not resume through
+`seq_realignTrackToMasterClock()`.
+
+**API** (foreground; every publish holds PRIMASK for its whole body, and
+`seq_loopActive` is written last on engage / first on disengage):
+
+| Function | Behaviour |
+|---|---|
+| `seq_loopEngage(mask, div, mod)` | returns 0 and does nothing while stopped; turns recording off; filters `mask` by `seq_loopableTrackMask()`; snapshots at one anchor; returns the mask now looping |
+| `seq_loopUpdateMask(newMask)` | engaged only: tracks leaving resume (inside the call, before the mask is committed), tracks joining get one fresh anchor, tracks staying keep theirs; returns the committed mask |
+| `seq_loopDisengage()` | clears gate and mask, resumes every looped track (if running) |
+| `seq_loopUpdateDivision(div, mod)` | single-byte stores; anchors untouched |
+| `seq_loopableTrackMask()` | bit N set unless track N's played Scene region has the exclude bit |
+
+**Scene changes** (`seq_selectActivePattern()`,
+`seq_alignActivePatternToScene()`, `seq_chainRepeatSelf()`): after
+`seq_refreshTrackEffectiveParams()`, one PRIMASK section runs
+`seq_realignActivePatternToMasterClock()` and
+`seq_loopRefreshSceneSnapshots()`: anchors are kept and each snapshot becomes
+the incoming Scene's canonical pre-advance position at `anchor − 1`
+(`seq_loopCanonicalPreAdvance()`: the realign mapping of §6.4; anchor 0 →
+seed cursor −1, accumulator `interval − 256`). The loop start therefore
+stays at the same master-clock position with the incoming Scene's own scale
+(1/16 loop start at step 5 = tick 96 → a 1/8 incoming track starts at step 3;
+tick 120 → mid step 3). Between the change and the next wrap the track plays
+the incoming Scene from its realigned position. Resume after a scene change
+projects the refreshed snapshot, which equals the incoming Scene's
+master-clock position.
+
+**Cursor reset** (`seq_setStepIndexToStart()`): ends with
+`seq_loopRebaseToStart()`: anchors 0, snapshots = the freshly seeded state.
+This covers a resetting scene change (`seq_resetToPatternStart()`: pcr for
+direct/chain changes, the qac reset bit for queued ones), external resets and
+boundary pattern commits — the loop start becomes the beginning of the Scene
+and the loop stays engaged. `seq_setRunning(0)` clears `seq_loopActive` and
+the mask before the reset, so a transport stop ends the loop.
+
+**Invariants:** never reintroduce a shared loop tick counter or an
+un-anchored snapshot taken at the press (both drift off the grid); never
+publish looper state outside PRIMASK; keep the wrap before the DDA advance;
+FX sequencer and Effects are never looped.
+
+### 6.6 Scene change timing, queued changes and scene chaining (S080)
+
+**Divisions.** A direct (SEQ) change uses `scd` (`PAR_SCENE_CHANGE_DIV`,
+0..9 → master 1/16 units 0, 2, 4, 8, 16, 32, 48, 64, and 16 for `ens`/`enl`,
+`seq_sceneChangeDivUnits()`); a queued (SHIFT+SEQ) change uses `qcd`
+(`PAR_SCENE_QUEUE_DIV`, 0..17 → 0, 2, 4, 8, 16, 32, 48, 64, 80, 96, 112, 128,
+144, 192, 240, 256, 16, 16, `seq_queueChangeDivUnits()`). Units 0 = instant.
+`ens`/`enl` (end of shortest/longest track) are approximated by one bar.
+
+**State** (file-static): `seq_pendingSceneChange/Index/Div` (direct),
+`seq_pendingSceneQueue/QueueScene/QueueDiv` (queued), `seq_pendingChainFire`
+(the direct pending change was raised by a chain), `seq_sceneFireFlag`
+(TIM3 → foreground). API: `seq_requestSceneChange()` (clears a stale chain
+marker), `seq_queueSceneChange()` (instant or stopped transport raises the
+fire flag at once), `seq_sceneChangeFirePending()`, `seq_pendingSceneTarget()`
+(queue wins), `seq_pendingSceneIsQueue()`, `seq_pendingSceneIsChain()`,
+`seq_queuedSceneTarget()` (0xFF none; the fast-blink LED owner reads it),
+`seq_clearPendingSceneChange()` (all; used when a fire is consumed and on
+transport stop), `seq_cancelPendingDirectChange()` (direct + chain only; a
+queued change survives a manual change, and an instant queue re-arms).
+
+**Boundary detection** (`seq_handleMasterBoundary()`, TIM3, every master
+1/16): with a change pending, `units != 0 && clock % units == 0` raises the
+fire flag (queue units if a queue is pending, else direct). The foreground
+executor and queue actions are in `MODULE_INTERCHANGE_SPEC.md` (menu).
+
+**PC reset.** A resetting change runs `seq_resetToPatternStart()` after
+`seq_selectActivePattern()`: master clock, bar counter and every cursor
+restart (and the looper rebases, §6.5). Direct and chain changes reset when
+pcr (`PAR_BAR_RESET_MODE`) is on; queued changes ignore pcr and reset only
+for qac `res`, `u+r`, `o+r`, `mmr`, `r+r`. Non-resetting changes realign to
+the running master clock (`seq_selectActivePattern()` never resets).
+
+**Scene chaining.** Per Scene, `chain_condition[2]` (0..78) and
+`chain_next[2]` (0..43) in `scene_settings_t`
+(`BANK_PRESET_ARCHITECTURE.md`). Engine state (5 B): `seq_chainBarCount`,
+`seq_chainRepCount` (saturating 255, reset when a Scene is selected or
+repeated, on Bank Load alignment and on transport start/stop),
+`seq_previousScene` (set only when the active Scene really changes; 0xFF on
+stop/Bank Load), `seq_chainStopped`, `seq_pendingChainFire`.
+
+`seq_chainServiceTick()` runs in `seq_processSchedulerTick()` after the
+master boundary and before deferred triggers, on every tick after tick 0:
+
+1. Bar end = `elapsed % 384 == 0`. Repetition end =
+   `seq_chainAtRepetitionEnd()`: the longest track cycle
+   `max(effective length × Q8.8 interval)`; true when
+   `((elapsed << 8) % cycle) < 256` (the first tick at or after each cycle
+   multiple, exact for fractional scales).
+2. Counters advance on their boundary.
+3. Evaluation is skipped while a direct, queued or chain change is pending.
+4. `seq_chainEvaluate()`: weight per condition (`seq_chainConditionWeight()`:
+   0 nul; 1 xal / 2 bal = 100 at their boundary; 3..13 / 14..24 = 100 when the
+   repetition / bar count equals 1..8, 16, 32, 64; 25..33 / 34..42 = 10..90 at
+   repetition / bar ends; 43..46 / 47..54 = 100 at a bar end when the master
+   bar just completed is X of 4 / 8 (`((elapsed/384) − 1) % n`); 55..70 = 100
+   at a repetition end when `seq_previousScene == NN−1`; 71..78 fill / loop
+   active / inactive at repetition / bar ends). Condition 1 priority:
+   w1 = 100 → 1; two probabilities summing over 100 → proportional draw (one
+   always fires); otherwise one draw r ∈ 0..99: r < w1 → 1, r < w1 + w2
+   (capped at 100) → 2, else no change.
+5. `stp` (43) sets `seq_chainStopped`: the DDA and loop wraps stop; the
+   transport, deferred triggers and rolls continue; counts continue.
+   Otherwise `seq_chainResolveNext()` (0 slf, 1 nxt, 2 prv, 3..18 sNN, 19..34
+   random 1..NN, 35..38 random next N excluding current, 39..42 previous N;
+   absent target → no change) and the change is published as a direct
+   pending change with `seq_pendingChainFire = 1`, `div` 0, fire flag last —
+   it executes at this boundary, not re-quantised by `scd`.
+
+The foreground executor treats a chain fire whose target is the playing Scene
+as a repeat: `seq_chainRepeatSelf(pcr)` resets the chain counters and the
+`stp` freeze, retriggers once modes and the per-track condition counters,
+realigns (keeping loop anchors), or restarts when pcr is on; there is no
+DSP re-apply. Any executed change clears `stp` through
+`seq_selectActivePattern()`.
+
+**Adding a chain condition or next value:** extend the SceneData clamp
+constants (`SCENE_CHAIN_CONDITION_MAX` / `SCENE_CHAIN_NEXT_MAX`), the name
+table in MenuText.h (index = stored value, numeric order), the weight or
+resolve switch in sequencer.c, the sceneset parser maximum and the menu clamp.
+Conditions must be ISR-safe single-byte reads.
+
 ## 7. PAT4 wire format
 
 All current Scene/Bank/root Pattern Save operations write PAT4. Legacy text
@@ -657,7 +872,7 @@ One PAT4 file is exactly 10,656 bytes:
 | --- | ---: | ---: | --- |
 | Fixed header | 0 | 32 | magic/version/stack/generation/CRC/reserved |
 | Pattern parameters | 32 | 16 | change-bar, next, 14 reserved |
-| Track parameters | 48 | 112 | 7 × (length, scale CC, shuffle, run mode, 12 reserved) |
+| Track parameters | 48 | 112 | 7 × (length, scale CC, shuffle, run mode, loop exclude, 11 reserved) |
 | Address array | 160 | 1,792 | 7 × 128 little-endian encoded entries |
 | Bitmap | 1,952 | 512 | exact bit-packed allocator state |
 | Pool | 2,464 | 8,192 | dynamic blocks/padding |
@@ -684,7 +899,12 @@ zero.
 Track header bytes per track (16 each, base = 48 + 16 × track): 0 length,
 1 scale (CC 0..127 since S078; older files carry the 14-index value and are
 not migrated on device), 2 shuffle, 3 run mode (S078; pre-S078 files carry
-0 = `fwd`), 4..15 reserved zero. The file size and CRC rules are unchanged.
+0 = `fwd`), 4 looper exclusion (S080: 1 = track not loopable; written
+0/1 from bit N of `track_loop_exclude`, read back nonzero → bit set; older
+files carry 0 = loopable), 5..15 reserved zero. The writer
+(`filesystem_patternBuildHeader()`) and all three readers (Scene load, root
+Pattern Load, AutoSave Pattern boot read) handle byte 4. The file size, CRC
+rules and version (2) are unchanged.
 
 Scene directories contain exactly one `<Pattern name>.pat`, not a fixed
 `pattern.pat`. The root library uses `Pattern/NNN <name>.pat`. Pattern Load

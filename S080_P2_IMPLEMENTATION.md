@@ -4128,6 +4128,10 @@ PERF/looper/chain spec sections) are updated at session close, not here.
 
 ## Step 14 — Post-hardware follow-up (user, after the P2 implementation)
 
+**Status: implemented and PASSED on hardware (user, 2026-10-11).**  The
+full S080 P2 implementation (Steps 0–13) was also hardware-checked by the
+user before this step ("seems ok so far").
+
 Two minor points from the first hardware pass, **implemented in code** (not
 just scheduled).  Line numbers below are in the tree *after* these edits.
 The comment blocks quoted here are the ones now in the source.
@@ -4317,7 +4321,7 @@ Settings note: a settings.cfg written before this change that stored qcd 8
 (`ens`) or 9 (`enl`) now reads as 5b / 6b (backward compatibility not
 required).  The settings key (`qcd`) and the `lines=24` count are unchanged.
 
-### 14.3 Hardware checks for this step
+### 14.3 Hardware checks for this step (all PASS, 2026-10-11)
 
 | Row | Action | Expected |
 |-----|--------|----------|

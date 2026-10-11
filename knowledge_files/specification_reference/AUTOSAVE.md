@@ -4,7 +4,29 @@
 
 This is the authoritative reference for the implemented Helicase AutoSave
 format, ownership, boot restore, mutation tracking, and background writer
-through Session 078. Session 073 changed nothing in AutoSave.
+through Session 080. Session 073 and Session 079 changed nothing in AutoSave.
+
+Session 080 made two changes:
+
+- **Scene chain cells** (Scene parameters 72..75): the per-Scene chain
+  conditions `chain_condition[0..1]` (72..73, values 0..78) and next-scene
+  values `chain_next[0..1]` (74..75, values 0..43), written by
+  `scene_setChainCondition/Next()` (`AUTOSAVE_SCENE_PARAM_CHAIN_CONDITION_BASE`
+  72, `AUTOSAVE_SCENE_PARAM_CHAIN_NEXT_BASE` 74). `AUTOSAVE_SCENE_PARAM_COUNT`
+  and `AUTOSAVE_SCENE_PARAMETER_LIVE_BYTES` go from 72 to **76** (capacity
+  118; static assert `COUNT <= ALLOC`). Appended into the reserved tail: no
+  format version bump, no migration needed — every older record holds zero
+  there, which restores `nul`/`slf` (no chaining), a safe value. The restore
+  goes through the clamping setters.
+- **Restore loop fix** (`autosave_applyScenePayload()`): a zero track-Morph
+  length cell (a pre-S078 record) is skipped with `continue`; the old
+  `return` aborted the loop and skipped every later Scene cell (58..71 and
+  now 72..75) for such records.
+
+The Pattern-side Loopable flag added in S080 (`track_loop_exclude`) is
+Pattern data and travels in PAT4 (track header byte 4), not in the scalar
+record. The Pattern AutoSave snapshot (`pat_background_region`) grew with the
+region type to 10,527 B.
 
 Session 078 made one change:
 
@@ -234,8 +256,8 @@ Each Scene region reserves:
 
 - eight name bytes;
 - two HCNAMES source bytes immediately after the name;
-- 118 Scene-parameter bytes, currently 72 live
-  (`AUTOSAVE_SCENE_PARAM_COUNT`, S078):
+- 118 Scene-parameter bytes, currently 76 live
+  (`AUTOSAVE_SCENE_PARAM_COUNT`, S080):
 
   | Index | Meaning |
   |---:|---|
@@ -253,7 +275,9 @@ Each Scene region reserves:
   | 51..57 | track Morph endpoint length, tracks 1..7 (S078; 1..128; 0 = pre-S078 record, skipped on restore) |
   | 58..64 | track Morph endpoint scale CC, tracks 1..7 (S078; 0..127) |
   | 65..71 | track Morph endpoint shuffle, tracks 1..7 (S078; 0..127) |
-  | 72..117 | reserved (zero) |
+  | 72..73 | Scene chain condition 1, 2 (S080; 0..78, 0 = `nul`) |
+  | 74..75 | Scene chain next scene 1, 2 (S080; 0..43, 0 = `slf`, 43 = `stp`) |
+  | 76..117 | reserved (zero) |
 
   - 512 Effect bytes: 3 type bytes, 8 name bytes, 419 live parameter cells, and
     80 reserved bytes;
@@ -324,7 +348,8 @@ The same reasoning covers appending a **Scene parameter** into the reserved
 tail of the 118-byte allocation. That was done for Effect Morph (index 40,
 S072), the bus compressor (41..44, S074), FX-send Morph (45..50, S075 F2) and
 the track Morph endpoints (51..71, S078; a zero length is skipped on restore
-because zero is not a valid length).
+because zero is not a valid length — the loop `continue`s past it since
+S080) and the Scene chain (72..75, S080; zero = no chaining).
 The condition: zero, which
 every older record holds there, must be a safe value to restore. The first
 restore after the S074 upgrade therefore reads `cmp off`, `cam 0`, `ctm 0`,

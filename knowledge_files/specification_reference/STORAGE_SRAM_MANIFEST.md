@@ -4,11 +4,29 @@ Where every byte of the STM32F765VIH6's on-chip storage goes: program flash,
 sample flash, ITCM, DTCM, SRAM1 and SRAM2. It also records the rules for
 changing any of it.
 
-- **Current as of:** Session 079 close (2026-10-10), `dev-ph6-cleanup`,
-  HEAD uncommitted. DEV link:
-  `text=544,072`, `data=408`, `bss=427,776`; flash payload 544,480 B of
-  753,664 B (**headroom 209,184 B**). Production (`DEV_MODE_LOGGING=0`) was
+- **Current as of:** Session 080 close (2026-10-11), `dev-ph6-cleanup`,
+  code at `4869a98`. DEV link:
+  `text=556,008`, `data=412`, `bss=427,976`; flash payload 556,420 B of
+  753,664 B (**headroom 197,244 B**). Production (`DEV_MODE_LOGGING=0`) was
   last measured at S075 F1 and needs a rebuild.
+- **S080 changes:** +200 B BSS (+4 B data) from S079 (PERF performance
+  surface, `080_SESSION_HANDOFF_LOG.md` §8). Owners: `sequencer.c` looper
+  state 67 B (`seq_loopActive`, mask/division/modifier 3 B,
+  `seq_loopStartStep[7]` 14 B, `seq_loopStartAccum[7]` 14 B,
+  `seq_loopStartPlayState[7]` 7 B, `seq_loopAnchor[7]` 28 B), scene-change
+  pending state 7 B, chain runtime 5 B (`seq_chainBarCount`,
+  `seq_chainRepCount`, `seq_previousScene`, `seq_chainStopped`,
+  `seq_pendingChainFire`); `buttonHandler.c` looper holds 5 B, overlay
+  runtime 10 B (`bh_overlayActive`, voice mask, track, note, velocity,
+  count, interval 2 B, next 2 B), SHIFT+REC 3 B, `bh_shiftReleaseConsume`,
+  `bh_chainPlayArmed`; `ledHandler.c` fast blink 4 B (`led_fastBlinkLed`,
+  `led_fastBlinkPhase`, `led_fastBlinkNext`); `menu.c`
+  `menu_chainMenuScene` 1 B; `scenes` +64 B (16 × 4 B chain settings,
+  26,496 B); `pat_regions` +16 B and `pat_background_region` +1 B
+  (`track_loop_exclude`, 10,527 B per region); plus alignment. The P2 table
+  was presented under the allocation policy before implementation. Flash:
+  +11,936 B text (looper/chain engines, PERF UI, name tables: 79 chain
+  conditions, 44 next values, 18 qcd, 9 qac, 12 overlay types).
 - **S079 changes:** +160 B BSS from S078. P1: `sequencer.c`
   `seq_trackRepeatCount[7]` + `seq_trackLastConditionFired[7]` +
   `seq_fillActive` + per-track roll state arrays (~67 B, padded to 80 B).
@@ -310,14 +328,14 @@ only works while sector 6 holds no code.
 
 ---
 
-## 5. Static RAM ledger (Session 078 close DEV link)
+## 5. Static RAM ledger (Session 080 close DEV link)
 
 | Region and section | Start | Capacity | Static bytes | Free |
 |---|---|---:|---:|---:|
 | SRAM1 `.dma_nocache` | `0x20020000` | part of SRAM1 | 3,100 | — |
-| SRAM1 `.data` | `0x20020c1c` | part of SRAM1 | 416 | — |
-| SRAM1 `.bss` | `0x20020dc0` | part of SRAM1 | 293,964 | — |
-| **SRAM1 total** | `0x20020000` | **376,832** | **297,480** | **79,352** |
+| SRAM1 `.data` | `0x20020c1c` | part of SRAM1 | 412 | — |
+| SRAM1 `.bss` | `0x20020db8` | part of SRAM1 | 294,324 | — |
+| **SRAM1 total** | `0x20020000` | **376,832** | **297,836** | **78,996** |
 | DTCM `.dtcm` | `0x20000000` | part of DTCM | 512 | — |
 | DTCM `.dtcmz` | `0x20000200` | part of DTCM | 3,960 | — |
 | DTCM `.dtcm_fxbuf` (arena) | `0x20001180` | part of DTCM | 126,592 | 0 (reserved arena) |
@@ -325,8 +343,13 @@ only works while sector 6 holds no code.
 | ITCM `.itcm` (code) | `0x00000000` | 16,384 | **4,168** | 12,216 |
 | SRAM2 `.devwdg_noinit` | `0x2007c000` | 16,384 | 0 | see stack note |
 
-- Static data RAM (SRAM1 + DTCM including the arena) is 428,544 B;
-  including ITCM code, 432,712 B.
+- Static data RAM (SRAM1 + DTCM including the arena) is 428,900 B;
+  including ITCM code, 433,068 B.
+- **Session 080 changes:** `.bss` +200 B, `.data` +4 B over S079 (owners in
+  the header and §8.2). DEV link `text=556,008`, `data=412`, `bss=427,976`;
+  flash payload 556,420 B.
+- **Session 079 changes:** `.bss` +160 B (owners in the header). DEV link
+  `text=544,072`, `data=408`, `bss=427,776`.
 - **Session 078 changes:** `.bss` +608 B (owners listed in the header and
   §8.2). DEV link `text=539,856`, `data=416`, `bss=427,616`; flash payload
   540,272 B.
@@ -463,9 +486,9 @@ byte, including alignment and small variables omitted here.
 
 | Owner / object | Bytes | Allocation and use |
 | --- | ---: | --- |
-| `SceneData.c`: `scenes` | 26,432 | Sixteen resident Scene records, 1,652 B each: 71 B settings including the S075 F2 `fx_send_morph[6]` and the S078 `track_morph_length/scale/shuffle[7]`, 420 B Scene-owned Effect record, and the 1,160 B Kit (plus alignment); Pattern regions are separate. |
-| `PatternData.c`: `pat_regions` | 168,416 | Sixteen packed regions of 10,526 B: each has 1,792 B step addresses, 8,192 B pool, 512 B bitmap, and 30 B Pattern/track settings (length, scale CC, shuffle, run mode × 7 + 2 Pattern bytes; run mode added in S078). Since S075 the top 132 B of each pool (33 chunks) is a permanent swap block outside normal allocation (8,060 B usable), kept as a guaranteed rewrite area for copy/clear and later features (`PATTERN_DYNAMIC_STACK.md` §3, §12.17). |
-| `PatternData.c`: `pat_background_region` | 10,526 | One Scene-sized background region outside `pat_regions[]`, not a playable Scene (S077). Serves as the immutable snapshot for an in-flight Pattern AutoSave, the copy/clear scratch pool for an overlapping paste (`pat_backgroundPoolMut()`), and future Bank Load staging. Replaces the former `pat_autosave_snapshot` at identical size. |
+| `SceneData.c`: `scenes` | 26,496 | Sixteen resident Scene records, 1,656 B each: 75 B settings including the S075 F2 `fx_send_morph[6]`, the S078 `track_morph_length/scale/shuffle[7]` and the S080 `chain_condition[2]`/`chain_next[2]`, 420 B Scene-owned Effect record, and the 1,160 B Kit (plus alignment); Pattern regions are separate. |
+| `PatternData.c`: `pat_regions` | 168,432 | Sixteen packed regions of 10,527 B: each has 1,792 B step addresses, 8,192 B pool, 512 B bitmap, and 31 B Pattern/track settings (length, scale CC, shuffle, run mode × 7, the S080 loop-exclude mask, 2 Pattern bytes; run mode added in S078). Since S075 the top 132 B of each pool (33 chunks) is a permanent swap block outside normal allocation (8,060 B usable), kept as a guaranteed rewrite area for copy/clear and later features (`PATTERN_DYNAMIC_STACK.md` §3, §12.17). |
+| `PatternData.c`: `pat_background_region` | 10,527 | One Scene-sized background region outside `pat_regions[]`, not a playable Scene (S077). Serves as the immutable snapshot for an in-flight Pattern AutoSave, the copy/clear scratch pool for an overlapping paste (`pat_backgroundPoolMut()`), and future Bank Load staging. Replaces the former `pat_autosave_snapshot` at identical size. |
 | `PatternStackService.c`: `reservation_image` | 512 | One non-persisted bit image for the current service Scene's trailing pool reservations; three separate one-byte policy/rebuild flags accompany it. |
 | `PatternStackService.c`: `service_queue` | 256 | Sixty-four 32-bit mutation entries; cursors and repair/handover state are additional small SRAM1 objects. |
 | `Autosave.c`: `autosave_dirty_mask` | 3,856 | Sole canonical scalar dirty-bit mask. |
@@ -490,6 +513,9 @@ byte, including alignment and small variables omitted here.
 | `usb_manager.c`: `USB_OTG_dev` | 1,524 | USB core/device handle. |
 | `usb_midi_core.c`: `usb_MidiMessages` | 2,048 | USB MIDI input ring. |
 | `sequencer.c`: pending automation + dirty bits | 560 | 128 four-byte pending records (512 B) and six per-voice 64-bit dirty maps (48 B). |
+| `sequencer.c`: PERF looper (S080) | 67 | `seq_loopActive` (ISR gate), `seq_loopTrackMask`/`Division`/`Modifier`, per track `seq_loopAnchor[7]` (uint32 master tick, 28 B) and the snapshot `seq_loopStartStep[7]` (14 B), `seq_loopStartAccum[7]` (14 B), `seq_loopStartPlayState[7]` (7 B). Runtime only; written under PRIMASK, read by TIM3 (`PATTERN_DYNAMIC_STACK.md` §6.5). |
+| `sequencer.c`: scene change / chain state (S080) | 12 | Pending direct/queued change (index, division, flags, fire flag, 7 B) and chain runtime (bar/repetition counts, previous Scene, `stp` freeze, chain-fire marker, 5 B) (`PATTERN_DYNAMIC_STACK.md` §6.6). |
+| `buttonHandler.c` / `ledHandler.c` / `menu.c`: PERF UI state (S080) | 25 | Looper holds 5 B, BAR overlay runtime 10 B, SHIFT+REC 3 B, release-consume and chain chord 2 B, fast blink 4 B, chain editor Scene 1 B. |
 | `sequencer.c`: per-track timing state (S078) | 76 | ISR-static: `seq_trackAccumulator[7]` (Q8.8, 14 B), `seq_fxAccumulator` (2 B), `seq_fxStepCounter` (4 B), `seq_trackShuffleDelay/Pending/Vel/Note[7]` (28 B), `seq_trackPlayState[7]` (7 B), `seq_effectiveTrackLength/Scale/Shuffle[7]` (21 B, the morphed/automated timing cache). Written by TIM3 and by foreground refresh points (`PATTERN_DYNAMIC_STACK.md` §6.4). |
 | `presetMorphEngine.c`: track step overrides (S078) | 24 | `track_param_override_value[3][7]` + `track_param_override_mask[3]`: runtime-only length/scale/shuffle step-automation overlay. |
 | `InstrumentManager.c`: `lfo_descriptor_targets` | 192 | Twelve descriptor LFO adapters for six slots and two target pairs. |
@@ -630,3 +656,10 @@ not describe it in detail.
   Morph endpoints (+352 B `scenes`), run mode (+112 B `pat_regions`,
   +7 B `pat_background_region`); section +608 B. DEV link `text=539,856`,
   `data=416`, `bss=427,616`; flash payload 540,272 B (headroom 213,392 B).
+- **S079:** step conditions/roll state and roll fill duck (+160 B). DEV link
+  `text=544,072`, `data=408`, `bss=427,776`; payload 544,480 B.
+- **S080:** PERF looper, scene change/queue/chain state, PERF UI state, Scene
+  chain settings (+64 B `scenes`), loop exclude (+16 B `pat_regions`, +1 B
+  `pat_background_region`); `.bss` +200 B, `.data` +4 B. DEV link
+  `text=556,008`, `data=412`, `bss=427,976`; payload 556,420 B (headroom
+  197,244 B).
