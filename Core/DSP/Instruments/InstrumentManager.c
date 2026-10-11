@@ -187,6 +187,27 @@ _Static_assert(sizeof(HiHatVoice) <= INSTRUMENT_RUNTIME_SLOT_BYTES,
 _Static_assert(sizeof(InstrumentRuntimeSlot) == INSTRUMENT_RUNTIME_SLOT_BYTES,
                "Tagged slot reserve changed through alignment or member size");
 
+/*
+ * Per-slot roll fill gate fade (S079 P2 fix 4).
+ *
+ * What: gateFade is the live multiplier (1.0 open, 0.0 ducked); gateFadeStep
+ * is the per-block decrement while a fade runs (0 when idle); gateDuck is the
+ * request set by the sequencer and consumed once per block. Why: the roll fill
+ * boundary ducks the voice with a ~ROLL_FILL_FADE_MS fade applied by the mixer
+ * to the dry and send gains. The mixer's existing per-block gain interpolation
+ * smooths each step, so no per-sample loop is added. Inputs:
+ * instrumentManager_requestGateDuck(), instrumentManager_triggerTrack() (resets
+ * to open). Outputs: instrumentManager_gateGain(). RAM: 6 x (4 + 4 + 1) B.
+ * Affiliates: mixer_faderGains(), instrumentManager_calcSlotAsync().
+ */
+static float instrumentManager_gateFade[INSTRUMENT_SLOT_COUNT];
+static float instrumentManager_gateFadeStep[INSTRUMENT_SLOT_COUNT];
+static volatile uint8_t instrumentManager_gateDuck[INSTRUMENT_SLOT_COUNT];
+
+/* Per-block fade decrement for ROLL_FILL_FADE_MS at the real sample rate. */
+static const float instrumentManager_gateFadeStepRate =
+    (float)OUTPUT_DMA_SIZE / ((float)ROLL_FILL_FADE_MS * 0.001f * REAL_FS);
+
 static uint8_t instrumentManager_resolveModulationTarget(
     uint8_t scene_index,
     instrument_param_id_t id,
@@ -1340,6 +1361,9 @@ void instrumentManager_runtimeInit(void)
         runtime_slot_type[slot] =
             instrument ? instrument->type : INSTRUMENT_TYPE_UNKNOWN;
         memset(&runtime_slots[slot], 0, sizeof(runtime_slots[slot]));
+        instrumentManager_gateFade[slot] = 1.0f;
+        instrumentManager_gateFadeStep[slot] = 0.0f;
+        instrumentManager_gateDuck[slot] = 0u;
         switch (runtime_slot_type[slot]) {
         case INSTRUMENT_TYPE_DRM:
             Drum_initVoice(instrumentManager_drumRuntime(slot), slot);
@@ -1487,6 +1511,10 @@ void instrumentManager_resetRuntimeSlotFromScene(uint8_t slot,
     default:
         break;
     }
+    /* S079 P2 fix 4: a rebind opens the slot's gate fade. */
+    instrumentManager_gateFade[slot] = 1.0f;
+    instrumentManager_gateFadeStep[slot] = 0.0f;
+    instrumentManager_gateDuck[slot] = 0u;
 }
 
 void instrumentManager_resetRuntimeSlot(uint8_t slot)
@@ -1673,6 +1701,25 @@ void instrumentManager_calcSlotAsync(uint8_t slot)
      * would change SceneData while the audio path kept calculating the old
      * fixed instrument engines.
      */
+    /*
+     * S079 P2 fix 4: roll fill gate fade. Consume a pending duck request, then
+     * advance the per-block ramp. When no fade runs the step is 0 and the gain
+     * stays 1.0; the multiply cost is paid in the mixer every block either way.
+     */
+    if (instrumentManager_gateDuck[slot]) {
+        instrumentManager_gateDuck[slot] = 0u;
+        instrumentManager_gateFade[slot] = 1.0f;
+        instrumentManager_gateFadeStep[slot] =
+            instrumentManager_gateFadeStepRate;
+    }
+    if (instrumentManager_gateFadeStep[slot] > 0.0f) {
+        instrumentManager_gateFade[slot] -=
+            instrumentManager_gateFadeStep[slot];
+        if (instrumentManager_gateFade[slot] <= 0.0f) {
+            instrumentManager_gateFade[slot] = 0.0f;
+            instrumentManager_gateFadeStep[slot] = 0.0f;
+        }
+    }
     switch (instrumentManager_slotType(slot)) {
     case INSTRUMENT_TYPE_DRM:
         Drum_calcVoiceAsync(instrumentManager_drumRuntime(slot), AMP_EG_SYNC);
@@ -1799,6 +1846,14 @@ void instrumentManager_triggerTrack(uint8_t trigger_track, uint8_t note,
     if (slot == 5u)
         instrumentManager_applySlot6AlternateDecay(alternate_slot6);
 
+    /*
+     * S079 P2 fix 4: a new trigger restores the slot's gate fade to open. This
+     * is the single trigger funnel (sequencer, MIDI, and preview all arrive
+     * through voiceControl_triggerNow()), so any retrigger cancels a duck.
+     */
+    instrumentManager_gateFade[slot] = 1.0f;
+    instrumentManager_gateFadeStep[slot] = 0.0f;
+
     switch (instrumentManager_slotType(slot)) {
     case INSTRUMENT_TYPE_DRM:
         Drum_triggerVoice(instrumentManager_drumRuntime(slot), slot,
@@ -1819,6 +1874,25 @@ void instrumentManager_triggerTrack(uint8_t trigger_track, uint8_t note,
     default:
         break;
     }
+}
+
+void instrumentManager_requestGateDuck(uint8_t trigger_track)
+{
+    uint8_t slot;
+
+    if (trigger_track > INSTRUMENT_SLOT_COUNT)
+        return;
+    slot = (trigger_track >= INSTRUMENT_SLOT_COUNT)
+        ? (uint8_t)(INSTRUMENT_SLOT_COUNT - 1u)
+        : trigger_track;
+    instrumentManager_gateDuck[slot] = 1u;
+}
+
+float instrumentManager_gateGain(uint8_t slot)
+{
+    if (slot >= INSTRUMENT_SLOT_COUNT)
+        return 1.0f;
+    return instrumentManager_gateFade[slot];
 }
 
 static void instrumentManager_writeParameter(Parameter parameter,

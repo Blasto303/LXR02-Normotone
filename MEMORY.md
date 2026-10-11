@@ -20,52 +20,46 @@ make all && make img   →   build/LXRV2_lxr02.img   (use `make all`: bare `make
 
 **Commits belong to the user.** Do not suggest or prompt when to commit.
 
-**Current working source**: **Session 078 is closed** on `dev-ph6-cleanup`
-(2026-10-10). S078 implemented four parts: P1 track settings expansion
-(continuous 128-position per-track step scale with Q8.8 DDA timing, FX
-sequencer on the same curve, per-track shuffle, per-track run modes, morphable
-and automatable track length/scale/shuffle), P2 STEP multi-step editing and
-held-step track automation, P3 the STEP underline/pot-clear fix (hardware
-14/14 PASS), and P4 the run-mode remediation (Morph view gated on physical
-SHIFT, Morph-view rule, `run`/`Track`/`RunMode` label). P1–P4 are all
-hardware PASS (user, 2026-10-10).
+**Current working source**: **Session 079 is closed** on `dev-ph6-cleanup`
+(2026-10-10). S079 implemented two parts: P1 step trigger conditions,
+per-step roll/rhythm/fill, and micro-timing (design + implementation, 16
+files); P2 roll follow-up remediation (step-button toggle, scroll marker,
+rhythm presentation, roll fill duck; 9 files). SD_CARD v1→v2 conversion
+(194 PAT4 files). P1 hardware tested with three addendum fixes applied.
+P2 hardware testing pending.
 
-- **Commits:** P1 `0c23def`, P2+P3 `b537e6f`; P4 (`menu.c`, `menu.h`,
-  `MenuText.h`) and the close-out docs are uncommitted. The user manages
-  commits.
-- **Build at S078 close (DEV config):** `text=539,856`, `data=416`,
-  `bss=427,616`; flash payload 540,272 B of 753,664 (**213,392 B free**).
-  BSS +608 B from S077 (76 B sequencer timing state, 24 B track overrides,
-  352 B Scene track Morph endpoints, 119 B run-mode bytes; all approved at
-  plan acceptance). The production build (`DEV_MODE_LOGGING 0`) was last
-  measured at S075 F1 and needs a rebuild.
-- **Hardware (user):** S078 P1, P2, P3 and P4 PASS; retest checklist S076 P4,
-  S077 P1, S077 P2 sections PASS. Open: checklist rows 3.10/3.14/3.15 and
-  C1–C6, S077 P5/P6 (never had checklist rows).
+- **Commits:** S079 changes are uncommitted. The user manages commits.
+- **Build at S079 close (DEV config):** `text=544,072`, `data=408`,
+  `bss=427,776`; flash payload 544,480 B of 753,664 (**209,184 B free**).
+  BSS +160 B from S078 (P1 +80 B sequencer condition/roll state, P2 +80 B
+  InstrumentManager gate arrays + sequencer duck arrays). The production
+  build (`DEV_MODE_LOGGING 0`) was last measured at S075 F1 and needs a
+  rebuild.
+- **Hardware (user):** S079 P1 initial tested and three addendum fixes
+  applied. S079 P2 hardware testing pending. Open: retest rows 3.10/
+  3.14/3.15 and C1–C6, S077 P5/P6 (never had checklist rows).
 
-Session 078 in one paragraph:
+Session 079 in one paragraph:
 
-- **P1:** `track_scale` is a CC 0..127 on `0.25 × 2^(cc/(127/5))` (14 nudged
-  musical stops, default 76 = 1/16); per-track Q8.8 DDA accumulators
-  (`stepScale_ticksQ8()`, seed `interval − 256`); FX sequencer DDA + step
-  counter; shuffle `(shuffle × 24)/256` ticks on odd steps; run modes
-  fwd/rev/pip/rnd/onc/1fr (`track_play_mode[7]`, PAT4 byte 3); Morph
-  endpoints `track_morph_*[7]` in Scene settings (AutoSave cells 51..71,
-  `sceneset.scg` lines 15..17); sequencer reads only the effective cache
-  `seq_effectiveTrack*[]`; Scene targets 405..425; STEP SHIFT Morph view;
-  `tools/convert_scene_scale.py` (no on-device migration).
-- **P2:** multi-step velocity/note/probability broadcast; held steps + TRACK
-  → STEP held-step track automation overlay (`copyClear_isClearMode()`).
-- **P3:** STEP Pattern-wide underline search (`VA_SEARCH_SCENE_TRACK_BIT`),
-  dead presence branch/byte removed, editor search restarts made
-  unconditional, `menu_knobClearTarget()` STEP arm for SHIFT+COPY pot clears.
-- **P4:** `menu_patternTrackMorphViewActive()` requires physical SHIFT;
-  non-morphable cells are never blanked/locked in a Morph view; relabel.
+- **P1:** 7-special pool block (note/velocity/condition/roll/timing/rhythm/
+  fill using flag bits 0–6). 39-entry trigger condition dispatch (probability,
+  repeat-count X:Y, fill/!fill, last/!last, mute/!mute across 7 tracks with
+  self-mute bypass). Per-step roll engine (8 absolute rates, packed rhythm
+  byte, fill percentage with carry-over). Micro-timing delay merged with
+  shuffle deferral. `PAT_RAW_BLOCK_MAX` 132→136, `PAT_POOL_SWAP_CHUNKS`
+  33→34. PAT4 version 1→2 (`tools/convert_pattern_specials.py`). Addendum:
+  subpage chain, display text, 7th-track mute condition (39 entries total).
+- **P2:** `menu_toggleStepEditSubpage()` (step re-press toggle);
+  `checkScrollSign()` subpage-2 arm; `stepRollRhythmBytes[21]` ordered list
+  with `menu_rollRhythmStep()` stepper; per-slot gate fade (removed
+  `instrumentManager_applyTriggerGateDecay`, `voiceControl_noteOnGated`,
+  `seq_triggerVoiceGated`; added `instrumentManager_requestGateDuck` /
+  `instrumentManager_gateGain` + mixer fold + `ROLL_FILL_FADE_MS 5u`).
 
 **Permanent authority:**
 
-- `knowledge_files/log_archive/078_SESSION_HANDOFF_LOG.md` (and 077, 076,
-  075, 074, 073, 072);
+- `knowledge_files/log_archive/079_SESSION_HANDOFF_LOG.md` (and 078, 077,
+  076, 075, 074, 073, 072);
 - `knowledge_files/specification_reference/COPYCLEAR_UTILITIES.md` (new in
   S075);
 - `knowledge_files/specification_reference/dsp_instruments_effects/`:
@@ -89,6 +83,10 @@ Session 078 in one paragraph:
   results are recorded).
 - The root `S078_*.md` task documents (P1–P4 plans/schedules and
   `S078_RETEST_CHECKLIST.md`) are superseded by `078_SESSION_HANDOFF_LOG.md`
+  and the updated specifications (the user deletes them).
+- The four root `S079_*.md` task documents (`S079_P1_STEP_CONDITIONS_SPECIALS.md`,
+  `S079_P1_IMPLEMENTATION.md`, `S079_P2_ROLL_FOLLOWUP_REMEDIATION.md`,
+  `S079_P2_IMPLEMENTATION.md`) are superseded by `079_SESSION_HANDOFF_LOG.md`
   and the updated specifications (the user deletes them).
 
 Per-track step scale/shuffle playback, deferred since S068, was implemented in

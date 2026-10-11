@@ -552,6 +552,16 @@ static void mixer_faderGains(uint8_t slot,
 		 */
 		*send_gain = send * adc_sliderGainMirrored(fader);
 	}
+	/*
+	 * S079 P2 fix 4: fold the roll fill gate fade into both taps. The dry and
+	 * the send follow the same duck; the caller's last-gain interpolation
+	 * smooths the per-block steps.
+	 */
+	{
+		const float gate = instrumentManager_gateGain(slot);
+		*mix_gain *= gate;
+		*send_gain *= gate;
+	}
 }
 
 /*

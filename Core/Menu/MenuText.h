@@ -164,6 +164,8 @@ static const char shortNames[][4] = {
      * settings. Accessor: valueNames[TEXT_TRACK_PLAY_MODE] (menu.c).
      */
     {"run"},
+    /* S079 step-special compact labels: cdn/tim/rol/rtm/rfl (fix 2, P2). */
+    {"cdn"},{"tim"},{"rol"},{"rtm"},{"rfl"},
 };
 
 static const char catNames[][16] = {
@@ -211,6 +213,30 @@ static const char longNames[][16] = {
     /* S078 per-track run mode long name (S078 P4: renamed from PlayMode to
      * match the FX sequencer's RunMode). */
     {"RunMode"},
+    /* S079 step-special long names (fix 2: Conditin, % Delay; P2: Rhythm). */
+    {"Conditin"},{"% Delay"},{"RollRate"},{"Rhythm"},{"RollFill"},
+};
+
+/*
+ * Trigger condition display names (S079 §3; fix 3 extends to track 7).
+ * [0]=count; [1..39] = condition indices 0..38.
+ */
+static const char conditionNames[][4] = {
+    {39},
+    {"  -"},{"r10"},{"r20"},{"r30"},{"r40"},{"r50"},{"r60"},{"r70"},
+    {"r80"},{"r90"},{"r95"},
+    {"1:2"},{"2:2"},{"1:3"},{"2:3"},{"3:3"},{"1:4"},{"2:4"},{"3:4"},
+    {"4:4"},{"1:-"},
+    {"fil"},{"!fl"},{"lst"},{"!ls"},
+    {"1mu"},{"2mu"},{"3mu"},{"4mu"},{"5mu"},{"6mu"},
+    {"!1m"},{"!2m"},{"!3m"},{"!4m"},{"!5m"},{"!6m"},
+    {"7mu"},{"!7m"},
+};
+
+/* Per-step roll rate display names (S079 §4.1). [0]=count; [1..9] = 0..8. */
+static const char stepRollRateNames[][4] = {
+    {9},
+    {"off"},{"1/8"},{"8tr"},{" 16"},{"16t"},{" 32"},{"32t"},{" 48"},{" 64"},
 };
 
 #endif /* MENUTEXT_H_ */

@@ -572,28 +572,45 @@ uint8_t ccCopy_buildStep(uint8_t selection, const uint8_t *src_block,
             return 0u;
         }
         *trigger_mode = src_trigger ? PAT_RAW_TRIGGER_ON : PAT_RAW_TRIGGER_KEEP;
+        /*
+         * Merge all: union the flags and take the source value for every
+         * special it stored, falling back to the destination's value for
+         * specials the source left absent (S079 extends this to all seven).
+         */
         flags = (uint8_t)(ss.flags | ds.flags);
         if ((ss.flags & PAT_SPECIAL_NOTE_BIT) == 0u)
             ss.note = ds.note;
         if ((ss.flags & PAT_SPECIAL_VEL_BIT) == 0u)
             ss.velocity = ds.velocity;
-        if ((ss.flags & PAT_SPECIAL_PROB_BIT) == 0u)
-            ss.probability = ds.probability;
+        if ((ss.flags & PAT_SPECIAL_COND_BIT) == 0u)
+            ss.condition = ds.condition;
+        if ((ss.flags & PAT_SPECIAL_ROLL_BIT) == 0u)
+            ss.roll = ds.roll;
+        if ((ss.flags & PAT_SPECIAL_TIMING_BIT) == 0u)
+            ss.timing = ds.timing;
+        if ((ss.flags & PAT_SPECIAL_RHYTHM_BIT) == 0u)
+            ss.rhythm = ds.rhythm;
+        if ((ss.flags & PAT_SPECIAL_FILL_BIT) == 0u)
+            ss.fill = ds.fill;
+        ss.flags = flags;
         sc = ccCopy_union(sa, sc, da, dc);
-        return pat_rawEncode(out, flags, ss.note, ss.velocity, ss.probability,
-                             sa, sc);
+        return pat_rawEncode(out, flags, &ss, sa, sc);
     case CC_COPY_AUTO:
-        /* Source automation and probability replace the destination's. */
-        flags = (uint8_t)((ds.flags & (uint8_t)~PAT_SPECIAL_PROB_BIT) |
-                          (ss.flags & PAT_SPECIAL_PROB_BIT));
+        /*
+         * Source automation and trigger condition replace the destination's;
+         * every other destination special is retained (S079).
+         */
+        flags = (uint8_t)((ds.flags & (uint8_t)~PAT_SPECIAL_COND_BIT) |
+                          (ss.flags & PAT_SPECIAL_COND_BIT));
         if (sc == 0u && dc == 0u && flags == ds.flags &&
-            ((flags & PAT_SPECIAL_PROB_BIT) == 0u ||
-             ss.probability == ds.probability)) {
+            ((flags & PAT_SPECIAL_COND_BIT) == 0u ||
+             ss.condition == ds.condition)) {
             *skip = 1u;
             return 0u;
         }
-        return pat_rawEncode(out, flags, ds.note, ds.velocity,
-                             ss.probability, sa, sc);
+        ds.condition = ss.condition;
+        ds.flags = flags;
+        return pat_rawEncode(out, flags, &ds, sa, sc);
     case CC_COPY_MERGE_AUTO:
     default:
         if (sc == 0u) {
@@ -601,8 +618,7 @@ uint8_t ccCopy_buildStep(uint8_t selection, const uint8_t *src_block,
             return 0u;
         }
         sc = ccCopy_union(sa, sc, da, dc);
-        return pat_rawEncode(out, ds.flags, ds.note, ds.velocity,
-                             ds.probability, sa, sc);
+        return pat_rawEncode(out, ds.flags, &ds, sa, sc);
     }
 }
 

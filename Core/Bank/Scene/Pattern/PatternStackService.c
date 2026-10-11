@@ -49,7 +49,11 @@ typedef enum {
     PATSVC_OP_REMOVE_AUTOMATION,
     PATSVC_OP_SET_NOTE,
     PATSVC_OP_SET_VOLUME,
-    PATSVC_OP_SET_PROBABILITY,
+    PATSVC_OP_SET_CONDITION,
+    PATSVC_OP_SET_ROLL,
+    PATSVC_OP_SET_TIMING,
+    PATSVC_OP_SET_RHYTHM,
+    PATSVC_OP_SET_FILL,
     PATSVC_OP_CLEAR_TRACK_BARRIER,
     PATSVC_OP_REMOVE_TRACK_TARGET_BARRIER,
     PATSVC_OP_CLEAR_PATTERN
@@ -467,7 +471,15 @@ static uint8_t patSvc_blockChunksAt(const pat_scene_region_t *region,
         value_count++;
     if (flags & PAT_SPECIAL_VEL_BIT)
         value_count++;
-    if (flags & PAT_SPECIAL_PROB_BIT)
+    if (flags & PAT_SPECIAL_COND_BIT)
+        value_count++;
+    if (flags & PAT_SPECIAL_ROLL_BIT)
+        value_count++;
+    if (flags & PAT_SPECIAL_TIMING_BIT)
+        value_count++;
+    if (flags & PAT_SPECIAL_RHYTHM_BIT)
+        value_count++;
+    if (flags & PAT_SPECIAL_FILL_BIT)
         value_count++;
     bytes = (uint16_t)(PAT_BLOCK_HEADER_BYTES + 1u + value_count +
                        ((uint16_t)auto_count * 2u));
@@ -477,7 +489,8 @@ static uint8_t patSvc_blockChunksAt(const pat_scene_region_t *region,
     return (uint8_t)(bytes >> 2u);
 }
 
-/* Calculate a logical block's chunk count from flags and automation count. */
+/* Calculate a logical block's chunk count from flags and automation count
+ * (S079: seven specials). */
 static uint8_t patSvc_blockChunksFor(uint8_t flags, uint8_t auto_count)
 {
     uint8_t value_count = 0u;
@@ -488,7 +501,15 @@ static uint8_t patSvc_blockChunksFor(uint8_t flags, uint8_t auto_count)
         value_count++;
     if (flags & PAT_SPECIAL_VEL_BIT)
         value_count++;
-    if (flags & PAT_SPECIAL_PROB_BIT)
+    if (flags & PAT_SPECIAL_COND_BIT)
+        value_count++;
+    if (flags & PAT_SPECIAL_ROLL_BIT)
+        value_count++;
+    if (flags & PAT_SPECIAL_TIMING_BIT)
+        value_count++;
+    if (flags & PAT_SPECIAL_RHYTHM_BIT)
+        value_count++;
+    if (flags & PAT_SPECIAL_FILL_BIT)
         value_count++;
     if (auto_count > PAT_BLOCK_AUTO_COUNT_MASK)
         auto_count = PAT_BLOCK_AUTO_COUNT_MASK;
@@ -948,7 +969,11 @@ static uint8_t patSvc_requiredChunks(uint8_t scene, uint8_t operation,
     }
     if (operation != PATSVC_OP_SET_NOTE &&
         operation != PATSVC_OP_SET_VOLUME &&
-        operation != PATSVC_OP_SET_PROBABILITY)
+        operation != PATSVC_OP_SET_CONDITION &&
+        operation != PATSVC_OP_SET_ROLL &&
+        operation != PATSVC_OP_SET_TIMING &&
+        operation != PATSVC_OP_SET_RHYTHM &&
+        operation != PATSVC_OP_SET_FILL)
         return 0u;
 
     specials = pat_readStepSpecials(scene, track, step);
@@ -963,10 +988,31 @@ static uint8_t patSvc_requiredChunks(uint8_t scene, uint8_t operation,
             flags &= (uint8_t)~PAT_SPECIAL_VEL_BIT;
         else
             flags |= PAT_SPECIAL_VEL_BIT;
-    } else if (payload == 127u) {
-        flags &= (uint8_t)~PAT_SPECIAL_PROB_BIT;
-    } else {
-        flags |= PAT_SPECIAL_PROB_BIT;
+    } else if (operation == PATSVC_OP_SET_CONDITION) {
+        if (payload == 0u)
+            flags &= (uint8_t)~PAT_SPECIAL_COND_BIT;
+        else
+            flags |= PAT_SPECIAL_COND_BIT;
+    } else if (operation == PATSVC_OP_SET_ROLL) {
+        if (payload == 0u)
+            flags &= (uint8_t)~PAT_SPECIAL_ROLL_BIT;
+        else
+            flags |= PAT_SPECIAL_ROLL_BIT;
+    } else if (operation == PATSVC_OP_SET_TIMING) {
+        if (payload == 0u)
+            flags &= (uint8_t)~PAT_SPECIAL_TIMING_BIT;
+        else
+            flags |= PAT_SPECIAL_TIMING_BIT;
+    } else if (operation == PATSVC_OP_SET_RHYTHM) {
+        if (payload == 0u)
+            flags &= (uint8_t)~PAT_SPECIAL_RHYTHM_BIT;
+        else
+            flags |= PAT_SPECIAL_RHYTHM_BIT;
+    } else if (operation == PATSVC_OP_SET_FILL) {
+        if (payload == 100u)
+            flags &= (uint8_t)~PAT_SPECIAL_FILL_BIT;
+        else
+            flags |= PAT_SPECIAL_FILL_BIT;
     }
     count = pat_stepAutomationCount(scene, track, step);
     return patSvc_blockChunksFor(flags, count);
@@ -1001,9 +1047,21 @@ static uint8_t patSvc_executeEvent(uint32_t event)
         return pat_setStepNote(service_scene, track, step, (uint8_t)payload);
     case PATSVC_OP_SET_VOLUME:
         return pat_setStepVolume(service_scene, track, step, (uint8_t)payload);
-    case PATSVC_OP_SET_PROBABILITY:
-        return pat_setStepProbability(service_scene, track, step,
-                                      (uint8_t)payload);
+    case PATSVC_OP_SET_CONDITION:
+        return pat_setStepCondition(service_scene, track, step,
+                                    (uint8_t)payload);
+    case PATSVC_OP_SET_ROLL:
+        return pat_setStepRoll(service_scene, track, step,
+                               (uint8_t)payload);
+    case PATSVC_OP_SET_TIMING:
+        return pat_setStepTiming(service_scene, track, step,
+                                 (uint8_t)payload);
+    case PATSVC_OP_SET_RHYTHM:
+        return pat_setStepRhythm(service_scene, track, step,
+                                 (uint8_t)payload);
+    case PATSVC_OP_SET_FILL:
+        return pat_setStepFill(service_scene, track, step,
+                               (uint8_t)payload);
     case PATSVC_OP_CLEAR_PATTERN:
         pat_clearPattern(service_scene);
         return 1u;
@@ -1605,14 +1663,65 @@ uint8_t patSvc_setStepVolume(uint8_t scene, uint8_t track, uint8_t step,
                                           value), 1u);
 }
 
-/* Submit a probability-special edit through the Pattern stack service. */
-uint8_t patSvc_setStepProbability(uint8_t scene, uint8_t track,
-                                  uint8_t step, uint8_t value)
+/*
+ * Submit a condition-special edit through the Pattern stack service (S079).
+ *
+ * What: queues PATSVC_OP_SET_CONDITION with the condition index. Value 0
+ * clears the condition. Inputs: Scene/track/step coordinates and condition
+ * 0..36. Output: optimistic acceptance or 0 on rejection. Affiliates:
+ * menu_broadcastStepSpecial() PAR_STEP_CONDITION arm.
+ */
+uint8_t patSvc_setStepCondition(uint8_t scene, uint8_t track,
+                                uint8_t step, uint8_t value)
 {
     if (!patSvc_validStepRequest(scene, track, step, 0u, 0u))
         return 0u;
     return patSvc_submit(scene,
-                         patSvc_packEvent(PATSVC_OP_SET_PROBABILITY, track,
+                         patSvc_packEvent(PATSVC_OP_SET_CONDITION, track,
+                                          step, value), 1u);
+}
+
+/* Submit a roll-rate edit through the Pattern stack service (S079 §4). */
+uint8_t patSvc_setStepRoll(uint8_t scene, uint8_t track,
+                           uint8_t step, uint8_t value)
+{
+    if (!patSvc_validStepRequest(scene, track, step, 0u, 0u))
+        return 0u;
+    return patSvc_submit(scene,
+                         patSvc_packEvent(PATSVC_OP_SET_ROLL, track,
+                                          step, value), 1u);
+}
+
+/* Submit a micro-timing edit through the Pattern stack service (S079 §7). */
+uint8_t patSvc_setStepTiming(uint8_t scene, uint8_t track,
+                             uint8_t step, uint8_t value)
+{
+    if (!patSvc_validStepRequest(scene, track, step, 0u, 0u))
+        return 0u;
+    return patSvc_submit(scene,
+                         patSvc_packEvent(PATSVC_OP_SET_TIMING, track,
+                                          step, value), 1u);
+}
+
+/* Submit a roll-rhythm edit through the Pattern stack service (S079 §5). */
+uint8_t patSvc_setStepRhythm(uint8_t scene, uint8_t track,
+                             uint8_t step, uint8_t value)
+{
+    if (!patSvc_validStepRequest(scene, track, step, 0u, 0u))
+        return 0u;
+    return patSvc_submit(scene,
+                         patSvc_packEvent(PATSVC_OP_SET_RHYTHM, track,
+                                          step, value), 1u);
+}
+
+/* Submit a roll-fill edit through the Pattern stack service (S079 §6). */
+uint8_t patSvc_setStepFill(uint8_t scene, uint8_t track,
+                           uint8_t step, uint8_t value)
+{
+    if (!patSvc_validStepRequest(scene, track, step, 0u, 0u))
+        return 0u;
+    return patSvc_submit(scene,
+                         patSvc_packEvent(PATSVC_OP_SET_FILL, track,
                                           step, value), 1u);
 }
 

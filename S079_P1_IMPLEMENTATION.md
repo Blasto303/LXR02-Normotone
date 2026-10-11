@@ -1682,3 +1682,526 @@ Stack budget: `PAT_RAW_BLOCK_MAX` grows by 4 bytes (132 → 136). Every
 stack-allocated `uint8_t buf[PAT_RAW_BLOCK_MAX]` grows by 4 B. The deepest
 caller is copy/clear paste which already sits well within the stack budget.
 Verify with `arm-none-eabi-size` and manual worst-case trace.
+
+---
+
+## Implementation progress log (agent, 2026-10-10)
+
+Running notes recorded as each schedule step lands. Build command:
+`make build/<path>.o` per translation unit (full `make all && make img`
+after all steps).
+
+### Plan deviation noted up front — DTYPE nibble space is full
+
+S6.2/S6.3/S6.8 as written add three new `DTYPE_*` enum values
+(`DTYPE_CONDITION`, `DTYPE_ROLL_RATE`, `DTYPE_ROLL_RHYTHM`). All sixteen
+`DTYPE_*` nibble values are already assigned (0..15, `DTYPE_1B128` is 15)
+and `menu_cellDtype()` returns a byte whose low nibble is extracted with
+`& 0x0f`; a new value >= 16 would alias to `DTYPE_0B255` and display
+wrongly. This is documented in MEMORY.md ("Menu dtype space is full (S078)")
+and in the `[PAR_TRACK_PLAY_MODE]` comment in `menu.c`. Decision: follow
+the project-prescribed workaround — reuse `DTYPE_0B127` for the new step
+params and add static-param special cases keyed on
+`MENU_CELL_STATIC + PAR_STEP_CONDITION/ROLL/RHYTHM` (the run-mode precedent
+`MENU_CELL_STATIC + PAR_TRACK_PLAY_MODE`). User-visible behaviour matches
+the plan.
+
+### Step 0 — constants and types — DONE
+
+- `PatternData.h`: new flags bits 0..6 (note, vel, cond, roll, timing,
+  rhythm, fill) with `PAT_SPECIAL_FLAGS_MASK 0x7F`; `pat_step_specials_t`
+  widened to 7 values + flags; `PAT_RAW_BLOCK_MAX` 132 -> 136; the raw-block
+  header comment updated to seven specials/34 chunks. `pat_rawEncode()`
+  signature now takes `const pat_step_specials_t *`; the special setters were
+  renamed (`pat_setStepProbability` -> `pat_setStepCondition`) and the four
+  new setters declared `pat_setStepRoll/Timing/Rhythm/Fill`. All comment
+  blocks updated per S0.1..S0.6.
+- `config.h`: `PAT_POOL_SWAP_CHUNKS` 33 -> 34 with the S0.7 comment.
+  (`PAT_POOL_ALLOC_CHUNKS`/`_SWAP_OFFSET` derive from it automatically.)
+
+### Step 1 — PatternData.c — DONE
+
+All of S1.1..S1.18 applied: `pat_blockChunks()`, `pat_blockWrite()`
+(struct pointer), `pat_blockRead()`, `pat_blockReadAutomations()`,
+`pat_tryAppendAutomation()`, `pat_writeDynamic()`, `pat_writeSpecials()`,
+`pat_readStepSpecials()`, `pat_applyStepToMenu()`, the four automation CRUD
+call sites, the seven setters, `pat_rawDecode()`, `pat_rawEncode()`.
+Defaults now condition 0 / roll 0 / timing 0 / rhythm 0 / fill 100.
+Compiles (only the pre-existing packed-member warning).
+
+### Step 2 — PatternStackService.c/h — DONE
+
+Op enum renamed/expanded; `patSvc_blockChunksFor()` plus the additional
+`patSvc_blockChunksAt()` site (**not in the plan — found during review; both
+reproduce block geometry and must count the four new value bytes**);
+`patSvc_requiredChunks()`, `patSvc_executeEvent()`,
+`patSvc_setStepCondition()` + four new service setters, and the header
+declarations. Compiles.
+
+### Step 6.1 — ParameterArray.h — DONE (prerequisite for PatternData.c)
+
+`PAR_STEP_PROB` replaced by `PAR_STEP_CONDITION`; `PAR_STEP_TIMING`,
+`PAR_STEP_ROLL`, `PAR_STEP_RHYTHM`, `PAR_STEP_FILL` added. NUM_PARAMS is
+fixed at 384, so the net +4 ids consume existing `parameter_values[]`
+capacity.
+
+### Step 3 — Sequencer — DONE
+
+- S3.1 state added: `seq_trackRepeatCount`, `seq_trackLastConditionFired`,
+  `seq_trackRndStepCount` (**added; the plan's random-mode X:Y accounting
+  needs a free counter**), `seq_fillActive`, and the roll state arrays. The
+  roll set includes `seq_rollStepNote[]` (**added; the plan's S3.5 uses
+  `seq_rollStepNote` but S3.1 omitted it**).
+- S3.2 condition evaluator: full 0..36 dispatch (probability / X:Y / fill /
+  last / mute), now taking `track`.
+- S3.3 `seq_advanceTrackStep()`: repeat-count increments at every play-mode
+  wrap point and per `len` random steps; mute bypass for self-mute
+  conditions; `track` passed to the evaluator; combined shuffle +
+  micro-timing deferral; roll start; live-roll suppression when a per-step
+  roll is active; `seq_rollActive` cleared when a step has no roll.
+- S3.4 `seq_processShuffleDelays` renamed `seq_processDeferredTriggers`;
+  S3.5 `seq_processRollTicks()` added; S3.6 `seq_rollComputeVelocity()`
+  added; S3.11 `seq_triggerVoiceGated()` added. The roll helpers
+  `seq_rollPpq()`, `seq_rollCarries()`, `seq_rollBegin()` implement §4/§5/§6.
+- S3.7 call order: `seq_processRollTicks()` runs **after the per-track DDA
+  advance** (not after the deferred-trigger pass as sketched) so a carry-over
+  step can extend its chain before the tick that would exhaust it.
+  `seq_processDeferredTriggers()` still runs before the DDA advance.
+- S3.8/S3.9 resets: `seq_setStepIndexToStart()`, `seq_selectActivePattern()`,
+  `seq_setTrackPlayedScene()`, and `seq_init()` clear the new state.
+- S3.10 `extern uint8_t seq_fillActive;` added to `sequencer.h`.
+
+**Roll-engine interpretation (documented decisions).** The schedule leaves
+§4/§6 partly as placeholders, so the following reading was implemented:
+
+- A step with a roll rate hands its trigger stream to `seq_rollBegin()`; the
+  step's own hit is retrigger #1. Slots per step = `ceil((interval * fill /
+  100) / ppq)`, minimum 1; fill 0 collapses to a single gated hit; the final
+  slot of a fill < 100 window is gated (§6.1). Retrigger #2..N are queued for
+  the tick engine at the roll's PPQ spacing.
+- Carry-over requires an active chain and identical rate/rhythm/fill: it
+  preserves the tick accumulator and velocity-pattern position and extends the
+  queued count, so the roll is seamless (§4.2). A carry step does not fire its
+  own hit. Because the true end of a chain is not knowable ahead of time
+  (random play mode), an interior gate can still sound at a fill < 100 step
+  boundary inside a chain — a documented deviation from §6.1 that affects only
+  multi-step fill<100 chains; fill=100 chains have no gate, and single
+  fill<100 steps gate at the correct position.
+- §7.6: the roll's retrigger countdown begins at step-advance time; a
+  shuffle/micro-timing-deferred step fires its own hit at the delayed time,
+  which can offset the first retrigger by the delay. Documented deviation.
+
+### Step 4 — Voice control gated trigger — DONE
+
+S4.1 `voiceControl_noteOnGated()` declared; S4.2 implemented by packing the
+gate flag into bit 7 of the queued velocity byte; S4.3
+`voiceControl_processPending()` strips the flag and applies the gate. S4.4:
+rather than per-voice-type decay surgery, the gate is applied by a new
+`instrumentManager_applyTriggerGateDecay()` (InstrumentManager.c/h) which
+scales the slot's live `SlopeEg2` amp-envelope decay by 0.1 — the shared
+envelope accessor covers the Drum/Snare/Cymbal/HiHat paths uniformly. Requires
+hardware listening; the next normal trigger re-applies the full decay.
+
+### Step 5 — Button handler fill mode — DONE
+
+S5.1..S5.4: fill arming on the PERF (`SELECT_MODE_PERF`) press, promotion to
+`seq_fillActive` in `buttonHandler_tick()`, and clearing on the
+`BUT_MODE2` release. **Deviation:** the hold is measured with `time_sysTick`
+elapsed time rather than counting `buttonHandler_tick()` calls, because the
+main loop is not gated to 1 ms (it interleaves audio calls), so call counting
+would not be millisecond-accurate.
+
+### Step 6 — Menu (rest) — DONE
+
+- S6.3 dtype table entries use `DTYPE_0B127` (rhythm `DTYPE_0B255`).
+- S6.4 `TEXT_CONDITION/MICROTIMING/ROLL_RATE/ROLL_RHYTHM/ROLL_FILL` appended
+  at the end of `NamesEnum` (not inserted mid-enum: `valueNames[]` is
+  positionally initialised), with matching `valueNames[]`, `SHORT_*`,
+  `LONG_*`, `shortNames[]`, and `longNames[]` entries.
+- S6.5 `conditionNames[37+1]` and `stepRollRateNames[9+1]` tables added to
+  MenuText.h.
+- S6.6 SEQ_PAGE subpage 1 = vel/note/condition/micro-timing, subpage 2 =
+  roll/rhythm/fill; the automation entry cursor moved from parameter 2 to 3 in
+  `menu_moveToMenuItem()`, the right-affordance bound and the return index
+  updated with it.
+- S6.7 `PAR_STEP_CONDITION` + four new arms in `menu_parseGlobalParam()`.
+- S6.8 label formatting via static-param special cases in `va_formatValue3()`,
+  `menu_formatCellValue3()`, and the `menu_repaintGeneric()` painter;
+  clamps in `menu_clampCellValue()` (condition 0..36, roll 0..8, timing
+  0..99, fill 0..100, rhythm 0..255). Rhythm displays `N±M` and edits the raw
+  packed byte (cycle 10..15 shown as a..f to fit three characters).
+- S6.9 pot-clear comment updated for the four fixed cells.
+
+### Step 7 — Copy/clear — DONE
+
+All `pat_rawEncode()` call sites updated to the struct pointer. Merge-all now
+unions all seven flags/values; copy-auto replaces the trigger condition and
+keeps every other destination special; clear-notes keeps the condition (the
+gate) plus automation and drops note/velocity.
+
+### Step 8 — Pattern file version — DONE
+
+`PATTERN_FILE_VERSION` 1 -> 2. The existing
+`filesystem_patternHeaderValid()` check (`version != PATTERN_FILE_VERSION` ->
+reject) is the guard, so pre-S079 files (version 1) are rejected with no
+reader change needed.
+
+### Step 9 — Converter tool — DONE
+
+`tools/convert_pattern_specials.py` added. It bumps the header version to 2
+and rewrites each specials block's probability byte to the mapped condition
+index, recomputing the CRC32C. **Deviation:** old probability 127 is written
+as condition 0 in place (same behaviour as "remove the byte") rather than
+shrinking the block, keeping the pool geometry and bitmap untouched. Verified
+by a synthetic round-trip (prob 73 -> condition 6, version 2, idempotent
+second pass).
+
+### Build verification (final)
+
+`make all` succeeds. Flash: 544,240 / 753,664 B used, headroom 209,424 B
+(+3,976 B text, +80 B BSS over the S078 close). ITCM 4,168 B, DTCM statics
+4,472 B, FX arena margin 3,712 B. Only pre-existing warnings remain (unused
+`filesystem.c` helpers, the `PatternData.c` packed-member notice, an
+`EuklidGenerator.c` sign-compare). Hardware validation is still required for
+the roll engine, the gated trigger, fill mode, and the STEP subpage layout.
+
+---
+
+## Post-implementation assessment
+
+Independent diff review against the schedule, clean rebuild, and link budget
+analysis performed 2026-10-10.
+
+### Build gate
+
+| Metric | S078 close | S079 P1 | Delta |
+|--------|-----------|---------|-------|
+| text | 539,856 | 543,832 | +3,976 B |
+| data | 416 | 408 | −8 B |
+| bss | 427,616 | 427,696 | +80 B |
+| Flash payload | 540,272 | 544,240 | +3,968 B |
+| Flash headroom | 213,392 | 209,424 | −3,968 B |
+| ITCM | — | 4,168 | — |
+| DTCM statics | — | 4,472 | — |
+| FX arena margin | — | 3,712 | — |
+
+Text growth +3,976 B vs the ~4 KB estimate: on target. BSS growth +80 B vs
+the ~67 B estimate: the added `seq_rollStepNote[7]` and
+`seq_trackRndStepCount[7]` arrays (14 B, not in the original schedule) account
+for the difference. No linker errors; only pre-existing warnings survive.
+
+### Schedule compliance — all 9 steps verified
+
+Every schedule step (S0 through S9) is implemented. The diff touches the
+expected 20 files; no file is missing and no unscheduled file was modified
+outside the implementation's scope.
+
+### Deviations from the schedule (all acceptable)
+
+1. **DTYPE nibble saturation (S6.2/S6.3/S6.8).** The plan called for new
+   `DTYPE_CONDITION`, `DTYPE_ROLL_RATE`, `DTYPE_ROLL_RHYTHM` enum values, but
+   the nibble is full (0..15 occupied). Implementation follows the established
+   run-mode precedent: reuse `DTYPE_0B127`/`DTYPE_0B255` and key display
+   formatting and clamping on `MENU_CELL_STATIC + PAR_STEP_*` checks. Correct
+   and consistent with the codebase.
+
+2. **`patSvc_blockChunksAt()` (S2.2).** The schedule only listed
+   `patSvc_blockChunksFor()`. The implementation also expanded
+   `patSvc_blockChunksAt()`, a second chunk-counting function that mirrors the
+   same bit-counting pattern. Required; a miss in the schedule.
+
+3. **`seq_trackRndStepCount[7]` (S3.1).** The schedule mentioned random-mode
+   X:Y tracking as a possibility but did not declare the array. Implementation
+   adds it (+7 B BSS) and increments the repeat counter once per `len` random
+   steps.
+
+4. **`seq_rollStepNote[7]` (S3.1).** The schedule's S3.5 uses
+   `seq_rollStepNote[]` but S3.1 did not declare it. Implementation adds the
+   array (+7 B BSS). Required; a miss in the schedule.
+
+5. **Gated-decay path (S4.4).** The schedule proposed a per-voice-type decay
+   surgery through `voiceControl_applyGatedDecay()`. Implementation routes
+   through `instrumentManager_applyTriggerGateDecay()` instead, which uses the
+   existing `instrumentManager_ampEg()` accessor to reach every voice type's
+   `SlopeEg2` uniformly. Cleaner; the voice-control layer stays voice-agnostic.
+   New function added to both `InstrumentManager.c` and `InstrumentManager.h`
+   (2 files not in the schedule's affected-files table).
+
+6. **Fill hold timing (S5.1).** The schedule described a counter-based
+   `bh_fillHoldTimer`. Implementation uses `time_sysTick` elapsed comparison
+   instead, which is independent of the main-loop cadence and more accurate.
+
+7. **Roll tick placement (S3.7).** The schedule places `seq_processRollTicks()`
+   immediately after `seq_processDeferredTriggers()`. Implementation places it
+   **after the DDA per-track advance loop** so a carry-over step arriving on
+   the same tick can extend its chain before that tick would exhaust it. Sound
+   reasoning; documented in the running notes.
+
+8. **`seq_queueStepAutomations()` value-count expansion.** The schedule did not
+   list this site. Implementation correctly expanded its flag-bit count for
+   automation-offset calculation (sequencer.c ~line 1254). Required; a miss in
+   the schedule.
+
+9. **`seq_init()` and `seq_setTrackPlayedScene()` resets.** The schedule listed
+   `seq_setStepIndexToStart()` and `seq_selectActivePattern()` for state reset
+   but did not list `seq_init()` or `seq_setTrackPlayedScene()`.
+   Implementation clears the new arrays in both, which is correct — every entry
+   point that resets play state must also reset condition/roll state.
+
+10. **Converter preserves pool geometry (S9.1).** Rather than shrinking blocks
+    whose probability byte becomes condition 0, the converter writes the 0 in
+    place and preserves the existing block sizes and bitmap. This avoids pool
+    compaction in the converter and is safe since condition 0 is the always-fire
+    default and gets cleared on the next edit.
+
+### Correctness observations
+
+1. **Flag-bit ordering consistency.** All nine expansion sites (pat_blockChunks,
+   pat_blockWrite, pat_blockRead, pat_blockReadAutomations,
+   pat_tryAppendAutomation, pat_rawDecode, pat_rawEncode,
+   patSvc_blockChunksFor, patSvc_blockChunksAt, seq_queueStepAutomations) use
+   the same ascending-bit order: note, vel, cond, roll, timing, rhythm, fill.
+   Verified by diff inspection.
+
+2. **Default-value gating.** Each setter correctly clears its flag bit at the
+   default value (note 63, vel 100, condition 0, roll 0, timing 0, rhythm 0,
+   fill 100) and sets it otherwise, ensuring the pool only stores non-default
+   values.
+
+3. **`pat_rawEncode()` null-specials guard.** The implementation adds a
+   `(flags != 0u && !specials)` guard that was not in the schedule — a correct
+   defensive check that prevents a null dereference when flags are set but no
+   struct is passed.
+
+4. **Mute bypass structure.** The self-mute bypass reads the step's specials
+   only when the address entry has the specials bit set, then checks whether
+   the condition is a self-referencing mute (voice index == track). This avoids
+   unnecessary pool reads on muted tracks with no specials.
+
+5. **`seq_evaluateStepCondition()` updates `seq_trackLastConditionFired` for
+   every conditional step** (condition != 0), as specified. Unconditional steps
+   (condition == 0) return early without touching the flag.
+
+6. **Vel packing for gated triggers.** Velocity is 0..127; bit 7 is free for
+   the gate flag. `voiceControl_processPending()` strips it before the synth
+   sees the velocity and applies the decay after the trigger. No velocity
+   corruption possible.
+
+7. **Copy/clear: clear-notes keeps the condition.** The implementation masks
+   `sp.flags &= PAT_SPECIAL_COND_BIT` (not a bitwise OR), keeping only the
+   condition and dropping all other specials. This matches the plan's stated
+   intent: condition gates the retained automation.
+
+### Items to watch during hardware testing
+
+1. **Roll gate trigger audibility.** The `ampEg->decay *= 0.1f` scaling
+   produces a choked hit only if the envelope has meaningful decay. On very
+   short sounds (e.g. a click or a sample with zero decay) the gate may be
+   inaudible. Not a bug — the gate is a modulation of the decay, and zero
+   times 0.1 is still zero.
+
+2. **Roll carry-over at fill < 100.** The running notes document the deviation:
+   when a multi-step chain has fill < 100, the gate trigger fires at each
+   step boundary's remaining-count exhaustion rather than only at the chain's
+   true end. This is a corner case (fill < 100 + multi-step chain + random
+   play mode).
+
+3. **PERF button release routing.** The fill deactivation is on `BUT_MODE2`
+   release. Verify that no other release handler for `BUT_MODE2` interferes
+   (the existing `SHIFT_BUT_MODE2` release is gated by `shiftActive` and does
+   not touch fill state).
+
+4. **Subpage 2 reachability.** Subpage 2 (roll/rhythm/fill) is in the static
+   table and should be reachable via the normal left/right subpage scroll from
+   the track-settings subpage (0) or step-specials subpage (1). Verify on
+   hardware.
+
+### Verdict
+
+All schedule steps implemented. Clean build, no new warnings, link budget
+within estimates (+3,968 B flash, +80 B BSS). The 10 deviations are all
+justified improvements or schedule misses that the implementation correctly
+caught. Ready for hardware validation.
+
+---
+
+## Addendum — S079 P1 Post-Testing Fix Plan
+
+Three issues found during hardware validation.
+
+### Fix 1: Step-special subpage 2 unreachable (roll settings page)
+
+**Problem.** SEQ_PAGE subpage 2 (roll rate / roll rhythm / roll fill) is defined
+in the page table (`menuPages.h:97`) but has no navigation path.
+`menu_showStepEditPage()` (`menu.c:15763`) always enters subpage 1 (vel / note /
+condition / timing). Scrolling right from position 3 on subpage 1 enters the
+automation list (`menu.c:11926`) instead of subpage 2. The VOICE re-press toggle
+(`menu_toggleStepTrackSettingsHalf()`, `menu.c:15781`) only works on subpage 0.
+The generic `checkvalid` cross-subpage scroll (`menu.c:12049`) is gated to
+`MENU_MIDI_PAGE` only.
+
+**Fix.** Chain subpages 1 → 2 → automations in the `menu_moveToMenuItem` SEQ
+scroll path. Four changes in `menu.c`:
+
+| Location | Current | Changed to |
+|---|---|---|
+| `menu.c:11926` | Right from sub 1 pos 3 → enter automations | Right from sub 1 pos 3 → sub 2 pos 0 (`menuIndex = 2u << PAGE_SHIFT`) |
+| New block after 11926 | — | Right from sub 2 pos 2 → enter automations (`menu_stepAutoActive = 1; menuIndex = 2u << PAGE_SHIFT`) |
+| `menu.c:11972` | Left exit from automations → sub 1 pos 3 | Left exit from automations → sub 2 pos 2 (`menuIndex = (2u << PAGE_SHIFT) \| 2u`) |
+| New block | — | Left from sub 2 pos 0 → sub 1 pos 3 (`menuIndex = (1u << PAGE_SHIFT) \| 3u`) |
+
+Update `menu_stepAutomationPageActive()` (`menu.c:10406`): change the
+`activePage == 1u` check to `activePage == 2u` because automations now live on
+subpage 2.
+
+Update the `active_page == 0u` guard on pot-clear routing (`menu.c:13140`):
+confirm it still correctly excludes subpages 1 and 2 from track-automation
+clear — no change needed since both are > 0.
+
+Update endless-pot snapshot refresh: `menu_endlessPotMappingChanged()` is
+already called from `menu_showStepEditPage()` on initial entry. The subpage
+transition writes menuIndex and should call `menu_repaint()` — no pot snapshot
+change needed because step-special cells are not pot-owned.
+
+Affected renderer: `menu_repaintStepAutomation()` references
+`menu_stepAutomationPageActive()`. After the predicate update, the renderer
+works unchanged because it only reads `menu_stepAutoPageIndex` and the
+automation block list, not the page table.
+
+### Fix 2: Step-special display text corrections
+
+**Problem.** Four step-special labels use the wrong abbreviation or long name:
+
+| Current short | Correct short | Current long | Correct long |
+|---|---|---|---|
+| `con` | `cdn` | `Conditn` | `Conditin` |
+| `dly` | `tim` | `MicTimng` | `% Delay` |
+
+**Fix.** Two files, four string edits:
+
+`MenuText.h:168` — shortNames S079 block:
+```
+{"con"},{"dly"},  →  {"cdn"},{"tim"},
+```
+
+`MenuText.h:217` — longNames S079 block:
+```
+{"Conditn"},{"MicTimng"},  →  {"Conditin"},{"% Delay"},
+```
+
+No enum renumbering — `TEXT_CONDITION` and `TEXT_MICROTIMING` are positional
+indices into `shortNames[]` / `longNames[]`, and the enum values do not change.
+
+### Fix 3: Missing 7th-track mute condition
+
+**Problem.** The trigger-condition mute range covers tracks 1–6 only:
+- Condition indices 25–30 = "is track N muted" (tracks 1–6)
+- Condition indices 31–36 = "is track N not muted" (tracks 1–6)
+- Total condition count: 37 (indices 0–36)
+- `conditionNames[]` (`MenuText.h:221`) has `{37}` as its count sentinel
+- `seq_evaluateStepCondition()` (`sequencer.c:1433`) uses `(cond - 25u) % 6u`,
+  which wraps index 37 back to track 1 instead of addressing track 7
+
+Track 7 should have its own mute condition pair: "7mu" (index 37) and "!7m"
+(index 38).
+
+**Fix.** Five files:
+
+**`MenuText.h:221–230`** — Extend `conditionNames[]`:
+```
+{37},                           →  {39},
+...
+{"!5m"},{"!6m"},                →  {"!5m"},{"!6m"},{"7mu"},{"!7m"},
+```
+New table has 40 entries: count sentinel `{39}` plus indices 0–38.
+
+**`sequencer.c:1431–1439`** — Mute evaluation:
+```c
+/* Mute / not-mute, values 25..38 (25..31 muted, 32..38 not muted). */
+uint8_t voice_idx = (uint8_t)((cond - 25u) % 7u);
+uint8_t is_muted = (uint8_t)((seq_mutedTracks >> voice_idx) & 1u);
+
+if (cond <= 31u)
+    result = is_muted;
+else
+    result = (uint8_t)(!is_muted);
+```
+Change modulus from 6 to 7. Change muted-range boundary from 30 to 31. Change
+the undefined-value guard at line 1391 from `cond > 36u` to `cond > 38u`.
+
+**`menu.c:5634`** — Condition clamp:
+```
+if (*value > 36u)  →  if (*value > 38u)
+    *value = 36u;      *value = 38u;
+```
+
+**`menu.c:9459`** — Condition label renderer boundary:
+```
+if (value > 36u)  →  if (value > 38u)
+```
+
+**`tools/convert_pattern_specials.py`** — Update `probability_to_condition()`
+docstring range comment from `0..36` to `0..38`. The actual mapping function
+only produces values 0–10 (probability buckets), so no code change is needed
+in the converter — old files never stored condition values above 10. But the
+script's file header comment describing the condition table should note the
+expanded range.
+
+---
+
+## Addendum fix implementation log (agent, 2026-10-10)
+
+### Fix 1 — STEP subpage chain (subpage 2 reachability) — DONE
+
+`menu.c`, in the `menu_moveToMenuItem()` SEQ path and
+`menu_stepAutomationPageActive()`:
+
+- Right from subpage 1 position 3 now advances to subpage 2 position 0
+  (`menuIndex = 2u << PAGE_SHIFT`) instead of entering the automation editor.
+- New block: right from subpage 2 position 2 enters the automation editor
+  (`menu_stepAutoActive = 1u; menuIndex = 2u << PAGE_SHIFT`).
+- New block: left from subpage 2 position 0 returns to subpage 1 position 3.
+- Left exit from the automation editor now returns to subpage 2 position 2
+  (`menuIndex = (2u << PAGE_SHIFT) | 2u`).
+- `menu_stepAutomationPageActive()` predicate changed from `activePage == 1u`
+  to `== 2u`, because the variable automation list now lives on subpage 2.
+
+The pot-clear `active_page == 0u` guard needs no change (both 1 and 2 are
+`> 0`, so track-automation clear stays scoped to subpage 0). Step-special
+cells are not pot-owned, so no endless-pot snapshot change was needed. The
+`checkScrollSign` `>` affordance on subpage 2 was left as-is per the fix plan
+(cosmetic only).
+
+### Fix 2 — display text corrections — DONE
+
+`MenuText.h`: shortNames S079 block now `{"cdn"},{"tim"},...` (was
+`con`/`dly`); longNames S079 block now `{"Conditin"},{"% Delay"},...` (was
+`Conditn`/`MicTimng`). No enum renumbering — the strings are positionally
+indexed by the unchanged `TEXT_CONDITION`/`TEXT_MICROTIMING` ids.
+
+### Fix 3 — track-7 mute conditions — DONE
+
+- `MenuText.h`: `conditionNames[]` count sentinel `{37}` -> `{39}` and the
+  table extended with `{"7mu"},{"!7m"}` (indices 37 and 38).
+- `sequencer.c` `seq_evaluateStepCondition()`: undefined-value guard
+  `cond > 36u` -> `cond > 38u`; mute branch modulus `% 6u` -> `% 7u` and the
+  muted/not-muted boundary `cond <= 30u` -> `cond <= 31u` (25..31 = muted
+  voices 1..7, 32..38 = not muted).
+- `sequencer.c` self-mute bypass in `seq_advanceTrackStep()`: muted range
+  `25..31` (`cond - 25u`) and not-muted range `32..38` (`cond - 32u`), so a
+  self-mute condition on track 7 (voice index 6) is detected.
+- `menu.c` `menu_clampCellValue()`: `PAR_STEP_CONDITION` clamp upper bound
+  36 -> 38 (and the domain comment).
+- `menu.c` `menu_getConditionName()`: out-of-range boundary 36 -> 38 (and the
+  doc comment).
+- `tools/convert_pattern_specials.py`: header and
+  `probability_to_condition()` docstrings now describe the 0..38 range; the
+  mapping itself is unchanged (only probability buckets 0..10 are emitted).
+
+### Build verification (fixes)
+
+`make all` succeeds. Flash: 544,312 / 753,664 B used, headroom 209,352 B
+(+72 B over the pre-fix build from the new navigation blocks and the two extra
+condition labels). No new warnings. `convert_pattern_specials.py` still
+parses cleanly. The three fixes are structurally complete and now need
+on-device confirmation (subpage 2 reachability and the 7mu/!7m conditions).

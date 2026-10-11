@@ -50,7 +50,30 @@ and the Session 076 additions:
   `handleSelectButton()` SHIFT+STEP split.
 
 and the Session 078 additions (per-track timing, `PATTERN_DYNAMIC_STACK.md`
-§6.4 and §6.3a; Morph rules in `BANK_PRESET_ARCHITECTURE.md`):
+§6.4 and §6.3a; Morph rules in `BANK_PRESET_ARCHITECTURE.md`),
+
+and the Session 079 additions (step trigger conditions, per-step roll,
+micro-timing, P2 remediation):
+
+- 7-special pool block: `PAT_SPECIAL_COND_BIT` (was `PROB`), `ROLL_BIT`,
+  `TIMING_BIT`, `RHYTHM_BIT`, `FILL_BIT`; `pat_step_specials_t` widened;
+  `pat_rawEncode()` takes `const pat_step_specials_t *`;
+- `pat_setStepCondition()` (was `pat_setStepProbability()`),
+  `pat_setStepRoll()`, `pat_setStepTiming()`, `pat_setStepRhythm()`,
+  `pat_setStepFill()` — PatternData step-special setters;
+- `patSvc_setStepCondition()` (was `patSvc_setStepProbability()`),
+  `patSvc_setStepRoll()`, `patSvc_setStepTiming()`,
+  `patSvc_setStepRhythm()`, `patSvc_setStepFill()` — service wrappers;
+- `menu_toggleStepEditSubpage()` — flips SEQ sub 1 ↔ 2 on step re-press;
+- `instrumentManager_requestGateDuck(trigger_track)` — arms a ~5 ms
+  output-gain fade for the roll fill boundary (replaces the removed
+  `instrumentManager_applyTriggerGateDecay()`);
+- `instrumentManager_gateGain(slot)` — read by the mixer each block;
+- **Removed:** `instrumentManager_applyTriggerGateDecay()` (decay mutation
+  was root cause of stuck-decay bug), `voiceControl_noteOnGated()` and
+  bit-7 velocity packing (gated-trigger plumbing),
+  `seq_triggerVoiceGated()` (roll engine fires plain triggers only);
+- `seq_fillActive` — fill mode flag, set by buttonHandler PERF hold;
 
 - StepScale's 128-position Q8.8 curve (`stepScale_ticksQ8()`,
   `stepScale_formatShort()`, `stepScale_isMusicalStop()`) shared by Pattern

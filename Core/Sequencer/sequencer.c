@@ -210,6 +210,94 @@ static uint8_t seq_trackShuffleVel[NUM_TRACKS];
 static uint8_t seq_trackShuffleNote[NUM_TRACKS];
 
 /*
+ * Per-track repeat count for X:Y conditions (S079 §3.2).
+ *
+ * What: increments when a track's step index wraps (forward: len-1->0,
+ * reverse: 0->len-1, pip: at each boundary reversal, random: once per len
+ * steps drawn). Why: X:Y conditions need a modulo counter. Reset to 0 on
+ * transport/pattern reset (seq_setStepIndexToStart) and Scene change
+ * (seq_selectActivePattern). Once modes never wrap, so the counter stays at
+ * 0. Inputs: play-mode wrap logic in seq_advanceTrackStep(). Outputs:
+ * seq_evaluateStepCondition() reads this. RAM: 7 B SRAM1 static. Affiliates:
+ * seq_setStepIndexToStart(), seq_selectActivePattern().
+ */
+static uint8_t seq_trackRepeatCount[NUM_TRACKS];
+
+/*
+ * Per-track free step counter for the random play mode (S079 §3.2).
+ *
+ * What: counts steps drawn in random play mode; when it reaches the effective
+ * length it resets and seq_trackRepeatCount increments. Why: random mode never
+ * "wraps" a cursor, so a free counter is the only way to advance the X:Y
+ * repeat count once per traversal. RAM: 7 B SRAM1 static.
+ */
+static uint8_t seq_trackRndStepCount[NUM_TRACKS];
+
+/*
+ * Per-track last-condition-fired flag for lst/!ls chaining (S079 §3.4).
+ *
+ * What: set to 1 when the last evaluated conditional step (condition 1..36)
+ * fired, 0 when it was suppressed. Default 0 (not fired). Updated by
+ * seq_evaluateStepCondition() for any step with condition != 0. Why: lst/!ls
+ * conditions chain off the most recent conditional step on this track.
+ * Inputs: seq_evaluateStepCondition(). Outputs: condition indices 23/24 read
+ * this. RAM: 7 B SRAM1 static. Affiliates: seq_setStepIndexToStart().
+ */
+static uint8_t seq_trackLastConditionFired[NUM_TRACKS];
+
+/*
+ * Fill-mode active flag (S079 §3.3).
+ *
+ * What: nonzero while the PERF button has been held past the double-click
+ * timeout. Why: fil/!fl conditions read this flag. Written by
+ * buttonHandler_tick() foreground PERF hold logic; read by the TIM3 ISR. A
+ * single-byte store/load is atomic on Cortex-M7. RAM: 1 B SRAM1 static.
+ * Affiliates: buttonHandler.c PERF press/release.
+ */
+uint8_t seq_fillActive;
+
+/*
+ * Per-track roll playback state (S079 §4).
+ *
+ * What: seq_rollActive is nonzero while a per-step roll chain is running.
+ * seq_rollTickAccum counts down the PPQ ticks to the next retrigger.
+ * seq_rollVelPos is the position in the rhythm velocity cycle. seq_rollRemaining
+ * is the number of additional retriggers queued for the current chain.
+ * seq_rollLastRate/Rhythm/Fill store the previous step's roll parameters for
+ * carry-over detection. seq_rollStepVel/Note hold the step payload each
+ * retrigger fires with. Why: roll retriggers fire from seq_processSchedulerTick
+ * using the same tick-driven mechanism as shuffle, at absolute note rates
+ * independent of the track's step scale. Inputs: set by seq_rollBegin() from
+ * seq_advanceTrackStep(). Outputs: seq_triggerVoice() with rhythm-modified
+ * velocity. RAM: ~72 B SRAM1 static. Affiliates:
+ * seq_processRollTicks(), seq_rollComputeVelocity().
+ */
+static uint8_t seq_rollTickAccum[NUM_TRACKS];
+static uint8_t seq_rollVelPos[NUM_TRACKS];
+static uint8_t seq_rollRemaining[NUM_TRACKS];
+static uint8_t seq_rollActive[NUM_TRACKS];
+static uint8_t seq_rollLastRate[NUM_TRACKS];
+static uint8_t seq_rollLastRhythm[NUM_TRACKS];
+static uint8_t seq_rollLastFill[NUM_TRACKS];
+static uint8_t seq_rollStepVel[NUM_TRACKS];
+static uint8_t seq_rollStepNote[NUM_TRACKS];
+
+/*
+ * Per-track roll fill duck countdown (S079 P2 fix 4).
+ *
+ * What: seq_rollDuckDelta is the number of PPQ ticks from the last retrigger
+ * of a fill < 100 step to the fill-window end; seq_rollDuckDelay is the live
+ * countdown and seq_rollDuckActive marks it running. Why: the fill boundary
+ * must duck the sounding voice with a fast fade instead of the removed gated
+ * trigger. Inputs: set by seq_rollBegin()/seq_rollArmDuck(). Outputs:
+ * instrumentManager_requestGateDuck() when the countdown expires. RAM: 21 B
+ * SRAM1 static. Affiliates: seq_processRollTicks().
+ */
+static uint8_t seq_rollDuckDelta[NUM_TRACKS];
+static uint8_t seq_rollDuckDelay[NUM_TRACKS];
+static uint8_t seq_rollDuckActive[NUM_TRACKS];
+
+/*
  * Per-track play state (S078 §4.4).
  *
  * What: one byte per track packing runtime play mode state. Bit 0 is the
@@ -694,6 +782,22 @@ void seq_init()
 	memset(seq_trackShuffleVel, 0, sizeof(seq_trackShuffleVel));
 	memset(seq_trackShuffleNote, 0, sizeof(seq_trackShuffleNote));
 	memset(seq_trackPlayState, 0, sizeof(seq_trackPlayState));
+	/* S079: clear per-track condition and roll runtime state at boot. */
+	memset(seq_trackRepeatCount, 0, sizeof(seq_trackRepeatCount));
+	memset(seq_trackRndStepCount, 0, sizeof(seq_trackRndStepCount));
+	memset(seq_trackLastConditionFired, 0,
+	       sizeof(seq_trackLastConditionFired));
+	memset(seq_rollActive, 0, sizeof(seq_rollActive));
+	memset(seq_rollTickAccum, 0, sizeof(seq_rollTickAccum));
+	memset(seq_rollVelPos, 0, sizeof(seq_rollVelPos));
+	memset(seq_rollRemaining, 0, sizeof(seq_rollRemaining));
+	memset(seq_rollLastRate, 0, sizeof(seq_rollLastRate));
+	memset(seq_rollLastRhythm, 0, sizeof(seq_rollLastRhythm));
+	memset(seq_rollLastFill, 0, sizeof(seq_rollLastFill));
+	memset(seq_rollDuckActive, 0, sizeof(seq_rollDuckActive));
+	memset(seq_rollDuckDelay, 0, sizeof(seq_rollDuckDelay));
+	memset(seq_rollDuckDelta, 0, sizeof(seq_rollDuckDelta));
+	seq_fillActive = 0u;
 	seq_fxAccumulator = 0u;
 	seq_fxStepCounter = 0u;
 	/*
@@ -813,6 +917,45 @@ void seq_setTrackPlayedScene(uint8_t track, uint8_t scene_index)
     if (track >= 5u) {
         seq_trackPlayState[5] = 0u;
         seq_trackPlayState[6] = 0u;
+    }
+    /*
+     * S079 §3.2/§3.4: a per-track Scene change resets that track's X:Y repeat
+     * counter, random step counter, and last-condition chain flag.
+     */
+    seq_trackRepeatCount[track] = 0u;
+    seq_trackRndStepCount[track] = 0u;
+    seq_trackLastConditionFired[track] = 0u;
+    if (track >= 5u) {
+        seq_trackRepeatCount[5] = 0u;
+        seq_trackRndStepCount[5] = 0u;
+        seq_trackLastConditionFired[5] = 0u;
+        seq_trackRepeatCount[6] = 0u;
+        seq_trackRndStepCount[6] = 0u;
+        seq_trackLastConditionFired[6] = 0u;
+    }
+    /* S079 P2 fix 4: per-track Scene change cancels the track's roll + duck. */
+    seq_rollActive[track] = 0u;
+    seq_rollTickAccum[track] = 0u;
+    seq_rollVelPos[track] = 0u;
+    seq_rollRemaining[track] = 0u;
+    seq_rollLastRate[track] = 0u;
+    seq_rollLastRhythm[track] = 0u;
+    seq_rollLastFill[track] = 0u;
+    seq_rollDuckActive[track] = 0u;
+    seq_rollDuckDelay[track] = 0u;
+    seq_rollDuckDelta[track] = 0u;
+    if (track >= 5u) {
+        uint8_t pair = (track == 5u) ? 6u : 5u;
+        seq_rollActive[pair] = 0u;
+        seq_rollTickAccum[pair] = 0u;
+        seq_rollVelPos[pair] = 0u;
+        seq_rollRemaining[pair] = 0u;
+        seq_rollLastRate[pair] = 0u;
+        seq_rollLastRhythm[pair] = 0u;
+        seq_rollLastFill[pair] = 0u;
+        seq_rollDuckActive[pair] = 0u;
+        seq_rollDuckDelay[pair] = 0u;
+        seq_rollDuckDelta[pair] = 0u;
     }
     /* S078 §5.4: the reassigned track's Scene changed, rebuild its cache. */
     seq_refreshTrackEffectiveParams();
@@ -1015,6 +1158,25 @@ void seq_selectActivePattern(uint8_t pattern)
 	 * 1fr tracks at step zero.
 	 */
 	memset(seq_trackPlayState, 0, sizeof(seq_trackPlayState));
+	/*
+	 * S079 §3.2/§3.4: a Scene change resets the per-track X:Y repeat counters
+	 * and last-condition chain flags; the new Scene's conditions start fresh.
+	 */
+	memset(seq_trackRepeatCount, 0, sizeof(seq_trackRepeatCount));
+	memset(seq_trackRndStepCount, 0, sizeof(seq_trackRndStepCount));
+	memset(seq_trackLastConditionFired, 0,
+	       sizeof(seq_trackLastConditionFired));
+	/* S079 P2 fix 4: a Scene change cancels running rolls and pending ducks. */
+	memset(seq_rollActive, 0, sizeof(seq_rollActive));
+	memset(seq_rollTickAccum, 0, sizeof(seq_rollTickAccum));
+	memset(seq_rollVelPos, 0, sizeof(seq_rollVelPos));
+	memset(seq_rollRemaining, 0, sizeof(seq_rollRemaining));
+	memset(seq_rollLastRate, 0, sizeof(seq_rollLastRate));
+	memset(seq_rollLastRhythm, 0, sizeof(seq_rollLastRhythm));
+	memset(seq_rollLastFill, 0, sizeof(seq_rollLastFill));
+	memset(seq_rollDuckActive, 0, sizeof(seq_rollDuckActive));
+	memset(seq_rollDuckDelay, 0, sizeof(seq_rollDuckDelay));
+	memset(seq_rollDuckDelta, 0, sizeof(seq_rollDuckDelta));
 	/* S078 §5.4: the played Scenes changed, so rebuild the effective cache. */
 	seq_refreshTrackEffectiveParams();
 	seq_realignActivePatternToMasterClock();
@@ -1145,7 +1307,15 @@ static void seq_queueStepAutomations(uint8_t track, uint8_t step)
         value_count++;
     if (flags & PAT_SPECIAL_VEL_BIT)
         value_count++;
-    if (flags & PAT_SPECIAL_PROB_BIT)
+    if (flags & PAT_SPECIAL_COND_BIT)
+        value_count++;
+    if (flags & PAT_SPECIAL_ROLL_BIT)
+        value_count++;
+    if (flags & PAT_SPECIAL_TIMING_BIT)
+        value_count++;
+    if (flags & PAT_SPECIAL_RHYTHM_BIT)
+        value_count++;
+    if (flags & PAT_SPECIAL_FILL_BIT)
         value_count++;
     auto_count = (uint8_t)(block[1] & PAT_BLOCK_AUTO_COUNT_MASK);
     if ((uint32_t)offset +
@@ -1245,34 +1415,252 @@ static void seq_queueEffectStepMarker(uint8_t track, uint8_t step)
 }
 
 /*
- * Evaluate the conditional playback gate for one step.
+ * Evaluate the per-step trigger condition (S079 §3).
  *
- * Input: resolved PatternData specials read from the dynamic block before the
- * trigger-active check. Output: 1 when the complete step may participate in
- * playback, or 0 when both its trigger and automation are suppressed.
+ * What: the single gate before a step fires. Returns 1 (fire) or 0
+ * (suppress). Updates seq_trackLastConditionFired for conditional steps.
+ * Why: all condition logic lives at one entry point. Condition 0 and
+ * undefined values (37..255) always pass.
  *
- * Probability is currently the only conditional special. The PatternData
- * default (127, including an absent probability special) always passes; lower
- * values are compared against the same hardware-RNG conversion used by the
- * former trigger-local implementation. This is the single entry point for
- * future conditional-trigger evaluations, so named conditions can be added
- * here without reintroducing trigger-state-dependent automation queueing.
+ * Probability conditions 1..10 map to 10%..95% and are compared against the
+ * hardware RNG. Repeat-count conditions 11..20 fire when
+ * (seq_trackRepeatCount % Y) == (X - 1); value 20 ("1:-") fires only on the
+ * first play of the track. Fill conditions 21/22 read seq_fillActive. Last
+ * conditions 23/24 read seq_trackLastConditionFired. Mute conditions 25..36
+ * test one voice's mute bit in seq_mutedTracks.
  *
- * Common caller: seq_advanceTrackStep() in TIM3 ISR context. Affiliates:
- * pat_readStepSpecials() and GetRngValue().
+ * Inputs: specials struct (condition index), track index (for mute/repeat/
+ * last state). Outputs: gate result, side effect on
+ * seq_trackLastConditionFired. Context: TIM3 ISR. Affiliates:
+ * seq_advanceTrackStep(), GetRngValue(), seq_mutedTracks,
+ * seq_trackRepeatCount, seq_fillActive, seq_trackLastConditionFired.
  */
-static uint8_t seq_evaluateStepCondition(const pat_step_specials_t *sp)
+static uint8_t seq_evaluateStepCondition(const pat_step_specials_t *sp,
+                                          uint8_t track)
 {
-    /* Probability gate. */
-    if (sp->probability < 127u) {
+    uint8_t cond = sp->condition;
+    uint8_t result = 1u;
+
+    if (cond == 0u || cond > 38u)
+        return 1u;
+
+    if (cond <= 10u) {
+        /* Probability: 10%..95%, values 1..10. */
+        static const uint8_t prob_thresholds[10] = {
+            13u, 25u, 38u, 51u, 64u, 76u, 89u, 102u, 114u, 121u
+        };
+        uint8_t threshold = prob_thresholds[cond - 1u];
         uint8_t rnd = (uint8_t)(((uint16_t)(GetRngValue() & 0x7FFFu) *
                                  127u) / 32767u);
-        if (rnd >= sp->probability)
-            return 0u;
+
+        result = (uint8_t)(rnd < threshold);
+    } else if (cond <= 20u) {
+        /* Repeat count: X:Y, values 11..20. */
+        if (cond == 20u) {
+            result = (uint8_t)(seq_trackRepeatCount[track] == 0u);
+        } else {
+            static const uint8_t xy_table[9][2] = {
+                {1u,2u},{2u,2u},{1u,3u},{2u,3u},{3u,3u},
+                {1u,4u},{2u,4u},{3u,4u},{4u,4u}
+            };
+            uint8_t x = xy_table[cond - 11u][0];
+            uint8_t y = xy_table[cond - 11u][1];
+
+            result = (uint8_t)((seq_trackRepeatCount[track] % y) ==
+                               (uint8_t)(x - 1u));
+        }
+    } else if (cond <= 22u) {
+        /* Fill / not-fill, values 21..22. */
+        if (cond == 21u)
+            result = seq_fillActive;
+        else
+            result = (uint8_t)(!seq_fillActive);
+    } else if (cond <= 24u) {
+        /* Last / not-last conditional step, values 23..24. */
+        if (cond == 23u)
+            result = seq_trackLastConditionFired[track];
+        else
+            result = (uint8_t)(!seq_trackLastConditionFired[track]);
+    } else {
+        /*
+         * Mute / not-mute, values 25..38 (fix 3). 25..31 = "is voice N muted"
+         * for voices 1..7, 32..38 = "is voice N not muted". The zero-based
+         * voice index is (cond - 25) mod 7 over both halves.
+         */
+        uint8_t voice_idx = (uint8_t)((cond - 25u) % 7u);
+        uint8_t is_muted = (uint8_t)((seq_mutedTracks >> voice_idx) & 1u);
+
+        if (cond <= 31u)
+            result = is_muted;
+        else
+            result = (uint8_t)(!is_muted);
     }
 
-    /* Future conditional-trigger evaluations belong at this single gate. */
-    return 1u;
+    seq_trackLastConditionFired[track] = result;
+    return result;
+}
+
+/*
+ * Convert a roll rate index to its PPQ tick interval (S079 §4.1).
+ *
+ * Absolute note values at 96 PPQ: off 0, 1/8 12, 8tr 8, 16 6, 16t 4, 32 3,
+ * 32t 2, 48 2, 64 1 (the 64th's 1.5 PPQ is quantised to 1). Inputs: roll
+ * rate index 0..8. Output: ticks between retriggers, 0 for off.
+ */
+static uint8_t seq_rollPpq(uint8_t rate)
+{
+    static const uint8_t table[9] = {
+        0u, 12u, 8u, 6u, 4u, 3u, 2u, 2u, 1u
+    };
+
+    if (rate > 8u)
+        return 0u;
+    return table[rate];
+}
+
+/*
+ * Compute the velocity for the current roll retrigger position (S079 §5).
+ *
+ * What: decode the rhythm byte (bits 7..4 cycle length, bit 3 direction, bits
+ * 2..0 full count) and return the velocity for the current position in the
+ * cycle. Within the full-count window the step velocity applies; beyond it the
+ * velocity is halved (direction 0) or doubled (direction 1). Halved velocity
+ * floors at 1; doubled clamps at 127. Byte 0x00 and any full >= cycle decode as
+ * off (no velocity change: every retrigger at step velocity). Inputs:
+ * seq_rollVelPos, seq_rollStepVel, seq_rollLastRhythm. Output: velocity
+ * 1..127.
+ */
+static uint8_t seq_rollComputeVelocity(uint8_t track)
+{
+    uint8_t r = seq_rollLastRhythm[track];
+    uint8_t cycle = (uint8_t)((r >> 4u) & 0x0Fu);
+    uint8_t dir = (uint8_t)((r >> 3u) & 1u);
+    uint8_t full = (uint8_t)(r & 0x07u);
+    uint8_t vel = seq_rollStepVel[track];
+    uint8_t pos;
+
+    if (cycle == 0u)
+        cycle = 1u;
+    if (full == 0u)
+        full = 1u;
+    if (full > cycle) {         /* off-equivalent / invalid -> step velocity */
+        full = 1u;
+        cycle = 1u;
+    }
+    pos = (uint8_t)(seq_rollVelPos[track] % cycle);
+    if (pos < full)
+        return vel;
+    if (dir == 0u) {
+        vel = (uint8_t)(vel / 2u);
+        if (vel == 0u)
+            vel = 1u;
+        return vel;
+    }
+    vel = (uint8_t)(vel * 2u);
+    if (vel > 127u)
+        vel = 127u;
+    return vel;
+}
+
+/*
+ * Test whether an incoming roll step continues the running roll (S079 §4.2).
+ *
+ * A carry requires an active chain and identical rate, rhythm, and fill.
+ * Inputs: track, incoming specials. Output: nonzero for a carry.
+ */
+static uint8_t seq_rollCarries(uint8_t track, const pat_step_specials_t *sp)
+{
+    return (uint8_t)(seq_rollActive[track] && sp->roll != 0u &&
+                     seq_rollLastRate[track] == sp->roll &&
+                     seq_rollLastRhythm[track] == sp->rhythm &&
+                     seq_rollLastFill[track] == sp->fill);
+}
+
+/*
+ * Arm the fill-window duck for one track (S079 P2 fix 4).
+ *
+ * What: starts the duck countdown from the step's stored delta when the roll
+ * is active and the fill is below 100. Why: the duck is scheduled when the
+ * last retrigger of the fill window has fired. Inputs: per-track roll state.
+ * Output: seq_rollDuckDelay/Active armed. Affiliates: seq_processRollTicks().
+ */
+static void seq_rollArmDuck(uint8_t track)
+{
+    if (!seq_rollActive[track] || seq_rollLastFill[track] >= 100u)
+        return;
+    seq_rollDuckDelay[track] = seq_rollDuckDelta[track];
+    seq_rollDuckActive[track] = 1u;
+}
+
+/*
+ * Begin or continue a per-step roll at the step's fire time (S079 §4, §6).
+ *
+ * What: computes the number of retrigger slots for the step's fill window
+ * (interval x fill / 100, at the roll's PPQ spacing) and fires retrigger #1
+ * unless this step carries the previous chain. Every retrigger fires normally;
+ * a fill < 100 window instead arms a duck countdown so the sounding voice is
+ * faded out (S079 P2 fix 4) at the fill-window end. fill 0 collapses to a
+ * single hit ducked within the first block. The remaining slots are queued for
+ * seq_processRollTicks(). On a carry the velocity-pattern position and tick
+ * accumulator are preserved and only the slot count is extended, so the roll
+ * is seamless across the step boundary. Inputs: track and resolved specials.
+ * Outputs: the per-track roll state arrays. Context: TIM3 ISR. Affiliates:
+ * seq_processRollTicks(), seq_rollArmDuck().
+ */
+static void seq_rollBegin(uint8_t track, const pat_step_specials_t *sp)
+{
+    uint8_t ppq = seq_rollPpq(sp->roll);
+    uint8_t carry = seq_rollCarries(track, sp);
+    uint16_t interval;
+    uint16_t filled;
+    uint16_t slots;
+
+    if (ppq == 0u) {
+        seq_rollActive[track] = 0u;
+        return;
+    }
+    interval = (uint16_t)(stepScale_ticksQ8(seq_effectiveTrackScale[track])
+                          >> 8u);
+    if (interval == 0u)
+        interval = 1u;
+    filled = (uint16_t)(((uint32_t)interval * sp->fill) / 100u);
+    if (sp->fill == 0u)
+        slots = 1u;                             /* single retrigger */
+    else
+        slots = (uint16_t)((filled + ppq - 1u) / ppq);
+    if (slots == 0u)
+        slots = 1u;
+    if (slots > 255u)
+        slots = 255u;
+
+    if (!carry) {
+        seq_rollTickAccum[track] = ppq;
+        seq_rollVelPos[track] = 0u;
+        seq_rollRemaining[track] = (uint8_t)(slots - 1u);
+        /* Retrigger #1 is the step's own hit; it always fires normally. */
+        seq_triggerVoice(track, sp->velocity, sp->note);
+        seq_rollVelPos[track] = 1u;
+    } else {
+        seq_rollRemaining[track] =
+            (uint8_t)(seq_rollRemaining[track] + (uint8_t)(slots - 1u));
+    }
+    seq_rollActive[track] = 1u;
+    seq_rollLastRate[track] = sp->roll;
+    seq_rollLastRhythm[track] = sp->rhythm;
+    seq_rollLastFill[track] = sp->fill;
+    seq_rollStepVel[track] = sp->velocity;
+    seq_rollStepNote[track] = sp->note;
+
+    /* S079 P2 fix 4: the fill-window end schedules a duck, not a gated hit. */
+    seq_rollDuckActive[track] = 0u;              /* cancel any interior duck */
+    if (sp->fill < 100u)
+        seq_rollDuckDelta[track] = (uint8_t)(
+            filled - (uint16_t)((slots - 1u) * ppq));
+    else
+        seq_rollDuckDelta[track] = 0u;
+
+    if (seq_rollRemaining[track] == 0u)
+        seq_rollArmDuck(track);                  /* slots == 1 case */
 }
 
 /*
@@ -1370,20 +1758,25 @@ static void seq_advanceTrackStep(uint8_t track)
 	switch (play_mode) {
 	case 1u: /* rev */
 		seq_stepIndex[track]--;
-		if (seq_stepIndex[track] < 0)
+		if (seq_stepIndex[track] < 0) {
 			seq_stepIndex[track] = (int16_t)(len - 1u);
+			/* Wrap 0 -> len-1 counts as one traversal (S079 §3.2). */
+			seq_trackRepeatCount[track]++;
+		}
 		break;
 	case 2u: /* pip */
 		if (seq_trackPlayState[track] & SEQ_PLAY_STATE_PIP_REV) {
 			if (seq_stepIndex[track] <= 0) {
 				seq_trackPlayState[track] &=
 				    (uint8_t)~SEQ_PLAY_STATE_PIP_REV;
+				seq_trackRepeatCount[track]++;
 			} else {
 				seq_stepIndex[track]--;
 			}
 		} else {
 			if (seq_stepIndex[track] >= (int16_t)(len - 1u)) {
 				seq_trackPlayState[track] |= SEQ_PLAY_STATE_PIP_REV;
+				seq_trackRepeatCount[track]++;
 			} else {
 				seq_stepIndex[track]++;
 			}
@@ -1392,6 +1785,10 @@ static void seq_advanceTrackStep(uint8_t track)
 	case 3u: /* rnd */
 		seq_stepIndex[track] =
 		    (int16_t)(((uint16_t)GetRngValue() & 0x7FFFu) % len);
+		if (++seq_trackRndStepCount[track] >= len) {
+			seq_trackRndStepCount[track] = 0u;
+			seq_trackRepeatCount[track]++;
+		}
 		break;
 	case 4u: /* onc — once, aligned to the master clock at entry */
 	case 5u: /* 1fr — once, always from step zero */
@@ -1405,8 +1802,10 @@ static void seq_advanceTrackStep(uint8_t track)
 	case 0u: /* fwd */
 	default:
 		seq_stepIndex[track]++;
-		if (seq_stepIndex[track] >= (int16_t)len)
+		if (seq_stepIndex[track] >= (int16_t)len) {
 			seq_stepIndex[track] = 0;
+			seq_trackRepeatCount[track]++;
+		}
 		break;
 	}
 
@@ -1416,7 +1815,50 @@ static void seq_advanceTrackStep(uint8_t track)
 		return;
 	}
 
-	if (!(seq_mutedTracks & (1u << track))) {
+	{
+		uint8_t track_muted = (uint8_t)((seq_mutedTracks >> track) & 1u);
+		uint8_t process_step = (uint8_t)(!track_muted);
+
+		/*
+		 * Mute gate with self-mute bypass (S079 §3.5).
+		 *
+		 * What: muted tracks normally skip all step processing. However, if a
+		 * step on a muted track has a mute condition that tests its own track
+		 * (e.g. "3mu" on track 3), the mute is bypassed and the condition is
+		 * evaluated. Why: a self-mute condition is meaningless without bypass -
+		 * the step would never be reached. Self-mute conditions test the
+		 * zero-based voice index equal to this track. Inputs: seq_mutedTracks
+		 * bitmask, the step's address entry, and its pool condition byte.
+		 * Output: process_step is set when the step should run despite the
+		 * mute. Affiliates: pat_readStepSpecials(), seq_evaluateStepCondition().
+		 */
+		if (track_muted) {
+			const pat_scene_region_t *mute_region =
+			    pat_sceneRegion(seq_perTrackPattern[track]);
+			uint16_t mute_addr = mute_region
+			    ? mute_region->address[track][(uint8_t)seq_stepIndex[track]]
+			    : PAT_ADDR_SENTINEL;
+
+			if ((mute_addr & PAT_ADDR_SPECIALS_BIT) != 0u) {
+				pat_step_specials_t msp = pat_readStepSpecials(
+				    seq_perTrackPattern[track], track,
+				    (uint8_t)seq_stepIndex[track]);
+				uint8_t cond = msp.condition;
+				uint8_t self_mute = 0u;
+
+				if (cond >= 25u && cond <= 31u &&
+				    (uint8_t)(cond - 25u) == track)
+					self_mute = 1u;
+				else if (cond >= 32u && cond <= 38u &&
+				    (uint8_t)(cond - 32u) == track)
+					self_mute = 1u;
+				if (self_mute &&
+				    seq_evaluateStepCondition(&msp, track))
+					process_step = 1u;
+			}
+		}
+
+		if (process_step) {
 		/*
 		 * Resolve specials and evaluate the step gate before checking bit 15.
 		 * Bit 14 owns both conditional values and automation, so a non-trigger
@@ -1424,7 +1866,14 @@ static void seq_advanceTrackStep(uint8_t track)
 		 */
 		pat_step_specials_t sp = pat_readStepSpecials(
 		    seq_perTrackPattern[track], track, (uint8_t)seq_stepIndex[track]);
-		uint8_t step_allowed = seq_evaluateStepCondition(&sp);
+		uint8_t step_allowed = seq_evaluateStepCondition(&sp, track);
+
+		/* A step with no roll ends any running per-step roll and duck
+		 * (S079 §4.2, S079 P2 fix 4). */
+		if (sp.roll == 0u) {
+			seq_rollActive[track] = 0u;
+			seq_rollDuckActive[track] = 0u;
+		}
 
 		if (pat_isStepActive(track, (uint8_t)seq_stepIndex[track], seq_perTrackPattern[track])) {
 			if (seq_eraseActive && track == menu_getActiveVoice()) {
@@ -1444,19 +1893,22 @@ static void seq_advanceTrackStep(uint8_t track)
 				                    (uint8_t)seq_stepIndex[track]);
 			} else if (step_allowed) {
 				/*
-				 * Shuffle trigger deferral (S078 §3.2).
+				 * Trigger emission: per-step roll or shuffle/micro-timing
+				 * deferral (S078 §3.2, S079 §4, §7).
 				 *
-				 * What: odd-indexed steps (1, 3, 5, ...) with nonzero shuffle
-				 * are deferred by (shuffle_value * 24) / 256 PPQ ticks. Even
-				 * steps fire immediately. Why: shuffle is a groove/feel
-				 * concept that delays every other beat. The delay is always
-				 * based on the 1/16th grid (24 PPQ ticks), not the track's
-				 * step scale, so it vanishes for large scales (musically
-				 * correct). Inputs: region->track_shuffle[track],
-				 * seq_stepIndex[track] parity. Outputs: immediate trigger or
-				 * deferred trigger setup. A pending deferral is flushed first
-				 * so a fast track cannot lose an un-fired odd step.
-				 * Affiliates: seq_processSchedulerTick() shuffle tick-down.
+				 * What: a step with a roll rate hands its complete trigger
+				 * stream to seq_rollBegin() (which fires retrigger #1 and
+				 * arms the tick engine). Otherwise odd-indexed steps with
+				 * nonzero shuffle are deferred by (shuffle x 24) / 256 PPQ
+				 * ticks and micro-timing adds (step_interval x timing) / 100
+				 * ticks on top. Why: shuffle is a 1/16-grid groove; micro-timing
+				 * is relative to the track's own step interval. Inputs:
+				 * seq_effectiveTrackShuffle[track], sp.roll, sp.timing,
+				 * seq_stepIndex[track] parity. Outputs: roll start, immediate
+				 * trigger, or combined deferred trigger setup. A pending
+				 * deferral is flushed first so a fast track cannot lose an
+				 * un-fired odd step. Affiliates: seq_processDeferredTriggers(),
+				 * seq_rollBegin().
 				 */
 				/*
 				 * Effective (morphed) shuffle (S078 §5.1/§3.2): the
@@ -1467,27 +1919,43 @@ static void seq_advanceTrackStep(uint8_t track)
 				uint8_t is_odd_step =
 				    (uint8_t)(seq_stepIndex[track] & 1);
 
-				if (seq_trackShufflePending[track]) {
-					seq_trackShufflePending[track] = 0u;
-					seq_triggerVoice(track,
-					                 seq_trackShuffleVel[track],
-					                 seq_trackShuffleNote[track]);
-				}
-				if (shuffle_val > 0u && is_odd_step && len > 0u) {
-					uint8_t delay =
-					    (uint8_t)(((uint16_t)shuffle_val * 24u) / 256u);
-
-					if (delay > 0u) {
-						seq_trackShuffleDelay[track] =
-						    (uint8_t)(delay - 1u);
-						seq_trackShufflePending[track] = 1u;
-						seq_trackShuffleVel[track] = sp.velocity;
-						seq_trackShuffleNote[track] = sp.note;
-					} else {
-						seq_triggerVoice(track, sp.velocity, sp.note);
-					}
+				if (sp.roll > 0u) {
+					seq_rollBegin(track, &sp);
 				} else {
-					seq_triggerVoice(track, sp.velocity, sp.note);
+					if (seq_trackShufflePending[track]) {
+						seq_trackShufflePending[track] = 0u;
+						seq_triggerVoice(track,
+						                 seq_trackShuffleVel[track],
+						                 seq_trackShuffleNote[track]);
+					}
+					{
+						uint8_t total_delay = 0u;
+
+						if (shuffle_val > 0u && is_odd_step &&
+						    len > 0u)
+							total_delay = (uint8_t)(
+							    ((uint16_t)shuffle_val * 24u) / 256u);
+						if (sp.timing > 0u) {
+							uint16_t mt_interval = (uint16_t)(
+							    stepScale_ticksQ8(
+							        seq_effectiveTrackScale[track])
+							    >> 8u);
+							total_delay = (uint8_t)(total_delay +
+							    (uint8_t)(((uint32_t)mt_interval *
+							               sp.timing) / 100u));
+						}
+						if (total_delay > 0u) {
+							seq_trackShuffleDelay[track] =
+							    (uint8_t)(total_delay - 1u);
+							seq_trackShufflePending[track] = 1u;
+							seq_trackShuffleVel[track] =
+							    sp.velocity;
+							seq_trackShuffleNote[track] = sp.note;
+						} else {
+							seq_triggerVoice(track, sp.velocity,
+							                 sp.note);
+						}
+					}
 				}
 			}
 		}
@@ -1504,9 +1972,11 @@ static void seq_advanceTrackStep(uint8_t track)
                                       (uint8_t)seq_stepIndex[track]);
             seq_queueStepAutomations(track, (uint8_t)seq_stepIndex[track]);
         }
+		}
 	}
 
-	if (seq_rollRate != 0xffu && (seq_rollState & (1u << track))) {
+	if (seq_rollRate != 0xffu && (seq_rollState & (1u << track)) &&
+	    !seq_rollActive[track]) {
 		if ((seq_stepIndex[track] % seq_rollRate) == 0) {
 			const uint8_t vol = ROLL_VOLUME;
 			seq_triggerVoice(track, vol, MIDI_DEFAULT_TRIGGER_NOTE);
@@ -2040,20 +2510,22 @@ void seq_realignTrackToMasterClock(uint8_t track)
 }
 
 /*
- * Shuffle delay tick-down (S078 §3.2).
+ * Deferred trigger tick-down (S078 §3.2, S079 §7.4).
  *
- * What: each PPQ tick decrements the shuffle delay counter for any track with
- * a pending deferred trigger. When the counter reaches zero, the deferred
+ * What: each PPQ tick decrements the delay counter for any track with a
+ * pending deferred trigger. When the counter reaches zero, the deferred
  * trigger fires with the velocity/note captured at the original step. Why:
- * shuffle must operate at PPQ tick resolution for smooth swing feel. The delay
- * is computed from (shuffle_value * 24) / 256, which produces 0..11 ticks of
- * delay at 96 PPQ. A pending deferral fires even if its track stopped in the
- * meantime (S078 §10.2): the step was already reached; shuffle only delays
- * execution. Inputs: seq_trackShufflePending[], seq_trackShuffleDelay[].
- * Outputs: seq_triggerVoice() when a delay expires. Affiliates:
- * seq_advanceTrackStep() sets up the deferred trigger.
+ * the delay carries the combined shuffle and micro-timing offset for a step,
+ * which must operate at PPQ tick resolution for smooth timing. The shuffle
+ * part is (shuffle_value * 24) / 256 (0..11 ticks at 96 PPQ); micro-timing
+ * adds (step_interval x timing) / 100 on top. A pending deferral fires even if
+ * its track stopped in the meantime (S078 §10.2): the step was already
+ * reached; the delay only postpones execution. Inputs:
+ * seq_trackShufflePending[], seq_trackShuffleDelay[]. Outputs:
+ * seq_triggerVoice() when a delay expires. Affiliates: seq_advanceTrackStep()
+ * sets up the deferred trigger.
  */
-static void seq_processShuffleDelays(void)
+static void seq_processDeferredTriggers(void)
 {
 	uint8_t track;
 
@@ -2067,6 +2539,65 @@ static void seq_processShuffleDelays(void)
 		} else {
 			seq_trackShuffleDelay[track]--;
 		}
+	}
+}
+
+/*
+ * Tick-driven per-step roll retrigger engine (S079 §4).
+ *
+ * What: services the per-track fill-window duck countdown, then for each track
+ * with an active roll and queued retriggers decrements the tick accumulator.
+ * When it reaches zero, fires one retrigger with rhythm-modified velocity,
+ * resets the accumulator to the roll rate's PPQ interval, advances the
+ * velocity-pattern position, and decrements the queued count. When the queued
+ * count reaches zero on a step whose fill is below 100, the duck is armed so
+ * the voice fades out at the fill-window end (S079 P2 fix 4). Why: roll
+ * retriggers run from the PPQ tick clock, same as the deferred-trigger engine,
+ * at absolute note rates. A chain whose slots are exhausted stays "active" (so
+ * the next step can carry it over) until the next step's begin clears or
+ * extends it (the duck countdown lives outside that remaining check so it can
+ * still expire). Inputs: seq_rollActive, seq_rollTickAccum, seq_rollVelPos,
+ * seq_rollRemaining, seq_rollStepVel/Note, seq_rollLastRate/Fill,
+ * seq_rollDuck*. Outputs: seq_triggerVoice() and
+ * instrumentManager_requestGateDuck(). Context: TIM3 ISR via
+ * seq_processSchedulerTick(). Affiliates: seq_rollBegin() roll setup.
+ */
+static void seq_processRollTicks(void)
+{
+	uint8_t track;
+
+	for (track = 0u; track < NUM_TRACKS; track++) {
+		uint8_t ppq;
+		uint8_t vel;
+
+		if (!seq_rollActive[track])
+			continue;
+		if (seq_rollDuckActive[track]) {
+			if (seq_rollDuckDelay[track] == 0u) {
+				instrumentManager_requestGateDuck(track);
+				seq_rollDuckActive[track] = 0u;
+			} else {
+				seq_rollDuckDelay[track]--;
+			}
+		}
+		if (seq_rollRemaining[track] == 0u)
+			continue;               /* chain idle, awaiting next step */
+		ppq = seq_rollPpq(seq_rollLastRate[track]);
+		if (ppq == 0u) {
+			seq_rollActive[track] = 0u;
+			continue;
+		}
+		if (seq_rollTickAccum[track] > 0u) {
+			seq_rollTickAccum[track]--;
+			continue;
+		}
+		vel = seq_rollComputeVelocity(track);
+		seq_rollRemaining[track]--;
+		if (seq_rollRemaining[track] == 0u)
+			seq_rollArmDuck(track);
+		seq_triggerVoice(track, vel, seq_rollStepNote[track]);
+		seq_rollTickAccum[track] = (uint8_t)(ppq - 1u);
+		seq_rollVelPos[track]++;
 	}
 }
 
@@ -2104,7 +2635,7 @@ static void seq_processSchedulerTick(void)
 	}
 
 	/* Shuffle deferral tick-down runs before this tick's DDA advance. */
-	seq_processShuffleDelays();
+	seq_processDeferredTriggers();
 
 	/*
 	 * Per-track DDA step advance (S078 §2.4.1, replacing the global divisor).
@@ -2146,6 +2677,12 @@ static void seq_processSchedulerTick(void)
         seq_ledState.chaseStep = seq_stepIndex[menu_getActiveVoice()];
         seq_ledState.dirty |= SEQ_LED_DIRTY_CHASE;
     }
+
+    /*
+     * S079 §4: roll retriggers run after the DDA advance so a carry-over step
+     * can extend its chain before the tick that would otherwise exhaust it.
+     */
+    seq_processRollTicks();
 
     /* FX sequencer follows the same master PPQ clock, independent of Pattern. */
     seq_fxClockTick();
@@ -2764,6 +3301,20 @@ static void seq_setStepIndexToStart()
 		seq_trackShuffleDelay[i] = 0u;
 		seq_trackShufflePending[i] = 0u;
 		seq_trackPlayState[i] = 0u;
+		/* S079: reset per-track condition and roll runtime state. */
+		seq_trackRepeatCount[i] = 0u;
+		seq_trackRndStepCount[i] = 0u;
+		seq_trackLastConditionFired[i] = 0u;
+		seq_rollActive[i] = 0u;
+		seq_rollTickAccum[i] = 0u;
+		seq_rollVelPos[i] = 0u;
+		seq_rollRemaining[i] = 0u;
+		seq_rollLastRate[i] = 0u;
+		seq_rollLastRhythm[i] = 0u;
+		seq_rollLastFill[i] = 0u;
+		seq_rollDuckActive[i] = 0u;
+		seq_rollDuckDelay[i] = 0u;
+		seq_rollDuckDelta[i] = 0u;
 	}
 	/*
 	 * Seed the FX DDA the same way so its step zero plays on the first tick,

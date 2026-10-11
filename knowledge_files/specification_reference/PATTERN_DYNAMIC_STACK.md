@@ -3,13 +3,39 @@
 ## Authority and status
 
 This is the authoritative live-memory, allocator, PAT4 interchange, Pattern
-Stack Service, and Pattern AutoSave reference, **current as of the Session 078
+Stack Service, and Pattern AutoSave reference, **current as of the Session 079
 close** (2026-10-10, `dev-ph6-cleanup`). Session 073 changed
 nothing. Session 074 changed no Pattern storage or allocator code; it added a
 second reader of step automation (the Effect-page underline search reads every
 step of every track of the viewed Pattern through
 `pat_readStepAutomations()`, 4 steps per foreground pass) and saw a torn PAT4
 file repair itself exactly as designed (§9).
+
+**Session 079 changed this area in five ways:**
+
+- **7-special pool block format** (§4): expanded from 3 specials
+  (note/velocity/probability) to 7 (note/velocity/condition/roll/timing/
+  rhythm/fill) using flag bits 0–6. `PAT_SPECIAL_PROB_BIT` renamed to
+  `PAT_SPECIAL_COND_BIT`; four new bit definitions. `PAT_SPECIAL_FLAGS_MASK`
+  = `0x7Fu`. `pat_step_specials_t` widened to 8 fields (7 values + flags).
+  `PAT_RAW_BLOCK_MAX` 132 → 136 (34 chunks). `pat_rawEncode()` signature
+  widened from 3 positional values to `const pat_step_specials_t *`. Default
+  fill = 100 (bit cleared when value == 100).
+- **Swap block** (§3): `PAT_POOL_SWAP_CHUNKS` 33 → 34 (136 B) to match the
+  wider maximum block.
+- **Trigger condition system** (§6): probability replaced by a 39-entry
+  condition dispatch (10 probability, 10 repeat-count X:Y, fill/!fill,
+  last/!last, 14 mute/!mute across 7 tracks); self-mute bypass on muted
+  tracks; `seq_trackRepeatCount[7]`, `seq_trackLastConditionFired[7]`,
+  `seq_fillActive`.
+- **Per-step roll engine** (§6): `seq_rollBegin()`, `seq_processRollTicks()`,
+  `seq_rollComputeVelocity()` — 8 roll rates (absolute note values), packed
+  rhythm byte encoding (21 ordered entries), fill percentage with ~5 ms
+  output-gain duck via `instrumentManager_requestGateDuck()` /
+  `instrumentManager_gateGain()` in the mixer. Carry-over across matching
+  steps. Roll + duck state reset at all four sequencer reset sites.
+- **PAT4 version** (§7): bumped from 1 to 2; reader rejects version 1.
+  Offline converter `tools/convert_pattern_specials.py`.
 
 **Session 078 changed this area in four ways:**
 
@@ -65,12 +91,13 @@ Implemented and hardware accepted:
 
 - 16 independent resident Scene Patterns;
 - 7 tracks × 128 steps per Scene;
-- trigger state plus dynamic note, velocity, and probability specials;
+- trigger state plus dynamic note, velocity, condition, roll, timing,
+  rhythm, and fill specials (7 specials since S079; was 3 before);
 - per-step automation entries (2-byte LE, 7-bit value + 9-bit target,
   up to 63 per step) with uniqueness invariant and dtype-aware editing;
 - first-fit bit-packed pool allocator and block reclamation;
 - Pattern/track settings storage, Menu edit, and PAT4 persistence; Sequencer
-  probability playback; per-track step-length playback (Session 068) and,
+  condition playback (39-entry dispatch since S079); per-track step-length playback (Session 068) and,
   since Session 078, per-track continuous step scale, shuffle and run modes
   with Morph and step automation (§6.4);
 - sequencer automation playback: TIM3 copies to 32-entry debounced
@@ -165,11 +192,12 @@ pool end.
 allocatable chunks. It creates an 8,192-byte pool (`256 × 32`). Allocation is
 in 4-byte chunks, so the pool contains 2,048 chunks.
 
-**Swap block (S075).** The top 33 chunks (132 B, bytes 8,060..8,191,
-`PAT_POOL_SWAP_OFFSET`) of every Scene's pool are permanently reserved: normal
-allocation (`pat_poolAlloc()`), service searches, repair and reservations stop
-at `PAT_POOL_ALLOC_CHUNKS` (2,015 chunks, 8,060 B usable). The block holds one
-maximum dynamic block and is a guaranteed rewrite area: a step can be
+**Swap block (S075, widened S079).** The top 34 chunks (136 B, bytes
+8,056..8,191, `PAT_POOL_SWAP_OFFSET`) of every Scene's pool are permanently
+reserved: normal allocation (`pat_poolAlloc()`), service searches, repair and
+reservations stop at `PAT_POOL_ALLOC_CHUNKS` (2,014 chunks, 8,056 B usable).
+The block holds one maximum dynamic block (7 specials + 63 automations) and
+is a guaranteed rewrite area: a step can be
 republished without free pool space while its old block is still live.
 Copy/clear is its first user; the reserve is kept for any later feature that
 needs the same guarantee. PAT4 is unchanged (the reserve is free space);
@@ -196,17 +224,20 @@ A block starts at a 4-byte-aligned pool offset:
 bytes 0..1  big-endian header (byte 0 = bits 15..8, byte 1 = bits 7..0)
              bits 15..6: track * 128 + step (10-bit back-reference)
              bits 5..0: automation count (0..63), so byte 1 & 0x3F
-byte 2      special flags: bit0 note, bit1 velocity, bit2 probability
-bytes 3..   present values in note, velocity, probability order
+byte 2      special flags: bit0 note, bit1 velocity, bit2 condition,
+            bit3 roll, bit4 timing, bit5 rhythm, bit6 fill
+bytes 3..   present values in ascending flag-bit order:
+            note, velocity, condition, roll, timing, rhythm, fill
 next bytes  automation entries, 2 bytes each, auto_count entries:
              each entry little-endian: bits 15..9 = 7-bit value (0..127),
              bits 8..0 = 9-bit instrument_param_id_t target
 padding     zero to a 4-byte boundary
 ```
 
-Block size: `chunks = (2 + 1 + popcount(flags & 0x07) + auto_count * 2 + 3) / 4`.
-One special with no automation is one 4-byte chunk. Three specials with four
-automations is four chunks (14 bytes padded to 16). An unknown flag bit or an
+Block size: `chunks = (2 + 1 + popcount(flags & 0x7F) + auto_count * 2 + 3) / 4`.
+One special with no automation is one 4-byte chunk. Seven specials with no
+automation is three chunks (10 bytes padded to 12). Seven specials with 63
+automations is 34 chunks (136 bytes). An unknown flag bit (bit 7) or an
 inconsistent back-reference makes a block invalid.
 
 Each automation entry's 9-bit target is the canonical `instrument_param_id_t`:
@@ -223,9 +254,10 @@ DTYPE_LFO_POLARITY, DTYPE_NOTE_NAME, DTYPE_1B16). No DTYPE_0B255 parameter
 is currently automatable. If a DTYPE_0B255 parameter becomes automatable in
 the future, its conversion must be handled as a dtype-conditional special case.
 
-Default resolved values when a special is absent are the Pattern default note,
-default velocity, and probability 127. `pat_readStepSpecials()` always returns
-usable values plus flags saying which were explicitly stored.
+Default resolved values when a special is absent are: note 63, velocity 100,
+condition 0 (always fire), roll 0 (off), timing 0 (none), rhythm 0 (off),
+fill 100 (full step). `pat_readStepSpecials()` always returns usable values
+plus flags saying which were explicitly stored.
 
 Writers use read-modify-write semantics with publication-safe ordering
 (Session 067): allocate new block, write complete content, PRIMASK-protect the
@@ -253,7 +285,8 @@ invalid coordinate:
   PatternTrace one — see `DEV_MODES.md` and note the two trace systems share
   some letters with different meanings);
 - `pat_clearTrack`, `pat_clearPattern`;
-- `pat_readStepSpecials` and the note/velocity/probability setters;
+- `pat_readStepSpecials` and the note/velocity/condition/roll/timing/
+  rhythm/fill setters;
 - `pat_readStepAutomations` — read decoded entries for one step (returns
   count);
 - `pat_writeStepAutomation` — add or update one entry (uniqueness enforced,
@@ -291,10 +324,25 @@ boundary (§12.17).
 ## 6. Sequencer and menu integration
 
 The Sequencer obtains trigger/special state through PatternData. For a
-triggered step it evaluates probability using the hardware RNG, suppresses the
-event when the random value is greater than or equal to the stored 0..127
-probability, and otherwise triggers with the resolved note and velocity. Roll
-events remain independent fixed-note behavior.
+triggered step it evaluates the trigger condition via
+`seq_evaluateStepCondition()` — a 39-entry dispatch table covering
+probability (r10–r95 via hardware RNG), repeat-count X:Y conditions
+(`seq_trackRepeatCount[7]`, modulo comparison), fill/!fill
+(`seq_fillActive`, armed by PERF hold past `DOUBLE_CLICK_TIMEOUT`),
+last/!last chaining (`seq_trackLastConditionFired[7]`), and mute/!mute
+across all 7 tracks (with self-mute bypass: a step on a muted track whose
+condition tests its own track's mute state bypasses the mute gate). Condition
+0 (default/absent) always passes. A failed condition suppresses both trigger
+and automation. The sequencer then triggers with the resolved note and
+velocity. If the step has a roll special, `seq_rollBegin()` starts a
+per-step retrigger engine at the specified rate (8 absolute note values,
+independent of track scale), with rhythm-modified velocity via the packed
+byte pattern and a fill percentage that controls how much of the step
+duration the roll occupies. Fill < 100 ducks the voice at the fill boundary
+via `instrumentManager_requestGateDuck()`. If the step has a micro-timing
+delay, the trigger is deferred by `(step_interval * timing_value) / 100`
+ticks, additive with shuffle. Roll carry-over extends across adjacent steps
+with matching rate/rhythm/fill.
 
 ### 6.1 Step automation playback
 
@@ -315,15 +363,14 @@ There is no coalescing; a full queue drops the entry and records a
 PatternTrace overflow witness (`H`). Effect step markers (identity bit 11)
 share the queue. The ISR is the sole writer.
 
-Trigger condition including probability gates the complete step: trigger and
-automation together, for any step that has the probability special set,
-whether or not the step has an active trigger (bit 15). The probability
-special is read from the dynamic block before the trigger-active check so it
-applies to non-trigger steps with automation. Default probability (127, or
-absent special) always passes — a step without probability set plays
-unconditionally. A step whose probability roll fails produces no trigger and
-no automation entries; previously held automation values persist through the
-skipped step. Erase is independent of probability.
+Trigger condition gates the complete step: trigger and automation together,
+for any step that has a condition special set (value 1–38), whether or not the
+step has an active trigger (bit 15). The condition is read from the dynamic
+block before the trigger-active check so it applies to non-trigger steps with
+automation. Default condition (0, or absent special) always passes — a step
+without a condition plays unconditionally. A step whose condition fails
+produces no trigger and no automation entries; previously held automation
+values persist through the skipped step. Erase is independent of condition.
 
 The foreground drain (`seq_drainPendingAutomation()`) runs inside
 `audio_check_and_render()` immediately after `voiceControl_processPending()`,
@@ -357,7 +404,7 @@ expand to 0..255:
   `effects_applyAutomation(track, local, value7)`. EffectsManager owns the
   value, owner track, and pending-end mask. An overlay ends when its writing
   track advances to an automation step that does not rewrite that parameter;
-  a failed-probability or muted step queues no marker and therefore holds it.
+  a failed-condition or muted step queues no marker and therefore holds it.
   The common reset latch clears all Effect overlays and `fxm` before the new
   pass's records apply. `fxm` follows the reset rule rather than the
   per-parameter end rule.
@@ -414,8 +461,9 @@ the next trigger). Details: `075_SESSION_HANDOFF_LOG.md` §11.
 
 ### 6.3 Step-edit automation pages
 
-After the existing specials pages (note, velocity, probability), the
-selected-step edit page shows dynamically counted automation pages. Each
+After the step-specials subpages (subpage 1: velocity, note, condition,
+micro-timing; subpage 2: roll rate, rhythm, fill), the selected-step edit
+page shows dynamically counted automation pages. Each
 page displays one entry with a 5-item cursor: number (with number-lock
 mode), del/clr action, voice, parameter (with uniqueness-filtered cycling),
 and amount (with dtype-aware display and bounds clamping). An "add" page
@@ -423,12 +471,15 @@ follows the last assigned entry. Detail views show category+long_name for
 parameter targets and dtype-aware named values for amounts.
 
 The selected-step edit page reads the live dynamic block. Setting note,
-velocity, or probability performs a tracked pool read-modify-write and repaints
-the menu. Track and Pattern setting pages read/write the fields in the resident
-region; PAT4 persists them.
+velocity, condition, or any roll/timing special performs a tracked pool
+read-modify-write and repaints the menu. Track and Pattern setting pages
+read/write the fields in the resident region; PAT4 persists them.
 
-The automation pages run only on SEQ_PAGE subpage 1
-(`menu_stepAutomationPageActive()`). Every target change goes through
+The automation pages are entered by scrolling right from subpage 2 position 2
+(roll fill). `menu_stepAutomationPageActive()` returns true when
+`menu_stepAutoActive && activePage == 2u` (S079; was `== 1u` before S079).
+Left-exit from automations returns to subpage 2 position 2. Step-button
+re-press toggles sub 1 ↔ sub 2 via `menu_toggleStepEditSubpage()` (S079 P2). Every target change goes through
 `menu_stepAutomationReplaceTarget()` and every delete through
 `menu_stepAutomationExecuteItem0()`; since S078 both restart the
 automation-presence search unconditionally (the former
@@ -439,7 +490,7 @@ not change presence.
 ### 6.3a STEP-page multi-step editing and track automation (S078)
 
 **Multi-step specials broadcast.** In STEP mode with two or more SEQ buttons
-held, a velocity/note/probability edit is written to every held step of the
+held, a velocity/note/condition/timing/roll/rhythm/fill edit is written to every held step of the
 visible bar (`menu_broadcastStepSpecial()` → `patSvc_setStepVolume/Note/
 Probability()`; `buttonHandler_seqHeldMask()` + `buttonHandler_visibleStep()`).
 The display seeds from the last-pressed step; one held step is the old path;
@@ -615,7 +666,7 @@ Fixed-header fields:
 
 ```text
 0..3    "PAT4"
-4..5    uint16 LE format version = 1
+4..5    uint16 LE format version = 2 (bumped from 1 in S079; reader rejects v1)
 6..7    uint16 LE stack size = 256 (must equal firmware PAT_STACK_SIZE)
 8..9    uint16 LE header size = 160
 10..13  uint32 LE generation

@@ -615,8 +615,7 @@ static uint8_t ccSvc_sourceBlock(const cc_job_t *job, const cc_paste_geo_t *g,
             count = ccCopy_retargetEntries(&ctx, autos, count);
             if (count_drops)
                 ccSvc_traceRetargetDropped((uint8_t)(before - count));
-            bytes = pat_rawEncode(out, sp.flags, sp.note, sp.velocity,
-                                  sp.probability, autos, count);
+            bytes = pat_rawEncode(out, sp.flags, &sp, autos, count);
         }
         *block_out = bytes ? out : 0;
         return bytes;
@@ -730,8 +729,7 @@ uint8_t ccSvc_runPatternPaste(const cc_job_t *job)
                     count = ccCopy_retargetEntries(&ctx, autos, count);
                     ccSvc_traceRetargetDropped((uint8_t)(before - count));
                 }
-                bytes = pat_rawEncode(block, sp.flags, sp.note, sp.velocity,
-                                      sp.probability, autos, count);
+                bytes = pat_rawEncode(block, sp.flags, &sp, autos, count);
             }
             if (bytes != 0u) {
                 memcpy(&pat_backgroundPoolMut()[(uint16_t)run->aux * 4u],
@@ -919,7 +917,8 @@ static uint8_t ccSvc_clearSelection(const cc_job_t *job)
 /*
  * Clear one step: `all` empties it (trigger off), `automation` strips the
  * automation and keeps trigger and specials, `notes` turns the trigger off,
- * removes note/velocity specials, and keeps probability plus automation.
+ * removes note/velocity specials, and keeps the trigger condition plus
+ * automation.
  * Rewrites never grow, so they use the swap path. Returns CC_RUN_DONE or
  * CC_RUN_WAIT (swap-return pending).
  */
@@ -951,14 +950,16 @@ static uint8_t ccSvc_clearStep(uint8_t scene, uint8_t track, uint8_t step,
     if (sel == CC_CLEAR_AUTO) {
         if (count == 0u)
             return CC_RUN_DONE;
-        bytes = pat_rawEncode(block, sp.flags, sp.note, sp.velocity,
-                              sp.probability, 0, 0u);
+        bytes = pat_rawEncode(block, sp.flags, &sp, 0, 0u);
         return ccSvc_rewriteShrink(scene, track, step, block, bytes,
                                    PAT_RAW_TRIGGER_KEEP);
     }
-    /* notes: probability gates the retained automation and must stay. */
-    bytes = pat_rawEncode(block, (uint8_t)(sp.flags & PAT_SPECIAL_PROB_BIT),
-                          0u, 0u, sp.probability, autos, count);
+    /*
+     * notes: the trigger condition gates the retained automation and must
+     * stay; the note and velocity specials are dropped (S079).
+     */
+    sp.flags &= (uint8_t)PAT_SPECIAL_COND_BIT;
+    bytes = pat_rawEncode(block, sp.flags, &sp, autos, count);
     return ccSvc_rewriteShrink(scene, track, step, block, bytes,
                                PAT_RAW_TRIGGER_OFF);
 }
@@ -967,7 +968,7 @@ static uint8_t ccSvc_clearStep(uint8_t scene, uint8_t track, uint8_t step,
  * Run one Pattern clear in bounded steps (spec §5, §9.6).
  *
  * What: empties steps (all), strips automation (automation), or turns
- * triggers off and removes note/velocity specials while keeping probability
+ * triggers off and removes note/velocity specials while keeping the condition
  * and automation (notes), over a step range, a track, or the whole Pattern;
  * and
  * resets track settings for `clear track`. Every rewrite is
@@ -1100,8 +1101,7 @@ uint8_t ccSvc_runRegionCopy(uint8_t src_scene, uint8_t dst_scene)
                 count = ccCopy_retargetEntries(&ctx, autos, count);
                 ccSvc_traceRetargetDropped((uint8_t)(before - count));
             }
-            bytes = pat_rawEncode(block, sp.flags, sp.note, sp.velocity,
-                                  sp.probability, autos, count);
+            bytes = pat_rawEncode(block, sp.flags, &sp, autos, count);
             if (!pat_rawRegionPublishRewritten(src_scene, dst_scene, index,
                                                bytes ? block : 0))
                 ccTrace_anomaly(AUTOSAVE_TRACE_CC_ANOM_REGION_REWRITE_GREW,
@@ -1186,9 +1186,8 @@ static uint8_t ccSvc_runRegister(void)
                 if (autos[i].target != target)
                     autos[kept++] = autos[i];
             if (kept != count) {
-                uint8_t bytes = pat_rawEncode(block, sp.flags, sp.note,
-                                              sp.velocity, sp.probability,
-                                              autos, kept);
+                uint8_t bytes = pat_rawEncode(block, sp.flags, &sp, autos,
+                                              kept);
 
                 if (ccSvc_rewriteShrink(scene, t, s, block, bytes,
                                         PAT_RAW_TRIGGER_KEEP) == CC_RUN_WAIT)

@@ -35,20 +35,32 @@
 #define PAT_ADDR_OFFSET_MASK  0x3FFFu
 
 /*
- * Special-flags byte assignments for one dynamic pool block.
+ * Special-flags byte assignments for one dynamic pool block (S079 §2).
  *
- * Bit 0 stores a note override, bit 1 stores a velocity override, and bit 2
- * stores a probability override. Bits 3..7 remain reserved and are kept clear
- * by this session's writer. Inputs/outputs are compile-time masks only;
- * PatternData.c and the Sequencer use them to agree on value-byte ordering.
- * Affiliates: pat_blockRead(), pat_blockWrite(), and pat_readStepSpecials().
+ * What: encodes which value bytes are present in a pool block. Bits 0..6
+ * each gate one stored byte; bit 7 is reserved. The ordering determines the
+ * byte sequence in the pool: note, velocity, condition, roll, timing,
+ * rhythm, fill. Why: all block readers and writers must agree on bit
+ * assignment so the positional byte stream is parsed consistently. Inputs:
+ * compile-time masks only. Outputs: PatternData.c, PatternStackService.c,
+ * and the Sequencer use these to agree on value-byte ordering. Affiliates:
+ * pat_blockRead(), pat_blockWrite(), pat_readStepSpecials(),
+ * pat_rawDecode(), pat_rawEncode(), pat_blockChunks(),
+ * patSvc_blockChunksFor().
+ *
+ * S079 replaces the former bit-2 probability override with a generic trigger
+ * condition and assigns bits 3..6 to roll rate, micro-timing, roll rhythm,
+ * and roll fill. There is no backward compatibility: old probability bytes
+ * are translated offline by tools/convert_pattern_specials.py.
  */
-#define PAT_SPECIAL_NOTE_BIT     (1u << 0)
-#define PAT_SPECIAL_VEL_BIT      (1u << 1)
-#define PAT_SPECIAL_PROB_BIT     (1u << 2)
-#define PAT_SPECIAL_FLAGS_MASK   (PAT_SPECIAL_NOTE_BIT | \
-                                  PAT_SPECIAL_VEL_BIT | \
-                                  PAT_SPECIAL_PROB_BIT)
+#define PAT_SPECIAL_NOTE_BIT      (1u << 0)
+#define PAT_SPECIAL_VEL_BIT       (1u << 1)
+#define PAT_SPECIAL_COND_BIT      (1u << 2)
+#define PAT_SPECIAL_ROLL_BIT      (1u << 3)
+#define PAT_SPECIAL_TIMING_BIT    (1u << 4)
+#define PAT_SPECIAL_RHYTHM_BIT    (1u << 5)
+#define PAT_SPECIAL_FILL_BIT      (1u << 6)
+#define PAT_SPECIAL_FLAGS_MASK    0x7Fu
 
 /*
  * Dynamic pool block header encoding.
@@ -114,7 +126,18 @@ _Static_assert(sizeof(pat_scene_region_t) ==
  * Inputs/outputs: PAT_STACK_SIZE and the public resident region above. The
  * CRC field is four bytes at offset 14 and is treated as zero while hashing.
  */
-#define PATTERN_FILE_VERSION             1u
+/*
+ * PAT4 fixed-header version byte (S079).
+ *
+ * What: the value stored at header offset 4 and required by the
+ * filesystem_patternHeaderValid() reader. Bumping 1 -> 2 (with the S079
+ * 7-special block format) makes the reader reject every pre-S079 Pattern file,
+ * which is the intended no-backward-compatibility behaviour: old probability
+ * bytes are not interpreted as conditions. Files are converted offline by
+ * tools/convert_pattern_specials.py. Affiliates: filesystem.c Pattern
+ * reader/writer, the converter tool.
+ */
+#define PATTERN_FILE_VERSION             2u
 #define PATTERN_FILE_FIXED_HEADER_BYTES  32u
 #define PATTERN_FILE_PARAMETER_BYTES     16u
 #define PATTERN_FILE_TRACK_HEADER_BYTES  16u
@@ -180,19 +203,26 @@ void pat_releaseStepDynamic(uint8_t scene_index, uint8_t track,
 uint8_t pat_sceneHasActiveSteps(uint8_t scene_index);
 
 /*
- * Resolved values read from one dynamic step block.
+ * Resolved values read from one dynamic step block (S079 §8).
  *
- * `note`, `velocity`, and `probability` always contain usable values: absent
- * specials are filled with PAT_DEFAULT_NOTE, PAT_DEFAULT_VELOCITY, and 127.
- * `flags` reports which of those values were explicitly stored. Inputs are a
- * Scene/track/step coordinate; invalid or unallocated steps return defaults.
- * Affiliates: Sequencer playback and the STEP menu display/edit path.
+ * What: holds the seven per-step special values plus a flags byte reporting
+ * which were explicitly stored. Absent fields carry their default: note 63,
+ * velocity 100, condition 0 (always fire), roll 0 (off), timing 0 (none),
+ * rhythm 0 (1-1), fill 100 (full). Why: callers read one struct instead of
+ * parsing the pool block. Inputs: Scene/track/step coordinate. Outputs:
+ * usable values for Sequencer playback, STEP menu display/edit, and
+ * copy/clear. Affiliates: pat_readStepSpecials(), pat_rawDecode(),
+ * pat_blockRead(), seq_advanceTrackStep(), pat_applyStepToMenu().
  */
 typedef struct {
-    uint8_t note;
-    uint8_t velocity;
-    uint8_t probability;
-    uint8_t flags;
+    uint8_t note;       /* bit 0 */
+    uint8_t velocity;   /* bit 1 */
+    uint8_t condition;  /* bit 2: trigger condition index 0..36 */
+    uint8_t roll;       /* bit 3: roll rate index 0..8 */
+    uint8_t timing;     /* bit 4: micro-timing delay 0..99 */
+    uint8_t rhythm;     /* bit 5: roll rhythm packed byte */
+    uint8_t fill;       /* bit 6: roll fill percent 0..100 */
+    uint8_t flags;      /* which bits were present */
 } pat_step_specials_t;
 
 /*
@@ -246,13 +276,21 @@ void pat_clearPattern(uint8_t scene_index);
  * step: new bytes are written into unreferenced pool space, the complete
  * address halfword is published in one PRIMASK store, and only then is the
  * old run freed. PAT_RAW_BLOCK_MAX is the largest encoded block (2-byte
- * header, flags, three specials, 63 automation entries, rounded to 33
+ * header, flags, seven specials, 63 automation entries, rounded to 34
  * chunks); caller buffers of that size hold any block. Trigger policies:
  * KEEP re-reads the live trigger bit inside the critical section (paste of
  * automation/specials only), OFF publishes trigger clear, ON publishes trigger
  * set (merge and replace pastes resolve the trigger before publishing).
  */
-#define PAT_RAW_BLOCK_MAX   132u
+/*
+ * Maximum encoded block size (S079 §10.1): 2-byte header + 1 flags byte + 7
+ * special value bytes + 63 x 2-byte automation entries = 136 bytes (34
+ * chunks). Why: PAT_RAW_BLOCK_MAX sizes every stack-allocated block buffer
+ * and must be the ceiling across all callers. Affiliates: pat_rawReadBlock(),
+ * pat_rawEncode(), pat_rawRegionCopiedBlock(), copy/clear paste buffers,
+ * config.h PAT_POOL_SWAP_CHUNKS.
+ */
+#define PAT_RAW_BLOCK_MAX   136u
 #define PAT_RAW_TRIGGER_KEEP 0u
 #define PAT_RAW_TRIGGER_OFF  1u
 #define PAT_RAW_TRIGGER_ON   2u
@@ -290,13 +328,17 @@ uint8_t pat_rawDecode(const uint8_t *block, pat_step_specials_t *specials,
 /*
  * Encode a block into a caller buffer.
  *
- * Inputs: special flags/values and up to 63 automation entries (merge pastes
- * drop entries past 63 before calling). Output: allocated byte size, or 0
- * when the block would be empty (no specials and no automation) or invalid.
- * The back-reference field is left zero; placement stamps it.
+ * What: writes a complete pool block from the specials struct and automation
+ * entries. Why: separating encode from placement lets copy/clear rewrite
+ * blocks without placement. Inputs: specials struct (only fields gated by
+ * flags are written), up to 63 automation entries (merge pastes drop entries
+ * past 63 before calling). Output: allocated byte size, or 0 when the block
+ * would be empty (no specials and no automation) or invalid. The
+ * back-reference field is left zero; placement stamps it. Affiliates:
+ * pat_rawPlace(), pat_rawPlaceViaSwap(), copyClearService.c.
  */
 uint8_t pat_rawEncode(uint8_t out[PAT_RAW_BLOCK_MAX], uint8_t flags,
-                      uint8_t note, uint8_t velocity, uint8_t probability,
+                      const pat_step_specials_t *specials,
                       const pat_automation_entry_t *autos, uint8_t count);
 
 /*
@@ -426,11 +468,61 @@ void pat_applyStepToMenu(uint8_t scene_index, uint8_t track, uint8_t step);
  * What: retain the other special values and replace the complete dynamic
  * block. Why: S067 removed unsafe same-size in-place rewrites, so callers
  * need a failure result when a disjoint replacement cannot fit. Inputs are
- * resident coordinates and one 7-bit value; output is nonzero on commit.
+ * resident coordinates and one value; output is nonzero on commit.
  * PatternStackService.h supplies the application-facing queue boundary.
  */
-uint8_t pat_setStepProbability(uint8_t scene_index, uint8_t track,
-                               uint8_t step, uint8_t value);
+/*
+ * Set or clear one step's trigger condition (S079 §3).
+ *
+ * What: retain all other specials while changing the condition index. Value
+ * 0 is the always-fire default and clears the condition flag bit. Inputs:
+ * Scene/track/step and a condition index 0..36. Output:
+ * pat_writeSpecials() updates or releases storage and returns nonzero after
+ * commit. Affiliates: menu PAR_STEP_CONDITION dispatch,
+ * pat_readStepSpecials().
+ */
+uint8_t pat_setStepCondition(uint8_t scene_index, uint8_t track,
+                             uint8_t step, uint8_t value);
+/*
+ * Set or clear one step's roll rate (S079 §4).
+ *
+ * What: retain all other specials while changing roll rate. Value 0 is off
+ * (no roll) and clears the roll flag bit. Inputs: Scene/track/step and a
+ * roll rate index 0..8. Output: pat_writeSpecials() updates or releases
+ * storage. Affiliates: menu PAR_STEP_ROLL dispatch.
+ */
+uint8_t pat_setStepRoll(uint8_t scene_index, uint8_t track,
+                        uint8_t step, uint8_t value);
+/*
+ * Set or clear one step's micro-timing delay (S079 §7).
+ *
+ * What: retain all other specials while changing timing. Value 0 is no delay
+ * and clears the timing flag bit. Inputs: Scene/track/step and a delay value
+ * 0..99. Output: pat_writeSpecials() updates or releases storage.
+ * Affiliates: menu PAR_STEP_TIMING dispatch.
+ */
+uint8_t pat_setStepTiming(uint8_t scene_index, uint8_t track,
+                          uint8_t step, uint8_t value);
+/*
+ * Set or clear one step's roll rhythm pattern (S079 §5).
+ *
+ * What: retain all other specials while changing rhythm. Value 0 is off (no
+ * velocity change, the default) and clears the rhythm flag bit. Inputs:
+ * Scene/track/step and a packed rhythm byte. Output: pat_writeSpecials()
+ * updates or releases storage. Affiliates: menu PAR_STEP_RHYTHM dispatch.
+ */
+uint8_t pat_setStepRhythm(uint8_t scene_index, uint8_t track,
+                          uint8_t step, uint8_t value);
+/*
+ * Set or clear one step's roll fill percentage (S079 §6).
+ *
+ * What: retain all other specials while changing fill. Value 100 is the
+ * default (full step) and clears the fill flag bit. Inputs: Scene/track/step
+ * and a fill value 0..100. Output: pat_writeSpecials() updates or releases
+ * storage. Affiliates: menu PAR_STEP_FILL dispatch.
+ */
+uint8_t pat_setStepFill(uint8_t scene_index, uint8_t track,
+                        uint8_t step, uint8_t value);
 uint8_t pat_setStepNote(uint8_t scene_index, uint8_t track, uint8_t step,
                         uint8_t value);
 uint8_t pat_setStepVolume(uint8_t scene_index, uint8_t track, uint8_t step,

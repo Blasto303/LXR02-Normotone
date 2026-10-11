@@ -1119,8 +1119,25 @@ const enum Datatypes parameter_dtypes[NUM_PARAMS] = {
     [PAR_BUS_COMP_SIDECHAIN] = DTYPE_0B127,
     [PAR_ACTIVE_STEP] = DTYPE_0B127,
     [PAR_STEP_VOLUME] = DTYPE_0B127,
-    [PAR_STEP_PROB] = DTYPE_0B127,
+    /*
+     * Step-special cells (S079).
+     *
+     * Why DTYPE_0B127/DTYPE_0B255 and not new dtypes: all sixteen DTYPE_*
+     * nibble values are already assigned and the packed dtype byte has no
+     * spare nibble, so a new enum value would wrap in the (dtype & 0x0f)
+     * extraction used by every Menu formatter. The condition/roll/rhythm name
+     * and clamp behaviour is instead applied by static-param special cases in
+     * va_formatValue3(), menu_formatCellValue3(), menu_clampCellValue(), and
+     * the menu_repaintGeneric() edit painter, all keyed on
+     * MENU_CELL_STATIC + PAR_STEP_CONDITION/ROLL/RHYTHM (the run-mode
+     * precedent). Timing and fill stay numeric.
+     */
+    [PAR_STEP_CONDITION] = DTYPE_0B127,
     [PAR_STEP_NOTE] = DTYPE_NOTE_NAME,
+    [PAR_STEP_TIMING] = DTYPE_0B127,
+    [PAR_STEP_ROLL] = DTYPE_0B127,
+    [PAR_STEP_RHYTHM] = DTYPE_0B255,
+    [PAR_STEP_FILL] = DTYPE_0B127,
     [PAR_EUKLID_LENGTH] = DTYPE_1B128,
     [PAR_EUKLID_STEPS] = DTYPE_1B128,
     [PAR_EUKLID_ROTATION] = DTYPE_0B127,
@@ -1287,6 +1304,12 @@ static const Name valueNames[NUM_NAMES] = {
     {SHORT_BUS_COMP_SIDECHAIN,CAT_SCENE,LONG_BUS_COMP_SIDECHAIN},
     /* S078 per-track run mode: run / Track / RunMode (S078 P4 relabel). */
     {SHORT_PLAY_MODE,CAT_TRACK,LONG_PLAY_MODE},
+    /* S079 step specials: cdn/tim/rol/rtm/rfl on the STEP page. */
+    {SHORT_CONDITION,CAT_STEP,LONG_CONDITION},
+    {SHORT_MICROTIMING,CAT_STEP,LONG_MICROTIMING},
+    {SHORT_ROLL_RATE,CAT_STEP,LONG_ROLL_RATE},
+    {SHORT_ROLL_RHYTHM,CAT_VELOCITY,LONG_ROLL_RHYTHM},
+    {SHORT_ROLL_FILL,CAT_STEP,LONG_ROLL_FILL},
 };
 
 /* -----------------------------------------------------------------------
@@ -1877,6 +1900,10 @@ static uint8_t getMaxEntriesForMenu(uint8_t menuId);
 static void getMenuItemNameForValue(uint8_t menuId, uint8_t curParmVal, char *buf);
 static void menu_getLfoPolarityName(uint8_t value, char *buf);
 static void menu_getPlayModeName(uint16_t value, char *buf);
+static void menu_getConditionName(uint16_t value, char *buf);
+static void menu_getRollRateName(uint16_t value, char *buf);
+static void menu_getRollRhythmName(uint16_t value, char *buf);
+static uint16_t menu_rollRhythmStep(uint16_t byte, int32_t delta);
 static void menu_endlessPotMappingChanged(void);
 static uint8_t menu_cpuUseWidgetVisible(void);
 static void menu_formatCpuUsePercent3(char *buf);
@@ -2973,6 +3000,22 @@ static void va_formatValue3(const menu_cell_t *cell, uint8_t value,
         menu_getPlayModeName(value, out);
         return;
     }
+    /* Step condition/roll/rhythm show their label lists (S079). */
+    if (cell && cell->kind == MENU_CELL_STATIC &&
+        cell->static_param == PAR_STEP_CONDITION) {
+        menu_getConditionName(value, out);
+        return;
+    }
+    if (cell && cell->kind == MENU_CELL_STATIC &&
+        cell->static_param == PAR_STEP_ROLL) {
+        menu_getRollRateName(value, out);
+        return;
+    }
+    if (cell && cell->kind == MENU_CELL_STATIC &&
+        cell->static_param == PAR_STEP_RHYTHM) {
+        menu_getRollRhythmName(value, out);
+        return;
+    }
 
     switch (dtype) {
     case DTYPE_PM63:
@@ -3621,8 +3664,8 @@ static void va_writeAutomationFromKnob(uint8_t knobNr, int8_t delta)
  * setter is called once per held step (or once for the selected step);
  * nothing is mutated when the mask is empty. Affiliates:
  * buttonHandler_seqHeldMask(), buttonHandler_visibleStep(),
- * patSvc_setStepVolume/Note/Probability. Called from the
- * PAR_STEP_VOLUME/PAR_STEP_NOTE/PAR_STEP_PROB arms in menu_parseGlobalParam()
+ * patSvc_setStepVolume/Note/Condition/Roll/Timing/Rhythm/Fill. Called from the
+ * PAR_STEP_* arms in menu_parseGlobalParam()
  * (reached through menu_cellCommitValue() -> menu_sendEditedParameter()).
  */
 static void menu_broadcastStepSpecial(
@@ -5446,6 +5489,22 @@ static void menu_formatCellValue3(const menu_cell_t *cell, char *valueAsText)
         menu_getPlayModeName(value, valueAsText);
         return;
     }
+    /* Step condition/roll/rhythm show their label lists (S079). */
+    if (cell && cell->kind == MENU_CELL_STATIC &&
+        cell->static_param == PAR_STEP_CONDITION) {
+        menu_getConditionName(value, valueAsText);
+        return;
+    }
+    if (cell && cell->kind == MENU_CELL_STATIC &&
+        cell->static_param == PAR_STEP_ROLL) {
+        menu_getRollRateName(value, valueAsText);
+        return;
+    }
+    if (cell && cell->kind == MENU_CELL_STATIC &&
+        cell->static_param == PAR_STEP_RHYTHM) {
+        menu_getRollRhythmName(value, valueAsText);
+        return;
+    }
 
     /*
      * Format one cell value for the compact four-column view. Instrument cells
@@ -5564,6 +5623,41 @@ static void menu_clampCellValue(const menu_cell_t *cell, uint16_t *value)
         cell->static_param == PAR_TRACK_PLAY_MODE) {
         if (*value > (uint16_t)(trackPlayModeNames[0][0] - 1u))
             *value = (uint16_t)(trackPlayModeNames[0][0] - 1u);
+        return;
+    }
+    /*
+     * Step-special domains (S079): condition 0..38 (fix 3), roll rate 0..8,
+     * micro-timing 0..99, roll fill 0..100, rhythm snapped to its ordered list
+     * (S079 P2). Applied here because the DTYPE_* nibble space is full.
+     */
+    if (cell->kind == MENU_CELL_STATIC &&
+        cell->static_param == PAR_STEP_CONDITION) {
+        if (*value > 38u)
+            *value = 38u;
+        return;
+    }
+    if (cell->kind == MENU_CELL_STATIC &&
+        cell->static_param == PAR_STEP_ROLL) {
+        if (*value > 8u)
+            *value = 8u;
+        return;
+    }
+    if (cell->kind == MENU_CELL_STATIC &&
+        cell->static_param == PAR_STEP_TIMING) {
+        if (*value > 99u)
+            *value = 99u;
+        return;
+    }
+    if (cell->kind == MENU_CELL_STATIC &&
+        cell->static_param == PAR_STEP_FILL) {
+        if (*value > 100u)
+            *value = 100u;
+        return;
+    }
+    if (cell->kind == MENU_CELL_STATIC &&
+        cell->static_param == PAR_STEP_RHYTHM) {
+        /* Snap any unlisted byte to a list entry (off by default, S079 P2). */
+        *value = menu_rollRhythmStep(*value, 0);
         return;
     }
 
@@ -9349,6 +9443,126 @@ static void menu_getPlayModeName(uint16_t value, char *buf)
     buf[2] = p[2] ? p[2] : ' ';
 }
 
+/*
+ * Format one step trigger condition into a three-character field (S079 §3).
+ *
+ * What: writes the 3-char condition label for values 0..38 (fix 3 adds the
+ * track-7 mute pair); values 39..255 (undefined, forward compatible) and any
+ * out-of-range input display as the always-fire default. Inputs: raw stored
+ * condition and a three-character
+ * output. Outputs: exactly three characters, no terminator. Affiliates:
+ * conditionNames[] (MenuText.h), va_formatValue3(), menu_formatCellValue3(),
+ * the edit-view painter.
+ */
+static void menu_getConditionName(uint16_t value, char *buf)
+{
+    const char *p;
+
+    if (value > 38u)
+        value = 0u;
+    p = conditionNames[value + 1u];
+    buf[0] = p[0];
+    buf[1] = p[1] ? p[1] : ' ';
+    buf[2] = p[2] ? p[2] : ' ';
+}
+
+/*
+ * Format one per-step roll rate into a three-character field (S079 §4.1).
+ *
+ * What: writes the off/1/8/8tr/16/16t/32/32t/48/64 label for values 0..8 and
+ * clamps larger values to 0 (off). Inputs: raw stored rate and a
+ * three-character output. Outputs: exactly three characters, no terminator.
+ * Affiliates: stepRollRateNames[] (MenuText.h), va_formatValue3(),
+ * menu_formatCellValue3(), the edit-view painter.
+ */
+static void menu_getRollRateName(uint16_t value, char *buf)
+{
+    const char *p;
+
+    if (value > 8u)
+        value = 0u;
+    p = stepRollRateNames[value + 1u];
+    buf[0] = p[0];
+    buf[1] = p[1] ? p[1] : ' ';
+    buf[2] = p[2] ? p[2] : ' ';
+}
+
+/*
+ * Format one roll rhythm byte as the N-M/N+M cycle label (S079 §5.1; S079 P2
+ * fix 3).
+ *
+ * What: decodes bits 7..4 (cycle), bit 3 (0 halve, 1 double), bits 2..0 (full
+ * count), and writes "<full><dir><cycle>" for a listed pairing. Byte 0, cycle
+ * 0, full 0, and full >= cycle never change velocity and display as "off"
+ * (1-1/1+1 are equivalent to off and are not offered). Inputs: packed rhythm
+ * byte and a three-character output. Outputs: exactly three characters.
+ * Affiliates: stepRollRhythmBytes[], menu_rollRhythmStep().
+ */
+static void menu_getRollRhythmName(uint16_t value, char *buf)
+{
+    uint8_t r = (uint8_t)(value & 0xFFu);
+    uint8_t cycle = (uint8_t)((r >> 4u) & 0x0Fu);
+    uint8_t dir = (uint8_t)((r >> 3u) & 1u);
+    uint8_t full = (uint8_t)(r & 0x07u);
+
+    if (cycle < 2u || full == 0u || full >= cycle) {
+        memcpy(buf, "off", 3);
+        return;
+    }
+    buf[0] = (char)('0' + full);
+    buf[1] = (dir == 0u) ? '-' : '+';
+    buf[2] = (char)('0' + cycle);   /* cycle is 2..5 */
+}
+
+/*
+ * Ordered roll-rhythm list (S079 P2 fix 3).
+ *
+ * What: the packed rhythm bytes the STEP rhythm cell cycles through: off,
+ * then the ten halve ("-") patterns (cycle 2..5, full < cycle) in the requested
+ * order, then the same ten as double ("+"). Why: equal pairs (full == cycle)
+ * never change velocity and are omitted; the packed encoding is sparse, so the
+ * editor steps this list instead of using raw value arithmetic. Inputs: none.
+ * Affiliates: menu_rollRhythmStep(), menu_getRollRhythmName().
+ */
+static const uint8_t stepRollRhythmBytes[] = {
+    0x00u,                                   /* off */
+    0x21u, 0x31u, 0x32u, 0x41u, 0x42u,       /* 1-2 1-3 2-3 1-4 2-4 */
+    0x43u, 0x51u, 0x52u, 0x53u, 0x54u,       /* 3-4 1-5 2-5 3-5 4-5 */
+    0x29u, 0x39u, 0x3Au, 0x49u, 0x4Au,       /* 1+2 1+3 2+3 1+4 2+4 */
+    0x4Bu, 0x59u, 0x5Au, 0x5Bu, 0x5Cu        /* 3+4 1+5 2+5 3+5 4+5 */
+};
+
+/*
+ * Step the packed roll-rhythm byte along the ordered list (S079 P2 fix 3).
+ *
+ * What: finds the byte's list position (an unlisted byte maps to off), applies
+ * the signed delta, clamps to the list ends, and returns the new packed byte.
+ * Why: the rhythm must move through the offered list, not raw byte values.
+ * Inputs: current packed byte and a signed delta. Output: the new packed byte.
+ * Affiliates: menu_encoderChangeParameter(), menu_parseKnobDelta(),
+ * menu_clampCellValue().
+ */
+static uint16_t menu_rollRhythmStep(uint16_t byte, int32_t delta)
+{
+    const int32_t count = (int32_t)(sizeof(stepRollRhythmBytes) /
+                                    sizeof(stepRollRhythmBytes[0]));
+    int32_t index = 0;
+    int32_t i;
+
+    for (i = 0; i < count; i++) {
+        if (stepRollRhythmBytes[i] == (uint8_t)byte) {
+            index = i;
+            break;
+        }
+    }
+    index += delta;
+    if (index < 0)
+        index = 0;
+    else if (index >= count)
+        index = count - 1;
+    return (uint16_t)stepRollRhythmBytes[index];
+}
+
 /* -----------------------------------------------------------------------
 ** Mod target display helpers
 ** ----------------------------------------------------------------------- */
@@ -9598,9 +9812,21 @@ static uint8_t checkScrollSign(uint8_t activePage, uint8_t activeParameter)
     /*
      * STEP specials lead to the live automation pages on the right. The
      * custom automation renderer takes ownership once the user scrolls past
-     * probability, so this affordance is limited to the three fixed cells.
+     * micro-timing, so this affordance is limited to the four fixed cells
+     * (S079).
      */
     if (menu_activePage == SEQ_PAGE && activePage == 1u &&
+        !menu_stepAutoActive && activeParameter <= 3u)
+        return '>';
+
+    /*
+     * Roll subpage leads right into the automation list (S079 P2 fix 2).
+     *
+     * What: shows '>' on SEQ subpage 2 positions 0..2, matching the subpage-1
+     * affordance. Why: the roll page must advertise that the automation list
+     * follows to its right. Affiliates: menu_moveToMenuItem() subpage chain.
+     */
+    if (menu_activePage == SEQ_PAGE && activePage == 2u &&
         !menu_stepAutoActive && activeParameter <= 2u)
         return '>';
 
@@ -10236,7 +10462,7 @@ static void menu_repaintLoadSavePage(void)
 static uint8_t menu_stepAutomationPageActive(void)
 {
     return (uint8_t)(menu_stepAutoActive && menu_activePage == SEQ_PAGE &&
-                     (((menuIndex & MASK_PAGE) >> PAGE_SHIFT) == 1u));
+                     (((menuIndex & MASK_PAGE) >> PAGE_SHIFT) == 2u));
 }
 
 /*
@@ -11445,9 +11671,27 @@ static void menu_repaintGeneric(void)
                     menu_getPlayModeName(value, &editDisplayBuffer[1][13]);
                     break;
                 }
+                /* Step condition/roll labels (S079). */
+                if (cell.kind == MENU_CELL_STATIC &&
+                    cell.static_param == PAR_STEP_CONDITION) {
+                    menu_getConditionName(value, &editDisplayBuffer[1][13]);
+                    break;
+                }
+                if (cell.kind == MENU_CELL_STATIC &&
+                    cell.static_param == PAR_STEP_ROLL) {
+                    menu_getRollRateName(value, &editDisplayBuffer[1][13]);
+                    break;
+                }
                 /* fall through */
             default:
             case DTYPE_0B255:
+                /* Step roll rhythm shows its N-M/N+M cycle label (S079). */
+                if (cell.kind == MENU_CELL_STATIC &&
+                    cell.static_param == PAR_STEP_RHYTHM) {
+                    menu_getRollRhythmName(value, &editDisplayBuffer[1][13]);
+                    break;
+                }
+                /* fall through */
             case DTYPE_1B16:
             case DTYPE_1B128:
             case DTYPE_VOICE_LFO:
@@ -11688,6 +11932,17 @@ static void menu_encoderChangeParameter(int8_t inc)
     }
 
     /*
+     * Roll rhythm is a sparse packed byte, so it scrolls its own list (S079 P2
+     * fix 3) instead of the generic value+delta arithmetic.
+     */
+    if (cell.kind == MENU_CELL_STATIC &&
+        cell.static_param == PAR_STEP_RHYTHM) {
+        value = menu_rollRhythmStep(value, inc);
+        (void)menu_cellCommitValue(&cell, value);
+        return;
+    }
+
+    /*
      * Apply encoder acceleration in a value-local domain before committing to
      * the owner. Static cells eventually write parameter_values[]; instrument
      * cells write SceneData through Preset so active/morph endpoints and DSP
@@ -11732,16 +11987,27 @@ static void menu_moveToMenuItem(int8_t inc)
     inc = (int8_t)(inc > 0 ? 1 : -1);
 
     /*
-     * Probability is the last fixed STEP field. Scrolling right from it
-     * enters the variable automation list, while the static table's empty
-     * cells remain unreachable. The custom renderer starts on page zero and
-     * keeps item 0 selected for DELETE/CLEAR/ADD clicks.
+     * STEP subpage chain (S079 fix 1): sub 1 (vel/note/condition/timing) ->
+     * sub 2 (roll/rhythm/fill) -> variable automation list. Scrolling right
+     * from the last fixed cell of sub 1 advances to sub 2; from the last fixed
+     * cell of sub 2 it enters the automation editor. Scrolling left reverses
+     * the chain. The static table's empty cells remain unreachable.
      */
     if (menu_activePage == SEQ_PAGE && activePage == 1 &&
+        !menu_stepAutoActive && activeParameter == 3 && inc > 0) {
+        menuIndex = (uint8_t)(2u << PAGE_SHIFT);
+        return;
+    }
+    if (menu_activePage == SEQ_PAGE && activePage == 2 &&
         !menu_stepAutoActive && activeParameter == 2 && inc > 0) {
         menu_stepAutoActive = 1u;
         menu_stepAutoPageIndex = 0u;
-        menuIndex = (uint8_t)(1u << PAGE_SHIFT);
+        menuIndex = (uint8_t)(2u << PAGE_SHIFT);
+        return;
+    }
+    if (menu_activePage == SEQ_PAGE && activePage == 2 &&
+        !menu_stepAutoActive && activeParameter == 0 && inc < 0) {
+        menuIndex = (uint8_t)((1u << PAGE_SHIFT) | 3u);
         return;
     }
 
@@ -11783,7 +12049,7 @@ static void menu_moveToMenuItem(int8_t inc)
         } else {
             menu_stepAutoActive = 0u;
             menu_stepAutoNumberLocked = 0u;
-            menuIndex = (uint8_t)((1u << PAGE_SHIFT) | 2u);
+            menuIndex = (uint8_t)((2u << PAGE_SHIFT) | 2u);
         }
         return;
     }
@@ -12934,7 +13200,8 @@ static uint8_t menu_knobClearTarget(uint8_t knobNr, cc_pot_target_t *out)
          * PAR_TRACK_SCALE / PAR_SHUFFLE), and this arm previously accepted
          * only the PERF Morph cells, so SHIFT+COPY + pot never queued a clear
          * for track automation. The `active_page == 0u` guard is required:
-         * SEQ subpage 1 positions 0..2 (velocity, note, probability) are also
+         * SEQ subpage 1 positions 0..3 (velocity, note, condition,
+         * micro-timing, S079) are also
          * STATIC and must stay non-clearable. The SHIFT Morph endpoint view
          * changes only value resolution, not the cell, so the clear works in
          * both views, as on VOICE.
@@ -13110,6 +13377,15 @@ void menu_parseKnobDelta(uint8_t knobNr, int8_t delta)
     }
     if (menu_cellIsVelocityTargetParam(&cell)) {
         if (menu_velocityTargetEditParam(&cell, delta))
+            menu_knobs_dirty = 1;
+        return;
+    }
+
+    /* Roll rhythm scrolls its ordered list (S079 P2 fix 3). */
+    if (cell.kind == MENU_CELL_STATIC &&
+        cell.static_param == PAR_STEP_RHYTHM) {
+        value = menu_rollRhythmStep(value, delta);
+        if (menu_cellCommitValue(&cell, value))
             menu_knobs_dirty = 1;
         return;
     }
@@ -15192,21 +15468,58 @@ void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
         /*
          * Active step changes reload step edit fields from PatternData.
          *
-         * This does not mutate the step; it copies note/velocity/probability
-         * and automation lane data for the selected step into menu parameters.
+         * This does not mutate the step; it copies every step special
+         * (note/velocity/condition/roll/timing/rhythm/fill) and automation
+         * lane data for the selected step into menu parameters.
          */
         pat_applyStepToMenu(menu_getViewedPattern(), menu_getActiveVoice(), value);
         menu_stepAutomationReset();
         break;
 
-    case PAR_STEP_PROB:
+    case PAR_STEP_CONDITION:
         /*
-         * Step probability mutates the selected Pattern step (or every
-         * physically held step) for the active voice/viewed pattern.
+         * Step trigger condition mutates the selected Pattern step (or every
+         * physically held step) for the active voice/viewed pattern (S079 §3).
          */
         menu_broadcastStepSpecial(menu_getViewedPattern(),
                                   menu_getActiveVoice(),
-                                  (uint8_t)value, patSvc_setStepProbability);
+                                  (uint8_t)value, patSvc_setStepCondition);
+        break;
+
+    case PAR_STEP_TIMING:
+        /*
+         * Step micro-timing delay (S079 §7).
+         */
+        menu_broadcastStepSpecial(menu_getViewedPattern(),
+                                  menu_getActiveVoice(),
+                                  (uint8_t)value, patSvc_setStepTiming);
+        break;
+
+    case PAR_STEP_ROLL:
+        /*
+         * Step roll rate (S079 §4).
+         */
+        menu_broadcastStepSpecial(menu_getViewedPattern(),
+                                  menu_getActiveVoice(),
+                                  (uint8_t)value, patSvc_setStepRoll);
+        break;
+
+    case PAR_STEP_RHYTHM:
+        /*
+         * Step roll rhythm (S079 §5).
+         */
+        menu_broadcastStepSpecial(menu_getViewedPattern(),
+                                  menu_getActiveVoice(),
+                                  (uint8_t)value, patSvc_setStepRhythm);
+        break;
+
+    case PAR_STEP_FILL:
+        /*
+         * Step roll fill (S079 §6).
+         */
+        menu_broadcastStepSpecial(menu_getViewedPattern(),
+                                  menu_getActiveVoice(),
+                                  (uint8_t)value, patSvc_setStepFill);
         break;
 
     case PAR_STEP_NOTE:
@@ -15550,6 +15863,28 @@ void menu_showStepEditPage(void)
     menuIndex = (uint8_t)(1u << PAGE_SHIFT);
     pat_applyStepToMenu(menu_getViewedPattern(), menu_getActiveVoice(),
                         parameter_values[PAR_ACTIVE_STEP]);
+    menu_endlessPotMappingChanged();
+    menu_repaintAll();
+}
+
+void menu_toggleStepEditSubpage(void)
+{
+    /*
+     * Alternate the STEP edit page between subpage 1 and subpage 2 (S079 P2).
+     *
+     * What: picks the other step-special subpage, selects its first cell, and
+     * repaints; the automation editor cursor is reset so a later scroll into
+     * the automation list starts clean. Why: repeated presses of the selected
+     * step button must toggle the two pages. Inputs: current SEQ subpage.
+     * Output: menuIndex on subpage 1 or 2 at parameter 0. Affiliates:
+     * buttonHandler_seqButtonPressed(), menu_moveToMenuItem() (the scroll
+     * chain is the other route between these subpages).
+     */
+    uint8_t sub = menu_getSubPage();
+    uint8_t next = (uint8_t)((sub == 1u) ? 2u : 1u);
+
+    menu_stepAutomationReset();
+    menuIndex = (uint8_t)((next << PAGE_SHIFT) | 0u);
     menu_endlessPotMappingChanged();
     menu_repaintAll();
 }

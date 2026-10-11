@@ -697,8 +697,36 @@ static void buttonHandler_setTimeraction(uint8_t buttonNr)
     buttonHandler_buttonTimerStepNr = (int8_t)buttonNr;
 }
 
+/*
+ * PERF-button fill-hold state (S079 §3.3).
+ *
+ * What: bh_fillArmed is set while the PERF (MODE2) button is held and the
+ * fill hold has not yet elapsed; bh_fillPressTick records the press time in
+ * the shared millisecond clock. Why: fill mode must activate only after the
+ * double-click timeout of continuous hold, so a normal mode-switch tap never
+ * triggers fill. Fill activates when the elapsed hold reaches
+ * DOUBLE_CLICK_TIMEOUT and deactivates on release. Using time_sysTick (rather
+ * than counting tick calls) keeps the hold independent of the main-loop
+ * cadence. Inputs: buttonHandler_tick(), handleModeButtons(), processRelease().
+ * Outputs: seq_fillActive (read by the TIM3 ISR). RAM: 3 B SRAM1 static.
+ */
+static uint16_t bh_fillPressTick;
+static uint8_t bh_fillArmed;
+
 void buttonHandler_tick(void)
 {
+    /*
+     * PERF fill-hold promotion (S079 §3.3).
+     *
+     * Inputs: bh_fillArmed/bh_fillPressTick set at PERF press. Output:
+     * seq_fillActive is set once the hold reaches DOUBLE_CLICK_TIMEOUT. The
+     * unsigned elapsed comparison stays correct across the 16-bit clock wrap.
+     */
+    if (bh_fillArmed &&
+        (uint16_t)(time_sysTick - bh_fillPressTick) >= DOUBLE_CLICK_TIMEOUT &&
+        !seq_fillActive)
+        seq_fillActive = 1u;
+
     /*
      * Foreground long-press poll using the wrapping 16-bit millisecond clock.
      *
@@ -1020,8 +1048,28 @@ static void buttonHandler_seqButtonPressed(uint8_t seqButtonPressed)
             }
             break;
         case SELECT_MODE_STEP:
-            led_clearAllBlinkLeds();
-            buttonHandler_selectActiveStep(ledNr, seqButtonPressed);
+            /*
+             * Re-press of the selected step toggles the two step pages
+             * (S079 P2 fix 1).
+             *
+             * What: a press on the step that is already selected while the
+             * STEP edit page is showing alternates SEQ subpage 1 and 2; any
+             * other press selects the step and opens subpage 1 as before. Why:
+             * the roll settings must be reachable from the step row without
+             * the scroll gesture. Inputs: the visible step, the selected step,
+             * and the current subpage. Output: menu_toggleStepEditSubpage() or
+             * buttonHandler_selectActiveStep(). Affiliates:
+             * menu_toggleStepEditSubpage(), menu_showStepEditPage().
+             */
+            if (buttonHandler_visibleStep(seqButtonPressed) ==
+                    buttonHandler_selectedStep &&
+                menu_activePage == SEQ_PAGE &&
+                (menu_getSubPage() == 1u || menu_getSubPage() == 2u)) {
+                menu_toggleStepEditSubpage();
+            } else {
+                led_clearAllBlinkLeds();
+                buttonHandler_selectActiveStep(ledNr, seqButtonPressed);
+            }
             break;
         case SELECT_MODE_PERF:
             /*
@@ -1162,6 +1210,9 @@ static void handleModeButtons(uint8_t mode)
 
     switch (bh_state.selectButtonMode) {
     case SELECT_MODE_PERF:
+        /* Arm the fill hold timer (S079 §3.3); fill activates after the hold. */
+        bh_fillArmed = 1u;
+        bh_fillPressTick = time_sysTick;
         led_clearSequencerLeds();
         led_clearSelectLeds();
         lastActiveSubPage = menu_getSubPage();
@@ -1991,8 +2042,21 @@ static void processRelease(uint8_t buttonNr)
             led_setActiveVoice(menu_getActiveVoice());
             led_setActiveSelectButton(menu_getSubPage());
             if (buttonHandler_morphVoiceModeActive)
-                led_setBlinkLed(LED_MODE1, 1u);
+               led_setBlinkLed(LED_MODE1, 1u);
         }
+        break;
+
+    case BUT_MODE2:
+        /*
+         * PERF release ends fill mode (S079 §3.3).
+         *
+         * Output: the fill hold is disarmed and seq_fillActive cleared, so
+         * fil/!fl conditions revert immediately. The PERF mode/page stays as
+         * the press-side handler already switched it.
+         */
+        bh_fillArmed = 0u;
+        bh_fillPressTick = 0u;
+        seq_fillActive = 0u;
         break;
 
     case BUT_BAR1:

@@ -131,8 +131,16 @@ uint8_t patSvc_setStepNote(uint8_t scene, uint8_t track, uint8_t step,
                            uint8_t value);
 uint8_t patSvc_setStepVolume(uint8_t scene, uint8_t track, uint8_t step,
                              uint8_t value);
-uint8_t patSvc_setStepProbability(uint8_t scene, uint8_t track,
-                                  uint8_t step, uint8_t value);
+uint8_t patSvc_setStepCondition(uint8_t scene, uint8_t track,
+                                uint8_t step, uint8_t value);
+uint8_t patSvc_setStepRoll(uint8_t scene, uint8_t track,
+                           uint8_t step, uint8_t value);
+uint8_t patSvc_setStepTiming(uint8_t scene, uint8_t track,
+                             uint8_t step, uint8_t value);
+uint8_t patSvc_setStepRhythm(uint8_t scene, uint8_t track,
+                             uint8_t step, uint8_t value);
+uint8_t patSvc_setStepFill(uint8_t scene, uint8_t track,
+                           uint8_t step, uint8_t value);
 void patSvc_eraseStep(uint8_t scene, uint8_t track, uint8_t step);
 void patSvc_clearTrack(uint8_t scene, uint8_t track);
 void patSvc_clearPattern(uint8_t scene);

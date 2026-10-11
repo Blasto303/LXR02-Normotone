@@ -79,8 +79,22 @@ enum ParamEnums
 
 	PAR_ACTIVE_STEP,
 	PAR_STEP_VOLUME,
-	PAR_STEP_PROB,
+	/*
+	 * Step-special flat parameter mirrors (S079).
+	 *
+	 * What: one id per editable step special. PAR_STEP_CONDITION replaces the
+	 * former PAR_STEP_PROB probability gate; PAR_STEP_TIMING, PAR_STEP_ROLL,
+	 * PAR_STEP_RHYTHM, and PAR_STEP_FILL are new. Why: the STEP page displays
+	 * and edits each special in its own cell through parameter_values[].
+	 * Inputs: pat_applyStepToMenu(), menu_parseGlobalParam(). Affiliates:
+	 * menuPages.h SEQ_PAGE, menu.c DTYPE/static-param dispatch.
+	 */
+	PAR_STEP_CONDITION,
 	PAR_STEP_NOTE,
+	PAR_STEP_TIMING,
+	PAR_STEP_ROLL,
+	PAR_STEP_RHYTHM,
+	PAR_STEP_FILL,
 
 	PAR_EUKLID_LENGTH,
 	PAR_EUKLID_STEPS,

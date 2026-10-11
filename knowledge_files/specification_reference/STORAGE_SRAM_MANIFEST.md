@@ -4,11 +4,18 @@ Where every byte of the STM32F765VIH6's on-chip storage goes: program flash,
 sample flash, ITCM, DTCM, SRAM1 and SRAM2. It also records the rules for
 changing any of it.
 
-- **Current as of:** Session 078 close (2026-10-10), `dev-ph6-cleanup`
-  (P1 `0c23def`, P2+P3 `b537e6f`, P4 uncommitted). DEV link:
-  `text=539,856`, `data=416`, `bss=427,616`; flash payload 540,272 B of
-  753,664 B (**headroom 213,392 B**). Production (`DEV_MODE_LOGGING=0`) was
+- **Current as of:** Session 079 close (2026-10-10), `dev-ph6-cleanup`,
+  HEAD uncommitted. DEV link:
+  `text=544,072`, `data=408`, `bss=427,776`; flash payload 544,480 B of
+  753,664 B (**headroom 209,184 B**). Production (`DEV_MODE_LOGGING=0`) was
   last measured at S075 F1 and needs a rebuild.
+- **S079 changes:** +160 B BSS from S078. P1: `sequencer.c`
+  `seq_trackRepeatCount[7]` + `seq_trackLastConditionFired[7]` +
+  `seq_fillActive` + per-track roll state arrays (~67 B, padded to 80 B).
+  P2: `InstrumentManager.c` `gateFade[6]` (24 B) + `gateFadeStep[6]`
+  (24 B) + `gateDuck[6]` (6 B) = 54 B padded to 56 B; `sequencer.c`
+  `seq_rollDuckDelta/Delay/Active[7]` = 21 B padded to 24 B; total +80 B.
+  Flash: P1 +3,968 B text, P2 +168 B text (removals offset new code).
 - **S078 changes (approved at plan acceptance):** +608 B BSS from S077.
   `sequencer.c` +76 B ISR-static timing state (per-track Q8.8 accumulators
   14 B, FX accumulator 2 B, FX step counter 4 B, shuffle delay/pending/

@@ -149,6 +149,9 @@ enum NamesEnum {
     TEXT_BUS_COMP_TIME, TEXT_BUS_COMP_SIDECHAIN,
     /* S078 per-track play mode label for the STEP track-settings page. */
     TEXT_TRACK_PLAY_MODE,
+    /* S079 STEP step-special labels: condition, micro-timing, roll family. */
+    TEXT_CONDITION, TEXT_MICROTIMING, TEXT_ROLL_RATE, TEXT_ROLL_RHYTHM,
+    TEXT_ROLL_FILL,
     NUM_NAMES
 };
 
@@ -199,6 +202,9 @@ enum longNamesEnum {
     LONG_BUS_COMP_TIME, LONG_BUS_COMP_SIDECHAIN,
     /* S078 per-track run mode long name: RunMode (S078 P4). */
     LONG_PLAY_MODE,
+    /* S079 step-special long names (condition, micro-timing, roll family). */
+    LONG_CONDITION, LONG_MICROTIMING, LONG_ROLL_RATE, LONG_ROLL_RHYTHM,
+    LONG_ROLL_FILL,
 };
 
 enum shortNamesEnum {
@@ -231,7 +237,10 @@ enum shortNamesEnum {
     SHORT_BUS_COMP_MODE, SHORT_BUS_COMP_AMOUNT,
     SHORT_BUS_COMP_TIME, SHORT_BUS_COMP_SIDECHAIN,
     /* S078 per-track run mode compact label: run (S078 P4). */
-    SHORT_PLAY_MODE
+    SHORT_PLAY_MODE,
+    /* S079 step-special compact labels. */
+    SHORT_CONDITION, SHORT_MICROTIMING, SHORT_ROLL_RATE, SHORT_ROLL_RHYTHM,
+    SHORT_ROLL_FILL
 };
 
 #define PAR_RUNTIME_CPU_USE 0xFFFEu
@@ -576,6 +585,18 @@ uint8_t menu_isStorageBusy(void);
 void menu_toggleStepTrackSettingsHalf(void);
 void menu_showStepTrackSettingsFirstHalf(void);
 void menu_showStepEditPage(void);
+/*
+ * Toggle the STEP edit page between the two step-special subpages (S079 P2).
+ *
+ * What: switches SEQ_PAGE between subpage 1 (vel/note/condition/timing) and
+ * subpage 2 (roll/rhythm/fill), selects parameter 0, resets the automation
+ * editor cursor, refreshes endless-pot snapshots, and repaints. Why:
+ * re-pressing the already-selected step button must reach the roll settings
+ * without the scroll gesture. Inputs: current SEQ subpage. Output: menuIndex
+ * moves to the other step-special subpage. Affiliates:
+ * buttonHandler_seqButtonPressed().
+ */
+void menu_toggleStepEditSubpage(void);
 /*
  * STEP held-step track automation overlay (S078 P2 §B).
  *

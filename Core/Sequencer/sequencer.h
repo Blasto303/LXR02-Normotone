@@ -39,6 +39,17 @@ extern uint8_t seq_recordActive;
 extern uint8_t seq_eraseActive;
 
 /*
+ * Fill-mode flag, written by buttonHandler PERF hold logic (S079 §3.3).
+ *
+ * What: nonzero while fill mode is active, i.e. while the PERF button has been
+ * held past DOUBLE_CLICK_TIMEOUT. Why: the condition evaluator reads this for
+ * the fil/!fl conditions. Written by the foreground button handler, read by
+ * the TIM3 ISR; a single-byte store/load is atomic on Cortex-M7. Affiliates:
+ * seq_evaluateStepCondition(), buttonHandler.c PERF hold.
+ */
+extern uint8_t seq_fillActive;
+
+/*
  * Per-track Pattern assignment stub for the unified stack service.
  *
  * What: seven resident Scene indices, one per sequencer track. Why: S067

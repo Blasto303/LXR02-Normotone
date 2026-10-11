@@ -647,6 +647,30 @@ uint8_t instrumentManager_runtimePan(uint8_t slot);
 float instrumentManager_runtimeVolume(uint8_t slot);
 void instrumentManager_triggerTrack(uint8_t trigger_track, uint8_t note,
                                     uint8_t velocity);
+
+/*
+ * Arm a fast gain fade-out on a track's voice (S079 P2 fix 4).
+ *
+ * What: maps a visible trigger track to its storage slot and sets that slot's
+ * duck request. Why: a per-step roll's fill boundary must duck the sounding
+ * voice with a short output fade instead of altering the voice's decay
+ * parameter (which was the P1 bug). Inputs: visible trigger track 0..6.
+ * Output: the slot's duck request is set; the audio path arms the fade at the
+ * next rendered block. Context: called from the TIM3 sequencer ISR; a single
+ * byte store is atomic on Cortex-M7. Affiliates: seq_processRollTicks(),
+ * instrumentManager_calcSlotAsync().
+ */
+void instrumentManager_requestGateDuck(uint8_t trigger_track);
+
+/*
+ * Current per-slot roll fill gate gain, 1.0 = open, 0.0 = fully ducked
+ * (S079 P2 fix 4).
+ *
+ * What: returns the live fade multiplier for one slot. Why: the mixer folds it
+ * into the slot's dry and send gains. Inputs: zero-based slot. Output:
+ * 0.0..1.0. Affiliates: mixer_faderGains().
+ */
+float instrumentManager_gateGain(uint8_t slot);
 /*
  * Return the type that currently owns a slot's live tagged runtime member.
  *
