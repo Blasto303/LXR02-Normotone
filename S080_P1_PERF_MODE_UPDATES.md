@@ -245,9 +245,16 @@ While looping with SELECT buttons held:
 
 - SEQ button scene changes work normally based on the still-running master
   step clock and global scene change options (see §5).
-- On scene change, the loop start point resets to the very beginning of the
-  new scene.
-- The same applies to individual track changes (TRACK+SEQ).
+- On scene change, each looped track's loop start point keeps the same
+  position relative to the master clock that it had in the outgoing scene.
+  The incoming scene's track is positioned at that master-clock point using
+  its own step scale and length. Example: outgoing track at 1/16 with the
+  loop start at the beginning of step 5; incoming track at 1/8 → its loop
+  start is the beginning of step 3. *(Corrected in S080 P2; the earlier text
+  "resets to the very beginning of the new scene" was a misstatement. See
+  S080_P2_PERF_EXPANSION_DEFECTS.md Defect 14.)*
+- Per-track scene changes (TRACK+SEQ) are not available while the looper is
+  engaged; SEQ is always a full scene change (S080 P2 Defect 9).
 
 ### 3.7 Effects and FX Sequence
 
@@ -420,9 +427,17 @@ What happens when a queued scene change fires:
 |---------|-------------|
 | `nrm`   | Normal change (default). |
 | `mut`   | All mutes are reset to off. |
-| `mor`   | All morphs are reset to 0. |
-| `m+m`   | Both mute reset and morph reset. |
+| `mrp`   | All morphs are reset to 0. |
+| `res`   | Reset: tracks restart from the beginning (queued PC reset). |
+| `u+r`   | Mute reset + reset. |
+| `o+r`   | Morph reset + reset. |
+| `mmr`   | Mute reset + morph reset + reset. |
 | `rld`   | Scene is reloaded from source (if source exists). Also resets mutes and morphs. |
+| `r+r`   | Reload + reset. |
+
+*(Changed in S080 P2, Defect 15: queued changes have their own PC reset,
+selected here; they ignore the global `pcr`.  `mor` is renamed `mrp`; `m+m`
+is removed.)*
 
 ### 5.5 Global `PCR` — Pattern Change Reset
 
@@ -431,6 +446,9 @@ settings.cfg:
 - Off (default): scene changes realign tracks to master clock position
   (existing behavior).
 - On: scene changes reset all tracks to play from the beginning.
+- *(S080 P2: this is the existing `PAR_BAR_RESET_MODE` / `pcr`, not a new
+  parameter (Defect 5).  It governs direct and chain-fired changes only;
+  queued changes use the reset options in `qac` (§5.4, Defect 15).)*
 
 Place this parameter adjacent to `scd`/`qcd`/`qac` in the global menu.
 
@@ -635,8 +653,8 @@ structure, serialized in `sceneset.scg`, and included in Scene save/load.
    step-scale DDA infrastructure to schedule trigger repeats. This is the
    proven timing mechanism for musically-quantized events.
 
-6. **PCR applies to all scene changes:** user-initiated, chain-initiated,
-   and queued. PCR is a global playback property.
+6. **PCR applies to direct and chain-initiated scene changes.** *(S080 P2,
+   Defect 15: queued changes have their own reset, selected by `qac`.)*
 
 7. **Condition table: insert, no migration.** `lop` and `!lp` are inserted
    after `!fl` at indices 23–24. Existing conditions shift by 2. No PAT4

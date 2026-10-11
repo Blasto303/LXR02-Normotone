@@ -144,6 +144,16 @@ typedef enum {
 #define SCENE_BUS_COMP_MODE_ST2        2u
 #define SCENE_BUS_COMP_SIDECHAIN_OFF   0u
 /*
+ * S080 Phase G chain domains. Two (condition, next) pairs per Scene; the
+ * condition and next-scene tables are chainConditionNames/chainNextNames
+ * (MenuText.h) and seq_chainConditionWeight()/seq_chainResolveNext()
+ * (sequencer.c), which must stay in the same order.
+ */
+#define SCENE_CHAIN_SLOT_COUNT      2u
+#define SCENE_CHAIN_CONDITION_MAX  78u
+#define SCENE_CHAIN_NEXT_MAX       43u
+#define SCENE_CHAIN_NEXT_STOP      43u
+/*
  * Bus compressor defaults (S075 F2-B, user decision F2-Q2): mode off,
  * amount 0, time 0, sidechain off. A fresh, cleared or default-staged Scene
  * has no compression and neutral values. Used only through
@@ -249,6 +259,23 @@ typedef struct {
     uint8_t track_morph_length[NUM_TRACKS];
     uint8_t track_morph_scale[NUM_TRACKS];
     uint8_t track_morph_shuffle[NUM_TRACKS];
+    /*
+     * Scene chain settings (S080 G1, P2).
+     *
+     * What: chain_condition[0..1] = cn1/cn2 (0..78: nul, xal, bal, x01..x64,
+     * b01..b64, r1x..r9x, r1b..r9b, 1:4..4:4, 1:8..8:8, >01..>16, fix, fib,
+     * !fx, !fb, lox, lob, !lx, !lb); chain_next[0..1] = nx1/nx2 (0..43: slf,
+     * nxt, prv, s01..s16, r01..r16, r+1..r+4, r-1..r-4, stp). Zero = nul / slf
+     * = no chaining. Why: per-Scene automatic transitions (plan §4). They copy
+     * and clear with the Scene but never fan out through the VOICE edit mask.
+     * Inputs: chain editor, sceneset.scg, AutoSave restore, copy/clear.
+     * Outputs: seq_chainEvaluate() (TIM3, single-byte reads). Storage:
+     * sceneset keys chain_condition/chain_next; AutoSave Scene cells 72..75.
+     * RAM: 4 B per Scene, 64 B across scenes[16]. Affiliates:
+     * scene_setChainCondition()/scene_setChainNext() (the only writers).
+     */
+    uint8_t chain_condition[SCENE_CHAIN_SLOT_COUNT];
+    uint8_t chain_next[SCENE_CHAIN_SLOT_COUNT];
     /*
      * Autosave extension rule for Scene settings.
      *
@@ -573,6 +600,20 @@ uint8_t scene_getTrackMorphScale(uint8_t scene_index, uint8_t track);
 void scene_setTrackMorphShuffle(uint8_t scene_index, uint8_t track,
                                 uint8_t value);
 uint8_t scene_getTrackMorphShuffle(uint8_t scene_index, uint8_t track);
+
+/*
+ * Scene chain accessors (S080 G2).
+ *
+ * Setters clamp (condition 0..78, next 0..43), commit through the change-aware
+ * Scene store (AutoSave cell + card-clean bit) and ignore invalid Scene/slot.
+ * Getters return 0 for invalid coordinates and are single-byte SRAM reads, so
+ * the TIM3 chain evaluator may call them. Clients: chain editor (menu.c),
+ * scene_commitSettings(), AutoSave restore, seq_chainEvaluate().
+ */
+void scene_setChainCondition(uint8_t scene_index, uint8_t slot, uint8_t value);
+uint8_t scene_getChainCondition(uint8_t scene_index, uint8_t slot);
+void scene_setChainNext(uint8_t scene_index, uint8_t slot, uint8_t value);
+uint8_t scene_getChainNext(uint8_t scene_index, uint8_t slot);
 
 /*
  * Whole-settings defaults and commit for copy/clear (S075).

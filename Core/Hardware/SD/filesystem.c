@@ -2592,9 +2592,10 @@ static void filesystem_resetGlobalsToDefaults(void)
     /*
      * S080 E11/F6: defaults for the new persistent globals. Overlay defaults
      * are vmx trigger / def note (0). Scene globals default to instant change
-     * (scd/qcd = 0), normal queue action (qac = 0), and PCR off (pcr = 0), which
-     * preserves the pre-S080 instant-switch behaviour when a settings.cfg from
-     * older firmware omits these keys.
+     * (scd/qcd = 0) and normal queue action (qac = 0, nrm), which preserves the
+     * pre-S080 instant-switch behaviour when a settings.cfg from older firmware
+     * omits these keys. The one PC reset (bar_reset_mode) keeps its pre-S080
+     * default below.
      */
     parameter_values[PAR_PERF_BTN_LT] = 0u;
     parameter_values[PAR_PERF_NOTE_LT] = 0u;
@@ -2603,7 +2604,6 @@ static void filesystem_resetGlobalsToDefaults(void)
     parameter_values[PAR_SCENE_CHANGE_DIV] = 0u;
     parameter_values[PAR_SCENE_QUEUE_DIV] = 0u;
     parameter_values[PAR_SCENE_QUEUE_ACTION] = 0u;
-    parameter_values[PAR_SCENE_PC_RESET] = 0u;
 }
 
 static void filesystem_sanitizeLoadedGlobals(void)
@@ -2611,6 +2611,28 @@ static void filesystem_sanitizeLoadedGlobals(void)
     uint8_t ch = parameter_values[PAR_MIDI_CHAN_GLOBAL];
     if (ch == 0u || ch > 16u)
         parameter_values[PAR_MIDI_CHAN_GLOBAL] = 1u;
+    /*
+     * S080 P2 Defect 15: qac has nine values (0..8). A hand-edited or corrupt
+     * settings.cfg must not leave an out-of-range action that the menu cannot
+     * display; out-of-range values fall back to nrm (0). P1 files storing 3
+     * (old m+m) or 4 (old rld) now read as res / u+r (backward compatibility
+     * not required, user).
+     */
+    if (parameter_values[PAR_SCENE_QUEUE_ACTION] > 8u)
+        parameter_values[PAR_SCENE_QUEUE_ACTION] = 0u;
+    /*
+     * S080 P2: qcd has its own 18-value list (0..17: ins, 1/8, 1/4, 1/2,
+     * 1b..9b, 12b, 15b, 16b, ens, enl) and scd keeps 0..9. Out-of-range values
+     * from a hand-edited or corrupt settings.cfg fall back to instant (0). A
+     * P1 file that stored qcd 8 (ens) or 9 (enl) now reads as 5b / 6b
+     * (backward compatibility not required, user). Affiliates:
+     * sceneQueueDivNames/sceneChangeDivNames (MenuText.h),
+     * seq_queueChangeDivUnits().
+     */
+    if (parameter_values[PAR_SCENE_QUEUE_DIV] > 17u)
+        parameter_values[PAR_SCENE_QUEUE_DIV] = 0u;
+    if (parameter_values[PAR_SCENE_CHANGE_DIV] > 9u)
+        parameter_values[PAR_SCENE_CHANGE_DIV] = 0u;
     /*
      * Normalize the persistent AutoSave preference at the common Global-load
      * boundary. Input is any flat/global compatibility image. Output is one
@@ -2792,7 +2814,6 @@ static uint8_t filesystem_settingsParamForKey(const char *key,
     else if (strcmp(key, "scd") == 0) *param = PAR_SCENE_CHANGE_DIV;
     else if (strcmp(key, "qcd") == 0) *param = PAR_SCENE_QUEUE_DIV;
     else if (strcmp(key, "qac") == 0) *param = PAR_SCENE_QUEUE_ACTION;
-    else if (strcmp(key, "pcr") == 0) *param = PAR_SCENE_PC_RESET;
     else return 0u;
     return 1u;
 }
@@ -3066,6 +3087,13 @@ static void filesystem_patternBuildHeader(uint8_t *header,
         header[base + 2u] = region->track_shuffle[track];
         /* S078 §4.5: byte 3 of the 16-byte track header stores play mode. */
         header[base + 3u] = region->track_play_mode[track];
+        /*
+         * S080 P2 Defect 8a: byte 4 stores the looper exclusion (1 = track
+         * not loopable). The byte was reserved and written as zero, so older
+         * files read as loopable and the PAT4 version stays 2.
+         */
+        header[base + 4u] =
+            (uint8_t)((region->track_loop_exclude >> track) & 1u);
     }
 }
 
@@ -13186,6 +13214,7 @@ static void filesystem_loadSceneDirectory_tick(void)
             uint8_t track;
             region->pattern_change_bar = staging_buf[32];
             region->pattern_next = staging_buf[33];
+            region->track_loop_exclude = 0u;
             for (track = 0u; track < NUM_TRACKS; track++) {
                 uint16_t base = (uint16_t)(48u +
                     track * PATTERN_FILE_TRACK_HEADER_BYTES);
@@ -13194,6 +13223,9 @@ static void filesystem_loadSceneDirectory_tick(void)
                 region->track_shuffle[track] = staging_buf[base + 2u];
                 /* S078 §4.5: old files are zero-filled here -> fwd. */
                 region->track_play_mode[track] = staging_buf[base + 3u];
+                /* S080 P2 Defect 8a: byte 4 = looper exclusion (old files 0). */
+                if (staging_buf[base + 4u] != 0u)
+                    region->track_loop_exclude |= (uint8_t)(1u << track);
             }
             op_stream_index = 0u;
             op_phase = 48u;
@@ -15218,6 +15250,7 @@ static void filesystem_loadPattern_tick(void)
             if (!region) { op_close_status = FS_STATUS_ERROR; op_phase = 13u; return; }
             region->pattern_change_bar = staging_buf[32u];
             region->pattern_next = staging_buf[33u];
+            region->track_loop_exclude = 0u;
             for (track = 0u; track < NUM_TRACKS; track++) {
                 uint16_t base = (uint16_t)(48u +
                     track * PATTERN_FILE_TRACK_HEADER_BYTES);
@@ -15226,6 +15259,9 @@ static void filesystem_loadPattern_tick(void)
                 region->track_shuffle[track] = staging_buf[base + 2u];
                 /* S078 §4.5: root Pattern Load play mode. */
                 region->track_play_mode[track] = staging_buf[base + 3u];
+                /* S080 P2 Defect 8a: byte 4 = looper exclusion (old files 0). */
+                if (staging_buf[base + 4u] != 0u)
+                    region->track_loop_exclude |= (uint8_t)(1u << track);
             }
             op_stream_index = 0u; op_phase = 9u; return;
         }
@@ -17347,6 +17383,20 @@ static uint8_t filesystem_nextScenesetLine(char *dst, uint16_t cap,
         return filesystem_formatAssignmentCsvU8Line(
             dst, cap, "track_morph_shuffle",
             scene->settings.track_morph_shuffle, NUM_TRACKS);
+    case 18u:
+        /*
+         * S080 G5: Scene chain lines, appended after the track Morph lines so
+         * no earlier writer line moves. chain_condition = cn1,cn2 (0..78);
+         * chain_next = nx1,nx2 (0..43). Parser keys: storageTypes.c
+         * storage_scenesetParseLine(). Affiliates: scene_settings_t.chain_*.
+         */
+        return filesystem_formatAssignmentCsvU8Line(
+            dst, cap, "chain_condition", scene->settings.chain_condition,
+            SCENE_CHAIN_SLOT_COUNT);
+    case 19u:
+        return filesystem_formatAssignmentCsvU8Line(
+            dst, cap, "chain_next", scene->settings.chain_next,
+            SCENE_CHAIN_SLOT_COUNT);
     default:
         return 0u;
     }
@@ -17470,12 +17520,14 @@ static uint8_t filesystem_nextSettingsLine(char *dst, uint16_t cap,
      * S080 F5: scene queue / change division globals.
      *
      * What: scd (direct scene-change division), qcd (queued change division),
-     * qac (queued change action), pcr (pattern-change reset). Why: these
-     * controls add musical timing and reset options to scene changes and must
-     * persist across power cycles. Together with the four overlay keys above
-     * the settings data lines grow from 17 to 25; the terminator count moves
-     * with them. Affiliates: filesystem_settingsParamForKey() (E11/F6), the
-     * global settings page (F3).
+     * qac (queued change action, 0..8 incl. the queued PC reset, S080 P2
+     * Defect 15). Why: these controls add musical timing and reset options to
+     * scene changes and must persist across power cycles. The one PC reset for
+     * direct/chain changes is bar_reset_mode above (S080 P2 Defect 5 removed
+     * the duplicate pcr key). Together with the four overlay keys above the
+     * settings data lines grow from 17 to 24; the terminator count moves with
+     * them. Affiliates: filesystem_settingsParamForKey(), the global settings
+     * page.
      */
     case 21u:
         return filesystem_formatAssignmentU16Line(
@@ -17487,23 +17539,20 @@ static uint8_t filesystem_nextSettingsLine(char *dst, uint16_t cap,
         return filesystem_formatAssignmentU16Line(
             dst, cap, "qac", parameter_values[PAR_SCENE_QUEUE_ACTION]);
     case 24u:
-        return filesystem_formatAssignmentU16Line(
-            dst, cap, "pcr", parameter_values[PAR_SCENE_PC_RESET]);
-    case 25u:
         /*
          * Self-checking terminator for format expansion.
          *
-         * What: emits "lines=25\n" as the final line, where 25 is the count
-         * of preceding data lines (cases 0u..24u: 17 original + 4 overlay
-         * (S080 E10) + 4 scene globals (S080 F5)). Why: gives consumers a
-         * cheap completeness signal that distinguishes a genuine end-of-file
-         * from a clean-but-early EOF after a crash. Adding a settings key
-         * requires incrementing both its own case and this declared count.
-         * The boot recovery prelude validates this count; the normal load path
-         * ignores it as an unknown key. Affiliates: §6 of
+         * What: emits "lines=24\n" as the final line, where 24 is the count
+         * of preceding data lines (cases 0u..23u: 17 original + 4 overlay
+         * (S080 E10) + 3 scene globals (S080 F5, P2 Defect 5)). Why: gives
+         * consumers a cheap completeness signal that distinguishes a genuine
+         * end-of-file from a clean-but-early EOF after a crash. Adding a
+         * settings key requires incrementing both its own case and this
+         * declared count. The boot recovery prelude validates this count; the
+         * normal load path ignores it as an unknown key. Affiliates: §6 of
          * S057_SETTINGS_WRITE_SAFE.md.
          */
-        return filesystem_formatAssignmentU16Line(dst, cap, "lines", 25u);
+        return filesystem_formatAssignmentU16Line(dst, cap, "lines", 24u);
     default:
         return 0u;
     }
@@ -28504,6 +28553,7 @@ static uint8_t filesystem_bootReaderReadPatternFile(const char *file_name,
     }
     region->pattern_change_bar = staging_buf[32u];
     region->pattern_next = staging_buf[33u];
+    region->track_loop_exclude = 0u;
     for (track = 0u; track < NUM_TRACKS; track++) {
         uint16_t base = (uint16_t)(48u +
             track * PATTERN_FILE_TRACK_HEADER_BYTES);
@@ -28512,6 +28562,9 @@ static uint8_t filesystem_bootReaderReadPatternFile(const char *file_name,
         region->track_shuffle[track] = staging_buf[base + 2u];
         /* S078 §4.5: AutoSave Pattern boot play mode. */
         region->track_play_mode[track] = staging_buf[base + 3u];
+        /* S080 P2 Defect 8a: byte 4 = looper exclusion (old files 0). */
+        if (staging_buf[base + 4u] != 0u)
+            region->track_loop_exclude |= (uint8_t)(1u << track);
     }
     if (filesystem_blockRead(file, (uint8_t *)region->address,
                              PATTERN_FILE_ADDRESS_BYTES) !=

@@ -1194,14 +1194,15 @@ const enum Datatypes parameter_dtypes[NUM_PARAMS] = {
     [PAR_MIDI_CHAN_GLOBAL] = DTYPE_1B16,
     [PAR_OSC_WAVE_INTERP] = DTYPE_ON_OFF,
     /*
-     * S080 E6/F10: BAR overlay and scene-global dtypes.
+     * S080 E6/F10/G and P2: BAR overlay, scene-global, chain and loopable
+     * dtypes.
      *
-     * Why DTYPE_0B127 (and DTYPE_ON_OFF for pcr) and not DTYPE_MENU: all 16
-     * DTYPE_MENU table ids and all 16 DTYPE_* nibbles are already used. The
-     * overlay trigger-type names, scene division/action names, and clamp
+     * Why DTYPE_0B127 and not DTYPE_MENU: all 16 DTYPE_MENU table ids and all
+     * 16 DTYPE_* nibbles are already used. The overlay trigger-type names,
+     * scene division/action names, chain condition/next names and their clamp
      * domains are applied by static-param special cases keyed on the PAR_ id
-     * (the S078 run-mode precedent). PAR_PERF_NOTE_* render def or a note name;
-     * PAR_SCENE_PC_RESET uses the normal on/off renderer.
+     * (the S078 run-mode precedent). PAR_PERF_NOTE_* render def or a note name.
+     * PAR_TRACK_LOOPABLE is an ordinary on/off cell.
      */
     [PAR_PERF_BTN_LT] = DTYPE_0B127,
     [PAR_PERF_NOTE_LT] = DTYPE_0B127,
@@ -1210,7 +1211,11 @@ const enum Datatypes parameter_dtypes[NUM_PARAMS] = {
     [PAR_SCENE_CHANGE_DIV] = DTYPE_0B127,
     [PAR_SCENE_QUEUE_DIV] = DTYPE_0B127,
     [PAR_SCENE_QUEUE_ACTION] = DTYPE_0B127,
-    [PAR_SCENE_PC_RESET] = DTYPE_ON_OFF,
+    [PAR_CHAIN_COND1] = DTYPE_0B127,
+    [PAR_CHAIN_NEXT1] = DTYPE_0B127,
+    [PAR_CHAIN_COND2] = DTYPE_0B127,
+    [PAR_CHAIN_NEXT2] = DTYPE_0B127,
+    [PAR_TRACK_LOOPABLE] = DTYPE_ON_OFF,
 };
 
 /* -----------------------------------------------------------------------
@@ -1337,11 +1342,12 @@ static const Name valueNames[NUM_NAMES] = {
     {SHORT_SCENE_CHANGE_DIV,CAT_SCENE,LONG_SCENE_CHANGE_DIV},
     {SHORT_SCENE_QUEUE_DIV,CAT_SCENE,LONG_SCENE_QUEUE_DIV},
     {SHORT_SCENE_QUEUE_ACTION,CAT_SCENE,LONG_SCENE_QUEUE_ACTION},
-    {SHORT_SCENE_PC_RESET,CAT_SCENE,LONG_SCENE_PC_RESET},
     {SHORT_CHAIN_COND1,CAT_CHAIN,LONG_CHAIN_COND1},
     {SHORT_CHAIN_NEXT1,CAT_CHAIN,LONG_CHAIN_NEXT1},
     {SHORT_CHAIN_COND2,CAT_CHAIN,LONG_CHAIN_COND2},
     {SHORT_CHAIN_NEXT2,CAT_CHAIN,LONG_CHAIN_NEXT2},
+    /* S080 P2 Defect 8a: lop / Track / Loopable on the STEP track page. */
+    {SHORT_TRACK_LOOPABLE,CAT_TRACK,LONG_TRACK_LOOPABLE},
 };
 
 /* -----------------------------------------------------------------------
@@ -2005,8 +2011,11 @@ typedef struct {
 /* S080 E6/F10: shared resolver for the overlay/scene-global static names. */
 static uint8_t menu_getS080StaticName(const menu_cell_t *cell,
                                       uint16_t value, char *buf);
-/* S080 F9: ungated PERF scene-change executor (shared with the deferral). */
-static void menu_perfSceneChangeExecute(uint8_t scene_index);
+/* S080 F9 / P2 Defect 15: ungated PERF scene-change executor; `restart`
+ * selects a PC reset (pcr for direct/chain changes, qac for queued ones). */
+static void menu_perfSceneChangeExecute(uint8_t scene_index, uint8_t restart);
+/* S080 P2 Defect 10: owner of the queued-scene fast blink (Step 8). */
+static void menu_syncQueuedSceneLed(void);
 
 typedef struct {
     uint8_t scene_index;
@@ -2074,6 +2083,9 @@ static uint8_t menu_busCompValueText(uint16_t paramNr, uint8_t value,
                                      char *dst);
 static uint8_t menu_commitBusCompParam(uint16_t paramNr, uint8_t value);
 static uint8_t menu_commitEffectMorphParam(uint8_t value);
+/* S080 G8: chain editor cell helpers (defined beside the editor). */
+static uint8_t menu_paramIsChain(uint16_t paramNr);
+static uint8_t menu_commitChainParam(uint16_t paramNr, uint8_t value);
 static instrument_param_id_t menu_sceneSettingAutomationTarget(
     const menu_cell_t *cell);
 static uint8_t menu_morphAutomationStore(uint8_t morph_value);
@@ -4917,6 +4929,30 @@ static uint8_t menu_cellCommitValue(const menu_cell_t *cell, uint16_t value)
         return changed;
     }
     /*
+     * S080 G8: chain editor cells commit to the viewed Scene only (no VOICE
+     * edit-mask fan-out); see menu_commitChainParam().
+     */
+    if (cell->kind == MENU_CELL_STATIC &&
+        menu_paramIsChain(cell->static_param))
+        return menu_commitChainParam(cell->static_param, (uint8_t)value);
+    /*
+     * S080 P2 Defect 8a: STEP-page lop cell.
+     *
+     * What: commits the on/off value to the viewed Scene's active track via
+     * PatternData and refreshes the mirror. Why: PAR_TRACK_LOOPABLE sits in
+     * the appended id range that menu_sendAllGlobals() replays on every
+     * settings load, so it must not commit through menu_parseGlobalParam().
+     * Inputs: clamped 0/1. Outputs: pat_setTrackLoopable(). Affiliates:
+     * pat_applyTrackSettingsToMenu(), seq_loopableTrackMask().
+     */
+    if (cell->kind == MENU_CELL_STATIC &&
+        cell->static_param == PAR_TRACK_LOOPABLE) {
+        pat_setTrackLoopable(menu_getViewedPattern(), menu_getActiveVoice(),
+                             (uint8_t)(value != 0u));
+        parameter_values[PAR_TRACK_LOOPABLE] = (uint8_t)(value != 0u);
+        return 1u;
+    }
+    /*
      * S074 bus compressor cells are Scene-owned, not Global-owned mirrors.
      * Fan out the clamped value through Preset and refresh from the active
      * Scene; this prevents settings.cfg bulk apply from writing SceneData.
@@ -5688,11 +5724,13 @@ static void menu_clampCellValue(const menu_cell_t *cell, uint16_t *value)
      * S080 E6/F10: BAR overlay and scene-global domains.
      *
      * What: clamp the overlay trigger type to 0..11, the overlay note to 0..127
-     * (0 = def), scd/qcd to 0..9, and qac to 0..4. Why: all DTYPE_MENU ids are
-     * used, so these domains are applied here as static-param special cases.
-     * pcr is DTYPE_ON_OFF and clamps through the normal dtype path. Inputs:
-     * resolved static cell and value. Output: clamped value. Affiliates:
-     * perfBtnTypeNames/sceneChangeDivNames/sceneQueueActionNames (MenuText.h).
+     * (0 = def), scd to 0..9, qcd to 0..17 (S080 P2 longer queue list), qac
+     * to 0..8 (Defect 15), chain conditions to
+     * 0..78 and chain next-scene values to 0..43 (Phase G). Why: all DTYPE_MENU
+     * ids are used, so these domains are applied here as static-param special
+     * cases. Inputs: resolved static cell and value. Output: clamped value.
+     * Affiliates: perfBtnTypeNames/sceneChangeDivNames/sceneQueueDivNames/
+     * sceneQueueActionNames/chainConditionNames/chainNextNames (MenuText.h).
      */
     if (cell->kind == MENU_CELL_STATIC) {
         switch (cell->static_param) {
@@ -5705,11 +5743,31 @@ static void menu_clampCellValue(const menu_cell_t *cell, uint16_t *value)
             if (*value > 127u) *value = 127u;
             return;
         case PAR_SCENE_CHANGE_DIV:
-        case PAR_SCENE_QUEUE_DIV:
             if (*value > 9u) *value = 9u;
             return;
+        case PAR_SCENE_QUEUE_DIV:
+            /*
+             * S080 P2: qcd has its own 18-entry list (ins .. 16b, ens, enl),
+             * 0..17; see sceneQueueDivNames (MenuText.h) and
+             * seq_queueChangeDivUnits() (sequencer.c).
+             */
+            if (*value > 17u) *value = 17u;
+            return;
         case PAR_SCENE_QUEUE_ACTION:
-            if (*value > 4u) *value = 4u;
+            /* S080 P2 Defect 15: nine queue actions, 0..8. */
+            if (*value > 8u) *value = 8u;
+            return;
+        case PAR_CHAIN_COND1:
+        case PAR_CHAIN_COND2:
+            /* S080 G: 79 chain conditions, 0..78. */
+            if (*value > SCENE_CHAIN_CONDITION_MAX)
+                *value = SCENE_CHAIN_CONDITION_MAX;
+            return;
+        case PAR_CHAIN_NEXT1:
+        case PAR_CHAIN_NEXT2:
+            /* S080 G: 44 next-scene values, 0..43. */
+            if (*value > SCENE_CHAIN_NEXT_MAX)
+                *value = SCENE_CHAIN_NEXT_MAX;
             return;
         default:
             break;
@@ -8160,70 +8218,167 @@ uint8_t menu_loadInstrumentIsActive(void)
 static uint16_t menu_residentPresentSceneMask(void);
 static uint16_t menu_allPhysicalSceneMask(void);
 static uint16_t menu_loadSaveSelectableSceneMask(void);
+
+/*
+ * Scene chain editor (S080 G8, P2 Defects 2 and 13).
+ *
+ * What: menu_chainMenuScene is the Scene whose chain is shown (0xFF =
+ * closed). menu_chainMenuOpen() shows the four chain cells of a present Scene
+ * on PATTERN_SETTINGS_PAGE sub-page 0 and keeps SHIFT lit; menu_chainMenuView()
+ * switches the viewed Scene (a SEQ press while open); menu_chainMenuClose()
+ * returns to PERFORMANCE_PAGE sub-page 0. Only a user SEQ press changes the
+ * viewed Scene; an active-Scene change (chain fire, queue) does not. Why: a
+ * latched per-Scene editor entered with SHIFT+PLAY+SEQ in PERF (plan §4.1);
+ * the retired, empty PATTERN_SETTINGS_PAGE hosts it without a new page table.
+ * Inputs: Scene index from buttonHandler. Outputs: page, PAR_CHAIN_* mirrors,
+ * SEQ/SHIFT LEDs. RAM: 1 byte SRAM1. Accessors: buttonHandler SHIFT+SEQ (open),
+ * PERF SEQ press (view), SHIFT press / MODE / overflow (close). Affiliates:
+ * menu_refreshPerfSceneLeds() (blinks active and viewed Scene),
+ * menu_commitChainParam(), scene_getChain*()/scene_setChain*().
+ */
+static uint8_t menu_chainMenuScene = 0xFFu;
+
+static void menu_chainLoadMirrors(uint8_t scene_index)
+{
+    parameter_values[PAR_CHAIN_COND1] = scene_getChainCondition(scene_index, 0u);
+    parameter_values[PAR_CHAIN_NEXT1] = scene_getChainNext(scene_index, 0u);
+    parameter_values[PAR_CHAIN_COND2] = scene_getChainCondition(scene_index, 1u);
+    parameter_values[PAR_CHAIN_NEXT2] = scene_getChainNext(scene_index, 1u);
+}
+
+uint8_t menu_chainMenuOpen(uint8_t scene_index)
+{
+    if (scene_index >= SCENE_COUNT || scene_index >= 16u ||
+        !bank_scenePresent(scene_index))
+        return 0u;
+    menu_chainMenuScene = scene_index;
+    menu_chainLoadMirrors(scene_index);
+    menu_switchPage(PATTERN_SETTINGS_PAGE);
+    menu_switchSubPage(0u);
+    menu_resetActiveParameter();
+    led_setValue(1u, LED_SHIFT);
+    menu_repaintAll();
+    return 1u;
+}
+
+void menu_chainMenuView(uint8_t scene_index)
+{
+    if (menu_chainMenuScene >= 16u || scene_index >= SCENE_COUNT ||
+        scene_index >= 16u || !bank_scenePresent(scene_index))
+        return;
+    menu_chainMenuScene = scene_index;
+    menu_chainLoadMirrors(scene_index);
+    menu_refreshPerfSceneLeds();
+    menu_repaintAll();
+}
+
+void menu_chainMenuClose(void)
+{
+    if (menu_chainMenuScene >= 16u)
+        return;
+    menu_chainMenuScene = 0xFFu;
+    menu_switchPage(PERFORMANCE_PAGE);
+    menu_switchSubPage(0u);
+    menu_resetActiveParameter();
+    led_setValue(buttonHandler_getShift(), LED_SHIFT);
+    menu_repaintAll();
+}
+
+uint8_t menu_chainMenuIsOpen(void)
+{
+    return (uint8_t)(menu_chainMenuScene < 16u);
+}
+
+static uint8_t menu_paramIsChain(uint16_t paramNr)
+{
+    return (uint8_t)(paramNr >= PAR_CHAIN_COND1 && paramNr <= PAR_CHAIN_NEXT2);
+}
+
+/*
+ * Commit one chain cell to the viewed Scene (S080 G8).
+ *
+ * What: writes the clamped value through the SceneData setter of the viewed
+ * Scene's slot and refreshes the four mirrors from the stored bytes. Why: the
+ * chain belongs to one Scene and never fans out (plan §9.2-3). Inputs:
+ * PAR_CHAIN_* id, value. Output: 1 (repaint) or 0 when closed.
+ */
+static uint8_t menu_commitChainParam(uint16_t paramNr, uint8_t value)
+{
+    uint8_t scene_index = menu_chainMenuScene;
+
+    if (scene_index >= 16u)
+        return 0u;
+    switch (paramNr) {
+    case PAR_CHAIN_COND1: scene_setChainCondition(scene_index, 0u, value); break;
+    case PAR_CHAIN_NEXT1: scene_setChainNext(scene_index, 0u, value);      break;
+    case PAR_CHAIN_COND2: scene_setChainCondition(scene_index, 1u, value); break;
+    case PAR_CHAIN_NEXT2: scene_setChainNext(scene_index, 1u, value);      break;
+    default: return 0u;
+    }
+    menu_chainLoadMirrors(scene_index);
+    return 1u;
+}
+
 void menu_refreshPerfSceneLeds(void)
 {
     uint8_t scene_index;
     uint8_t active_scene = scene_getActiveIndex();
+    uint8_t viewed = menu_getViewedPattern();
     uint16_t present_mask = menu_residentPresentSceneMask();
+    uint16_t blink_mask = 0u;
 
     /*
-     * Repaint PERF-mode Scene selection on the 16 SEQ LEDs.
+     * Repaint PERF-mode Scene selection on the 16 SEQ LEDs (S077 P2 §5,
+     * S080 P2 Defect 13).
      *
-     * Inputs: BankData's resident Scene-present mask, SceneData's active index,
-     * and PatternData step activity per Scene. Outputs: Scenes with any retained
-     * Pattern steps are lit steady, and the active resident Scene blinks even
-     * when its Pattern is empty. PERF selection is still gated by the resident
-     * present mask in menu_perfModeSceneButtonPressed(); the steady LED layer is
-     * deliberately Pattern activity because the row answers "which Scenes have
-     * something to play?" rather than "which child folders exist?".
+     * What: Scenes with retained Pattern steps are lit steady. These Scenes
+     * blink at the standard rate: the active Scene while stopped (while
+     * running it follows the beat pulse instead, S077 P2 §5.1); the viewed
+     * Scene when PAR_FOLLOW is off and it differs from the active one
+     * (§5.2); and, while the chain editor is open, both the active Scene and
+     * the Scene whose chain is shown, regardless of transport (plan §4.1,
+     * Defect 13). A blink already running is left alone so the per-beat
+     * refresh does not restart its phase; only LEDs leaving the blink set are
+     * cancelled. The queued Scene's double-rate flash is a separate LED layer
+     * (LED_LAYER_FAST) that this repaint cannot disturb. Inputs: BankData
+     * present mask, SceneData active index, PatternData step activity,
+     * transport, beat pulse, follow, menu_chainMenuScene. Outputs: SEQ LED
+     * base values and blink slots. Accessors: PERF entry, beat drain, scene
+     * change, chain editor. Affiliates: led_isBlinkLed(), led_setBlinkLed(),
+     * menu_syncQueuedSceneLed().
      */
+    if (active_scene < 16u &&
+        (present_mask & (uint16_t)(1u << active_scene)) != 0u &&
+        (!seq_isRunning() || menu_chainMenuScene < 16u))
+        blink_mask |= (uint16_t)(1u << active_scene);
+    if (!parameter_values[PAR_FOLLOW] && viewed < 16u &&
+        viewed != active_scene &&
+        (present_mask & (uint16_t)(1u << viewed)) != 0u)
+        blink_mask |= (uint16_t)(1u << viewed);
+    if (menu_chainMenuScene < 16u)
+        blink_mask |= (uint16_t)(1u << menu_chainMenuScene);
+
     for (scene_index = 0u; scene_index < 16u; scene_index++) {
         uint16_t bit = (uint16_t)(1u << scene_index);
-        led_setBlinkLed((uint8_t)(LED_SEQ1 + scene_index), 0u);
-        led_setValue(((present_mask & bit) != 0u) &&
-                         pat_sceneHasActiveSteps(scene_index),
-                     (uint8_t)(LED_SEQ1 + scene_index));
-    }
-    if (active_scene < 16u && (present_mask & (uint16_t)(1u << active_scene))) {
-        /*
-         * Active Scene LED tempo pulse (S077 P2 §5.1).
-         *
-         * What: while the transport runs, the active Scene's SEQ LED is on at
-         * beat boundaries and off between them, driven by
-         * seq_ledState.beatPulse and refreshed on every BEAT dirty event (see
-         * ledHandler.c). While stopped it keeps the standard blink. Why:
-         * distinguishes the active Scene from merely viewed Scenes and gives
-         * tempo-synchronised feedback. Affiliates: led_processSeqLedState()
-         * (the BEAT drain that calls back into this function in PERF mode).
-         */
-        if (seq_isRunning()) {
-            led_setBlinkLed((uint8_t)(LED_SEQ1 + active_scene), 0u);
-            led_setValue(seq_ledState.beatPulse,
-                         (uint8_t)(LED_SEQ1 + active_scene));
+        uint8_t led = (uint8_t)(LED_SEQ1 + scene_index);
+        uint8_t base = (uint8_t)(((present_mask & bit) != 0u) &&
+                                 pat_sceneHasActiveSteps(scene_index));
+
+        if ((blink_mask & bit) != 0u) {
+            if (!led_isBlinkLed(led)) {
+                led_setValue(base, led);
+                led_setBlinkLed(led, 1u);
+            }
         } else {
-            led_setBlinkLed((uint8_t)(LED_SEQ1 + active_scene), 1u);
+            led_setBlinkLed(led, 0u);
+            led_setValue(base, led);
         }
     }
-    {
-        /*
-         * Viewed Scene rapid indication (S077 P2 §5.2).
-         *
-         * What: when PAR_FOLLOW is off and the viewed Scene differs from the
-         * active Scene, the viewed Scene's SEQ LED blinks. Why: shows which
-         * Scene the user is viewing/editing while playback follows a different
-         * active Scene. A viewed Scene equal to the active Scene keeps the
-         * tempo pulse. Note: this uses the LED engine's single persistent blink
-         * cadence (LED_BLINK_TIME_MS, ledHandler.c); the engine has no separate
-         * rapid rate, so the indication is the blink-versus-pulse difference
-         * rather than a distinct fast cadence.
-         */
-        uint8_t viewed = menu_getViewedPattern();
-
-        if (!parameter_values[PAR_FOLLOW] && viewed < 16u &&
-            viewed != active_scene &&
-            (present_mask & (uint16_t)(1u << viewed)))
-            led_setBlinkLed((uint8_t)(LED_SEQ1 + viewed), 1u);
-    }
+    if (seq_isRunning() && active_scene < 16u &&
+        (present_mask & (uint16_t)(1u << active_scene)) != 0u &&
+        (blink_mask & (uint16_t)(1u << active_scene)) == 0u)
+        led_setValue(seq_ledState.beatPulse,
+                     (uint8_t)(LED_SEQ1 + active_scene));
 }
 
 void menu_perfModeSceneButtonPressed(uint8_t scene_index)
@@ -8249,10 +8404,15 @@ void menu_perfModeSceneButtonPressed(uint8_t scene_index)
         seq_requestSceneChange(scene_index, div);
         return;
     }
-    menu_perfSceneChangeExecute(scene_index);
+    /*
+     * S080 P2 Defect 5/15: a direct change resets only when pcr
+     * (PAR_BAR_RESET_MODE) is on.
+     */
+    menu_perfSceneChangeExecute(scene_index,
+                                (uint8_t)(parameter_values[PAR_BAR_RESET_MODE] != 0u));
 }
 
-static void menu_perfSceneChangeExecute(uint8_t scene_index)
+static void menu_perfSceneChangeExecute(uint8_t scene_index, uint8_t restart)
 {
     if (scene_index >= SCENE_COUNT || scene_index >= 16u ||
         !bank_scenePresent(scene_index)) {
@@ -8270,10 +8430,25 @@ static void menu_perfSceneChangeExecute(uint8_t scene_index)
      */
     menu_setShownPattern(scene_index);
     seq_selectActivePattern(scene_index);
-    /* S080 F9/G12: a manual/executed switch cancels pending chain changes. */
-    seq_clearPendingSceneChange();
-    /* S080 F9: PCR restarts all tracks from the beginning of the new Scene. */
-    if (parameter_values[PAR_SCENE_PC_RESET])
+    /*
+     * S080 F9/G12, P2: an executed switch cancels any pending direct change
+     * and any chain fire, but never a user-queued change - only a transport
+     * stop cancels a queued change (plan §5.3).
+     */
+    seq_cancelPendingDirectChange();
+    /*
+     * S080 P2 Defects 5/12/15: PC reset.
+     *
+     * What: when `restart` is set, every track and the master clock restart
+     * from the beginning of the new Scene, and an engaged looper moves every
+     * loop start to that beginning (Defect 14). Why: pcr governs direct and
+     * chain changes; queued changes pass the qac reset bit instead. With
+     * `restart` clear, seq_selectActivePattern() has already realigned every
+     * track to the running master clock. Inputs: restart. Outputs:
+     * seq_resetToPatternStart(). Affiliates: menu_perfModeSceneButtonPressed(),
+     * menu_serviceDeferredSceneChange(), seq_loopRebaseToStart().
+     */
+    if (restart)
         seq_resetToPatternStart();
     preset_startDrumsetApply();
     menu_refreshPerfSceneLeds();
@@ -8281,52 +8456,134 @@ static void menu_perfSceneChangeExecute(uint8_t scene_index)
 }
 
 /*
- * Apply the queued scene-change action (S080 F9, PAR_SCENE_QUEUE_ACTION).
+ * Queue action flags (S080 P2 Defect 15).
  *
- * What: qac selects nrm (nothing), mut (reset all mutes off), mor (reset all
- * morphs to 0), m+m (both), or rld (reload from source, plus mutes/morphs).
- * Why: a queued scene change may optionally normalise the console state.
- * Inputs: parameter_values[PAR_SCENE_QUEUE_ACTION]. Outputs: mute/morph reset
- * side effects applied before the change executes. Affiliates: seq_setMute(),
- * the change executor.
- *
- * Note: morph reset and source reload degradation are the two pieces of this
- * option that need extra plumbing (a Preset morph-reset entry point and an
- * async source read); mut/m+m/rld currently reset mutes, and rld/nrm execute a
- * normal change. Flagged in the S080 implementation notes.
+ * What: decodes PAR_SCENE_QUEUE_ACTION (0..8: nrm, mut, mrp, res, u+r, o+r,
+ * mmr, rld, r+r) into independent mute / morph / reset / reload bits. Why:
+ * the executor applies each part in a fixed order, and a table keeps the
+ * option list and its meaning in one place. Inputs: qac value. Output: flag
+ * byte (0 for out-of-range values = normal change). Accessors:
+ * menu_applyQueuedSceneAction(), menu_serviceDeferredSceneChange().
+ * Affiliates: sceneQueueActionNames (MenuText.h).
  */
-static void menu_applyQueuedSceneAction(void)
-{
-    uint8_t qac = parameter_values[PAR_SCENE_QUEUE_ACTION];
+#define MENU_QAC_MUTE    0x01u
+#define MENU_QAC_MORPH   0x02u
+#define MENU_QAC_RESET   0x04u
+#define MENU_QAC_RELOAD  0x08u
 
-    if (qac == 1u || qac == 3u || qac == 4u)     /* mut / m+m / rld */
-        seq_setMute(7u, 0u);
+static uint8_t menu_queueActionFlags(uint8_t qac)
+{
+    static const uint8_t flags[9] = {
+        0u,                                              /* nrm */
+        MENU_QAC_MUTE,                                   /* mut */
+        MENU_QAC_MORPH,                                  /* mrp */
+        MENU_QAC_RESET,                                  /* res */
+        MENU_QAC_MUTE | MENU_QAC_RESET,                  /* u+r */
+        MENU_QAC_MORPH | MENU_QAC_RESET,                 /* o+r */
+        MENU_QAC_MUTE | MENU_QAC_MORPH | MENU_QAC_RESET, /* mmr */
+        MENU_QAC_RELOAD | MENU_QAC_MUTE | MENU_QAC_MORPH, /* rld */
+        MENU_QAC_RELOAD | MENU_QAC_MUTE | MENU_QAC_MORPH |
+            MENU_QAC_RESET                               /* r+r */
+    };
+
+    return (qac < 9u) ? flags[qac] : 0u;
 }
 
 /*
- * Execute a deferred/queued scene change (S080 F8/F9 foreground half).
+ * Apply the pre-change part of a queued scene action (S080 F9, P2 Defects
+ * 11 and 15).
  *
- * What: called from the main-loop service cadence. If the TIM3 ISR raised the
- * scene-change fire flag, read the target and queue flag, clear the pending
- * state, apply the queue action when queued, then run the change executor. Why:
- * the ISR detects the boundary but cannot do DSP/LED/filesystem work. Inputs:
- * seq_sceneChangeFirePending(). Outputs: the scene change is performed.
- * Affiliates: seq_requestSceneChange()/seq_queueSceneChange() (F7),
- * seq_handleMasterBoundary() (F8).
+ * What: for the incoming Scene `target`, applies the mute reset (Sequencer
+ * mutes and the VOICE LED mirror) and the morph reset (overall, all six voice
+ * and the Effect Morph of the target set to 0 through preset_morphScene(),
+ * no edit-mask fan-out), then returns the decoded flags so the caller can
+ * pass the reset bit to the executor. Why: the morph reset runs before the
+ * change so the incoming Scene starts at Morph 0; the mute mirror must follow
+ * the Sequencer (Defect 11). Reload (rld/r+r) is deferred: it needs a
+ * performance-safe Scene Load path from this executor, so those options
+ * currently degrade to their mute + morph (+ reset) parts (plan §9.1-8).
+ * Inputs: target Scene, PAR_SCENE_QUEUE_ACTION. Outputs: mute/morph side
+ * effects; flag byte. Accessors: menu_serviceDeferredSceneChange().
+ * Affiliates: seq_setMute(), buttonHandler_clearAllMutes(),
+ * preset_morphScene(), menu_queueActionFlags().
+ */
+static uint8_t menu_applyQueuedSceneAction(uint8_t target)
+{
+    uint8_t flags =
+        menu_queueActionFlags(parameter_values[PAR_SCENE_QUEUE_ACTION]);
+
+    if ((flags & MENU_QAC_MUTE) != 0u) {
+        seq_setMute(7u, 0u);
+        buttonHandler_clearAllMutes();
+    }
+    if ((flags & MENU_QAC_MORPH) != 0u)
+        preset_morphScene(target, 0u);
+    return flags;
+}
+
+/*
+ * Run a fired deferred / queued / chain scene change (S080 F8/F9, P2).
+ *
+ * What: called on every buttonHandler_tick(). When the TIM3 ISR (or an
+ * instant request) has raised the fire flag it reads the target and the
+ * change kind, clears the pending state, then:
+ *   - queued (SHIFT+SEQ): applies the qac mute/morph parts and executes the
+ *     change with the qac reset bit (pcr is ignored, Defect 15);
+ *   - chain-fired to the playing Scene: a repeat (seq_chainRepeatSelf(),
+ *     no DSP re-apply), restarting when pcr is on;
+ *   - direct or chain-fired to another Scene: executes with pcr.
+ * Finally it re-derives the queued-scene fast blink (Defect 10). Why: the
+ * ISR detects boundaries; DSP apply, LEDs and Menu state are foreground work.
+ * A queued change fires regardless of the current menu (plan §5.3). Inputs:
+ * seq_sceneChangeFirePending(), seq_pendingSceneTarget/IsQueue/IsChain(),
+ * PAR_BAR_RESET_MODE. Outputs: the scene change. Accessors:
+ * buttonHandler_tick(). Affiliates: menu_perfSceneChangeExecute(),
+ * menu_applyQueuedSceneAction(), seq_chainRepeatSelf() (Step 11),
+ * menu_syncQueuedSceneLed() (Step 8).
  */
 void menu_serviceDeferredSceneChange(void)
 {
-    uint8_t scene;
-    uint8_t isQueue;
+    if (seq_sceneChangeFirePending()) {
+        uint8_t scene = seq_pendingSceneTarget();
+        uint8_t isQueue = seq_pendingSceneIsQueue();
+        uint8_t isChain = seq_pendingSceneIsChain();
+        uint8_t pcr = (uint8_t)(parameter_values[PAR_BAR_RESET_MODE] != 0u);
 
-    if (!seq_sceneChangeFirePending())
-        return;
-    scene = seq_pendingSceneTarget();
-    isQueue = seq_pendingSceneIsQueue();
-    seq_clearPendingSceneChange();
-    if (isQueue)
-        menu_applyQueuedSceneAction();
-    menu_perfSceneChangeExecute(scene);
+        seq_clearPendingSceneChange();
+        if (isQueue) {
+            uint8_t flags = menu_applyQueuedSceneAction(scene);
+
+            menu_perfSceneChangeExecute(
+                scene, (uint8_t)((flags & MENU_QAC_RESET) != 0u));
+        } else if (isChain && scene == scene_getActiveIndex()) {
+            seq_chainRepeatSelf(pcr);
+        } else {
+            menu_perfSceneChangeExecute(scene, pcr);
+        }
+    }
+    menu_syncQueuedSceneLed();
+}
+
+/*
+ * Owner of the queued-scene fast blink (S080 P2 Defect 10).
+ *
+ * What: in PERF mode, fast-blinks the SEQ LED of the queued Scene; otherwise
+ * (no queue, queue fired, transport stopped, or another mode owns the SEQ
+ * row) clears it. Why: re-deriving from sequencer state on every tick covers
+ * every way a queue can start, change or end without call sites in each path.
+ * Inputs: seq_queuedSceneTarget(), buttonHandler_getMode(). Outputs:
+ * led_setFastBlinkLed() on change only. Accessors:
+ * menu_serviceDeferredSceneChange(). Affiliates: LED_LAYER_FAST.
+ */
+static void menu_syncQueuedSceneLed(void)
+{
+    uint8_t target = seq_queuedSceneTarget();
+    uint8_t want = 0xFFu;
+
+    if (buttonHandler_getMode() == SELECT_MODE_PERF && target < 16u)
+        want = (uint8_t)(LED_SEQ1 + target);
+    if (led_getFastBlinkLed() != want)
+        led_setFastBlinkLed(want);
 }
 
 void menu_refreshVoiceHeldSceneLeds(void)
@@ -9644,7 +9901,7 @@ static void menu_getConditionName(uint16_t value, char *buf)
  * Inputs: cell and its value. Outputs: 3 characters in buf. Accessors:
  * menu_formatCellValue3(), va_formatValue3(), the menu_repaintGeneric() edit
  * painter. Affiliates: perfBtnTypeNames/sceneChangeDivNames/
- * sceneQueueActionNames (MenuText.h), setNoteName().
+ * sceneQueueDivNames/sceneQueueActionNames (MenuText.h), setNoteName().
  */
 static void menu_nameTable3(const char table[][4], uint8_t count,
                             uint16_t value, char *buf)
@@ -9679,11 +9936,26 @@ static uint8_t menu_getS080StaticName(const menu_cell_t *cell,
         }
         return 1u;
     case PAR_SCENE_CHANGE_DIV:
-    case PAR_SCENE_QUEUE_DIV:
         menu_nameTable3(sceneChangeDivNames, 10u, value, buf);
         return 1u;
+    case PAR_SCENE_QUEUE_DIV:
+        /*
+         * S080 P2: qcd uses its own list with the long bar counts (ins, 1/8,
+         * 1/4, 1/2, 1b..9b, 12b, 15b, 16b, ens, enl).
+         */
+        menu_nameTable3(sceneQueueDivNames, 18u, value, buf);
+        return 1u;
     case PAR_SCENE_QUEUE_ACTION:
-        menu_nameTable3(sceneQueueActionNames, 5u, value, buf);
+        /* S080 P2 Defect 15: nrm mut mrp res u+r o+r mmr rld r+r. */
+        menu_nameTable3(sceneQueueActionNames, 9u, value, buf);
+        return 1u;
+    case PAR_CHAIN_COND1:
+    case PAR_CHAIN_COND2:
+        menu_nameTable3(chainConditionNames, 79u, value, buf);
+        return 1u;
+    case PAR_CHAIN_NEXT1:
+    case PAR_CHAIN_NEXT2:
+        menu_nameTable3(chainNextNames, 44u, value, buf);
         return 1u;
     default:
         return 0u;
@@ -9921,28 +10193,27 @@ static int8_t menu_staticLastPopulatedColumn(uint8_t subPage)
 }
 
 /*
- * S080 A5: reflect the active PERF sub-page onto the SELECT row.
+ * Repaint the PERF SELECT row from looper state (S080 A5, P2 Defect 4).
  *
- * What:  lights SELECT1 for PERFORMANCE_PAGE sub-page 0 or SELECT2 for
- *        sub-page 1 and clears the other SELECT LEDs.
- * Why:   with the S080 A1 split the user needs a visual cue for which PERF
- *        sub-page is shown, mirroring the single active SELECT LED used on the
- *        multi-screen voice pages. The Phase C looper temporarily takes the
- *        SELECT row while engaged and restores this mapping on release.
- * Inputs: menu_getSubPage().
- * Outputs: one SELECT LED lit through led_setActiveSelectButton().
- * Accessors: menu_switchPage() PERF LED block, the S080 cross-subpage step in
- *        menu_moveToMenuItem(), and buttonHandler's looper disengage (it
- *        restores the sub-page indication after the loop releases the row).
- * Affiliates: led_setActiveSelectButton() (ledHandler.c).
+ * What:  lights the SELECT LED of the looper division while the looper is
+ *        held or engaged, otherwise clears the SELECT row.
+ * Why:   in PERF the SELECT row belongs to the performance looper; no SELECT
+ *        LED is lit unless the looper is active (Defect 4). The S080 A5
+ *        sub-page indication on SELECT1/SELECT2 is removed with it.
+ * Inputs: buttonHandler_loopSelectLed().
+ * Outputs: one SELECT LED lit, or the SELECT row dark.
+ * Accessors: menu_switchPage() PERF LED block, the PERF cross-sub-page step in
+ *        the encoder traversal, buttonHandler's looper release.
+ * Affiliates: led_setActiveSelectButton(), led_clearSelectLeds().
  */
 void menu_syncPerfSelectLed(void)
 {
-    uint8_t sub = menu_getSubPage();
+    uint8_t sel = buttonHandler_loopSelectLed();
 
-    if (sub > 1u)
-        sub = 0u;
-    led_setActiveSelectButton(sub);
+    if (sel < 8u)
+        led_setActiveSelectButton(sel);
+    else
+        led_clearSelectLeds();
 }
 
 static uint8_t menu_voiceAbsolutePositionSelectable(uint8_t subPage,
@@ -10086,13 +10357,22 @@ static uint8_t checkScrollSign(uint8_t activePage, uint8_t activeParameter)
 
     if (menu_activePage == MENU_MIDI_PAGE) {
         /*
-         * S074 settings cues: the Scene-owned compressor page is the last
-         * populated sub-page. The first settings screen points to it with
-         * '^', the compressor page identifies Scene ownership with '+', and
-         * the page before it becomes '*' through the existing next-page test.
+         * S074 / S080 P2 settings cues.
+         *
+         * What: the Scene-owned compressor page (MENU_GLOBAL_SCENE_SUBPAGE,
+         * the last populated sub-page) shows '+' for Scene ownership. The
+         * last Global screen directly before it - the scd/qcd/qac sub-page,
+         * which has no second half - shows '^' to say a Scene-settings page
+         * follows (user, S080 P2). Other screens keep the existing first-
+         * screen '^', next-page '*' and last-screen '<' rules. Inputs:
+         * activePage, is2ndPage, has2ndPage(). Output: cue character.
+         * Affiliates: menuPages.h MENU_MIDI_PAGE layout, menu_moveToMenuItem().
          */
         if (activePage == MENU_GLOBAL_SCENE_SUBPAGE && !is2ndPage)
             return '+';
+        if (activePage + 1 == MENU_GLOBAL_SCENE_SUBPAGE && !is2ndPage &&
+            !has2ndPage(activePage))
+            return '^';
         if (is2ndPage) {
             if ((activePage < NUM_SUB_PAGES-1) &&
                 (menuPages[MENU_MIDI_PAGE][activePage+1].top1 != TEXT_EMPTY))
@@ -12311,8 +12591,22 @@ static void menu_moveToMenuItem(int8_t inc)
      * Affiliates: menu_staticFirstPopulatedColumn()/menu_staticLastPopulated-
      *        Column(), menu_setPerfSelectLed().
      */
+    /*
+     * S080 P2: MENU_MIDI_PAGE joins the cross-sub-page step.
+     *
+     * What: the scd/qcd/qac sub-page ends after column 2, so the generic path
+     * would stop on its empty column 3 and never reach the compressor page
+     * that follows. With the step, scrolling past qac lands on cmp and
+     * scrolling back from cmp lands on qac. Full 8-column global sub-pages
+     * behave as before (the step fires at column 7 / column 0, where the
+     * generic path also crossed); the only change is that scrolling no longer
+     * wraps from the first to the last global sub-page, where it already
+     * stopped on an empty cell. Affiliates: menuPages.h MENU_MIDI_PAGE,
+     * MENU_GLOBAL_SCENE_SUBPAGE.
+     */
     if (menu_activePage == PERFORMANCE_PAGE ||
-        menu_activePage == RECORDING_PAGE) {
+        menu_activePage == RECORDING_PAGE ||
+        menu_activePage == MENU_MIDI_PAGE) {
         int8_t firstCol = menu_staticFirstPopulatedColumn((uint8_t)activePage);
         int8_t lastCol  = menu_staticLastPopulatedColumn((uint8_t)activePage);
 
@@ -14972,7 +15266,20 @@ void menu_switchSubPage(uint8_t subPageNr)
             if (has2ndPage(activePage))
                 activeParameter = 4;
             else if (menu_activePage == MENU_MIDI_PAGE) {
-                activePage = 0;
+                /*
+                 * S080 P2: a global sub-page with no second half (scd/qcd/qac)
+                 * advances to the next populated sub-page (the compressor
+                 * page) instead of jumping back to sub-page 0, so the MODE
+                 * MENU re-press cycle still reaches every settings screen.
+                 * After the last populated sub-page it wraps to 0 as before.
+                 */
+                menu_cell_t nextCell =
+                    menu_resolveCell((uint8_t)(activePage + 1u), 0u);
+                if (activePage < NUM_SUB_PAGES-1 &&
+                    !menu_cellIsEmpty(&nextCell))
+                    activePage++;
+                else
+                    activePage = 0;
                 activeParameter = 0;
             }
         } else {
@@ -15346,7 +15653,12 @@ void menu_switchPage(uint8_t pageNr)
     }
 
     /* LED updates */
-    if (pageNr == PERFORMANCE_PAGE) {
+    /*
+     * S080 G8: the chain editor page keeps the PERF LED rows (mutes on VOICE,
+     * Scene row on SEQ, looper on SELECT).
+     */
+    if (pageNr == PERFORMANCE_PAGE ||
+        (pageNr == PATTERN_SETTINGS_PAGE && menu_chainMenuScene < 16u)) {
         /*
          * PERF owns the SEQ row as the 16-Scene selector/status display.
          *
@@ -15359,8 +15671,7 @@ void menu_switchPage(uint8_t pageNr)
          */
         buttonHandler_showMuteLEDs();
         menu_refreshPerfSceneLeds();
-        /* S080 A5: show the active PERFORMANCE_PAGE sub-page on the SELECT
-         * row (sub-page 0 -> SELECT1, sub-page 1 -> SELECT2). */
+        /* S080 P2 Defect 4: the SELECT row shows only the looper division. */
         menu_syncPerfSelectLed();
     } else if (pageNr == EFFECT_PAGE) {
         /* Effect page owns mute/SELECT LEDs and the FX-sequencer row. */
@@ -15644,6 +15955,19 @@ void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
          */
         pat_setTrackPlayMode(menu_getViewedPattern(), menu_getActiveVoice(),
                              value);
+        break;
+
+    case PAR_TRACK_LOOPABLE:
+    case PAR_CHAIN_COND1:
+    case PAR_CHAIN_NEXT1:
+    case PAR_CHAIN_COND2:
+    case PAR_CHAIN_NEXT2:
+        /*
+         * S080 P2: display mirrors only. menu_sendAllGlobals() replays every
+         * id from PAR_BEGINNING_OF_GLOBALS on settings load; these mirrors
+         * must never write PatternData or SceneData from that bulk path.
+         * Page edits commit in menu_cellCommitValue().
+         */
         break;
 
     case PAR_QUANTISATION:
@@ -15971,9 +16295,16 @@ void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
 
     case PAR_BAR_RESET_MODE:
         /*
-         * Bar-reset mode is still Sequencer-owned global state and was only
-         * ever proxied by parser opcodes. Direct assignment preserves existing
-         * storage while making the ownership explicit.
+         * pcr - the one PC reset (S080 P2 Defect 5).
+         *
+         * What: sets the Sequencer's legacy boundary-commit bar reset and is
+         * read directly by the PERF scene-change executor: with pcr on, a
+         * direct (SEQ) or chain-fired scene change restarts every track and
+         * the master clock (seq_resetToPatternStart()). Queued (SHIFT+SEQ)
+         * changes ignore pcr and use the reset bit of qac (Defect 15). Why:
+         * one parameter, as before S080. Inputs: settings load / Global edit.
+         * Outputs: seq_resetBarOnPatternChange. Affiliates:
+         * menu_perfModeSceneButtonPressed(), menu_serviceDeferredSceneChange().
          */
         seq_resetBarOnPatternChange = value;
         break;
@@ -16385,17 +16716,20 @@ uint8_t menu_getViewedPattern(void) { return menu_shownPattern; }
 /*
  * BC18 diagnostic check: the Scene-owned compressor page stays last.
  *
- * What: verifies the named page contains cmp first, has an empty second half,
- * and has no populated settings page after it. Why: menu cues and SELECT
- * traversal rely on the append-only placement rule. Output: silent success;
- * on failure, a 1.5 s LCD notice before boot continues. Production compiles
- * the check out. Affiliate: menuPages.h and MENU_GLOBAL_SCENE_SUBPAGE.
+ * What: verifies the named page holds cmp first (top1), cam/ctm/csc after it,
+ * an empty second half (top5), and that no populated settings page follows
+ * it (S074 rule; S080 P2 moves the page to sub-page 3 with the four Scene
+ * cells together). Why: menu cues and SELECT traversal rely on the
+ * append-only placement rule. Output: silent success; on failure, a 1.5 s
+ * LCD notice before boot continues. Production compiles the check out.
+ * Affiliate: menuPages.h and MENU_GLOBAL_SCENE_SUBPAGE.
  */
 static void menu_devCheckGlobalSceneSubPage(void)
 {
     const Page *scene_page =
         &menuPages[MENU_MIDI_PAGE][MENU_GLOBAL_SCENE_SUBPAGE];
     uint8_t bad = (uint8_t)(scene_page->top1 != TEXT_BUS_COMP_MODE ||
+                            scene_page->top4 != TEXT_BUS_COMP_SIDECHAIN ||
                             scene_page->top5 != TEXT_EMPTY);
     uint8_t sub_page;
     uint16_t t0;

@@ -29,13 +29,16 @@
 #define PAGE_SHIFT      3
 
 /*
- * S074 Scene-owned bus compressor page.
+ * S074 Scene-owned bus compressor page (sub-page 3 since S080 P2).
  *
- * It is deliberately the last populated settings sub-page. New global pages
- * go before it and move this constant; menu cues and the diagnostic check use
- * the named boundary rather than a duplicated literal.
+ * It is deliberately the last populated settings sub-page and holds only the
+ * four Scene-owned compressor cells (cmp, cam, ctm, csc). The Global screen
+ * before it (scd, qcd, qac) shows the '^' cue and this page shows '+'. New
+ * global pages go before it and move this constant; menu cues, the
+ * cross-sub-page encoder step and the diagnostic check use the named boundary
+ * rather than a duplicated literal.
  */
-#define MENU_GLOBAL_SCENE_SUBPAGE 2u
+#define MENU_GLOBAL_SCENE_SUBPAGE 3u
 _Static_assert(MENU_GLOBAL_SCENE_SUBPAGE < NUM_SUB_PAGES,
                "Scene-owned settings page must be a real sub-page");
 
@@ -157,11 +160,14 @@ enum NamesEnum {
      * BtnNote</BtnStat>/BtnNote>).
      */
     TEXT_PERF_BTN_LT, TEXT_PERF_NOTE_LT, TEXT_PERF_BTN_RT, TEXT_PERF_NOTE_RT,
-    /* S080 F2: scene change/queue division, queue action, PCR globals. */
+    /* S080 F2: scene change/queue division and queue action globals. The
+     * S080 F2 duplicate pcr label was removed in S080 P2 (Defect 5); the one
+     * PC reset is TEXT_BAR_RESET_MODE. */
     TEXT_SCENE_CHANGE_DIV, TEXT_SCENE_QUEUE_DIV, TEXT_SCENE_QUEUE_ACTION,
-    TEXT_SCENE_PC_RESET,
     /* S080 G10: per-Scene chain parameter labels (cn1/nx1/cn2/nx2). */
     TEXT_CHAIN_COND1, TEXT_CHAIN_NEXT1, TEXT_CHAIN_COND2, TEXT_CHAIN_NEXT2,
+    /* S080 P2 Defect 8a: per-track loopable label (lop) on the STEP page. */
+    TEXT_TRACK_LOOPABLE,
     NUM_NAMES
 };
 
@@ -222,8 +228,9 @@ enum longNamesEnum {
     /* S080 overlay/scene/chain long names (parallel to TEXT_ additions). */
     LONG_PERF_BTN_LT, LONG_PERF_NOTE_LT, LONG_PERF_BTN_RT, LONG_PERF_NOTE_RT,
     LONG_SCENE_CHANGE_DIV, LONG_SCENE_QUEUE_DIV, LONG_SCENE_QUEUE_ACTION,
-    LONG_SCENE_PC_RESET,
     LONG_CHAIN_COND1, LONG_CHAIN_NEXT1, LONG_CHAIN_COND2, LONG_CHAIN_NEXT2,
+    /* S080 P2 Defect 8a: "Loopable". */
+    LONG_TRACK_LOOPABLE,
 };
 
 enum shortNamesEnum {
@@ -263,8 +270,9 @@ enum shortNamesEnum {
     /* S080 overlay/scene/chain compact labels (parallel to TEXT_ additions). */
     SHORT_PERF_BTN_LT, SHORT_PERF_NOTE_LT, SHORT_PERF_BTN_RT, SHORT_PERF_NOTE_RT,
     SHORT_SCENE_CHANGE_DIV, SHORT_SCENE_QUEUE_DIV, SHORT_SCENE_QUEUE_ACTION,
-    SHORT_SCENE_PC_RESET,
-    SHORT_CHAIN_COND1, SHORT_CHAIN_NEXT1, SHORT_CHAIN_COND2, SHORT_CHAIN_NEXT2
+    SHORT_CHAIN_COND1, SHORT_CHAIN_NEXT1, SHORT_CHAIN_COND2, SHORT_CHAIN_NEXT2,
+    /* S080 P2 Defect 8a: "lop". */
+    SHORT_TRACK_LOOPABLE
 };
 
 #define PAR_RUNTIME_CPU_USE 0xFFFEu
@@ -459,6 +467,19 @@ void    menu_perfModeSceneButtonPressed(uint8_t scene_index);
 void    menu_serviceDeferredSceneChange(void);
 void    menu_refreshPerfSceneLeds(void);
 /*
+ * S080 G8 scene chain editor (SHIFT+PLAY+SEQ in PERF).
+ *
+ * menu_chainMenuOpen() shows a present Scene's chain (returns 1 when opened),
+ * menu_chainMenuView() switches the viewed Scene while open,
+ * menu_chainMenuClose() returns to PERF, menu_chainMenuIsOpen() reports the
+ * latch. Clients: buttonHandler.c. Affiliates: PATTERN_SETTINGS_PAGE,
+ * scene_getChain*()/scene_setChain*().
+ */
+uint8_t menu_chainMenuOpen(uint8_t scene_index);
+void    menu_chainMenuView(uint8_t scene_index);
+void    menu_chainMenuClose(void);
+uint8_t menu_chainMenuIsOpen(void);
+/*
  * Repaint the temporary MODE VOICE held Scene edit-mask view.
  *
  * Inputs are BankData's scene_mask_voice_edit and present-Scene mask. Output:
@@ -652,12 +673,12 @@ void menu_enterStepTrackAutomationOverlay(uint8_t voiceNr);
 void menu_resetActiveParameter(void);
 uint8_t menu_getSubPage(void);
 /*
- * Re-assert the PERFORMANCE_PAGE SELECT-LED sub-page indication (S080 A5).
+ * Repaint the PERF SELECT row from looper state (S080 A5, P2 Defect 4).
  *
- * Input: none. Output: SELECT1/SELECT2 lit for PERF sub-page 0/1 (clears the
- * other SELECT LEDs). Client: buttonHandler when the PERF looper disengages and
- * returns the SELECT row to sub-page display. Affiliates: menu_switchPage()
- * PERF LED block, the PERF cross-sub-page step.
+ * Input: none. Output: the looper division's SELECT LED while the looper is
+ * held or engaged, otherwise a dark SELECT row. Clients: menu_switchPage()
+ * PERF block, the PERF sub-page step, buttonHandler looper release.
+ * Affiliates: buttonHandler_loopSelectLed().
  */
 void menu_syncPerfSelectLed(void);
 /*

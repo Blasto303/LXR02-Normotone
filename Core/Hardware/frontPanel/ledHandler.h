@@ -138,6 +138,14 @@ void led_flashGroup(LedFlashGroup group, uint16_t mask);
 void led_flashLed(uint8_t ledNr);
 void led_setBlinkLed(uint8_t ledNr, uint8_t onOff);
 void led_clearAllBlinkLeds(void);
+/*
+ * S080 P2 Defect 10: one double-rate blinking LED on its own layer (queued
+ * Scene). ledNr 0xFF clears it. Blink and base writes never disturb it.
+ */
+void    led_setFastBlinkLed(uint8_t ledNr);
+uint8_t led_getFastBlinkLed(void);
+/* S080 P2: 1 when ledNr holds a persistent blink slot. */
+uint8_t led_isBlinkLed(uint8_t ledNr);
 
 /* High-level voice/mode LED control — matches original API */
 /*
@@ -161,7 +169,6 @@ void led_clearSelectLeds(void);
 void led_clearVoiceLeds(void);
 void led_setActive_step(uint8_t stepNr);
 void led_clearActive_step(void);
-void led_initPerformanceLeds(void);
 
 /*
  * Paint the visible SEQ row from one parameter's automation presence.

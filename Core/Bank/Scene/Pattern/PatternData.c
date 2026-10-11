@@ -43,8 +43,8 @@ _Static_assert(PAT_STACK_SIZE > 0u && PAT_STACK_SIZE <= 512u,
                "PAT_STACK_SIZE must fit the 14-bit pool bitmap");
 _Static_assert(sizeof(pat_scene_region_t) ==
                (PAT_STEPS_PER_SCENE * 2u) + (PAT_STACK_SIZE * 32u) +
-               512u + 30u,
-               "pat_scene_region_t size must match the Pattern budget");
+               512u + 31u,
+               "pat_scene_region_t size must match the Pattern budget (S080 P2: +1 B loop exclude)");
 
 /*
  * Static lifetime owner for all resident Scene Pattern storage.
@@ -871,6 +871,8 @@ void pat_initScene(uint8_t scene_index)
     }
     region->pattern_change_bar = 0u;
     region->pattern_next = 0u;
+    /* S080 P2 Defect 8a: every track starts loopable. */
+    region->track_loop_exclude = 0u;
 }
 
 /*
@@ -1172,6 +1174,9 @@ void pat_applyTrackSettingsToMenu(uint8_t scene_index, uint8_t track)
     parameter_values[PAR_TRACK_SCALE] = region->track_scale[track];
     parameter_values[PAR_SHUFFLE] = region->track_shuffle[track];
     parameter_values[PAR_TRACK_PLAY_MODE] = region->track_play_mode[track];
+    /* S080 P2 Defect 8a: lop mirror (1 = loopable). */
+    parameter_values[PAR_TRACK_LOOPABLE] =
+        (uint8_t)((region->track_loop_exclude & (uint8_t)(1u << track)) == 0u);
 }
 
 /* Persist one track-length menu edit in the resident Scene region. */
@@ -1223,6 +1228,44 @@ void pat_setTrackPlayMode(uint8_t scene_index, uint8_t track, uint8_t value)
         return;
     region->track_play_mode[track] = value;
     pat_markSceneDirty(scene_index);
+}
+
+/*
+ * Per-track loopable setter/getter (S080 P2 Defect 8a).
+ *
+ * What: pat_setTrackLoopable() sets or clears the track's exclude bit in the
+ * resident region (loopable = 0 sets it) and marks the Scene's Pattern dirty
+ * only on change; pat_trackLoopable() reports 1 when the bit is clear. Why:
+ * the flag is Pattern data persisted in the PAT4 track header and travels
+ * with Pattern copy/clear. Inputs: Scene, track, flag. Outputs: region byte,
+ * Pattern AutoSave dirty. Accessors: menu_cellCommitValue() (lop cell),
+ * copyClearService.c, seq_loopableTrackMask() reads the region directly.
+ * Affiliates: pat_scene_region_t.track_loop_exclude.
+ */
+void pat_setTrackLoopable(uint8_t scene_index, uint8_t track, uint8_t loopable)
+{
+    pat_scene_region_t *region = pat_sceneRegionMut(scene_index);
+    uint8_t bit;
+    uint8_t next;
+
+    if (!region || !pat_trackValid(track))
+        return;
+    bit = (uint8_t)(1u << track);
+    next = loopable ? (uint8_t)(region->track_loop_exclude & (uint8_t)~bit)
+                    : (uint8_t)(region->track_loop_exclude | bit);
+    if (next == region->track_loop_exclude)
+        return;
+    region->track_loop_exclude = next;
+    pat_markSceneDirty(scene_index);
+}
+
+uint8_t pat_trackLoopable(uint8_t scene_index, uint8_t track)
+{
+    const pat_scene_region_t *region = pat_sceneRegion(scene_index);
+
+    if (!region || !pat_trackValid(track))
+        return 1u;
+    return (uint8_t)((region->track_loop_exclude & (uint8_t)(1u << track)) == 0u);
 }
 
 /*
@@ -2011,6 +2054,8 @@ void pat_rawRegionCopyBody(uint8_t src_scene, uint8_t dst_scene)
     memcpy(dst->track_shuffle, src->track_shuffle, sizeof(dst->track_shuffle));
     memcpy(dst->track_play_mode, src->track_play_mode,
            sizeof(dst->track_play_mode));
+    /* S080 P2 Defect 8a: the loop exclusion travels with a Scene copy. */
+    dst->track_loop_exclude = src->track_loop_exclude;
     dst->pattern_change_bar = src->pattern_change_bar;
     dst->pattern_next = src->pattern_next;
 }

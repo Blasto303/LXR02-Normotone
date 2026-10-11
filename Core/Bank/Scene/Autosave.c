@@ -110,9 +110,21 @@ _Static_assert(AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SCALE_BASE -
 _Static_assert(AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SHUFFLE_BASE -
                    AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SCALE_BASE == NUM_TRACKS,
                "Scene track Morph scale group must cover every track");
-_Static_assert(AUTOSAVE_SCENE_PARAM_COUNT -
+_Static_assert(AUTOSAVE_SCENE_PARAM_CHAIN_CONDITION_BASE -
                    AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SHUFFLE_BASE == NUM_TRACKS,
                "Scene track Morph shuffle group must cover every track");
+/* S080 G: the two chain groups close the live cells. */
+_Static_assert(AUTOSAVE_SCENE_PARAM_CHAIN_NEXT_BASE -
+                   AUTOSAVE_SCENE_PARAM_CHAIN_CONDITION_BASE ==
+                   SCENE_CHAIN_SLOT_COUNT,
+               "Scene chain condition group must cover both slots");
+_Static_assert(AUTOSAVE_SCENE_PARAM_COUNT -
+                   AUTOSAVE_SCENE_PARAM_CHAIN_NEXT_BASE ==
+                   SCENE_CHAIN_SLOT_COUNT,
+               "Scene chain next group must cover both slots");
+_Static_assert(AUTOSAVE_SCENE_PARAM_COUNT <=
+                   AUTOSAVE_SCENE_PARAMETER_ALLOC_BYTES,
+               "Scene live cells must fit the reserved Scene allocation");
 
 /*
  * Eight-bit Hamming-weight table for atomic dirty-mask accounting.
@@ -962,10 +974,19 @@ static uint8_t autosave_getSceneParameter(const scene_t *scene,
         /* Indices 58..64 are the S078 track Morph scale endpoints. */
         *value = scene->settings.track_morph_scale[
             parameter_index - AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SCALE_BASE];
-    } else {
+    } else if (parameter_index <
+               AUTOSAVE_SCENE_PARAM_CHAIN_CONDITION_BASE) {
         /* Indices 65..71 are the S078 track Morph shuffle endpoints. */
         *value = scene->settings.track_morph_shuffle[
             parameter_index - AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SHUFFLE_BASE];
+    } else if (parameter_index < AUTOSAVE_SCENE_PARAM_CHAIN_NEXT_BASE) {
+        /* Indices 72..73 are the S080 Scene chain conditions. */
+        *value = scene->settings.chain_condition[
+            parameter_index - AUTOSAVE_SCENE_PARAM_CHAIN_CONDITION_BASE];
+    } else {
+        /* Indices 74..75 are the S080 Scene chain next-scene values. */
+        *value = scene->settings.chain_next[
+            parameter_index - AUTOSAVE_SCENE_PARAM_CHAIN_NEXT_BASE];
     }
     return 1u;
 }
@@ -1476,8 +1497,10 @@ void autosave_applyScenePayload(uint8_t scene_index,
                  * A pre-S078 record leaves this cell zero-filled. Zero is not a
                  * valid length endpoint, so skip it and keep the fresh-Scene
                  * default rather than clamping to the unreachable minimum.
+                 * S080 P2: continue, not return - later cells (track Morph
+                 * scale/shuffle, Scene chain) must still restore.
                  */
-                return;
+                continue;
             }
             scene_setTrackMorphLength(
                 scene_index,
@@ -1492,12 +1515,30 @@ void autosave_applyScenePayload(uint8_t scene_index,
                 (uint8_t)(parameter_index -
                           AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SCALE_BASE),
                 value);
-        } else {
+        } else if (parameter_index <
+                   AUTOSAVE_SCENE_PARAM_CHAIN_CONDITION_BASE) {
             /* Indices 65..71 restore the S078 track Morph shuffle endpoints. */
             scene_setTrackMorphShuffle(
                 scene_index,
                 (uint8_t)(parameter_index -
                           AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SHUFFLE_BASE),
+                value);
+        } else if (parameter_index < AUTOSAVE_SCENE_PARAM_CHAIN_NEXT_BASE) {
+            /*
+             * Indices 72..73 restore the S080 chain conditions through the
+             * clamping setter; pre-S080 records hold zero (nul).
+             */
+            scene_setChainCondition(
+                scene_index,
+                (uint8_t)(parameter_index -
+                          AUTOSAVE_SCENE_PARAM_CHAIN_CONDITION_BASE),
+                value);
+        } else {
+            /* Indices 74..75 restore the S080 chain next-scene values. */
+            scene_setChainNext(
+                scene_index,
+                (uint8_t)(parameter_index -
+                          AUTOSAVE_SCENE_PARAM_CHAIN_NEXT_BASE),
                 value);
         }
     }

@@ -745,6 +745,27 @@ storage_status_t storage_scenesetParseLine(
                                   target_settings->track_morph_shuffle,
                                   NUM_TRACKS,
                                   127u);
+    } else if (storage_streq(key, "chain_condition")) {
+        /*
+         * Parse the Scene chain conditions (S080 G6).
+         *
+         * Inputs: two comma-separated values 0..78. Output: staged settings
+         * chain_condition[]. A missing key keeps the stage default 0 (nul = no
+         * chaining), so older sceneset.scg files load unchanged. Writer:
+         * filesystem_nextScenesetLine() line 18.
+         */
+        if (!target_settings)
+            return STORAGE_STATUS_BAD_VALUE;
+        return storage_parseCsvU8(value, target_settings->chain_condition,
+                                  SCENE_CHAIN_SLOT_COUNT,
+                                  SCENE_CHAIN_CONDITION_MAX);
+    } else if (storage_streq(key, "chain_next")) {
+        /* S080 G6: next-scene values 0..43 (slf..stp); writer line 19. */
+        if (!target_settings)
+            return STORAGE_STATUS_BAD_VALUE;
+        return storage_parseCsvU8(value, target_settings->chain_next,
+                                  SCENE_CHAIN_SLOT_COUNT,
+                                  SCENE_CHAIN_NEXT_MAX);
     } else if (storage_streq(key, "fader_setting")) {
         /*
          * Parse retained per-voice fader modes.

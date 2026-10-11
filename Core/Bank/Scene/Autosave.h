@@ -188,7 +188,7 @@
 #define AUTOSAVE_SCENE_NAME_OFFSET              0u
 #define AUTOSAVE_SCENE_PARAMETERS_OFFSET       10u
 #define AUTOSAVE_SCENE_PARAMETER_ALLOC_BYTES  118u
-#define AUTOSAVE_SCENE_PARAMETER_LIVE_BYTES    72u  /* S078: +21 track Morph endpoints */
+#define AUTOSAVE_SCENE_PARAMETER_LIVE_BYTES    76u  /* S080 G: +4 Scene chain cells (72..75) */
 #define AUTOSAVE_EFFECT_OFFSET                128u
 #define AUTOSAVE_EFFECT_TYPE_OFFSET             0u
 #define AUTOSAVE_EFFECT_TYPE_BYTES              3u
@@ -266,7 +266,15 @@ typedef enum {
     AUTOSAVE_SCENE_PARAM_TRACK_MORPH_LENGTH_BASE = 51,
     AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SCALE_BASE = 58,
     AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SHUFFLE_BASE = 65,
-    AUTOSAVE_SCENE_PARAM_COUNT = 72
+    /*
+     * S080 G: Scene chain bytes, condition 1/2 (72..73) and next 1/2
+     * (74..75). They occupy previously reserved cells of the 118-byte Scene
+     * allocation, so the AutoSave record layout, masks and format version
+     * stay unchanged. Owner: scene_setChainCondition()/scene_setChainNext().
+     */
+    AUTOSAVE_SCENE_PARAM_CHAIN_CONDITION_BASE = 72,
+    AUTOSAVE_SCENE_PARAM_CHAIN_NEXT_BASE = 74,
+    AUTOSAVE_SCENE_PARAM_COUNT = 76
 } autosave_scene_parameter_t;
 
 typedef enum {

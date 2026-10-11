@@ -228,22 +228,61 @@ enum ParamEnums
 	PAR_PERF_NOTE_RT,
 
 	/*
-	 * S080 scene queue / change division globals (scd, qcd, qac, pcr).
+	 * S080 scene queue / change division globals (scd, qcd, qac).
 	 *
 	 * What: PAR_SCENE_CHANGE_DIV (scd) is the musical division at which direct
-	 * scene changes take effect; PAR_SCENE_QUEUE_DIV (qcd) is the same for queued
-	 * (SHIFT+SEQ) changes; PAR_SCENE_QUEUE_ACTION (qac) selects the action on a
-	 * queued fire (normal / reset mutes / reset morphs / both / reload);
-	 * PAR_SCENE_PC_RESET (pcr) forces tracks to restart on scene change. Why:
-	 * adds musical timing and options to scene changes. Inputs: global settings
-	 * page edits and settings load/default. Outputs: sequencer scene-change
-	 * deferral and the foreground scene-change executor. Affiliates: filesystem
-	 * settings writer/parser (S080 F5/F6), MENU_MIDI_PAGE sub-page 3 (S080 F3).
+	 * (SEQ) scene changes take effect (0..9); PAR_SCENE_QUEUE_DIV (qcd) is the
+	 * division for queued (SHIFT+SEQ) changes, with its own longer list
+	 * (0..17, adding 5b..9b, 12b, 15b, 16b, S080 P2);
+	 * PAR_SCENE_QUEUE_ACTION (qac) selects what a
+	 * queued change does when it fires: nrm, mut, mrp, res, u+r, o+r, mmr, rld,
+	 * r+r (values 0..8, S080 P2 Defect 15). Why: musical timing and console
+	 * normalisation for scene changes. The PC reset for direct and chain-fired
+	 * changes is the pre-existing PAR_BAR_RESET_MODE (pcr); queued changes carry
+	 * their own reset inside qac and ignore pcr. Inputs: global settings page
+	 * edits and settings load/default. Outputs: sequencer scene-change deferral
+	 * and the foreground executor (menu_serviceDeferredSceneChange()).
+	 * Affiliates: filesystem settings writer/parser (keys scd/qcd/qac),
+	 * MENU_MIDI_PAGE sub-page 2, sceneQueueActionNames (MenuText.h).
 	 */
 	PAR_SCENE_CHANGE_DIV,
 	PAR_SCENE_QUEUE_DIV,
 	PAR_SCENE_QUEUE_ACTION,
-	PAR_SCENE_PC_RESET,
+
+	/*
+	 * S080 Phase G chain editor mirrors (cn1, nx1, cn2, nx2).
+	 *
+	 * What: display/edit mirrors of the four chain bytes of the Scene shown in
+	 * the SHIFT+PLAY+SEQ chain editor: condition 1 (0..78), next scene 1
+	 * (0..43), condition 2, next scene 2. Why: the generic static-cell renderer
+	 * reads parameter_values[]; the retained values live per Scene in
+	 * scene_settings_t.chain_condition[]/chain_next[]. Inputs: loaded from the
+	 * viewed Scene by menu_chainMenuOpen()/menu_chainMenuView(). Outputs:
+	 * edits commit through menu_commitChainParam() to that Scene only (no edit
+	 * mask fan-out). Never serialized as Globals; menu_parseGlobalParam()
+	 * treats them as no-ops so a settings load cannot write SceneData.
+	 * Affiliates: PATTERN_SETTINGS_PAGE (menuPages.h), chainConditionNames/
+	 * chainNextNames (MenuText.h), scene_setChainCondition()/Next().
+	 */
+	PAR_CHAIN_COND1,
+	PAR_CHAIN_NEXT1,
+	PAR_CHAIN_COND2,
+	PAR_CHAIN_NEXT2,
+
+	/*
+	 * S080 P2 Defect 8a: per-track loopable mirror (lop).
+	 *
+	 * What: on/off display/edit mirror of the active track's loopable flag in
+	 * the viewed Scene's Pattern region (1 = the looper may capture the track,
+	 * 0 = always excluded). Why: lets the performer keep utility tracks
+	 * running free while looping. Appended here, not beside
+	 * PAR_TRACK_PLAY_MODE, so no established Global id is renumbered. Inputs:
+	 * pat_applyTrackSettingsToMenu(). Outputs: edits commit through
+	 * menu_cellCommitValue() to pat_setTrackLoopable(); bulk Global apply is a
+	 * no-op for this id. Affiliates: pat_scene_region_t.track_loop_exclude,
+	 * seq_loopableTrackMask(), SEQ_PAGE sub-page 0 cell 6.
+	 */
+	PAR_TRACK_LOOPABLE,
 
 	NUM_PARAMS = 384,
 };
@@ -252,6 +291,13 @@ _Static_assert(PAR_AUTOSAVE_ENABLED < NUM_PARAMS,
 	"AutoSave parameter must fit the fixed flat parameter allocation");
 _Static_assert(PAR_BUS_COMP_SIDECHAIN < NUM_PARAMS,
 	"S074 bus compressor mirrors must fit the fixed flat parameter allocation");
+
+/*
+ * S080 P2: the chain mirrors and the loopable mirror consume existing
+ * parameter_values[] capacity; this keeps the fixed flat allocation honest.
+ */
+_Static_assert(PAR_TRACK_LOOPABLE < NUM_PARAMS,
+	"S080 chain/loopable mirrors must fit the fixed flat parameter allocation");
 
 #include "stm32f4xx.h"
 

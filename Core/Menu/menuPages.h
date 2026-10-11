@@ -42,25 +42,39 @@ const Page menuPages[NUM_PAGES][NUM_SUB_PAGES] = {
   {TEXT_BAR_RESET_MODE,TEXT_TRIGGER_IN_PPQ,   TEXT_TRIGGER_OUT1_PPQ,   TEXT_FOLLOW,TEXT_OSC_INTERP,    TEXT_CPU_USE,        TEXT_AUTOSAVE, TEXT_PAT_STORE_USE,
     PAR_BAR_RESET_MODE, PAR_PRESCALER_CLOCK_IN,PAR_PRESCALER_CLOCK_OUT1,PAR_FOLLOW, PAR_OSC_WAVE_INTERP,PAR_RUNTIME_CPU_USE, PAR_AUTOSAVE_ENABLED, PAR_PAT_STORE_USE},
   /*
-   * S074 Scene-owned bus compressor page. It remains the last populated
-   * settings page; the empty second half terminates encoder traversal.
-   * Values are active-Scene mirrors committed by menu.c's dedicated path.
+   * Scene change / queue globals (S080 F3, P2).
+   *
+   * What: scd, qcd, qac in columns 0-2; columns 3-7 are TEXT_EMPTY/PAR_NONE,
+   * so no parameter follows qac on this screen and it is the last Global
+   * screen. Its scroll cue is '^' (a Scene-settings page follows). Why: the
+   * compressor cells are Scene settings and must sit together on their own
+   * page, marked '+' (user, S080 P2 follow-up). Encoder traversal crosses
+   * from qac to the compressor page through the static cross-sub-page step
+   * (menu_moveToMenuItem(), extended to MENU_MIDI_PAGE in S080 P2); the
+   * MODE MENU re-press cycle reaches it through menu_switchSubPage().
+   * Affiliates: checkScrollSign() ('^' cue), MENU_GLOBAL_SCENE_SUBPAGE.
    */
+  {TEXT_SCENE_CHANGE_DIV,TEXT_SCENE_QUEUE_DIV,TEXT_SCENE_QUEUE_ACTION,TEXT_EMPTY,
+    TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,
+    PAR_SCENE_CHANGE_DIV,PAR_SCENE_QUEUE_DIV,PAR_SCENE_QUEUE_ACTION,PAR_NONE,
+    PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   /*
-   * S080 F3: the Scene sub-page keeps the S074 bus compressor in its first
-   * half and adds the scene change/queue division globals (scd, qcd, qac) plus
-   * PCR in the second half, which the existing same-sub-page half navigation
-   * and encoder already reach. (The plan proposed a dedicated sub-page 3, but
-   * the global traversal only crosses sub-pages at column 8 and stops on the
-   * empty cells, so sub-page 3 would be unreachable without changing global
-   * navigation semantics.) MENU_GLOBAL_SCENE_SUBPAGE stays the last populated
-   * Scene sub-page.
+   * Scene-owned bus compressor page (MENU_GLOBAL_SCENE_SUBPAGE, S074 /
+   * S080 P2).
+   *
+   * What: cmp, cam, ctm, csc together in columns 0-3; the empty second half
+   * terminates traversal. Why: all four are Scene settings (active-Scene
+   * mirrors fanned out through the VOICE edit mask), so they are shown
+   * together on the last settings page with the '+' Scene-ownership cue.
+   * New global pages go before this one and move MENU_GLOBAL_SCENE_SUBPAGE.
+   * Accessors: global encoder traversal, checkScrollSign() ('+'). Affiliates:
+   * menu_commitBusCompParam(), menu_devCheckGlobalSceneSubPage() (diagnostic
+   * layout check).
    */
   {TEXT_BUS_COMP_MODE,TEXT_BUS_COMP_AMOUNT,TEXT_BUS_COMP_TIME,TEXT_BUS_COMP_SIDECHAIN,
-    TEXT_SCENE_CHANGE_DIV,TEXT_SCENE_QUEUE_DIV,TEXT_SCENE_QUEUE_ACTION,TEXT_SCENE_PC_RESET,
+    TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,
     PAR_BUS_COMP_MODE,PAR_BUS_COMP_AMOUNT,PAR_BUS_COMP_TIME,PAR_BUS_COMP_SIDECHAIN,
-    PAR_SCENE_CHANGE_DIV,PAR_SCENE_QUEUE_DIV,PAR_SCENE_QUEUE_ACTION,PAR_SCENE_PC_RESET},
-  {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
+    PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
@@ -120,12 +134,13 @@ const Page menuPages[NUM_PAGES][NUM_SUB_PAGES] = {
 /* SEQ_PAGE
  * Subpage 0 is the track-settings front page. S078 §7 groups the three
  * morphable parameters (len, scl, shf) on the left, followed by the discrete
- * play mode (mod), MIDI channel, and MIDI note. The two remaining cells are
- * reserved. Clients: STEP-mode VOICE re-press toggles menuIndex through Menu
- * helpers, and encoder scrolling reaches every cell through normal traversal.
+ * play mode (run), MIDI channel, MIDI note and the S080 P2 looper opt-out
+ * (lop, Defect 8a). The last cell is the traversal terminator. Clients:
+ * STEP-mode VOICE re-press toggles menuIndex through Menu helpers, and encoder
+ * scrolling reaches every cell through normal traversal.
  */
 /* SEQ_PAGE */ {
-  {TEXT_PAT_LENGTH,TEXT_TRACK_SCALE,TEXT_SHUFFLE,TEXT_TRACK_PLAY_MODE,TEXT_MIDI_CHANNEL,TEXT_NOTE,TEXT_EMPTY,TEXT_EMPTY, PAR_TRACK_LENGTH,PAR_TRACK_SCALE,PAR_SHUFFLE,PAR_TRACK_PLAY_MODE,PAR_TRACK_MIDI_CHAN,PAR_TRACK_MIDI_NOTE,PAR_NONE,PAR_NONE},
+  {TEXT_PAT_LENGTH,TEXT_TRACK_SCALE,TEXT_SHUFFLE,TEXT_TRACK_PLAY_MODE,TEXT_MIDI_CHANNEL,TEXT_NOTE,TEXT_TRACK_LOOPABLE,TEXT_EMPTY, PAR_TRACK_LENGTH,PAR_TRACK_SCALE,PAR_SHUFFLE,PAR_TRACK_PLAY_MODE,PAR_TRACK_MIDI_CHAN,PAR_TRACK_MIDI_NOTE,PAR_TRACK_LOOPABLE,PAR_NONE},
   /*
    * Step specials subpage 1 (S079): vel, note, condition, micro-timing. The
    * four fixed cells end at micro-timing; scrolling past it enters the
@@ -151,9 +166,14 @@ const Page menuPages[NUM_PAGES][NUM_SUB_PAGES] = {
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
 },
 /* PATTERN_SETTINGS_PAGE */ {
-  /* Pattern repeat/next switching is retired. Scene-level switching owns future
-   * playback changes so parameters and Pattern data move together. */
-  {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
+  /*
+   * S080 G8: sub-page 0 hosts the SHIFT+PLAY+SEQ scene chain editor: cn1,
+   * nx1, cn2, nx2 (category Chain) of the Scene in menu_chainMenuScene. The
+   * cells are PAR_CHAIN_* mirrors committed by menu_commitChainParam(). Pattern
+   * repeat/next switching stays retired (the legacy ENABLE_EUKLID_PAGE SHIFT
+   * path would also land here; it is compiled out).
+   */
+  {TEXT_CHAIN_COND1,TEXT_CHAIN_NEXT1,TEXT_CHAIN_COND2,TEXT_CHAIN_NEXT2,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_CHAIN_COND1,PAR_CHAIN_NEXT1,PAR_CHAIN_COND2,PAR_CHAIN_NEXT2,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},

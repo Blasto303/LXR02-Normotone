@@ -1024,6 +1024,63 @@ uint8_t scene_getTrackMorphShuffle(uint8_t scene_index, uint8_t track)
 }
 
 /*
+ * Scene chain accessors (S080 G2; contract in SceneData.h).
+ *
+ * What: named setters/getters for the two chain pairs, clamped to the table
+ * sizes and committed through scene_storeParameterByte() with AutoSave cells
+ * AUTOSAVE_SCENE_PARAM_CHAIN_CONDITION_BASE/NEXT_BASE + slot. Why: the
+ * AutoSave extension rule requires a named index, getter and change-aware
+ * setter for every retained Scene byte. Inputs: Scene 0..15, slot 0..1,
+ * value. Outputs: scene.settings.chain_condition[]/chain_next[].
+ * Affiliates: autosave_getSceneParameter()/autosave_applyScenePayload().
+ */
+void scene_setChainCondition(uint8_t scene_index, uint8_t slot, uint8_t value)
+{
+    scene_t *scene = scene_get(scene_index);
+
+    if (!scene || slot >= SCENE_CHAIN_SLOT_COUNT)
+        return;
+    if (value > SCENE_CHAIN_CONDITION_MAX)
+        value = SCENE_CHAIN_CONDITION_MAX;
+    scene_storeParameterByte(
+        scene_index, &scene->settings.chain_condition[slot],
+        (uint8_t)(AUTOSAVE_SCENE_PARAM_CHAIN_CONDITION_BASE + slot), value);
+}
+
+uint8_t scene_getChainCondition(uint8_t scene_index, uint8_t slot)
+{
+    const scene_t *scene = scene_getConst(scene_index);
+
+    if (!scene || slot >= SCENE_CHAIN_SLOT_COUNT ||
+        scene->settings.chain_condition[slot] > SCENE_CHAIN_CONDITION_MAX)
+        return 0u;
+    return scene->settings.chain_condition[slot];
+}
+
+void scene_setChainNext(uint8_t scene_index, uint8_t slot, uint8_t value)
+{
+    scene_t *scene = scene_get(scene_index);
+
+    if (!scene || slot >= SCENE_CHAIN_SLOT_COUNT)
+        return;
+    if (value > SCENE_CHAIN_NEXT_MAX)
+        value = SCENE_CHAIN_NEXT_MAX;
+    scene_storeParameterByte(
+        scene_index, &scene->settings.chain_next[slot],
+        (uint8_t)(AUTOSAVE_SCENE_PARAM_CHAIN_NEXT_BASE + slot), value);
+}
+
+uint8_t scene_getChainNext(uint8_t scene_index, uint8_t slot)
+{
+    const scene_t *scene = scene_getConst(scene_index);
+
+    if (!scene || slot >= SCENE_CHAIN_SLOT_COUNT ||
+        scene->settings.chain_next[slot] > SCENE_CHAIN_NEXT_MAX)
+        return 0u;
+    return scene->settings.chain_next[slot];
+}
+
+/*
  * Default Instrument types of a fresh or emptied Scene (DRM, DRM, DRM, SNR,
  * CYM, HAT). Shared by scene_initAll() and scene_resetKitToDefaults() (S075)
  * so both produce the same Kit. filesystem_initSceneStage() keeps its own
@@ -1042,7 +1099,7 @@ static const instrument_type_t
  * stage defaults (filesystem_initSceneStage()). scene_commitSettings() writes
  * every field through its change-aware setter, so each changed byte marks its
  * own AutoSave cell and the card-clean bit; the before/after comparison runs
- * on a stack copy (sizeof(scene_settings_t), under 64 B) because the setters
+ * on a stack copy (sizeof(scene_settings_t), about 80 B) because the setters
  * do not report change. `src` may be another Scene's live settings.
  */
 void scene_settingsDefaults(scene_settings_t *out)
@@ -1103,6 +1160,15 @@ uint8_t scene_commitSettings(uint8_t scene_index, const scene_settings_t *src)
     scene_setEffectMorphAmount(scene_index, image.effect_morph_amount);
     for (i = 0u; i < SCENE_BUS_COMP_FIELD_COUNT; i++)
         scene_setBusCompSetting(scene_index, i, image.bus_comp[i]);
+    /*
+     * S080 G3: copy/clear carry the Scene chain (defaults 0 = no chaining via
+     * scene_settingsDefaults()' memset). Not part of the VOICE edit-mask
+     * fan-out: only this Scene changes.
+     */
+    for (i = 0u; i < SCENE_CHAIN_SLOT_COUNT; i++) {
+        scene_setChainCondition(scene_index, i, image.chain_condition[i]);
+        scene_setChainNext(scene_index, i, image.chain_next[i]);
+    }
     return (uint8_t)(memcmp(&before, &scene->settings, sizeof(before)) != 0);
 }
 

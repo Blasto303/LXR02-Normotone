@@ -851,6 +851,9 @@ uint8_t ccSvc_runPatternPaste(const cc_job_t *job)
                 /* S078 §4.1: play mode is part of a track copy. */
                 pat_setTrackPlayMode(job->scene, job->track,
                                      s->track_play_mode[src->track]);
+                /* S080 P2 Defect 8a: loopable is part of a track copy. */
+                pat_setTrackLoopable(job->scene, job->track,
+                                     pat_trackLoopable(src->scene, src->track));
             }
         } else if (dst) {
             uint16_t last = (uint16_t)g.dst_first + g.count - 1u;
@@ -1026,6 +1029,8 @@ uint8_t ccSvc_runPatternClear(const cc_job_t *job)
             pat_setTrackShuffle(job->scene, job->track, 0u);
             /* S078 §4.1: clearing a track returns play mode to fwd. */
             pat_setTrackPlayMode(job->scene, job->track, 0u);
+            /* S080 P2 Defect 8a: a cleared track is loopable again. */
+            pat_setTrackLoopable(job->scene, job->track, 1u);
         }
         ccSvc_release();
         ccSvc_patternChangedUi(job->scene,

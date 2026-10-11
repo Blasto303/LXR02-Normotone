@@ -166,10 +166,14 @@ static const char shortNames[][4] = {
     {"run"},
     /* S079 step-special compact labels: cdn/tim/rol/rtm/rfl (fix 2, P2). */
     {"cdn"},{"tim"},{"rol"},{"rtm"},{"rfl"},
-    /* S080 E4/G10: BAR overlay, scene globals, and chain labels. */
+    /* S080 E4/G10: BAR overlay, scene globals, and chain labels. The S080 F2
+     * duplicate "pcr" was removed in S080 P2 (Defect 5); index 63 above is the
+     * only pcr label. */
     {"pb<"},{"pn<"},{"pb>"},{"pn>"},
-    {"scd"},{"qcd"},{"qac"},{"pcr"},
+    {"scd"},{"qcd"},{"qac"},
     {"cn1"},{"nx1"},{"cn2"},{"nx2"},
+    /* S080 P2 Defect 8a: per-track loopable. */
+    {"lop"},
 };
 
 static const char catNames[][16] = {
@@ -225,8 +229,10 @@ static const char longNames[][16] = {
     {"Conditin"},{"% Delay"},{"RollRate"},{"Rhythm"},{"RollFill"},
     /* S080 E4/F4/G10: overlay, scene-global, and chain long names. */
     {"BtnStat<"},{"BtnNote<"},{"BtnStat>"},{"BtnNote>"},
-    {"ChngDiv"},{"QueDiv"},{"QueActn"},{"PCReset"},
+    {"ChngDiv"},{"QueDiv"},{"QueActn"},
     {"Conditn1"},{"NxtScn1"},{"Conditn2"},{"NxtScn2"},
+    /* S080 P2 Defect 8a. */
+    {"Loopable"},
 };
 
 /*
@@ -277,9 +283,10 @@ static const char perfBtnTypeNames[][4] = {
 };
 
 /*
- * S080 F4: scene change/queue division names (shared by scd and qcd).
+ * S080 F4: direct scene-change division names (scd).
  * [0]=count; [1..10] = stored value 0..9: instant, 1/8, 1/4, 1/2, 1-bar,
- * 2/3/4-bar, end-of-shortest-track, end-of-longest-track.
+ * 2/3/4-bar, end-of-shortest-track, end-of-longest-track. Since S080 P2 the
+ * queued division (qcd) has its own longer list, sceneQueueDivNames below.
  */
 static const char sceneChangeDivNames[][4] = {
     {10},
@@ -288,12 +295,43 @@ static const char sceneChangeDivNames[][4] = {
 };
 
 /*
- * S080 F4: queued scene-change action names.
- * [0]=count; [1..5] = 0..4: normal, reset mutes, reset morphs, both, reload.
+ * S080 P2: queued scene-change division names (qcd, QueDiv).
+ *
+ * What: [0]=count; [1..18] = stored qcd value 0..17: instant, 1/8, 1/4, 1/2,
+ * then 1..9, 12, 15 and 16 bars, then end-of-shortest-track and
+ * end-of-longest-track. Why: a queued change is pre-programmed during a
+ * performance and often lands at a phrase boundary, so qcd offers the longer
+ * bar counts (5b..9b, 12b, 15b, 16b, user request) that a direct change does
+ * not need. Rendered by the S080 static-param resolver because every
+ * DTYPE_MENU id is taken. Affiliates: PAR_SCENE_QUEUE_DIV,
+ * seq_queueChangeDivUnits() (sequencer.c, must keep the same order),
+ * menu_clampCellValue() (clamp 0..17), filesystem_sanitizeLoadedGlobals().
+ */
+static const char sceneQueueDivNames[][4] = {
+    {18},
+    {"ins"},{"1/8"},{"1/4"},{"1/2"},{"1b"},
+    {"2b"},{"3b"},{"4b"},{"5b"},{"6b"},
+    {"7b"},{"8b"},{"9b"},{"12b"},{"15b"},
+    {"16b"},{"ens"},{"enl"},
+};
+
+/*
+ * S080 F4 / P2 Defect 15: queued scene-change action names.
+ *
+ * What: [0] = count; [1..9] = qac values 0..8: nrm (plain change), mut (all
+ * mutes off), mrp (incoming Scene morphs to 0), res (queued PC reset: tracks
+ * and master clock restart), u+r (mute + reset), o+r (morph + reset), mmr
+ * (mute + morph + reset), rld (reload + mute + morph), r+r (reload + mute +
+ * morph + reset). Why: a queued change has its own PC reset, separate from
+ * pcr which governs direct and chain-fired changes. Rendered by the S080
+ * static-param resolver (all DTYPE_MENU ids are taken). Affiliates:
+ * PAR_SCENE_QUEUE_ACTION, menu_queueActionFlags() (menu.c),
+ * menu_clampCellValue() (clamp 0..8).
  */
 static const char sceneQueueActionNames[][4] = {
-    {5},
-    {"nrm"},{"mut"},{"mor"},{"m+m"},{"rld"},
+    {9},
+    {"nrm"},{"mut"},{"mrp"},{"res"},{"u+r"},
+    {"o+r"},{"mmr"},{"rld"},{"r+r"},
 };
 
 /*

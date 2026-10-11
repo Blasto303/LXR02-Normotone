@@ -108,14 +108,29 @@ typedef struct __attribute__((packed)) {
      * sequencer.c play-mode ISR logic, filesystem.c PAT4 reader/writer.
      */
     uint8_t track_play_mode[NUM_TRACKS];
+    /*
+     * Per-track looper exclusion (S080 P2 Defect 8a).
+     *
+     * What: bit N set = track N is never captured by the PERF looper ("lop"
+     * off); 0 = loopable (the default). Stored inverted so a zero-filled
+     * region or an older PAT4 file reads as "all loopable". Why: a persistent
+     * opt-out for utility tracks. Inputs: STEP track page edits, Scene/Pattern
+     * loads, copy/clear. Outputs: seq_loopableTrackMask(). Storage: byte 4 of
+     * each track's 16-byte PAT4 track header (0/1 per track; the bytes were
+     * reserved and zero, so the file version is unchanged). RAM: 1 byte per
+     * region (17 B across pat_regions[16] and pat_background_region).
+     * Affiliates: pat_setTrackLoopable()/pat_trackLoopable(), filesystem.c
+     * PAT4 writer/readers.
+     */
+    uint8_t track_loop_exclude;
     uint8_t pattern_change_bar;
     uint8_t pattern_next;
 } pat_scene_region_t;
 
 _Static_assert(sizeof(pat_scene_region_t) ==
                (PAT_STEPS_PER_SCENE * 2u) + (PAT_STACK_SIZE * 32u) +
-               512u + 30u,
-               "pat_scene_region_t size must match the Pattern budget");
+               512u + 31u,
+               "pat_scene_region_t size must match the Pattern budget (S080 P2: +1 B loop exclude)");
 
 /*
  * Fixed v4 Pattern file geometry.
@@ -433,6 +448,17 @@ void pat_setTrackShuffle(uint8_t scene_index, uint8_t track, uint8_t value);
  * PAR_TRACK_PLAY_MODE edit handler, pat_applyTrackSettingsToMenu().
  */
 void pat_setTrackPlayMode(uint8_t scene_index, uint8_t track, uint8_t value);
+
+/*
+ * Per-track looper opt-out (S080 P2 Defect 8a).
+ *
+ * pat_setTrackLoopable() stores loopable = 1 (default) or 0 for one track of a
+ * resident Scene and marks the Pattern dirty; pat_trackLoopable() returns 1
+ * when the track may be looped (also for invalid coordinates). Clients: Menu
+ * STEP track page, copy/clear, seq_loopableTrackMask().
+ */
+void pat_setTrackLoopable(uint8_t scene_index, uint8_t track, uint8_t loopable);
+uint8_t pat_trackLoopable(uint8_t scene_index, uint8_t track);
 
 /*
  * Step-automation persistence operations.
