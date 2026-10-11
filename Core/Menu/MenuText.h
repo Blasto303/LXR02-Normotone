@@ -76,8 +76,16 @@ static const char nextPatternNames[][4] = {
     {"p9"},{"p10"},{"p11"},{"p12"},{"p13"},{"p14"},{"p15"},{"p16"},
     {"r2"},{"r3"},{"r4"},{"r5"},{"r6"},{"r7"},{"r8"},
 };
+/*
+ * LFO retrigger selector names (S076 P2).
+ *
+ * The leading byte is the selectable-entry count. Index 7 is the new "scn"
+ * option (LFO_RETRIGGER_SCENE): a Scene change resets this LFO's phase to its
+ * scaled offset, while every voice value keeps the existing voice retrigger
+ * behaviour. Values 0..6 are unchanged.
+ */
 static const char retriggerNames[][4] = {
-    {7}, {"off"},{"v1"},{"v2"},{"v3"},{"v4"},{"v5"},{"v6"},
+    {8}, {"off"},{"v1"},{"v2"},{"v3"},{"v4"},{"v5"},{"v6"},{"scn"},
 };
 static const char lfoWaveNames[][4] = {
     {8}, {"sin"},{"tri"},{"sup"},{"sdn"},{"sqr"},{"rnd"},{"xup"},{"xdn"},
@@ -102,6 +110,16 @@ static const char syncRateNames[][4] = {
 };
 static const char extSyncNames[][4] = {
     {5}, {"off"}, {"usb"}, {"din"}, {"pls"}, {"aut"},
+};
+/*
+ * Per-track play-mode names (S078 §4.2).
+ *
+ * The leading byte is the selectable-entry count; entries follow in the stored
+ * play-mode order fwd/rev/pip/rnd/onc/1fr. Clients: the STEP track-settings
+ * `run` cell and the menu.c run-mode formatter (menu_getPlayModeName).
+ */
+static const char trackPlayModeNames[][4] = {
+    {6}, {"fwd"},{"rev"},{"pip"},{"rnd"},{"onc"},{"1fr"},
 };
 static const char waveformNames[][4] = {
     {6}, {"Sin"},{"Tri"},{"Saw"},{"Rec"},{"Noi"},{"Cym"},
@@ -139,6 +157,23 @@ static const char shortNames[][4] = {
     {"ats"},
     /* S074 bus compressor compact labels. */
     {"cmp"},{"cam"},{"ctm"},{"csc"},
+    /*
+     * S078 per-track run mode compact label (S078 P4: renamed from `mod`).
+     * `run` matches the FX sequencer's run-mode cell (menuEffects.c), so the
+     * same concept reads the same on the Effect page and the STEP track
+     * settings. Accessor: valueNames[TEXT_TRACK_PLAY_MODE] (menu.c).
+     */
+    {"run"},
+    /* S079 step-special compact labels: cdn/tim/rol/rtm/rfl (fix 2, P2). */
+    {"cdn"},{"tim"},{"rol"},{"rtm"},{"rfl"},
+    /* S080 E4/G10: BAR overlay, scene globals, and chain labels. The S080 F2
+     * duplicate "pcr" was removed in S080 P2 (Defect 5); index 63 above is the
+     * only pcr label. */
+    {"pb<"},{"pn<"},{"pb>"},{"pn>"},
+    {"scd"},{"qcd"},{"qac"},
+    {"cn1"},{"nx1"},{"cn2"},{"nx2"},
+    /* S080 P2 Defect 8a: per-track loopable. */
+    {"lop"},
 };
 
 static const char catNames[][16] = {
@@ -150,6 +185,17 @@ static const char catNames[][16] = {
     {"Generatr"},{"MIDI"},{"Trigger"},
     /* S074: CAT_SCENE, the full-view category of Scene-owned cells. */
     {"Scene"},
+    /*
+     * S078 P4: CAT_TRACK, the full-view category of per-track Pattern
+     * settings. The clicked-in view of the STEP run-mode cell reads
+     * "Track   RunMode", in parallel with the FX sequencer's
+     * "FX Seq  RunMode". Accessor: valueNames[TEXT_TRACK_PLAY_MODE].
+     */
+    {"Track"},
+    /* S080 E4: BAR overlay settings category. */
+    {"Prfrmnc"},
+    /* S080 G10: scene chain settings category. */
+    {"Chain"},
 };
 
 static const char longNames[][16] = {
@@ -176,6 +222,156 @@ static const char longNames[][16] = {
     {"AutoSave"},
     /* S074 bus compressor long names. */
     {"BusComp"},{"CompAmt"},{"CompTime"},{"CompSC"},
+    /* S078 per-track run mode long name (S078 P4: renamed from PlayMode to
+     * match the FX sequencer's RunMode). */
+    {"RunMode"},
+    /* S079 step-special long names (fix 2: Conditin, % Delay; P2: Rhythm). */
+    {"Conditin"},{"% Delay"},{"RollRate"},{"Rhythm"},{"RollFill"},
+    /* S080 E4/F4/G10: overlay, scene-global, and chain long names. */
+    {"BtnStat<"},{"BtnNote<"},{"BtnStat>"},{"BtnNote>"},
+    {"ChngDiv"},{"QueDiv"},{"QueActn"},
+    {"Conditn1"},{"NxtScn1"},{"Conditn2"},{"NxtScn2"},
+    /* S080 P2 Defect 8a. */
+    {"Loopable"},
+};
+
+/*
+ * Trigger condition display names (S079 §3; fix 3 extends to track 7;
+ * S080 B1 adds the loop-active pair).
+ *
+ * S080 B1: insert `lop` (loop active) and `!lp` (loop inactive) after `!fl`;
+ * the count grows 39 -> 41 and every later condition shifts up by two.
+ * The table is indexed directly by the stored condition value
+ * (menu_getConditionName() reads conditionNames[value + 1]), so it must stay
+ * in numeric order. The mute group is therefore emitted in the dispatch's
+ * order - 1mu..7mu (indices 27..33) then !1m..!7m (34..40) - matching
+ * seq_evaluateStepCondition()'s (cond - 27) % 7 / boundary cond <= 33 rule.
+ * (S079 fix 3 had appended 7mu/!7m at the end of the old 6-track grouping,
+ * leaving the displayed labels one group out of step; this corrects it.)
+ *
+ * [0]=count; [1..41] = condition indices 0..40.
+ */
+static const char conditionNames[][4] = {
+    {41},
+    {"  -"},{"r10"},{"r20"},{"r30"},{"r40"},{"r50"},{"r60"},{"r70"},
+    {"r80"},{"r90"},{"r95"},
+    {"1:2"},{"2:2"},{"1:3"},{"2:3"},{"3:3"},{"1:4"},{"2:4"},{"3:4"},
+    {"4:4"},{"1:-"},
+    {"fil"},{"!fl"},{"lop"},{"!lp"},{"lst"},{"!ls"},
+    {"1mu"},{"2mu"},{"3mu"},{"4mu"},{"5mu"},{"6mu"},{"7mu"},
+    {"!1m"},{"!2m"},{"!3m"},{"!4m"},{"!5m"},{"!6m"},{"!7m"},
+};
+
+/* Per-step roll rate display names (S079 §4.1). [0]=count; [1..9] = 0..8. */
+static const char stepRollRateNames[][4] = {
+    {9},
+    {"off"},{"1/8"},{"8tr"},{" 16"},{"16t"},{" 32"},{"32t"},{" 48"},{" 64"},
+};
+
+/*
+ * S080 E4: PERF BAR overlay trigger-type names.
+ *
+ * [0]=count; [1..12] = stored value 0..11. Rendered by the static-param
+ * special case in menu.c (S080 E6) because all 16 DTYPE_MENU ids are taken.
+ * Order: vmx, v10, v64, v32, flm, fls, then the held roll rates r/8..128.
+ * Affiliates: PAR_PERF_BTN_LT/RT, the overlay trigger dispatch (E12).
+ */
+static const char perfBtnTypeNames[][4] = {
+    {12},
+    {"vmx"},{"v10"},{"v64"},{"v32"},{"flm"},{"fls"},
+    {"r/8"},{"r16"},{"r32"},{"r64"},{"r6t"},{"128"},
+};
+
+/*
+ * S080 F4: direct scene-change division names (scd).
+ * [0]=count; [1..10] = stored value 0..9: instant, 1/8, 1/4, 1/2, 1-bar,
+ * 2/3/4-bar, end-of-shortest-track, end-of-longest-track. Since S080 P2 the
+ * queued division (qcd) has its own longer list, sceneQueueDivNames below.
+ */
+static const char sceneChangeDivNames[][4] = {
+    {10},
+    {"ins"},{"1/8"},{"1/4"},{"1/2"},{"1b"},
+    {"2b"},{"3b"},{"4b"},{"ens"},{"enl"},
+};
+
+/*
+ * S080 P2: queued scene-change division names (qcd, QueDiv).
+ *
+ * What: [0]=count; [1..18] = stored qcd value 0..17: instant, 1/8, 1/4, 1/2,
+ * then 1..9, 12, 15 and 16 bars, then end-of-shortest-track and
+ * end-of-longest-track. Why: a queued change is pre-programmed during a
+ * performance and often lands at a phrase boundary, so qcd offers the longer
+ * bar counts (5b..9b, 12b, 15b, 16b, user request) that a direct change does
+ * not need. Rendered by the S080 static-param resolver because every
+ * DTYPE_MENU id is taken. Affiliates: PAR_SCENE_QUEUE_DIV,
+ * seq_queueChangeDivUnits() (sequencer.c, must keep the same order),
+ * menu_clampCellValue() (clamp 0..17), filesystem_sanitizeLoadedGlobals().
+ */
+static const char sceneQueueDivNames[][4] = {
+    {18},
+    {"ins"},{"1/8"},{"1/4"},{"1/2"},{"1b"},
+    {"2b"},{"3b"},{"4b"},{"5b"},{"6b"},
+    {"7b"},{"8b"},{"9b"},{"12b"},{"15b"},
+    {"16b"},{"ens"},{"enl"},
+};
+
+/*
+ * S080 F4 / P2 Defect 15: queued scene-change action names.
+ *
+ * What: [0] = count; [1..9] = qac values 0..8: nrm (plain change), mut (all
+ * mutes off), mrp (incoming Scene morphs to 0), res (queued PC reset: tracks
+ * and master clock restart), u+r (mute + reset), o+r (morph + reset), mmr
+ * (mute + morph + reset), rld (reload + mute + morph), r+r (reload + mute +
+ * morph + reset). Why: a queued change has its own PC reset, separate from
+ * pcr which governs direct and chain-fired changes. Rendered by the S080
+ * static-param resolver (all DTYPE_MENU ids are taken). Affiliates:
+ * PAR_SCENE_QUEUE_ACTION, menu_queueActionFlags() (menu.c),
+ * menu_clampCellValue() (clamp 0..8).
+ */
+static const char sceneQueueActionNames[][4] = {
+    {9},
+    {"nrm"},{"mut"},{"mrp"},{"res"},{"u+r"},
+    {"o+r"},{"mmr"},{"rld"},{"r+r"},
+};
+
+/*
+ * S080 G9: scene chain condition names.
+ * [0]=count; [1..79] = condition index 0..78 (nul, always-rep, always-bar,
+ * repeat counts, bar counts, probabilities, bar positions, from-scene, fill
+ * and loop conditions). Rendered by the chain menu static-param path (G8/G10).
+ */
+static const char chainConditionNames[][4] = {
+    {79},
+    {"nul"},{"xal"},{"bal"},
+    {"x01"},{"x02"},{"x03"},{"x04"},{"x05"},{"x06"},{"x07"},{"x08"},
+    {"x16"},{"x32"},{"x64"},
+    {"b01"},{"b02"},{"b03"},{"b04"},{"b05"},{"b06"},{"b07"},{"b08"},
+    {"b16"},{"b32"},{"b64"},
+    {"r1x"},{"r2x"},{"r3x"},{"r4x"},{"r5x"},{"r6x"},{"r7x"},{"r8x"},{"r9x"},
+    {"r1b"},{"r2b"},{"r3b"},{"r4b"},{"r5b"},{"r6b"},{"r7b"},{"r8b"},{"r9b"},
+    {"1:4"},{"2:4"},{"3:4"},{"4:4"},
+    {"1:8"},{"2:8"},{"3:8"},{"4:8"},{"5:8"},{"6:8"},{"7:8"},{"8:8"},
+    {">01"},{">02"},{">03"},{">04"},{">05"},{">06"},{">07"},{">08"},
+    {">09"},{">10"},{">11"},{">12"},{">13"},{">14"},{">15"},{">16"},
+    {"fix"},{"fib"},{"!fx"},{"!fb"},
+    {"lox"},{"lob"},{"!lx"},{"!lb"},
+};
+
+/*
+ * S080 G9: scene chain next-scene names.
+ * [0]=count; [1..44] = value 0..43 (self, next, previous, absolute s01..s16,
+ * random up to r01..r16, relative random r+1..r+4 / r-1..r-4, stop playback).
+ */
+static const char chainNextNames[][4] = {
+    {44},
+    {"slf"},{"nxt"},{"prv"},
+    {"s01"},{"s02"},{"s03"},{"s04"},{"s05"},{"s06"},{"s07"},{"s08"},
+    {"s09"},{"s10"},{"s11"},{"s12"},{"s13"},{"s14"},{"s15"},{"s16"},
+    {"r01"},{"r02"},{"r03"},{"r04"},{"r05"},{"r06"},{"r07"},{"r08"},
+    {"r09"},{"r10"},{"r11"},{"r12"},{"r13"},{"r14"},{"r15"},{"r16"},
+    {"r+1"},{"r+2"},{"r+3"},{"r+4"},
+    {"r-1"},{"r-2"},{"r-3"},{"r-4"},
+    {"stp"},
 };
 
 #endif /* MENUTEXT_H_ */

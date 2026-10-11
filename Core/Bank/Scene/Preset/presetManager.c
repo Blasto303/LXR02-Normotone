@@ -143,6 +143,21 @@ static uint16_t drumset_apply_stall_ticks = 0u;
 static uint8_t drumset_apply_voice = 0;
 static uint8_t drumset_apply_scene = 0u;
 static uint16_t drumset_apply_pending_mask = 0u;
+/*
+ * Per-track single-voice apply worker (S077 P2 §3.4).
+ *
+ * What: one bit per instrument slot awaiting a deferred per-track instrument
+ * swap. The source Scene is not stored here; it is read from
+ * seq_perTrackPattern[slot] at commit time, so no per-slot Scene RAM is needed
+ * and a later reassignment simply re-arms. Why: assigning a track to another
+ * Scene must load that track's slot from the played Scene using the same
+ * envelope-quiet deferral as the drumset worker while leaving the other slots
+ * untouched. Outputs: preset_tickSingleVoiceApply() commits at most one quiet
+ * slot per foreground pass. RAM: +1 byte SRAM1. Owner: Preset. Affiliates:
+ * preset_startSingleVoiceApply(), preset_tickSingleVoiceApply(),
+ * preset_resetAndApplyKitVoiceImage(), instrumentManager_ampEnvelopeQuiet().
+ */
+static uint8_t single_voice_pending_mask = 0u;
 static uint8_t instrument_apply_active = 0u;
 static uint8_t instrument_apply_scene = 0u;
 static uint8_t instrument_apply_phase = 0u;
@@ -797,7 +812,8 @@ void preset_applySoundParameter(uint16_t paramNr, uint8_t value,
 static uint8_t preset_applyInstrumentRuntimeValueInternal(uint8_t scene_index,
                                                           instrument_param_id_t id,
                                                           instrument_param_value_t value,
-                                                          uint8_t recordAutomation)
+                                                          uint8_t recordAutomation,
+                                                          uint8_t force)
 {
     const kit_instrument_slot_t *instrument;
     const ParamDescriptor *descriptor;
@@ -823,7 +839,7 @@ static uint8_t preset_applyInstrumentRuntimeValueInternal(uint8_t scene_index,
      * instance offset and parameter type. ParameterArray/PAR_* is no longer the
      * instrument meaning layer.
      */
-    if (scene_index != scene_getActiveIndex())
+    if (!force && scene_index != scene_getActiveIndex())
         return 1u;
     return instrumentManager_writeRuntime(slot, descriptor, value);
 }
@@ -848,7 +864,26 @@ uint8_t preset_applyInstrumentRuntimeValue(uint8_t scene_index,
      * expanded by InstrumentManager only while applying runtime modulation
      * destinations.
      */
-    return preset_applyInstrumentRuntimeValueInternal(scene_index, id, value, 0u);
+    return preset_applyInstrumentRuntimeValueInternal(scene_index, id, value, 0u, 0u);
+}
+
+uint8_t preset_applyInstrumentRuntimeValueForced(uint8_t scene_index,
+                                                 instrument_param_id_t id,
+                                                 instrument_param_value_t value)
+{
+    /*
+     * Runtime apply that ignores the active-Scene write guard (S077 P2 §3.4).
+     *
+     * What: identical to preset_applyInstrumentRuntimeValue() but writes the
+     * live runtime even when scene_index is not the active Scene. Why: the
+     * per-track single-voice apply loads a slot from its played Scene, which may
+     * differ from the global active Scene, so the descriptor image for that
+     * Scene must still reach the voice runtime. Inputs: Scene index, slot/
+     * descriptor-index instrument ID, and descriptor image value. Output: the
+     * runtime value is written. Client: presetMorph_writeRuntimeBaseEx() when
+     * force is set (per-track apply). Affiliate: the guarded public wrapper.
+     */
+    return preset_applyInstrumentRuntimeValueInternal(scene_index, id, value, 0u, 1u);
 }
 
 /*
@@ -957,9 +992,11 @@ uint8_t preset_setInstrumentParameter(uint8_t scene_index, uint8_t slot,
     return 1u;
 }
 
-uint8_t preset_setSupplementalParameter(uint8_t scene_index, uint8_t slot,
+static uint8_t preset_setSupplementalParameterInternal(
+                                        uint8_t scene_index, uint8_t slot,
                                         uint8_t descriptor_index,
-                                        instrument_param_value_t value)
+                                        instrument_param_value_t value,
+                                        uint8_t force)
 {
     kit_instrument_slot_t *instrument = scene_instrumentSlot(scene_index, slot);
     const ParamDescriptor *descriptor;
@@ -988,9 +1025,20 @@ uint8_t preset_setSupplementalParameter(uint8_t scene_index, uint8_t slot,
      */
     preset_storeInstrumentEndpoint(
         scene_index, slot, descriptor_index, INSTRUMENT_IMAGE_MAIN, value);
-    if (scene_index == scene_getActiveIndex())
+    /* force > 0 lets the per-track single-voice apply install this source's
+     * target tokens into the runtime even when the Scene is not active
+     * (S077 P2 §3.4, Q13). */
+    if (force || scene_index == scene_getActiveIndex())
         return instrumentManager_writeRuntime(slot, descriptor, value);
     return 1u;
+}
+
+uint8_t preset_setSupplementalParameter(uint8_t scene_index, uint8_t slot,
+                                        uint8_t descriptor_index,
+                                        instrument_param_value_t value)
+{
+    return preset_setSupplementalParameterInternal(
+        scene_index, slot, descriptor_index, value, 0u);
 }
 
 /*
@@ -1043,6 +1091,26 @@ uint8_t preset_setInstrumentParameterFromMidi(uint8_t slot,
     preset_ensureMorphInitialized();
     presetMorph_requestVoice(scene_index, slot);
     return 1u;
+}
+
+/*
+ * Resolve one slot's played Scene for per-track playback (S077 P2 §3.5).
+ *
+ * What: returns the resident Scene playback reads for the slot's track, from
+ * seq_perTrackPattern[slot]. Why: the mixer resolves FX send, fader mode, and
+ * per-voice Morph amount through a Scene index every block; for a per-track
+ * override that index must be the track's played Scene, not the global active
+ * Scene. Inputs: slot 0..5 (tracks 5+6 share slot 5). Output: resident Scene
+ * index; seq_activePattern when no override is set. Context: foreground and
+ * mixer (audio) context; a single-byte read of SRAM1 written atomically by the
+ * button handler. Affiliates: seq_getTrackPlayedScene(),
+ * preset_getEffectiveFxSendAmount(), mixer_faderGains().
+ */
+uint8_t preset_getSlotPlayedScene(uint8_t slot)
+{
+    if (slot >= INSTRUMENT_SLOT_COUNT)
+        return scene_getActiveIndex();
+    return seq_getTrackPlayedScene(slot);
 }
 
 uint8_t preset_applyKitAudioRouting(uint8_t scene_index, uint8_t slot)
@@ -1242,6 +1310,20 @@ uint8_t preset_setVoiceAudioOut(uint8_t scene_index, uint8_t slot,
     if (route > MIXER_ROUTING_DAC2_R)
         route = MIXER_ROUTING_DAC1_STEREO;
     scene_setVoiceAudioOut(scene_index, slot, route);
+    /*
+     * S076 Rule A: a non-automation retained write supersedes any active
+     * step override for this slot. preset_applyKitAudioRouting() (called
+     * next) writes the retained route to the DSP mixer, and once the
+     * override is inactive the effective getter returns the retained route
+     * for display.
+     * Input: active Scene guard. Output: audio_out_step_override[slot].active = 0.
+     * Callers (upstream): menu_cellCommitValue() Scene-setting branch.
+     * Affiliate: preset_setAudioOutStepOverride() (the automation setter),
+     * preset_getEffectiveAudioOut() (the display bridge),
+     * preset_applyVoiceAudioOutRuntime() (the DSP write).
+     */
+    if (scene_index == scene_getActiveIndex())
+        audio_out_step_override[slot].active = 0u;
     return preset_applyKitAudioRouting(scene_index, slot);
 }
 
@@ -1262,6 +1344,21 @@ uint8_t preset_setVoiceFxSendAmount(uint8_t scene_index, uint8_t slot,
     if (amount > 127u)
         amount = 127u;
     scene_setVoiceFxSendAmount(scene_index, slot, amount);
+    /*
+     * S076 Rule A: a non-automation retained write supersedes any active
+     * step override for this slot. The mixer reads the effective getter
+     * each block; once the override is inactive the retained value takes
+     * over on the next block. No rebuild is needed because FX send has no
+     * interpolation worker — the mixer reads the value directly.
+     * Input: active Scene guard. Output: fx_send_step_override[slot].active = 0.
+     * Callers (upstream): menu_cellCommitValue() Scene-setting branch,
+     * clearOps.c `clear send`. Affiliate: preset_setFxSendStepOverride()
+     * (the automation setter), preset_getEffectiveFxSendAmount() (the
+     * mixer consumer), preset_getFxSendDisplayAmount() (the display
+     * bridge).
+     */
+    if (scene_index == scene_getActiveIndex())
+        fx_send_step_override[slot].active = 0u;
     return 1u;
 }
 
@@ -1281,6 +1378,20 @@ uint8_t preset_setVoiceFxSendMorph(uint8_t scene_index, uint8_t slot,
     if (amount > 127u)
         amount = 127u;
     scene_setVoiceFxSendMorph(scene_index, slot, amount);
+    /*
+     * S076 Rule A: editing either endpoint of a morphable FX send releases
+     * the step override so the interpolated result from retained Normal
+     * and Morph endpoints takes effect. The mixer consumer
+     * (preset_getEffectiveFxSendAmount) interpolates using the resolved
+     * voice Morph amount when no step override is active.
+     * Input: active Scene guard. Output: fx_send_step_override[slot].active = 0.
+     * Callers (upstream): menu_cellCommitValue() Scene-setting Morph
+     * branch, clearOps.c `clear send`. Affiliate:
+     * preset_setVoiceFxSendAmount() (the Normal-endpoint twin, also
+     * clears — Change 3).
+     */
+    if (scene_index == scene_getActiveIndex())
+        fx_send_step_override[slot].active = 0u;
     return 1u;
 }
 
@@ -1332,6 +1443,22 @@ uint8_t preset_setSlot6Track7AmpEnvelopeDecay(uint8_t scene_index,
         scene_setSlot6Track7MorphAmpEnvelopeDecay(scene_index, value);
     else
         scene_setSlot6Track7AmpEnvelopeDecay(scene_index, value);
+    /*
+     * S076 Rule A: a non-automation retained write supersedes any active
+     * step decay override. The generated track-7 trigger path reads the
+     * step override first when active; clearing it makes the next trigger
+     * use the retained Kit value (or the LFO layer, if one is active).
+     * Input: active Scene guard. Output:
+     * instrumentManager_clearSlot6Track7StepDecayOverride() sets
+     * slot6_track7_decay_step_active = 0.
+     * Callers (upstream): menu_cellCommitValue() Kit setting branch,
+     * InstrumentManager type-change normalization. Affiliate:
+     * instrumentManager_setSlot6Track7StepDecayOverride() (the automation
+     * setter), instrumentManager_getSlot6Track7StepDecay() (the trigger
+     * consumer).
+     */
+    if (scene_index == scene_getActiveIndex())
+        instrumentManager_clearSlot6Track7StepDecayOverride();
     return 1u;
 }
 
@@ -1340,6 +1467,36 @@ void preset_applySceneSettings(uint8_t scene_index)
     const scene_t *scene = scene_getConst(scene_index);
     if (!scene || scene_index != scene_getActiveIndex())
         return;
+
+    /*
+     * S076 Rule B: Scene activation clears every Scene-target step override
+     * left by the previous Scene's automation.
+     *
+     * What: deactivates all five persistent override families before the
+     * new Scene's mirrors, routing, and Morph are applied. Without this
+     * clear the new Scene's presetMorph_rebuildScene() reads stale
+     * morph_step_override values from the previous Scene, the mixer
+     * continues using the previous Scene's FX send override, and audio
+     * routing does not switch.
+     * Why: main-pattern automation sets these overrides per step, but the
+     * overrides carry no Scene identity. A Scene switch means every
+     * override from the previous Scene is stale; the new Scene's retained
+     * values are the correct baseline.
+     * Inputs: none (this function already validated that scene_index is the
+     * active Scene). Outputs: all override .active flags are 0.
+     * Effect Morph (effects_automation.morph_override_valid) is already
+     * cleared by effects_activateScene() → effects_automationReset(),
+     * which runs in preset_startDrumsetApply() at the same Scene-switch
+     * boundary before this function is called. No duplicate clear needed.
+     * Callers (upstream of this function): preset_startDrumsetApply()
+     * (Scene switch), Bank Load, boot. Affiliates:
+     * seq_restoreAllSceneAutomation() (the transport-boundary clear path,
+     * unchanged).
+     */
+    preset_clearAllFxSendStepOverrides();
+    preset_clearAllAudioOutStepOverrides(scene_index);
+    presetMorph_clearAllStepAutomationOverrides(scene_index);
+    instrumentManager_clearSlot6Track7StepDecayOverride();
 
     /*
      * Apply immediate Scene-wide settings that still have legacy mirrors.
@@ -1494,7 +1651,9 @@ static void preset_normalizeSlotModulationTargets(uint8_t scene_index,
     }
 }
 
-static void preset_applyKitVoiceSupplemental(uint8_t scene_index, uint8_t voice)
+static void preset_applyKitVoiceSupplementalInternal(uint8_t scene_index,
+                                                     uint8_t voice,
+                                                     uint8_t force)
 {
     const kit_instrument_slot_t *instrument =
         scene_instrumentSlotConst(scene_index, voice);
@@ -1520,10 +1679,40 @@ static void preset_applyKitVoiceSupplemental(uint8_t scene_index, uint8_t voice)
         const ParamDescriptor *descriptor = &entry->descriptors[i];
         if (descriptor->flags & INSTRUMENT_PARAM_FLAG_MORPHABLE)
             continue;
-        (void)preset_setSupplementalParameter(
+        (void)preset_setSupplementalParameterInternal(
             scene_index, voice, i,
-            instrument->parameter_images.instrument_parameters[i]);
+            instrument->parameter_images.instrument_parameters[i], force);
     }
+}
+
+/*
+ * Apply one source slot's normalized non-image runtime bindings.
+ *
+ * Inputs: resident Scene/slot after its Morph runtime image is current. Output:
+ * target selectors are installed for the active Scene only. Client: the
+ * all-source rebind loop after staged Instrument commit and ordinary Kit-slot
+ * supplemental apply. Affiliate: preset_applyKitVoiceSupplementalForced().
+ */
+static void preset_applyKitVoiceSupplemental(uint8_t scene_index, uint8_t voice)
+{
+    preset_applyKitVoiceSupplementalInternal(scene_index, voice, 0u);
+}
+
+/*
+ * Apply one source slot's supplemental bindings from a per-track played Scene
+ * (S077 P2 §3.4, Q13).
+ *
+ * Inputs: the track's played Scene and slot. Output: the slot's target tokens
+ * are installed into the live runtime even though the Scene is not active.
+ * Client: preset_tickSingleVoiceApply() after committing one slot's image.
+ * Guard: Scene-namespace target tokens still resolve through the active Scene's
+ * target table (InstrumentManager's token expansion is active-Scene scoped);
+ * voice-namespace LFO/velocity targets resolve slot-relative and are correct.
+ */
+static void preset_applyKitVoiceSupplementalForced(uint8_t scene_index,
+                                                   uint8_t voice)
+{
+    preset_applyKitVoiceSupplementalInternal(scene_index, voice, 1u);
 }
 
 /* Reset and apply one loaded Scene slot's descriptor image, without binding
@@ -1553,16 +1742,54 @@ static void preset_resetAndApplyKitVoiceImage(uint8_t scene_index,
     /*
      * Rebind the DSP runtime type at the same time as parameter commit.
      *
-     * Input: active Scene slot selected by the activation worker. Output:
-     * InstrumentManager's runtime type shadow and the concrete DSP voice object
-     * are reset immediately before routing/Morph descriptor values are copied.
-     * Inactive Scene retained writes must not call this path because the
-     * runtime shadow always belongs to the audible Scene.
+     * Input: the Scene slot selected by the activation worker (the active
+     * Scene for a scene-level switch, or the track's played Scene for the
+     * S077 P2 single-voice per-track apply). Output: InstrumentManager's
+     * runtime type shadow and the concrete DSP voice object are reset from that
+     * Scene immediately before routing/Morph descriptor values are copied.
+     * The reset now resolves the incoming type from the applied Scene, so the
+     * single-voice path commits the played Scene's instrument rather than the
+     * active Scene's.
+     */
+    instrumentManager_resetRuntimeSlotFromScene(voice, scene_index);
+    (void)preset_applyKitAudioRouting(scene_index, voice);
+    /*
+     * Commit the Morph interpolation image. An inactive played Scene uses the
+     * forced variant so the runtime receives that Scene's descriptor values;
+     * the active Scene keeps the normal path.
      */
     if (scene_index == scene_getActiveIndex())
-        instrumentManager_resetRuntimeSlot(voice);
-    (void)preset_applyKitAudioRouting(scene_index, voice);
-    presetMorph_applyVoiceNow(scene_index, voice);
+        presetMorph_applyVoiceNow(scene_index, voice);
+    else
+        presetMorph_applyVoiceNowFromScene(scene_index, voice);
+    /*
+     * S076 P2: restore or reset the LFO phase based on the incoming Scene's
+     * retrigger setting (S076 P2).
+     *
+     * What:       calls instrumentManager_restoreLfoPhaseIfNeeded(voice) which
+     *             checks the incoming LFO's retrigger field:
+     *             - LFO_RETRIGGER_SCENE: phase = phaseOffset (reset to the
+     *               incoming Scene's configured start offset).
+     *             - Otherwise: phase = captured snapshot from the outgoing
+     *               Scene (continue the LFO cycle uninterrupted).
+     * Why:        instrumentManager_resetRuntimeSlot() (called earlier in this
+     *             function or already complete) zeroed the phase. The
+     *             retrigger value was not available at reset time - it was
+     *             written by presetMorph_applyVoiceNow() in the line above.
+     *             This is the earliest point where both the retrigger setting
+     *             and the scaled phaseOffset are in the runtime LFO.
+     * Inputs:     zero-based voice slot; the incoming LFO's retrigger and
+     *             phaseOffset fields (already written by descriptor apply);
+     *             the static handoff struct (written by captureLfoPhases).
+     * Outputs:    lfo->phase set to either phaseOffset or captured phase.
+     * Guard:      runs for both the active Scene and the per-track played
+     *             Scene, because the slot reset above zeroed the phase in both
+     *             cases and the handoff snapshot must be honoured either way.
+     * Affiliates: instrumentManager_captureLfoPhases() (the snapshot writer,
+     *             called in preset_startDrumsetApply()),
+     *             LFO_RETRIGGER_SCENE (lfo.h).
+     */
+    instrumentManager_restoreLfoPhaseIfNeeded(voice);
 }
 
 /* Start the existing bounded all-source modulation rebind cursor.
@@ -1628,6 +1855,29 @@ void preset_sendDrumsetParameters(void)
 void preset_startDrumsetApply(void)
 {
     /*
+     * S076 P2: snapshot each slot's running LFO phase before the deferred
+     * Scene worker resets runtime slots (S076 P2).
+     *
+     * What:       calls instrumentManager_captureLfoPhases() to read the
+     *             current phase of each slot's LFO into the static handoff
+     *             struct.
+     * Why:        instrumentManager_resetRuntimeSlot() will zero the phase
+     *             via memset + lfo_init. The snapshot preserves the running
+     *             phase for slots whose incoming LFO does not have the scn
+     *             retrigger set.
+     * Inputs:     current runtime LFO phases (six uint32_t values).
+     * Outputs:    lfo_scene_handoff populated and marked valid.
+     * Placement:  before instrumentManager_clearAllRuntimeModulationTargets()
+     *             because the mod target teardown does not modify LFO phase
+     *             but must complete before any slot reset begins. The capture
+     *             runs once per Scene worker, not per slot.
+     * Affiliates: instrumentManager_restoreLfoPhaseIfNeeded() (the consumer,
+     *             called per slot in preset_resetAndApplyKitVoiceImage()),
+     *             instrumentManager_resetRuntimeSlot() (the reset that
+     *             destroys the phase).
+     */
+    instrumentManager_captureLfoPhases();
+    /*
      * Detach outgoing runtime targets before the deferred Scene worker starts.
      *
      * Inputs: the six currently tagged runtime members and their all-source
@@ -1646,8 +1896,137 @@ void preset_startDrumsetApply(void)
         (uint16_t)((1u << INSTRUMENT_SLOT_COUNT) - 1u);
     drumset_apply_active = 1u;
     drumset_apply_voice = 0u;
+    /*
+     * A scene-level switch coalesces all tracks (S077 P2 §4.3, Q2), so any
+     * pending per-track single-voice commit is stale and dropped here.
+     */
+    single_voice_pending_mask = 0u;
     /* A new Scene worker must not inherit non-progress from its predecessor. */
     drumset_apply_stall_ticks = 0u;
+}
+
+/*
+ * Apply per-voice Scene settings from a specific source Scene (S077 P2 §3.5).
+ *
+ * What: writes one slot's audio output route from the source Scene into the
+ * live mixer array. Why: when a track plays from a non-active Scene, its
+ * voice-level routing must come from the source Scene rather than the active
+ * Scene. Inputs: slot 0..5, source Scene index. Output: mixer_audioRouting[]
+ * updated for this slot only; no AutoSave or retained SceneData mutation.
+ * Note: FX send, fader mode, and per-voice Morph amount are read live every
+ * block by mixer_faderGains()/preset_getEffectiveFxSendAmount() through
+ * preset_getSlotPlayedScene(), so they need no snapshot here and follow later
+ * edits in the played Scene automatically. Not per-track (always from active
+ * Scene): the Effect record, bus compressor, global Morph amount, and effect
+ * Morph amount. Affiliates: preset_applyKitAudioRouting(), scene_getVoiceAudioOut().
+ */
+static void preset_applyPerVoiceSceneSettings(uint8_t slot,
+                                              uint8_t source_scene)
+{
+    uint8_t route;
+
+    if (slot >= INSTRUMENT_SLOT_COUNT || !scene_getConst(source_scene))
+        return;
+    route = scene_getVoiceAudioOut(source_scene, slot);
+    if (route > MIXER_ROUTING_DAC2_R)
+        route = MIXER_ROUTING_DAC1_STEREO;
+    mixer_audioRouting[slot] = route;
+}
+
+/*
+ * Commit one quiet slot from its played Scene for per-track playback
+ * (S077 P2 §3.4).
+ *
+ * What: shared commit body for the deferred single-voice worker and the
+ * trigger-time force path. Inputs: slot 0..5. Output: the slot's runtime image,
+ * routing, and supplemental targets are applied from seq_perTrackPattern[slot].
+ * Affiliates: preset_resetAndApplyKitVoiceImage(),
+ * preset_applyPerVoiceSceneSettings(), preset_applyKitVoiceSupplementalForced().
+ */
+static void preset_commitSingleVoiceSlot(uint8_t slot)
+{
+    uint8_t source_scene;
+
+    if (slot >= INSTRUMENT_SLOT_COUNT)
+        return;
+    source_scene = seq_getTrackPlayedScene(slot);
+    preset_resetAndApplyKitVoiceImage(source_scene, slot);
+    preset_applyPerVoiceSceneSettings(slot, source_scene);
+    preset_applyKitVoiceSupplementalForced(source_scene, slot);
+}
+
+/*
+ * Advance at most one deferred per-track single-voice apply (S077 P2 §3.4).
+ *
+ * What: scans single_voice_pending_mask round-robin and commits the first slot
+ * whose amp envelope is quiet. Why: a per-track Scene assignment must hot-swap
+ * that slot's instrument without clicking, exactly like the drumset worker, and
+ * without disturbing the other five slots. Inputs: single_voice_pending_mask
+ * and instrumentManager_ampEnvelopeQuiet(). Output: 1 when one slot committed
+ * this pass, 0 otherwise. A continuously ringing slot is committed by the
+ * trigger-time force path (preset_applyDeferredSceneSlotForTrigger()).
+ * Affiliates: preset_commitSingleVoiceSlot().
+ */
+static uint8_t preset_tickSingleVoiceApply(void)
+{
+    uint8_t slot;
+
+    if (single_voice_pending_mask == 0u)
+        return 0u;
+    for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++) {
+        uint8_t bit = (uint8_t)(1u << slot);
+
+        if ((single_voice_pending_mask & bit) == 0u)
+            continue;
+        if (!instrumentManager_ampEnvelopeQuiet(slot))
+            continue;
+        preset_commitSingleVoiceSlot(slot);
+        single_voice_pending_mask =
+            (uint8_t)(single_voice_pending_mask & ~bit);
+        return 1u;
+    }
+    return 0u;
+}
+
+/*
+ * Arm a deferred single-voice apply for one slot from a played Scene
+ * (S077 P2 §2.1, §3.4).
+ *
+ * What: a single-slot variant of preset_startDrumsetApply() for per-track Scene
+ * assignment. It (1) supersedes the drumset worker for this slot by clearing the
+ * slot's bit from drumset_apply_pending_mask, (2) captures the slot's LFO phase,
+ * (3) clears this slot's runtime modulation targets only, (4) applies the source
+ * Scene's audio routing, and (5) arms single_voice_pending_mask for the deferred
+ * quiet-wait commit. Why: assigning a track to another Scene must load that
+ * track's voice slot from the played Scene using the same envelope-quiet
+ * deferral as the drumset worker, without replacing the other slots. Inputs:
+ * slot 0..5, source Scene index (the caller passes seq_perTrackPattern[slot]).
+ * Outputs: the deferred worker commits the slot on a later foreground pass, or
+ * the trigger path forces it. Coexistence: clearing the drumset bit is the only
+ * coordination needed - the drumset worker already skips cleared slots (plan
+ * §3.4, Q6-b). For tracks 5+6 (HiHat pair) the caller invokes this for the one
+ * shared slot. Affiliates: preset_tickSingleVoiceApply(),
+ * instrumentManager_captureLfoPhaseForSlot(),
+ * instrumentManager_clearRuntimeModulationTargetsForSlot(),
+ * preset_applyPerVoiceSceneSettings().
+ */
+void preset_startSingleVoiceApply(uint8_t slot, uint8_t source_scene)
+{
+    uint8_t bit;
+
+    if (slot >= INSTRUMENT_SLOT_COUNT || !scene_getConst(source_scene))
+        return;
+    bit = (uint8_t)(1u << slot);
+    /* Supersede the drumset worker for this slot (Q6-b). */
+    drumset_apply_pending_mask =
+        (uint16_t)(drumset_apply_pending_mask & ~(uint16_t)bit);
+    /* Snapshot the running LFO phase before the slot reset destroys it. */
+    instrumentManager_captureLfoPhaseForSlot(slot);
+    /* Detach this slot's outgoing modulation graph only. */
+    instrumentManager_clearRuntimeModulationTargetsForSlot(slot);
+    /* Apply the source Scene's routing now; the image commits when quiet. */
+    preset_applyPerVoiceSceneSettings(slot, source_scene);
+    single_voice_pending_mask = (uint8_t)(single_voice_pending_mask | bit);
 }
 
 /*
@@ -1657,12 +2036,21 @@ void preset_startDrumsetApply(void)
  */
 uint8_t preset_applyWorkersIdle(void)
 {
-    return (uint8_t)(!drumset_apply_active && !instrument_apply_active);
+    return (uint8_t)(!drumset_apply_active && !instrument_apply_active &&
+                     single_voice_pending_mask == 0u);
 }
 
 uint8_t preset_tickDrumsetApply(void)
 {
     uint8_t checked;
+
+    /*
+     * Service the per-track single-voice worker first (S077 P2 §3.4). It
+     * commits at most one quiet slot per pass; returning here yields to audio
+     * exactly as the Scene worker does, so every existing caller polls it.
+     */
+    if (preset_tickSingleVoiceApply())
+        return 1u;
 
     if (!drumset_apply_active)
         return 0u;
@@ -1760,6 +2148,29 @@ void preset_applyDeferredSceneSlotForTrigger(uint8_t trigger_track)
      * bindings stay detached until every pending member is valid, then the
      * common all-source rebind cursor installs them without stale pointers.
      */
+    /*
+     * Force a pending per-track single-voice slot first (S077 P2 §3.4).
+     *
+     * What: if this trigger's slot has a deferred single-voice commit armed,
+     * commit it from the track's played Scene before the note fires. Why: a
+     * continuously ringing slot cannot reach the quiet threshold, so the trigger
+     * is the accepted force point (same policy as the drumset worker). Inputs:
+     * trigger_track 0..6. Output: the played Scene image, routing, and
+     * supplemental targets are applied and the pending bit cleared.
+     */
+    if (trigger_track <= INSTRUMENT_SLOT_COUNT) {
+        uint8_t svoice = (trigger_track >= INSTRUMENT_SLOT_COUNT)
+            ? (INSTRUMENT_SLOT_COUNT - 1u) : trigger_track;
+        uint8_t sbit = (uint8_t)(1u << svoice);
+
+        if ((single_voice_pending_mask & sbit) != 0u) {
+            presetMorph_prioritizeVoice(seq_getTrackPlayedScene(svoice),
+                                        svoice);
+            preset_commitSingleVoiceSlot(svoice);
+            single_voice_pending_mask =
+                (uint8_t)(single_voice_pending_mask & ~sbit);
+        }
+    }
     if (!drumset_apply_active ||
         drumset_apply_scene != scene_getActiveIndex()) {
         return;
@@ -3183,6 +3594,21 @@ void preset_morphScene(uint8_t scene_index, uint8_t morph)
     scene_setAllVoiceMorphAmounts(scene_index, morph);
     /* Global Morph also owns the retained Scene Effect Morph amount. */
     scene_setEffectMorphAmount(scene_index, morph);
+    /*
+     * S076 Rule A: bulk Morph set from PERF / global MIDI CC1 supersedes
+     * every active step-automation Morph override. Each slot is cleared
+     * individually through the single-slot helper. The clear precedes the
+     * active-Scene mirror sync and rebuild so the worker uses the newly
+     * retained amounts.
+     * Input: active Scene guard. Output: all morph_step_override[].active = 0.
+     * Callers (upstream): preset_morph() (PERF global Morph, MIDI CC1
+     * global). Affiliate: preset_morphVoiceScene() (the per-slot twin —
+     * Change 6).
+     */
+    if (scene_index == scene_getActiveIndex()) {
+        for (uint8_t s = 0u; s < INSTRUMENT_SLOT_COUNT; s++)
+            presetMorph_clearStepAutomationOverride(s);
+    }
     if (scene_index == scene_getActiveIndex()) {
         preset_syncSceneMorphMirrors(scene);
         presetMorph_requestAll(scene_index);
@@ -3218,6 +3644,19 @@ void preset_morphVoiceScene(uint8_t scene_index, uint8_t slot, uint8_t morph)
         return;
     preset_ensureMorphInitialized();
     scene_setVoiceMorphAmount(scene_index, slot, morph);
+    /*
+     * S076 Rule A: a non-automation Morph write supersedes any active step
+     * override for this slot. The clear precedes the active-Scene rebuild
+     * request so presetMorph_effectiveVoiceBase() returns the newly retained
+     * amount when the worker processes the queued slot.
+     * Input: active Scene guard. Output: morph_step_override[slot].active = 0.
+     * Callers (upstream): preset_morphVoice() (PERF, MIDI CC1 per-voice),
+     * menu_cellCommitValue() Morph cells. Affiliate:
+     * presetMorph_setStepAutomationOverride() (the automation setter),
+     * presetMorph_effectiveVoiceBase() (the worker consumer).
+     */
+    if (scene_index == scene_getActiveIndex())
+        presetMorph_clearStepAutomationOverride(slot);
     if (scene_index == scene_getActiveIndex()) {
         parameter_values[PAR_VOICE1_MORPH + slot] = morph;
         presetMorph_requestVoice(scene_index, slot);
@@ -3239,6 +3678,123 @@ void preset_rebuildMorph(void)
 
     preset_ensureMorphInitialized();
     presetMorph_rebuildScene(scene_index);
+}
+
+/*
+ * preset_resetSlotMorphToNormal — equalise one slot's Morph to its Normal.
+ *
+ * What:       iterates the descriptor table of the slot's current instrument
+ *             type and, for every descriptor whose flags include
+ *             INSTRUMENT_PARAM_FLAG_MORPHABLE, copies the retained Normal
+ *             image byte onto the retained Morph image byte. Non-morphable
+ *             descriptor rows are untouched.
+ * Why:        the "reset morph" clears (track- and Scene-level) need one shared
+ *             per-slot morphable-copy loop. Writing the retained Scene image
+ *             directly and marking once afterwards is the same pattern the
+ *             KitMrp/InstrumentMrp endpoint commits use; going through
+ *             preset_setInstrumentParameter() per byte would re-interpolate
+ *             each descriptor and re-check automation for a batch the caller
+ *             rebuilds with a single preset_rebuildMorph().
+ * Inputs:     scene_index (0..15) and slot (0..5). The slot's current type
+ *             selects the descriptor table.
+ * Outputs:    the count of Morph bytes changed (0 for invalid coordinates or an
+ *             empty descriptor table). On change, marks the slot's Morph
+ *             AutoSave scope and clears the Scene's card-clean bit. Does NOT
+ *             queue the Morph worker.
+ * Accessors:  scene_instrumentSlot(), instrumentManager_registryEntry(),
+ *             INSTRUMENT_PARAM_FLAG_MORPHABLE, autosave_markInstrumentMorphDirty(),
+ *             bank_invalidateSdCleanScene().
+ * Affiliates: preset_copySlotNormalToMorph() below,
+ *             ccClear_runResetMorphTrack(), ccClear_runResetSceneMorph(),
+ *             preset_rebuildMorph().
+ */
+uint8_t preset_resetSlotMorphToNormal(uint8_t scene_index, uint8_t slot)
+{
+    kit_instrument_slot_t *dst = scene_instrumentSlot(scene_index, slot);
+    const instrument_registry_entry_t *entry;
+    instrument_parameter_images_t *images;
+    uint8_t changed = 0u;
+    uint8_t i;
+
+    if (!dst)
+        return 0u;
+    entry = instrumentManager_registryEntry(dst->type);
+    if (!entry || !entry->descriptors)
+        return 0u;
+    images = &dst->parameter_images;
+    for (i = 0u; i < entry->descriptor_count; i++) {
+        if (!(entry->descriptors[i].flags & INSTRUMENT_PARAM_FLAG_MORPHABLE))
+            continue;
+        if (images->morph_instrument_parameters[i] !=
+            images->instrument_parameters[i]) {
+            images->morph_instrument_parameters[i] =
+                images->instrument_parameters[i];
+            changed++;
+        }
+    }
+    if (changed) {
+        autosave_markInstrumentMorphDirty(scene_index, slot);
+        bank_invalidateSdCleanScene(scene_index);
+    }
+    return changed;
+}
+
+/*
+ * preset_copySlotNormalToMorph — copy src Normal onto dst Morph.
+ *
+ * What:       reads the source slot's Normal image and writes every morphable
+ *             descriptor byte into the destination slot's Morph image, by
+ *             descriptor index. Returns 0 with no side effects when the source
+ *             and destination instrument types differ (a different type's
+ *             descriptor indices are meaningless, so the member is silently
+ *             skipped).
+ * Why:        the "inst -> morph" track copy and the "scene -> morph" Scene
+ *             copy share this cross-Scene, per-slot morphable-endpoint loop.
+ *             Matching types guarantee identical descriptor layouts, so an
+ *             index-by-index copy needs no key remapping.
+ * Inputs:     src_scene/src_slot (Normal source) and dst_scene/dst_slot (Morph
+ *             target), all coordinates valid.
+ * Outputs:    the count of Morph bytes changed (0 for invalid coordinates or a
+ *             type mismatch). On change, marks the destination slot's Morph
+ *             AutoSave scope and clears the destination Scene's card-clean bit.
+ *             Does NOT queue the Morph worker.
+ * Accessors:  scene_instrumentSlot(), instrumentManager_registryEntry(),
+ *             autosave_markInstrumentMorphDirty(), bank_invalidateSdCleanScene().
+ * Affiliates: preset_resetSlotMorphToNormal() above, ccCopy_runMorphTrack(),
+ *             ccCopy_runSceneMorph().
+ */
+uint8_t preset_copySlotNormalToMorph(uint8_t src_scene, uint8_t src_slot,
+                                     uint8_t dst_scene, uint8_t dst_slot)
+{
+    const kit_instrument_slot_t *src =
+        scene_instrumentSlotConst(src_scene, src_slot);
+    kit_instrument_slot_t *dst = scene_instrumentSlot(dst_scene, dst_slot);
+    const instrument_registry_entry_t *entry;
+    instrument_parameter_images_t *dst_images;
+    uint8_t changed = 0u;
+    uint8_t i;
+
+    if (!src || !dst || src->type != dst->type)
+        return 0u;
+    entry = instrumentManager_registryEntry(dst->type);
+    if (!entry || !entry->descriptors)
+        return 0u;
+    dst_images = &dst->parameter_images;
+    for (i = 0u; i < entry->descriptor_count; i++) {
+        if (!(entry->descriptors[i].flags & INSTRUMENT_PARAM_FLAG_MORPHABLE))
+            continue;
+        if (dst_images->morph_instrument_parameters[i] !=
+            src->parameter_images.instrument_parameters[i]) {
+            dst_images->morph_instrument_parameters[i] =
+                src->parameter_images.instrument_parameters[i];
+            changed++;
+        }
+    }
+    if (changed) {
+        autosave_markInstrumentMorphDirty(dst_scene, dst_slot);
+        bank_invalidateSdCleanScene(dst_scene);
+    }
+    return changed;
 }
 
 /* S075: the former global `srt` setter was retired with its Scene field. */

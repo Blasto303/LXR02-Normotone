@@ -73,6 +73,11 @@
 #define LED_PULSE_TIME_MS      50
 #define NUM_OF_BLINKABLE_LEDS  8
 #define LED_BLINK_TIME_MS      250
+/*
+ * Fast blink half-period (S080 P2 Defect 10): double the standard blink rate,
+ * used only by the queued-scene indication (LED_LAYER_FAST).
+ */
+#define LED_FAST_BLINK_TIME_MS 125
 #define NUM_OF_FLASHABLE_LEDS  LED_FLASH_GROUP_COUNT
 #define LED_FLASH_DURATION_TIME_MS 400
 #define LED_FLASH_CYCLE_TIME_MS    80
@@ -146,6 +151,12 @@ static uint8_t           led_sw43OriginalState;
 #define LED_LAYER_CHASE  (1u << 1)
 #define LED_LAYER_FLASH  (1u << 2)
 #define LED_LAYER_PULSE  (1u << 3)
+/*
+ * S080 P2 Defect 10: fast-blink layer. Priority: pulse > fast > flash >
+ * blink/chase > base. It is owned by led_setFastBlinkLed() alone; blink
+ * start/stop, led_clearAllBlinkLeds() and led_setValue() never clear it.
+ */
+#define LED_LAYER_FAST   (1u << 4)
 #define LED_LAYER_COUNT  41u
 
 static uint8_t led_activeLayers[LED_LAYER_COUNT];
@@ -170,6 +181,24 @@ static uint8_t led_flashGroupLed(LedFlashGroup group, uint8_t bit);
 static uint16_t led_nextBlinkTime;
 static volatile uint8_t led_blinkLedNumber[NUM_OF_BLINKABLE_LEDS];
 static volatile uint8_t led_blinkingLeds;
+
+/*
+ * Queued-scene fast blink state (S080 P2 Defect 10).
+ *
+ * What: led_fastBlinkLed is the one logical LED carrying LED_LAYER_FAST
+ * (0xFF = none); led_fastBlinkPhase is its current on/off phase;
+ * led_fastBlinkNext is the time_sysTick deadline of the next toggle. Why: a
+ * queued scene change flashes its SEQ LED at double the normal rate until the
+ * change fires (plan §5.3). Only one Scene can be queued, so one LED is
+ * enough. A dedicated layer keeps the indication independent of the eight
+ * shared blink slots, which the PERF Scene refresh clears on every beat.
+ * Inputs: led_setFastBlinkLed(). Outputs: LED phase via led_renderFromStack()
+ * and led_tickHandler(). RAM: 4 bytes SRAM1. Affiliates:
+ * menu_syncQueuedSceneLed() (the owner), LED_FAST_BLINK_TIME_MS.
+ */
+static uint8_t  led_fastBlinkLed   = 0xFFu;
+static uint8_t  led_fastBlinkPhase = 0u;
+static uint16_t led_fastBlinkNext  = 0u;
 
 /*
  * Remembered/base state for all shift-register LEDs.
@@ -285,7 +314,8 @@ static void led_resetToOriginal(uint8_t ledNr)
  * Re-render one LED from the highest active layer in its priority stack.
  *
  * Input: logical LED ID. Output: the physical LED output is set to the state
- * dictated by the highest active layer (pulse > flash > blink/chase > base).
+ * dictated by the highest active layer
+ * (pulse > fast > flash > blink/chase > base).
  * When no temporary layer is active, the LED falls back to its base state from
  * led_originalLedState[] or led_sw43OriginalState. Pulse and blink/chase keep
  * the state already written by their owner; flash is re-applied from the
@@ -308,6 +338,16 @@ static void led_renderFromStack(uint8_t ledNr)
 
     if (layers & LED_LAYER_PULSE)
         return;
+
+    /*
+     * S080 P2 Defect 10: the queued-scene fast blink owns its LED below pulse.
+     * Re-applying the phase here is what makes it survive base writes
+     * (led_setValue) and blink cancellation on the same LED.
+     */
+    if (layers & LED_LAYER_FAST) {
+        led_setValueTemp(led_fastBlinkPhase, ledNr);
+        return;
+    }
 
     if (layers & LED_LAYER_FLASH) {
         uint8_t group;
@@ -521,6 +561,8 @@ void led_clearAll(void)
     led_sw43State = 0;
     led_sw43OriginalState = 0;
     memset(led_activeLayers, 0, sizeof(led_activeLayers));
+    /* S080 P2 Defect 10: the fast-blink owner follows the cleared layers. */
+    led_fastBlinkLed = 0xFFu;
     dout_setSw43Led(0);
 }
 
@@ -792,9 +834,10 @@ void led_setBlinkLed(uint8_t ledNr, uint8_t onOff)
                     uint8_t index = (physLed == LED_BAR1) ? 40u : physLed;
                     if (index < LED_LAYER_COUNT)
                         led_activeLayers[index] |= LED_LAYER_BLINK;
+                    /* S080 P2: a fast-blink LED is never toggled by blink. */
                     if (index >= LED_LAYER_COUNT ||
                         !(led_activeLayers[index] &
-                          (LED_LAYER_PULSE | LED_LAYER_FLASH)))
+                          (LED_LAYER_PULSE | LED_LAYER_FLASH | LED_LAYER_FAST)))
                         led_toggleTemp(ledNr);
                 }
                 break;
@@ -839,6 +882,75 @@ void led_clearAllBlinkLeds(void)
             led_blinkingLeds &= (uint8_t)~(1<<i);
         }
     }
+}
+
+/*
+ * Set or clear the fast-blink LED (S080 P2 Defect 10).
+ *
+ * What: moves LED_LAYER_FAST to ledNr (0xFF = none). The previous LED drops
+ * the layer and re-renders from its remaining layers/base; the new LED starts
+ * in the "on" phase. Why: the queued Scene's SEQ LED flashes at double rate
+ * until the change fires, independent of the per-beat Scene refresh. Inputs:
+ * logical LED id or 0xFF. Outputs: layer bits, fast-blink state, LED output.
+ * Accessors: menu_syncQueuedSceneLed(). Affiliates: led_renderFromStack(),
+ * led_tickHandler(), led_clearAll().
+ */
+void led_setFastBlinkLed(uint8_t ledNr)
+{
+    uint8_t old = led_fastBlinkLed;
+    uint8_t physLed;
+    uint8_t index;
+
+    if (ledNr != 0xFFu) {
+        physLed = led_toPhysicalNumber(ledNr);
+        if (physLed >= NUM_OUTS && physLed != LED_BAR1)
+            ledNr = 0xFFu;
+    }
+    if (ledNr == old)
+        return;
+    led_fastBlinkLed = 0xFFu;
+    if (old != 0xFFu) {
+        physLed = led_toPhysicalNumber(old);
+        index = (physLed == LED_BAR1) ? 40u : physLed;
+        if (index < LED_LAYER_COUNT)
+            led_activeLayers[index] &= (uint8_t)~LED_LAYER_FAST;
+        led_renderFromStack(old);
+    }
+    if (ledNr != 0xFFu) {
+        physLed = led_toPhysicalNumber(ledNr);
+        index = (physLed == LED_BAR1) ? 40u : physLed;
+        if (index < LED_LAYER_COUNT)
+            led_activeLayers[index] |= LED_LAYER_FAST;
+        led_fastBlinkPhase = 1u;
+        led_fastBlinkNext = (uint16_t)(time_sysTick + LED_FAST_BLINK_TIME_MS);
+        led_fastBlinkLed = ledNr;
+        led_renderFromStack(ledNr);
+    }
+}
+
+/* S080 P2 Defect 10: current fast-blink LED, or 0xFF when none. */
+uint8_t led_getFastBlinkLed(void)
+{
+    return led_fastBlinkLed;
+}
+
+/*
+ * Report whether a logical LED holds a persistent blink slot (S080 P2).
+ *
+ * What: returns 1 when ledNr is in the blink set. Why: the PERF Scene refresh
+ * re-asserts blinks on every beat; restarting an already blinking LED (clear
+ * then set) resets its phase and makes the blink stutter, so the refresh asks
+ * first and leaves running blinks alone. Accessors: menu_refreshPerfSceneLeds().
+ */
+uint8_t led_isBlinkLed(uint8_t ledNr)
+{
+    int i;
+
+    for (i = 0; i < NUM_OF_BLINKABLE_LEDS; i++) {
+        if ((led_blinkingLeds & (1 << i)) && led_blinkLedNumber[i] == ledNr)
+            return 1u;
+    }
+    return 0u;
 }
 
 /*
@@ -889,12 +1001,27 @@ void led_tickHandler(void)
                 uint8_t ledNr = led_blinkLedNumber[i];
                 uint8_t physLed = led_toPhysicalNumber(ledNr);
                 uint8_t index = (physLed == LED_BAR1) ? 40u : physLed;
+                /* S080 P2: a fast-blink LED is never toggled by blink. */
                 if (index >= LED_LAYER_COUNT ||
                     !(led_activeLayers[index] &
-                      (LED_LAYER_PULSE | LED_LAYER_FLASH)))
+                      (LED_LAYER_PULSE | LED_LAYER_FLASH | LED_LAYER_FAST)))
                     led_toggleTemp(ledNr);
             }
         }
+    }
+
+    /*
+     * S080 P2 Defect 10: queued-scene fast blink.
+     *
+     * What: toggles the fast-blink phase every LED_FAST_BLINK_TIME_MS and
+     * re-renders its LED. Why: double-rate flashing until the queued change
+     * fires. The signed-distance test is wrap-safe on the 16-bit clock.
+     */
+    if (led_fastBlinkLed != 0xFFu &&
+        (uint16_t)(time_sysTick - led_fastBlinkNext) < 0x8000u) {
+        led_fastBlinkNext = (uint16_t)(time_sysTick + LED_FAST_BLINK_TIME_MS);
+        led_fastBlinkPhase ^= 1u;
+        led_renderFromStack(led_fastBlinkLed);
     }
 }
 
@@ -1146,22 +1273,6 @@ void led_clearActive_step(void)
 }
 
 /*
- * Draw SELECT-row feedback for performance mode.
- *
- * Inputs are implicit Menu state during the single-pattern bridge. Output:
- * SELECT LEDs are cleared and SELECT1 is lit as the only playable pattern slot.
- * The viewed/played pattern distinction is intentionally pinned until the Scene
- * architecture replaces the old pattern bank.
- *
- * Common callers: entering performance mode and pattern-change notification.
- */
-void led_initPerformanceLeds(void)
-{
-    led_clearSelectLeds();
-    led_setValue(1, LED_PART_SELECT1);
-}
-
-/*
  * Render sequencer chase/current-step feedback for the active UI context.
  *
  * Input: step is the playback bridge step index supplied through
@@ -1409,6 +1520,74 @@ void led_setBeatPulse(uint8_t on)
 }
 
 /*
+ * Update the SELECT LED bar chaselight during playback in STEP mode.
+ *
+ * What:       overlays a tempo-pulsed indicator on the SELECT row to show
+ *             which bar the sequencer is currently playing, in addition to
+ *             the steady-on indicator for the viewed bar (menu_currentBar).
+ *             The pulse follows the same beat timing as the Play button:
+ *             on at beat boundaries, off one step later.
+ * Why:        gives the user visual bar-position feedback during playback
+ *             without leaving STEP mode. The inverted-pulse rule ensures the
+ *             chaselight is visible even when the playback bar and the viewed
+ *             bar coincide (the LED blinks off instead of being a second on).
+ * Inputs:     seq_ledState.chaseStep (the active voice's absolute step
+ *             0..127, already reflecting the per-track length wrap),
+ *             seq_ledState.beatPulse (1 at beat boundary, 0 between),
+ *             menu_currentBar (the viewed bar 0..7),
+ *             seq_isRunning() (transport state).
+ *             Must only be called while SELECT_MODE_STEP is active.
+ * Outputs:    SELECT LED base state: menu_currentBar on, all others off.
+ *             When running and beat pulse is active:
+ *               - playback bar == viewed bar: that LED turns OFF (inverted).
+ *               - playback bar != viewed bar: that LED turns ON (normal pulse).
+ *             When running and beat pulse is inactive:
+ *               - base state only (viewed bar on, all others off).
+ *             When stopped: base state only.
+ * Accessors:  led_setValue(), seq_isRunning(), seq_ledState (ledHandler.h),
+ *             menu_currentBar (menu.h), NUM_STEPS_PER_BAR (PatternData.h).
+ * Affiliates: led_processSeqLedState() (the sole caller, via CHASE and BEAT
+ *             dirty handlers), led_setActiveSelectButton() (base state writer
+ *             called from buttonHandler_selectBar and led_updatePatternTrackView),
+ *             led_setBeatPulse() (Play button pulse, same timing source).
+ */
+static void led_updateSelectBarChaselight(void)
+{
+    uint8_t i;
+    uint8_t viewedBar = menu_currentBar;
+
+    /* Write base state: viewed bar on, all others off. */
+    for (i = 0u; i < 8u; i++)
+        led_setValue((uint8_t)(i == viewedBar), (uint8_t)(LED_PART_SELECT1 + i));
+
+    if (!seq_isRunning())
+        return;
+
+    {
+        uint8_t playbackBar =
+            (uint8_t)(seq_ledState.chaseStep / NUM_STEPS_PER_BAR);
+        uint8_t pulse = seq_ledState.beatPulse;
+
+        if (playbackBar >= NUM_BARS)
+            return;
+
+        if (pulse) {
+            if (playbackBar == viewedBar) {
+                /* Inverted pulse: the LED is already on for the viewed bar,
+                 * so turn it OFF at the beat to create a visible blink. */
+                led_setValue(0u, (uint8_t)(LED_PART_SELECT1 + playbackBar));
+            } else {
+                /* Normal pulse: light the playback bar LED at the beat. */
+                led_setValue(1u, (uint8_t)(LED_PART_SELECT1 + playbackBar));
+            }
+        }
+        /* When pulse is 0: base state only (the viewed bar on, others off).
+         * A previous normal-pulse LED is extinguished by the base-state
+         * write above; an inverted-pulse LED is restored the same way. */
+    }
+}
+
+/*
  * Notify the front-panel layer that playback has switched patterns.
  *
      * Input: playedPattern is the new sequencer pattern slot. Outputs:
@@ -1509,8 +1688,35 @@ void led_processSeqLedState(void)
     shownPattern = menu_getViewedPattern();
 
     /* Beat pulse: set/clear START_STOP according to seq_ledState.beatPulse. */
-    if (d & SEQ_LED_DIRTY_BEAT)
+    if (d & SEQ_LED_DIRTY_BEAT) {
         led_setBeatPulse(seq_ledState.beatPulse);
+        /*
+         * PERF Scene LED tempo pulse (S077 P2 §5.1).
+         *
+         * What: repaint the PERF Scene row on each beat-phase change so the
+         * active Scene's SEQ LED follows seq_ledState.beatPulse (the view that
+         * menu_refreshPerfSceneLeds() reads). Why: without a per-beat refresh
+         * the pulse would hold its last value. Affiliates:
+         * menu_refreshPerfSceneLeds(), buttonHandler_getMode().
+         */
+        if (buttonHandler_getMode() == SELECT_MODE_PERF)
+            menu_refreshPerfSceneLeds();
+        /*
+         * What:       update the SELECT-row bar chaselight whenever the beat
+         *             pulse phase changes (on -> off or off -> on).
+         * Why:        the pulse phase controls whether the playback-bar LED
+         *             is lit or dark. BEAT fires once per phase transition,
+         *             which is exactly when the SELECT-row chaselight must
+         *             repaint. The CHASE handler below covers bar-boundary
+         *             changes; this handler covers pulse-phase changes within
+         *             the same bar.
+         * Inputs:     SELECT_MODE_STEP guard; the function reads
+         *             seq_ledState.beatPulse internally.
+         * Affiliates: led_updateSelectBarChaselight() above.
+         */
+        if (buttonHandler_getMode() == SELECT_MODE_STEP)
+            led_updateSelectBarChaselight();
+    }
 
     /* Chase light: install it only while playback has a valid position. When
      * stopped, remove any old chase inversion instead of rendering the queued
@@ -1520,6 +1726,20 @@ void led_processSeqLedState(void)
             led_updateCurrentStep(seq_ledState.chaseStep);
         else
             led_clearActive_step();
+        /*
+         * What:       update the SELECT-row bar chaselight whenever the
+         *             playback step advances and may have crossed a bar
+         *             boundary, or when transport stops (clearing the pulse).
+         * Why:        the CHASE dirty bit fires at every step advance and at
+         *             stop, which is exactly when the playback bar may change
+         *             or disappear. Coupling the call here avoids a new dirty
+         *             flag.
+         * Inputs:     SELECT_MODE_STEP guard; the function reads
+         *             seq_ledState.chaseStep and beatPulse internally.
+         * Affiliates: led_updateSelectBarChaselight() above.
+         */
+        if (buttonHandler_getMode() == SELECT_MODE_STEP)
+            led_updateSelectBarChaselight();
     }
 
     /* Recorded step: update STEP1..16 for the visible bar unless performance

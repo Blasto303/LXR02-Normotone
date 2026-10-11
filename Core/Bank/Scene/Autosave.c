@@ -98,11 +98,33 @@ _Static_assert(AUTOSAVE_SCENE_PARAM_FX_SEND_MORPH_BASE -
                    AUTOSAVE_SCENE_PARAM_BUS_COMP_BASE ==
                    SCENE_BUS_COMP_FIELD_COUNT,
                "Scene bus compressor group must cover every field");
-/* S075 F2-H: the FX-send Morph group closes the live Scene cells. */
-_Static_assert(AUTOSAVE_SCENE_PARAM_COUNT -
+/* S075 F2-H: the FX-send Morph group is followed by the S078 track groups. */
+_Static_assert(AUTOSAVE_SCENE_PARAM_TRACK_MORPH_LENGTH_BASE -
                    AUTOSAVE_SCENE_PARAM_FX_SEND_MORPH_BASE ==
                    INSTRUMENT_SLOT_COUNT,
                "Scene FX-send Morph group must cover every instrument slot");
+/* S078 §5.4: the three per-track Morph endpoint groups close the live cells. */
+_Static_assert(AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SCALE_BASE -
+                   AUTOSAVE_SCENE_PARAM_TRACK_MORPH_LENGTH_BASE == NUM_TRACKS,
+               "Scene track Morph length group must cover every track");
+_Static_assert(AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SHUFFLE_BASE -
+                   AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SCALE_BASE == NUM_TRACKS,
+               "Scene track Morph scale group must cover every track");
+_Static_assert(AUTOSAVE_SCENE_PARAM_CHAIN_CONDITION_BASE -
+                   AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SHUFFLE_BASE == NUM_TRACKS,
+               "Scene track Morph shuffle group must cover every track");
+/* S080 G: the two chain groups close the live cells. */
+_Static_assert(AUTOSAVE_SCENE_PARAM_CHAIN_NEXT_BASE -
+                   AUTOSAVE_SCENE_PARAM_CHAIN_CONDITION_BASE ==
+                   SCENE_CHAIN_SLOT_COUNT,
+               "Scene chain condition group must cover both slots");
+_Static_assert(AUTOSAVE_SCENE_PARAM_COUNT -
+                   AUTOSAVE_SCENE_PARAM_CHAIN_NEXT_BASE ==
+                   SCENE_CHAIN_SLOT_COUNT,
+               "Scene chain next group must cover both slots");
+_Static_assert(AUTOSAVE_SCENE_PARAM_COUNT <=
+                   AUTOSAVE_SCENE_PARAMETER_ALLOC_BYTES,
+               "Scene live cells must fit the reserved Scene allocation");
 
 /*
  * Eight-bit Hamming-weight table for atomic dirty-mask accounting.
@@ -937,10 +959,34 @@ static uint8_t autosave_getSceneParameter(const scene_t *scene,
         /* Indices 41..44 are the S074 bus compressor settings (cmp..csc). */
         *value = scene->settings.bus_comp[
             parameter_index - AUTOSAVE_SCENE_PARAM_BUS_COMP_BASE];
-    } else {
+    } else if (parameter_index <
+               AUTOSAVE_SCENE_PARAM_TRACK_MORPH_LENGTH_BASE) {
         /* Indices 45..50 are the FX-send Morph endpoints (S075 F2-H). */
         *value = scene->settings.fx_send_morph[
             parameter_index - AUTOSAVE_SCENE_PARAM_FX_SEND_MORPH_BASE];
+    } else if (parameter_index <
+               AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SCALE_BASE) {
+        /* Indices 51..57 are the S078 track Morph length endpoints. */
+        *value = scene->settings.track_morph_length[
+            parameter_index - AUTOSAVE_SCENE_PARAM_TRACK_MORPH_LENGTH_BASE];
+    } else if (parameter_index <
+               AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SHUFFLE_BASE) {
+        /* Indices 58..64 are the S078 track Morph scale endpoints. */
+        *value = scene->settings.track_morph_scale[
+            parameter_index - AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SCALE_BASE];
+    } else if (parameter_index <
+               AUTOSAVE_SCENE_PARAM_CHAIN_CONDITION_BASE) {
+        /* Indices 65..71 are the S078 track Morph shuffle endpoints. */
+        *value = scene->settings.track_morph_shuffle[
+            parameter_index - AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SHUFFLE_BASE];
+    } else if (parameter_index < AUTOSAVE_SCENE_PARAM_CHAIN_NEXT_BASE) {
+        /* Indices 72..73 are the S080 Scene chain conditions. */
+        *value = scene->settings.chain_condition[
+            parameter_index - AUTOSAVE_SCENE_PARAM_CHAIN_CONDITION_BASE];
+    } else {
+        /* Indices 74..75 are the S080 Scene chain next-scene values. */
+        *value = scene->settings.chain_next[
+            parameter_index - AUTOSAVE_SCENE_PARAM_CHAIN_NEXT_BASE];
     }
     return 1u;
 }
@@ -1435,12 +1481,64 @@ void autosave_applyScenePayload(uint8_t scene_index,
                 (uint8_t)(parameter_index -
                           AUTOSAVE_SCENE_PARAM_BUS_COMP_BASE),
                 value);
-        } else {
+        } else if (parameter_index <
+                   AUTOSAVE_SCENE_PARAM_TRACK_MORPH_LENGTH_BASE) {
             /* Indices 45..50 restore FX-send Morph endpoints (S075 F2-H). */
             scene_setVoiceFxSendMorph(
                 scene_index,
                 (uint8_t)(parameter_index -
                           AUTOSAVE_SCENE_PARAM_FX_SEND_MORPH_BASE),
+                value);
+        } else if (parameter_index <
+                   AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SCALE_BASE) {
+            /* Indices 51..57 restore the S078 track Morph length endpoints. */
+            if (value == 0u) {
+                /*
+                 * A pre-S078 record leaves this cell zero-filled. Zero is not a
+                 * valid length endpoint, so skip it and keep the fresh-Scene
+                 * default rather than clamping to the unreachable minimum.
+                 * S080 P2: continue, not return - later cells (track Morph
+                 * scale/shuffle, Scene chain) must still restore.
+                 */
+                continue;
+            }
+            scene_setTrackMorphLength(
+                scene_index,
+                (uint8_t)(parameter_index -
+                          AUTOSAVE_SCENE_PARAM_TRACK_MORPH_LENGTH_BASE),
+                value);
+        } else if (parameter_index <
+                   AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SHUFFLE_BASE) {
+            /* Indices 58..64 restore the S078 track Morph scale endpoints. */
+            scene_setTrackMorphScale(
+                scene_index,
+                (uint8_t)(parameter_index -
+                          AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SCALE_BASE),
+                value);
+        } else if (parameter_index <
+                   AUTOSAVE_SCENE_PARAM_CHAIN_CONDITION_BASE) {
+            /* Indices 65..71 restore the S078 track Morph shuffle endpoints. */
+            scene_setTrackMorphShuffle(
+                scene_index,
+                (uint8_t)(parameter_index -
+                          AUTOSAVE_SCENE_PARAM_TRACK_MORPH_SHUFFLE_BASE),
+                value);
+        } else if (parameter_index < AUTOSAVE_SCENE_PARAM_CHAIN_NEXT_BASE) {
+            /*
+             * Indices 72..73 restore the S080 chain conditions through the
+             * clamping setter; pre-S080 records hold zero (nul).
+             */
+            scene_setChainCondition(
+                scene_index,
+                (uint8_t)(parameter_index -
+                          AUTOSAVE_SCENE_PARAM_CHAIN_CONDITION_BASE),
+                value);
+        } else {
+            /* Indices 74..75 restore the S080 chain next-scene values. */
+            scene_setChainNext(
+                scene_index,
+                (uint8_t)(parameter_index -
+                          AUTOSAVE_SCENE_PARAM_CHAIN_NEXT_BASE),
                 value);
         }
     }

@@ -644,6 +644,20 @@ static uint8_t effects_setMorphAmountScene(uint8_t scene_index, uint8_t amount)
     uint8_t before = scene_getEffectMorphAmount(scene_index);
 
     scene_setEffectMorphAmount(scene_index, amount);
+    /*
+     * S076 Rule A: a non-automation retained write supersedes the Pattern
+     * `fxm` Morph override for the active Scene. The service loop reads
+     * morph_override_valid every block; once cleared it uses the retained
+     * Scene Effect Morph amount for all LFO and base resolution.
+     * Input: active Scene guard against effects_state.scene_index (the
+     * runtime's own active Scene, which tracks scene_getActiveIndex()).
+     * Output: effects_automation.morph_override_valid = 0.
+     * Callers (upstream): effects_setMorphAmount() fan-out, called by
+     * menu_commitEffectMorphParam() and clearOps.c. Affiliate:
+     * effects_setMorphAutomation() (the automation setter).
+     */
+    if (scene_index == effects_state.scene_index)
+        effects_clearMorphAutomationOverride();
     return (uint8_t)(scene_getEffectMorphAmount(scene_index) != before);
 }
 
@@ -977,6 +991,111 @@ uint16_t effects_resetRecord(uint8_t dst_scene)
 }
 
 /*
+ * Reset Effect morph endpoints to Normal values with fan-out (S076 P3).
+ * Contract in EffectsManager.h.
+ *
+ * What:       for every same-type edit-mask member, copies each morphable
+ *             parameter's retained Normal byte onto its Morph byte through the
+ *             in-place whole-record commit pair. A member with no differing
+ *             byte is left closed and unmarked.
+ * Why:        "reset fx morph" fans out exactly like "clear fx": same-type
+ *             members share the descriptor layout, so the same morphable index
+ *             set is equalised in each.
+ * Inputs:     dst_scene; the destination's current type fixes the mask and the
+ *             morphable index set.
+ * Outputs:    the Scene mask of Scenes written. Side effects:
+ *             scene_finishEffectWholeCommit() marks the Effect region;
+ *             effects_activateScene() rebuilds the active runtime.
+ * Affiliates: effects_resetRecord() (model), effects_fanoutMask(),
+ *             effects_paramMorphable(), ccClear_runResetFxMorph().
+ */
+uint16_t effects_resetMorphToNormal(uint8_t dst_scene)
+{
+    const effect_record_t *dst = scene_effectConst(dst_scene);
+    effect_type_id_t type;
+    uint16_t mask;
+    uint16_t written = 0u;
+    uint8_t member;
+
+    if (!dst || dst_scene >= SCENE_COUNT)
+        return 0u;
+    type = dst->type;
+    mask = effects_fanoutMask(dst_scene, 1u);
+    for (member = 0u; member < SCENE_COUNT; member++) {
+        effect_record_t *record;
+        uint8_t changed = 0u;
+        uint8_t i;
+
+        if ((mask & (uint16_t)(1u << member)) == 0u)
+            continue;
+        record = scene_effectRecordForWholeCommit(member);
+        if (!record)
+            continue;
+        for (i = 0u; i < EFFECT_PARAM_COUNT; i++) {
+            if (!effects_paramMorphable(type, i))
+                continue;
+            if (record->morph[i] != record->normal[i]) {
+                record->morph[i] = record->normal[i];
+                changed = 1u;
+            }
+        }
+        if (changed) {
+            scene_finishEffectWholeCommit(member);
+            written |= (uint16_t)(1u << member);
+        }
+    }
+    if ((written & (uint16_t)(1u << scene_getActiveIndex())) != 0u)
+        effects_activateScene(scene_getActiveIndex());
+    return written;
+}
+
+/*
+ * Reset Effect morph endpoints for one Scene, no fan-out (S076 P3).
+ * Contract in EffectsManager.h.
+ *
+ * What:       the same morphable Normal -> Morph copy as
+ *             effects_resetMorphToNormal() but applied to exactly one Scene.
+ * Why:        the whole-Scene "reset morph" clear and "scene -> morph" copy
+ *             own their own edit-mask fan-out loop and hand each member's
+ *             Effect slice to this single-Scene helper.
+ * Inputs:     scene_index.
+ * Outputs:    nonzero if any byte changed. Side effects:
+ *             scene_finishEffectWholeCommit() on change and
+ *             effects_activateScene() when the active Scene changed.
+ * Affiliates: effects_resetMorphToNormal() above, effects_paramMorphable(),
+ *             ccClear_runResetSceneMorph().
+ */
+uint8_t effects_resetMorphToNormalSingle(uint8_t scene_index)
+{
+    const effect_record_t *dst = scene_effectConst(scene_index);
+    effect_record_t *record;
+    effect_type_id_t type;
+    uint8_t changed = 0u;
+    uint8_t i;
+
+    if (!dst || scene_index >= SCENE_COUNT)
+        return 0u;
+    type = dst->type;
+    record = scene_effectRecordForWholeCommit(scene_index);
+    if (!record)
+        return 0u;
+    for (i = 0u; i < EFFECT_PARAM_COUNT; i++) {
+        if (!effects_paramMorphable(type, i))
+            continue;
+        if (record->morph[i] != record->normal[i]) {
+            record->morph[i] = record->normal[i];
+            changed = 1u;
+        }
+    }
+    if (changed) {
+        scene_finishEffectWholeCommit(scene_index);
+        if (scene_index == scene_getActiveIndex())
+            effects_activateScene(scene_index);
+    }
+    return changed;
+}
+
+/*
  * Paste one retained FX-sequence step across same-type edit-mask members.
  *
  * Inputs: destination Scene, 0..15 step, and an 18-byte step image. Output:
@@ -1184,6 +1303,28 @@ void effects_setMorphAutomation(uint8_t amount)
     /* Pattern `fxm` is a runtime-only expanded Morph-base override. */
     effects_automation.morph_override = amount;
     effects_automation.morph_override_valid = 1u;
+}
+
+/*
+ * Clear the Pattern `fxm` Morph-base override (S076 Rule A).
+ *
+ * What: deactivates effects_automation.morph_override_valid so the Effect
+ * service loop falls back to the retained Scene Effect Morph amount.
+ * Why: a non-automation write (menu edit, MIDI CC1 global, copy/clear)
+ * must supersede any active Pattern fxm override so the user's edit is
+ * audible. The full transport-boundary clear (effects_automationReset)
+ * continues to own bulk clear; this API clears only the morph override
+ * without touching per-parameter Effect overlays or owner tracks.
+ * Inputs: none. Output: morph_override_valid = 0; the morph_override
+ * value is left stale because it is not read while invalid.
+ * Callers: effects_setMorphAmountScene() (the active-Scene retained
+ * write path). Affiliates: effects_setMorphAutomation() (the setter),
+ * effects_automationReset() (the transport/Scene clear),
+ * effects_service() service loop line 1567–1568 (the consumer).
+ */
+void effects_clearMorphAutomationOverride(void)
+{
+    effects_automation.morph_override_valid = 0u;
 }
 
 void effects_setLfoContribution(uint8_t source_slot, uint8_t pair,

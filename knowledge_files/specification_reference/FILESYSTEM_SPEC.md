@@ -1,8 +1,8 @@
 # Helicase SD Card Filesystem Specification
 
 This is the authoritative product-level filesystem and instrument-file
-reference through Session 075 (Session 069 for every phase before Phase 5;
-the Session 072, 073, 074 and 075 additions are noted below). It includes the Session 058 Bank
+reference through Session 080 (Session 069 for every phase before Phase 5;
+the Session 072, 073, 074, 075, 078 and 080 additions are noted below). It includes the Session 058 Bank
 I/O and stopped-playback speedups, the Session 059 typed Instrument-index
 repair, and Session 060's `.hcnames` atomic safe-write/refreshed flag, the boot
 Instrument `.hcindex` generation fix, and system-wide macOS AppleDouble
@@ -49,6 +49,41 @@ Session 075 (Phase 6 copy/clear, `COPYCLEAR_UTILITIES.md`):
 - F3 makes external MIDI CC/NRPN a retained endpoint entry (saved with the
   Scene, AutoSave-marked, clamped to the menu domain) instead of a
   runtime-only write ("Morph, Modulation, and Automation").
+
+Session 078 (per-track timing, `PATTERN_DYNAMIC_STACK.md` §6.4):
+
+- PAT4 track header **byte 1 (`track_scale`) is now a step-scale CC 0..127**
+  on the continuous 128-position curve (76 = `1/16`), and **byte 3 carries
+  the run mode** (0 `fwd` .. 5 `1fr`; older files carry 0 = `fwd`). The file
+  size, layout and CRC are unchanged. Old cards are **not migrated on
+  device**: a pre-S078 `track_scale` byte 0..13 is read as a CC and plays
+  near the fast end of the curve. `tools/convert_scene_scale.py` remaps the
+  seven bytes offline (old index → CC 0, 16, 38, 54, 76, 83, 86, 93, 100,
+  103, 110, 127, 127, 127; 1 bar and 2 bars clamp to `1/2` with a warning)
+  and recomputes the CRC32C;
+- `sceneset.scg` lines 15..17 add the Scene's track Morph endpoints
+  `track_morph_length`, `track_morph_scale`, `track_morph_shuffle` (7 values
+  each). Missing keys keep the staged defaults 16/76/0;
+- `.fx` `step_scale` keeps its 14 symbolic tokens, each now naming a CC on
+  the same curve, and also accepts a decimal CC 0..127 (see "`.fx` Effect
+  files"). Old `.fx` files load at the same musical division with no
+  migration.
+
+Session 080 (PERF performance surface, `MODULE_INTERCHANGE_SPEC.md` "PERF
+performance surface"):
+
+- `settings.cfg` gains seven Global keys — `perf_btn_lt`, `perf_note_lt`,
+  `perf_btn_rt`, `perf_note_rt` (BAR overlay trigger type 0..11 / note
+  0..127, 0 = the track's note), `scd` (direct scene change division 0..9),
+  `qcd` (queued change division 0..17), `qac` (queue action 0..8) — and the
+  terminator becomes `lines=24` (see "settings.cfg"). A P1-era file's `pcr=`
+  line (a duplicate PC reset, removed) is skipped as an unknown key; the PC
+  reset stays `bar_reset_mode`;
+- `sceneset.scg` lines 18/19 add `chain_condition` and `chain_next` (Scene
+  chaining, 2 values each); missing keys load 0 = no chaining;
+- PAT4 track header **byte 4 carries the looper exclusion** (1 = track not
+  loopable; older files carry 0 = loopable). Version, size, layout and CRC are
+  unchanged; no card conversion is needed.
 
 - AsyncFATFS stores a cluster-rounded size while a file is open for writing,
   so an interrupted write leaves an overlong file;
@@ -632,8 +667,17 @@ The current writer emits keyed text with:
 The remaining accepted/written keys are bpm, ext_sync, quantisation,
 midi_chan_global, midi_filt_tx, midi_filt_rx, midi_routing,
 screensaver_on_off, bar_reset_mode, prescaler_clock_in,
-prescaler_clock_out1, prescaler_clock_out2, follow, and osc_wave_interp.
-The complete writer schema is 17 lines. Legacy `scene_source_NN` keys are
+prescaler_clock_out1, prescaler_clock_out2, follow, and osc_wave_interp, and
+since Session 080 `perf_btn_lt`, `perf_note_lt`, `perf_btn_rt`,
+`perf_note_rt`, `scd`, `qcd`, `qac` (writer cases 17..23; defaults 0). The
+complete writer schema is 24 data lines plus the `lines=24` terminator (17
+before S080). Load sanitizes out-of-range S080 values to 0: `qac` > 8,
+`qcd` > 17, `scd` > 9. Value meanings: `scd` 0..9 = ins 1/8 1/4 1/2 1b 2b 3b
+4b ens enl; `qcd` 0..17 = ins 1/8 1/4 1/2 1b..9b 12b 15b 16b ens enl; `qac`
+0..8 = nrm mut mrp res u+r o+r mmr rld r+r. P1-era files storing qac 3/4 or
+qcd 8/9 read with the new meanings (no migration). `bar_reset_mode` is the
+one PC reset (pcr): with it on, direct and chain-fired scene changes restart
+the tracks. Legacy `scene_source_NN` keys are
 accepted and ignored so an existing settings file migrates without becoming an
 error; provenance is now owned only by HCNAMES.
 Unknown or out-of-scope keys are not a way to restore Scene state. In
@@ -647,7 +691,8 @@ make it durable, then removes the old `settings.cfg` and renames the temp
 file into place. A boot-time recovery prelude runs before the normal settings
 load: a leftover `settings.tmp` is validated with the same
 `filesystem_parseSettingsLine()` parser plus a self-checking terminator line
-(`lines=17`, the 18th emitted line) and either promoted (valid) or discarded
+(`lines=N` with N = the number of data lines before it; 24 since Session 080,
+17 before) and either promoted (valid) or discarded
 (invalid), leaving the prior `settings.cfg` untouched either way. Hardware-
 tested via a deliberate mid-promotion power-cut simulation
 (`057_SESSION_HANDOFF_LOG.md` §6). This is the same temp+sync+promote pattern
@@ -971,6 +1016,11 @@ The writer emits one `key=value` line per field, in this order:
 | 12 | `bus_comp_time` | 0..127 (`ctm`) | S074; optional |
 | 13 | `bus_comp_sidechain` | 0..6 (`off`, voice 1..6) | S074; optional |
 | 14 | `fx_send_morph` | 6 × 0..127 | S075 F2; missing loads 0 |
+| 15 | `track_morph_length` | 7 × 1..128 | S078; missing keeps the staged default 16 |
+| 16 | `track_morph_scale` | 7 × 0..127 (step-scale CC) | S078; missing keeps 76 (`1/16`) |
+| 17 | `track_morph_shuffle` | 7 × 0..127 | S078; missing keeps 0 |
+| 18 | `chain_condition` | 2 × 0..78 (cn1, cn2) | S080; missing loads 0 (`nul`) |
+| 19 | `chain_next` | 2 × 0..43 (nx1, nx2; 43 = `stp`) | S080; missing loads 0 (`slf`) |
 
 - **`voice_decimation_all` retired (S075).** Global `srt` is no longer a
   parameter: the key is not written, and an existing file that contains it
@@ -1016,18 +1066,24 @@ Generation: uint32_t LE (0 for library saves, incremented by AutoSave)
 CRC32C:     uint32_t LE (zeroed during computation, covers entire file)
 Reserved:   10 bytes
 Pattern:    pattern_change_bar(1), pattern_next(1), reserved(14)
-Tracks:     7 × 16B: length(1), scale(1), shuffle(1), reserved(13)
+Tracks:     7 × 16B: length(1), scale(1), shuffle(1), run_mode(1, S078),
+            reserved(12)
 Address:    7 × 128 × 2B (uint16_t LE, trigger/specials/offset encoding)
 Bitmap:     512B (bit-packed chunk occupancy; first 256B cover 2,048 chunks,
             upper 256B are 0xFF reserved)
 Pool:       8,192B (PAT_STACK_SIZE × 32 bytes)
 ```
 
-In PAT4, each raw `track_scale` byte uses the shared StepScale index order
-(`1/64` through `2 bars`). Existing bytes are preserved on load; an index
-outside 0..13 displays/plays as the `1/16` default without an automatic card
-rewrite. This Step 8 reinterpretation changes the retained meaning and UI
-only: track playback still ignores scale until the joint track-scale pass.
+In PAT4, each raw `track_scale` byte is a step-scale CC 0..127 on the shared
+128-position StepScale curve (S078; 76 = `1/16`, the 14 musical stops are
+listed in `PATTERN_DYNAMIC_STACK.md` §6.4) and is played per track. Bytes are
+preserved on load with no automatic card rewrite; files written before S078
+hold the old 14-entry index (0..13) and play near `1/64` until converted with
+`tools/convert_scene_scale.py`. Byte 3 is the run mode (0..5; ≥ 6 plays as
+`fwd`). Byte 4 is the looper exclusion (S080; written 0/1 per track from
+`track_loop_exclude`, any nonzero byte reads as "not loopable"; older files
+hold 0 = loopable). All three Pattern readers (root Pattern Load, Scene Load
+Pattern, AutoSave Pattern boot) and the writer handle bytes 1, 3 and 4.
 
 CRC32C is Castagnoli, computed over the entire file while treating the 4 bytes
 at offset 14 as zero. This matches the HCPR AutoSave record CRC contract.
@@ -1112,9 +1168,18 @@ filter_type=0
 [sequence]
 run_mode=fwd|rev|pip|rnd|sel
 length=1..16
-step_scale=1/64|1/32t|1/32|1/16t|1/16|1/8t|1/16.|1/8|1/4t|1/8.|1/4|1/2|1bar|2bar
+step_scale=1/64|1/32t|1/32|1/16t|1/16|1/8t|1/16.|1/8|1/4t|1/8.|1/4|1/2|1bar|2bar|<CC 0..127>
 lane.<key>=0x<16-bit-lock-mask>,<16 values 0..255>
 ```
+
+Since S078 each `step_scale` token names a CC on the 128-position curve
+(`storage_effectScaleTokens[]` in `storageTypes.c`): `1/64` 0, `1/32t` 16,
+`1/32` 38, `1/16t` 54, `1/16` 76, `1/8t` 83, `1/16.` 86, `1/8` 93, `1/4t` 100,
+`1/8.` 103, `1/4` 110, `1/2` 127, `1bar` 127, `2bar` 127 (the last two exceed
+the curve's 8× maximum and clamp to `1/2`). The musical stops `d32` (CC 60)
+and `d/4` (CC 120) have no token and are written as decimals, as is every
+non-stop CC. The parser also accepts a decimal CC; the writer emits the token when one exists, else the decimal value. Old
+`.fx` files therefore need no migration.
 
 Registered `type` tokens are `off`, `flt` (StereoFilter) and `cbt`
 (CrumpBit, S074). A `cbt` file's `[params]` use the common keys plus
@@ -1152,6 +1217,9 @@ Current `scene_settings_t` fields:
 - `audio_out[INSTRUMENT_SLOT_COUNT]`
 - `fx_send_amount[INSTRUMENT_SLOT_COUNT]`
 - `fx_send_morph[INSTRUMENT_SLOT_COUNT]` (Morph endpoint of the FX send)
+- `track_morph_length/scale/shuffle[NUM_TRACKS]` (Morph endpoints of the
+  Pattern's per-track length 1..128, scale CC 0..127 and shuffle 0..127;
+  Session 078)
 - `fader_setting[INSTRUMENT_SLOT_COUNT]` (0..`SCENE_FADER_SETTING_MAX` = 3)
 - `effect_morph_amount` (0..255, Session 072)
 - `bus_comp[SCENE_BUS_COMP_FIELD_COUNT]` (mode, amount, time, sidechain;

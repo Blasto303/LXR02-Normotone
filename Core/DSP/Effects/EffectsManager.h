@@ -357,6 +357,40 @@ uint8_t effects_setSeqLaneLock(uint8_t scene_index, uint16_t step_mask,
  */
 uint16_t effects_pasteRecord(uint8_t dst_scene, const effect_record_t *src);
 uint16_t effects_resetRecord(uint8_t dst_scene);
+/*
+ * Reset Effect morph endpoints to their Normal values (S076 P3).
+ *
+ * What:       effects_resetMorphToNormal() iterates each edit-mask member of
+ *             the destination and, for every Effect parameter index where
+ *             effects_paramMorphable() is nonzero for the shared type, copies
+ *             effect_record.normal[i] onto effect_record.morph[i]. Non-morphable
+ *             rows, sequence data, type and settings are untouched.
+ *             effects_resetMorphToNormalSingle() performs the same copy for one
+ *             Scene with no edit-mask fan-out.
+ * Why:        "clear scene reset fx morph" fans out exactly like "clear fx"
+ *             (same-type members receive the change). "clear scene reset morph"
+ *             and "copy scene -> morph" fan out through the bank edit mask and
+ *             call effects_resetMorphToNormalSingle() per member.
+ *             Centralising the morphability check and the SceneData whole-record
+ *             commit path keeps the effect-morph owner boundary in Effects.
+ * Inputs:     effects_resetMorphToNormal(): dst_scene; the destination's
+ *             current Effect type determines the fan-out mask and which
+ *             parameters are morphable. effects_resetMorphToNormalSingle():
+ *             scene_index.
+ * Outputs:    effects_resetMorphToNormal() returns the Scene mask of Scenes
+ *             whose Effect record was written (0 if invalid or nothing changed);
+ *             effects_resetMorphToNormalSingle() returns nonzero if any byte
+ *             changed. Both mark the Effect AutoSave region through
+ *             scene_finishEffectWholeCommit() and activate the runtime when the
+ *             active Scene changed.
+ * Accessors:  effects_paramMorphable(), effects_fanoutMask(),
+ *             scene_effectConst(), scene_effectRecordForWholeCommit(),
+ *             scene_finishEffectWholeCommit(), effects_activateScene().
+ * Affiliates: effects_resetRecord() (model), ccClear_runResetFxMorph(),
+ *             ccClear_runResetSceneMorph(), ccCopy_runSceneMorph().
+ */
+uint16_t effects_resetMorphToNormal(uint8_t dst_scene);
+uint8_t effects_resetMorphToNormalSingle(uint8_t scene_index);
 uint8_t effects_pasteSeqStep(uint8_t dst_scene, uint8_t step,
                              const effect_seq_step_t *src);
 uint8_t effects_clearSeqLanes(uint8_t scene_index, uint16_t step_mask,
@@ -409,6 +443,15 @@ void effects_automationStepBegin(uint8_t track);
 uint8_t effects_applyAutomation(uint8_t track, uint8_t local, uint8_t value7);
 void effects_automationStepFlush(void);
 void effects_setMorphAutomation(uint8_t amount);
+/*
+ * Clear the Pattern `fxm` Morph-base override (S076 Rule A).
+ *
+ * What: deactivates the morph_override_valid flag without touching per-
+ * parameter Effect overlays. Input: none. Output: the Effect service loop
+ * falls back to retained Scene Effect Morph on the next block. Caller:
+ * effects_setMorphAmountScene(). Affiliate: effects_setMorphAutomation().
+ */
+void effects_clearMorphAutomationOverride(void);
 
 void effects_setLfoContribution(uint8_t source_slot, uint8_t pair,
                                 uint8_t target, uint8_t direction,

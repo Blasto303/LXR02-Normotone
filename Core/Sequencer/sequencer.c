@@ -56,6 +56,7 @@
 #include "ledHandler.h"
 #include "menu.h"
 #include "SceneData.h"
+#include "BankData.h" /* S080 G7: bank_scenePresent() for chain targets. */
 #include "config.h"
 #include "PatternTrace.h"
 #include "PatternStackService.h"
@@ -96,6 +97,31 @@ static uint8_t seq_internalMidiClockPhase = 0;
  * older pending step by design.
  */
 static volatile uint8_t seq_fxEvent = 0u;
+
+/*
+ * FX sequencer Q8.8 DDA accumulator (S078 §2.4.4 Stage 3).
+ *
+ * What: one uint16_t holding the FX sequencer's fractional tick remainder,
+ * replacing the integer modulo in seq_fxClockTick(). Why: the FX sequencer
+ * shares the same 128-position curve as Pattern tracks and must support
+ * fractional tick intervals for non-musical CC positions. Inputs: incremented
+ * 256 per PPQ tick; seeded/reset by seq_setStepIndexToStart(). Outputs: gates
+ * seq_fxPublishStep() calls. RAM: 2 bytes ISR-static SRAM1. Affiliates:
+ * stepScale_ticksQ8(), scene_effectConst()->seq_step_scale.
+ */
+static uint16_t seq_fxAccumulator = 0u;
+
+/*
+ * FX sequencer step counter (S078 Stage 3).
+ *
+ * What: monotonically incremented each time the FX DDA accumulator fires.
+ * Replaces the former stateless n = seq_elapsedPpqTicks / ticks for computing
+ * fwd/rev/pip/rnd step indices. Why: with fractional tick intervals, integer
+ * division of the master clock no longer produces the correct step count.
+ * Input: incremented in seq_fxClockTick(). Reset: seq_setStepIndexToStart().
+ * Output: used to compute the FX step index. RAM: 4 bytes ISR-static SRAM1.
+ */
+static uint32_t seq_fxStepCounter = 0u;
 
 /* Effect automation handshake: owner mask and reset latch are SRAM1 bytes. */
 static volatile uint8_t seq_effectAutomationTracks = 0u;
@@ -147,6 +173,428 @@ uint8_t seq_rollState = 0;					/**< each bit represents a voice. if bit is set, 
 
 static int16_t seq_stepIndex[NUM_TRACKS]; /**< fixed 0..15 track cursors; -1 before the next trigger */
 
+/*
+ * Per-track Q8.8 DDA tick accumulator (S078 §2.4.1).
+ *
+ * What: one uint16_t per track holding the fractional tick remainder. Every
+ * PPQ tick adds 256 (1.0 in Q8.8); when the accumulator meets or exceeds the
+ * track's Q8.8 interval, a step advance fires and the interval is subtracted.
+ * Why: replaces the global SEQ_INTERNAL_TICKS_PER_DEFAULT_STEP modulo test,
+ * allowing each track to advance at its own rate from the 128-position log
+ * curve. Inputs: incremented by seq_processSchedulerTick(). Reset/seeded by
+ * seq_setStepIndexToStart(), seq_realignActivePatternToMasterClock(),
+ * seq_realignTrackToMasterClock(). Outputs: gates calls to
+ * seq_advanceTrackStep(). RAM: 14 bytes ISR-static SRAM1 (7 × uint16_t).
+ * Affiliates: stepScale_ticksQ8(), pat_scene_region_t::track_scale.
+ */
+static uint16_t seq_trackAccumulator[NUM_TRACKS];
+
+/*
+ * Per-track shuffle delay counters (S078 §3.2).
+ *
+ * What: seq_trackShuffleDelay[track] counts down the remaining PPQ ticks
+ * before a shuffle-deferred step fires. seq_trackShufflePending[track] is
+ * nonzero when a step trigger has been deferred and is waiting for its delay
+ * to expire. seq_trackShuffleVel/Note hold the captured trigger payload so
+ * step resolution happens at the original step, not at fire time. Why: shuffle
+ * delays odd-indexed steps (0-indexed 1, 3, 5, ...) by a fraction of the
+ * 1/16th note interval. The delay is always based on 24 PPQ ticks (the 1/16th
+ * grid at 96 PPQ), not the track's step scale. Inputs: set when
+ * seq_advanceTrackStep() reaches an odd step with nonzero shuffle.
+ * Decremented each PPQ tick. Outputs: the deferred trigger fires when the
+ * counter reaches zero. RAM: 28 bytes ISR-static SRAM1 (4 × 7 × uint8_t).
+ * Affiliates: pat_scene_region_t::track_shuffle, seq_triggerVoice().
+ */
+static uint8_t seq_trackShuffleDelay[NUM_TRACKS];
+static uint8_t seq_trackShufflePending[NUM_TRACKS];
+static uint8_t seq_trackShuffleVel[NUM_TRACKS];
+static uint8_t seq_trackShuffleNote[NUM_TRACKS];
+
+/*
+ * Per-track repeat count for X:Y conditions (S079 §3.2).
+ *
+ * What: increments when a track's step index wraps (forward: len-1->0,
+ * reverse: 0->len-1, pip: at each boundary reversal, random: once per len
+ * steps drawn). Why: X:Y conditions need a modulo counter. Reset to 0 on
+ * transport/pattern reset (seq_setStepIndexToStart) and Scene change
+ * (seq_selectActivePattern). Once modes never wrap, so the counter stays at
+ * 0. Inputs: play-mode wrap logic in seq_advanceTrackStep(). Outputs:
+ * seq_evaluateStepCondition() reads this. RAM: 7 B SRAM1 static. Affiliates:
+ * seq_setStepIndexToStart(), seq_selectActivePattern().
+ */
+static uint8_t seq_trackRepeatCount[NUM_TRACKS];
+
+/*
+ * Per-track free step counter for the random play mode (S079 §3.2).
+ *
+ * What: counts steps drawn in random play mode; when it reaches the effective
+ * length it resets and seq_trackRepeatCount increments. Why: random mode never
+ * "wraps" a cursor, so a free counter is the only way to advance the X:Y
+ * repeat count once per traversal. RAM: 7 B SRAM1 static.
+ */
+static uint8_t seq_trackRndStepCount[NUM_TRACKS];
+
+/*
+ * Per-track last-condition-fired flag for lst/!ls chaining (S079 §3.4).
+ *
+ * What: set to 1 when the last evaluated conditional step (condition 1..36)
+ * fired, 0 when it was suppressed. Default 0 (not fired). Updated by
+ * seq_evaluateStepCondition() for any step with condition != 0. Why: lst/!ls
+ * conditions chain off the most recent conditional step on this track.
+ * Inputs: seq_evaluateStepCondition(). Outputs: condition indices 23/24 read
+ * this. RAM: 7 B SRAM1 static. Affiliates: seq_setStepIndexToStart().
+ */
+static uint8_t seq_trackLastConditionFired[NUM_TRACKS];
+
+/*
+ * Fill-mode active flag (S079 §3.3).
+ *
+ * What: nonzero while the PERF button has been held past the double-click
+ * timeout. Why: fil/!fl conditions read this flag. Written by
+ * buttonHandler_tick() foreground PERF hold logic; read by the TIM3 ISR. A
+ * single-byte store/load is atomic on Cortex-M7. RAM: 1 B SRAM1 static.
+ * Affiliates: buttonHandler.c PERF press/release.
+ */
+uint8_t seq_fillActive;
+
+/*
+ * Looper state (S080 B3/C2, rewritten S080 P2 Defects 7/8/14).
+ *
+ * What: seq_loopActive is the ISR gate (see sequencer.h). seq_loopTrackMask
+ * selects the looping tracks; seq_loopDivision/seq_loopModifier set the loop
+ * length. For every looped track, seq_loopAnchor[] is the master-clock tick
+ * (seq_elapsedPpqTicks units) at which its loop window starts, and
+ * seq_loopStartStep/Accum/PlayState[] are the track's step cursor, Q8.8 DDA
+ * accumulator and play-state bits just before that tick's DDA advance (the
+ * snapshot). The ISR restores the snapshot whenever (elapsed - anchor) is a
+ * positive multiple of the loop length, before the DDA advance.
+ * Why anchors, not a shared tick counter: wraps always land on the master-
+ * clock grid of the anchor, so a division/modifier change cannot shift a
+ * track off the grid (P1 wrapped at once when the counter already exceeded a
+ * shorter length), a track added mid-loop wraps on its own window instead of
+ * another track's, and a scene change can keep the anchor while recomputing
+ * the snapshot for the incoming scene (Defect 14). Resuming projects the
+ * snapshot forward from the anchor, so a released track lands where it would
+ * have been even when its position was never the canonical master-clock
+ * position (Morph/automation scale changes, boundary commits, once modes).
+ * Inputs: seq_loopEngage()/UpdateMask()/Disengage()/UpdateDivision(), scene
+ * change refresh, transport reset rebase. Outputs: seq_loopProcessTick() wraps.
+ * Concurrency: every foreground writer holds PRIMASK while it publishes; the
+ * ISR reads only while seq_loopActive is set. RAM: 4 + 7x2 + 7x2 + 7 + 7x4 =
+ * 67 B SRAM1 static, runtime-only (P1: 34 B). Affiliates:
+ * seq_evaluateStepCondition() (lop/!lp), seq_processSchedulerTick().
+ */
+uint8_t seq_loopActive = 0u;
+static uint8_t  seq_loopTrackMask = 0u;
+static uint8_t  seq_loopDivision  = 0u;
+static uint8_t  seq_loopModifier  = 0u;
+static int16_t  seq_loopStartStep[NUM_TRACKS];
+static uint16_t seq_loopStartAccum[NUM_TRACKS];
+static uint8_t  seq_loopStartPlayState[NUM_TRACKS];
+static uint32_t seq_loopAnchor[NUM_TRACKS];
+
+/*
+ * Transport gate (defined with the runtime state below). Declared here so the
+ * S080 P2 scene-change helpers can read it before its definition.
+ */
+extern uint8_t seq_running;
+
+/*
+ * S080 F7: scene change deferral / queue state.
+ *
+ * What: seq_pendingSceneChange arms a direct (SEQ press) scene change that must
+ * wait for a musical boundary; seq_pendingSceneQueue arms a queued (SHIFT+SEQ)
+ * change. seq_pendingSceneIndex / seq_pendingQueueScene are the targets and
+ * seq_pendingSceneDiv / seq_pendingQueueDiv the selected divisions (0 = instant;
+ * scd 1..9 and qcd 1..17 index their own option lists, S080 P2: converted by
+ * seq_sceneChangeDivUnits() and seq_queueChangeDivUnits() respectively).
+ * seq_sceneFireFlag is the ISR -> foreground
+ * signal that the boundary was reached. Why: non-instant scd/qcd changes are
+ * detected in the TIM3 ISR (sample-accurate boundary) but executed in the
+ * foreground (DSP apply, LED refresh, optional reload). RAM: 7 B SRAM1 static.
+ * Affiliates: seq_handleMasterBoundary() (F8), the foreground executor
+ * (menu_serviceDeferredSceneChange()).
+ */
+static uint8_t seq_pendingSceneChange = 0u;
+static uint8_t seq_pendingSceneIndex  = 0u;
+static uint8_t seq_pendingSceneDiv    = 0u;
+static uint8_t seq_pendingSceneQueue  = 0u;
+static uint8_t seq_pendingQueueScene  = 0u;
+static uint8_t seq_pendingQueueDiv    = 0u;
+static uint8_t seq_sceneFireFlag      = 0u;
+
+/*
+ * Scene chain runtime state (S080 G7, P2).
+ *
+ * What: seq_chainBarCount / seq_chainRepCount count master-clock bar and
+ * repetition boundaries since the active Scene was selected (saturating at
+ * 255). seq_previousScene is the Scene active before the last real change
+ * (0xFF = none; the >NN conditions). seq_chainStopped freezes every track
+ * after a `stp` chain fire. seq_pendingChainFire marks the pending direct
+ * change as chain-raised. Why: the TIM3 evaluator needs per-activation
+ * counts; the foreground executor needs to tell a chain repeat from a real
+ * change. Inputs: seq_chainServiceTick(), seq_selectActivePattern(),
+ * seq_setRunning(), seq_chainRepeatSelf(). RAM: 5 B SRAM1, runtime-only.
+ * Affiliates: seq_chainEvaluate(), menu_serviceDeferredSceneChange().
+ */
+static uint8_t seq_chainBarCount    = 0u;
+static uint8_t seq_chainRepCount    = 0u;
+static uint8_t seq_previousScene    = 0xFFu;
+static uint8_t seq_chainStopped     = 0u;
+static uint8_t seq_pendingChainFire = 0u;
+
+/*
+ * Convert a scene change division to master 1/16-note units (S080 F8).
+ * 0 = instant (returns 0), 1..7 = 1/8, 1/4, 1/2, 1 bar, 2, 3, 4 bars,
+ * 8/9 = end of shortest/longest track (approximated by one bar until track-
+ * length-aware boundaries are added).
+ */
+static uint16_t seq_sceneChangeDivUnits(uint8_t div)
+{
+    switch (div) {
+    case 1u: return 2u;
+    case 2u: return 4u;
+    case 3u: return 8u;
+    case 4u: return 16u;
+    case 5u: return 32u;
+    case 6u: return 48u;
+    case 7u: return 64u;
+    case 8u: /* end of shortest track (approx) */
+    case 9u: /* end of longest track (approx)  */
+        return 16u;
+    default:
+        return 0u;
+    }
+}
+
+/*
+ * Convert a queued scene change division (qcd) to master 1/16-note units
+ * (S080 P2).
+ *
+ * What: 0 = instant (returns 0); 1..3 = 1/8, 1/4, 1/2 note; 4..12 = 1..9 bars;
+ * 13 = 12 bars; 14 = 15 bars; 15 = 16 bars; 16/17 = end of shortest/longest
+ * track (approximated by one bar, like scd). Why: the queued division has its
+ * own, longer option list (5b..9b, 12b, 15b, 16b, user request) so a queued
+ * change can land on long phrase boundaries; the direct scd list is unchanged.
+ * The order must match sceneQueueDivNames[] (MenuText.h). Inputs: qcd value.
+ * Output: units of the 16-bit master step clock (largest 256). Context: TIM3
+ * ISR and foreground (pure). Accessors: seq_handleMasterBoundary(),
+ * seq_queueSceneChange(), seq_cancelPendingDirectChange().
+ */
+static uint16_t seq_queueChangeDivUnits(uint8_t div)
+{
+    static const uint16_t units[18] = {
+        0u,                         /* ins */
+        2u, 4u, 8u,                 /* 1/8, 1/4, 1/2 */
+        16u, 32u, 48u, 64u, 80u,    /* 1b .. 5b */
+        96u, 112u, 128u, 144u,      /* 6b .. 9b */
+        192u, 240u, 256u,           /* 12b, 15b, 16b */
+        16u, 16u                    /* ens, enl (approx) */
+    };
+
+    return (div < 18u) ? units[div] : 0u;
+}
+
+/*
+ * Arm a direct (SEQ) scene change at a musical division (S080 F7, P2).
+ *
+ * What: records the target and scd division and arms the change; the TIM3
+ * ISR raises the fire flag at the boundary. A user request replaces any chain
+ * fire that has not run yet, so the pending change is no longer marked as
+ * chain-raised. Why: a manual switch cancels conditional changes (plan §4.5);
+ * a stale chain marker would make the executor treat this user change as a
+ * chain repeat. Inputs: scene_index, division (scd 1..9; 0 is executed
+ * directly by the caller). Outputs: seq_pendingScene*, seq_pendingChainFire
+ * cleared. Accessors: menu_perfModeSceneButtonPressed().
+ */
+void seq_requestSceneChange(uint8_t scene_index, uint8_t division)
+{
+    seq_pendingSceneIndex = scene_index;
+    seq_pendingSceneDiv = division;
+    seq_pendingChainFire = 0u;
+    seq_pendingSceneChange = 1u;
+}
+
+/*
+ * Arm a queued (SHIFT+SEQ) scene change (S080 F7, P2 Defect 1).
+ *
+ * What: records the target and qcd division and arms the queue. A queued
+ * change at the instant division (qcd = ins, the power-on default) or while
+ * the transport is stopped raises the fire flag at once instead of waiting for
+ * an ISR boundary. Why: the instant division converts to 0 units
+ * (seq_queueChangeDivUnits()), and the ISR boundary test requires
+ * units != 0, so an instant queue never fired (Defect 1); a
+ * stopped transport has no boundaries at all. Queuing again replaces the
+ * pending target; queuing the playing Scene still fires the queue action.
+ * Inputs: scene_index, division (qcd value). Outputs: seq_pendingQueue*,
+ * seq_pendingSceneQueue, possibly seq_sceneFireFlag. Context: foreground.
+ * Accessors: buttonHandler SHIFT+SEQ (PERF). Affiliates:
+ * seq_handleMasterBoundary() (deferred fire), menu_serviceDeferredSceneChange().
+ */
+void seq_queueSceneChange(uint8_t scene_index, uint8_t division)
+{
+    seq_pendingQueueScene = scene_index;
+    seq_pendingQueueDiv = division;
+    seq_pendingSceneQueue = 1u;
+    if (seq_queueChangeDivUnits(division) == 0u || !seq_running)
+        seq_sceneFireFlag = 1u;
+}
+
+uint8_t seq_sceneChangeFirePending(void) { return seq_sceneFireFlag; }
+
+uint8_t seq_pendingSceneIsQueue(void)
+{
+    return seq_pendingSceneQueue;
+}
+
+uint8_t seq_pendingSceneTarget(void)
+{
+    return seq_pendingSceneQueue ? seq_pendingQueueScene : seq_pendingSceneIndex;
+}
+
+/*
+ * Queued (SHIFT+SEQ) target, independent of any direct change (S080 P2
+ * Defect 10).
+ *
+ * Output: the queued Scene 0..15 while a queued change is armed, else 0xFF.
+ * Why: the fast-blink owner must show only the queued Scene. Single-byte
+ * reads of ISR-shared state. Accessor: menu_syncQueuedSceneLed().
+ */
+uint8_t seq_queuedSceneTarget(void)
+{
+    return seq_pendingSceneQueue ? seq_pendingQueueScene : 0xFFu;
+}
+
+/*
+ * Clear every pending scene change (S080 F7, P2).
+ *
+ * What: drops the direct, queued and chain-fired pending changes and the fire
+ * flag. Why: called by the foreground executor once it has consumed a fired
+ * change, and by the transport-stop path. Inputs: none. Outputs: all pending
+ * scene-change state zero. Accessors: menu_serviceDeferredSceneChange().
+ * Affiliates: seq_cancelPendingDirectChange().
+ */
+void seq_clearPendingSceneChange(void)
+{
+    seq_pendingSceneChange = 0u;
+    seq_pendingSceneQueue = 0u;
+    seq_pendingChainFire = 0u;
+    seq_sceneFireFlag = 0u;
+}
+
+/*
+ * Cancel a pending direct or chain-fired change, keeping a queued one
+ * (S080 P2).
+ *
+ * What: clears the deferred direct (scd) change and any chain fire. A
+ * user-queued change survives; if it was armed, the fire flag is cleared and
+ * the ISR re-raises it at the next qcd boundary (or at once for an instant
+ * queue). Why: a manual scene switch cancels conditional changes (plan §4.5)
+ * but only a transport stop cancels a queued change (plan §5.3). Inputs:
+ * none. Outputs: seq_pendingSceneChange/seq_pendingChainFire/seq_sceneFireFlag
+ * cleared; an instant queue re-arms its fire flag. Accessors:
+ * menu_perfSceneChangeExecute(). Affiliates: seq_queueSceneChange().
+ */
+void seq_cancelPendingDirectChange(void)
+{
+    seq_pendingSceneChange = 0u;
+    seq_pendingChainFire = 0u;
+    seq_sceneFireFlag = 0u;
+    if (seq_pendingSceneQueue &&
+        (seq_queueChangeDivUnits(seq_pendingQueueDiv) == 0u || !seq_running))
+        seq_sceneFireFlag = 1u;
+}
+
+/*
+ * Report whether the pending change was raised by a scene chain (S080 G7).
+ *
+ * Output: 1 when the fired direct change came from seq_chainFire(), else 0.
+ * Accessor: menu_serviceDeferredSceneChange() (repeat vs. full change).
+ */
+uint8_t seq_pendingSceneIsChain(void)
+{
+    return (uint8_t)(seq_pendingChainFire && !seq_pendingSceneQueue);
+}
+
+/*
+ * Per-track roll playback state (S079 §4).
+ *
+ * What: seq_rollActive is nonzero while a per-step roll chain is running.
+ * seq_rollTickAccum counts down the PPQ ticks to the next retrigger.
+ * seq_rollVelPos is the position in the rhythm velocity cycle. seq_rollRemaining
+ * is the number of additional retriggers queued for the current chain.
+ * seq_rollLastRate/Rhythm/Fill store the previous step's roll parameters for
+ * carry-over detection. seq_rollStepVel/Note hold the step payload each
+ * retrigger fires with. Why: roll retriggers fire from seq_processSchedulerTick
+ * using the same tick-driven mechanism as shuffle, at absolute note rates
+ * independent of the track's step scale. Inputs: set by seq_rollBegin() from
+ * seq_advanceTrackStep(). Outputs: seq_triggerVoice() with rhythm-modified
+ * velocity. RAM: ~72 B SRAM1 static. Affiliates:
+ * seq_processRollTicks(), seq_rollComputeVelocity().
+ */
+static uint8_t seq_rollTickAccum[NUM_TRACKS];
+static uint8_t seq_rollVelPos[NUM_TRACKS];
+static uint8_t seq_rollRemaining[NUM_TRACKS];
+static uint8_t seq_rollActive[NUM_TRACKS];
+static uint8_t seq_rollLastRate[NUM_TRACKS];
+static uint8_t seq_rollLastRhythm[NUM_TRACKS];
+static uint8_t seq_rollLastFill[NUM_TRACKS];
+static uint8_t seq_rollStepVel[NUM_TRACKS];
+static uint8_t seq_rollStepNote[NUM_TRACKS];
+
+/*
+ * Per-track roll fill duck countdown (S079 P2 fix 4).
+ *
+ * What: seq_rollDuckDelta is the number of PPQ ticks from the last retrigger
+ * of a fill < 100 step to the fill-window end; seq_rollDuckDelay is the live
+ * countdown and seq_rollDuckActive marks it running. Why: the fill boundary
+ * must duck the sounding voice with a fast fade instead of the removed gated
+ * trigger. Inputs: set by seq_rollBegin()/seq_rollArmDuck(). Outputs:
+ * instrumentManager_requestGateDuck() when the countdown expires. RAM: 21 B
+ * SRAM1 static. Affiliates: seq_processRollTicks().
+ */
+static uint8_t seq_rollDuckDelta[NUM_TRACKS];
+static uint8_t seq_rollDuckDelay[NUM_TRACKS];
+static uint8_t seq_rollDuckActive[NUM_TRACKS];
+
+/*
+ * Per-track play state (S078 §4.4).
+ *
+ * What: one byte per track packing runtime play mode state. Bit 0 is the
+ * "stopped" flag for once modes. Bit 1 is the pip direction (0 = forward,
+ * 1 = reverse); the earlier pip position in the two-length cycle is derived
+ * from seq_stepIndex[] and this direction bit, so no cycle counter is needed.
+ * Why: the DDA owns WHEN a step fires; this state owns WHERE the step index
+ * goes. Inputs: set by seq_advanceTrackStep() direction logic, cleared by
+ * retrigger events. Outputs: gates step advance for stopped once-mode tracks;
+ * controls pip direction toggling. RAM: 7 bytes ISR-static SRAM1. Affiliates:
+ * seq_setStepIndexToStart(), seq_setRunning(), seq_selectActivePattern(),
+ * seq_setTrackPlayedScene().
+ */
+static uint8_t seq_trackPlayState[NUM_TRACKS];
+#define SEQ_PLAY_STATE_STOPPED  (1u << 0)
+#define SEQ_PLAY_STATE_PIP_REV  (1u << 1)
+
+/*
+ * Effective (morphed) per-track timing values (S078 §5.4).
+ *
+ * What: the values the sequencer actually plays for each track's loop length,
+ * step-scale CC, and shuffle amount: the Pattern Normal value interpolated
+ * against the Scene Morph endpoint at the associated voice's retained Morph
+ * amount, or a step-automation overlay. Why: the Morph system must change
+ * playback without writing the retained pat_scene_region_t Normal values or
+ * marking the Pattern dirty, so the sequencer reads this cache instead of the
+ * region. Inputs: refreshed by seq_refreshTrackEffectiveParams() from the
+ * foreground Morph worker, the foreground Scene/Pattern change paths, and the
+ * transport/Pattern reset path. Outputs: read by seq_advanceTrackStep(),
+ * seq_processSchedulerTick(), and the realign helpers. RAM: 21 bytes ISR-static
+ * SRAM1 (3 x uint8_t[7]). Affiliates: presetMorph_getTrackEffective*(),
+ * presetMorph_trackTick().
+ */
+static uint8_t seq_effectiveTrackLength[NUM_TRACKS];
+static uint8_t seq_effectiveTrackScale[NUM_TRACKS];
+static uint8_t seq_effectiveTrackShuffle[NUM_TRACKS];
+
 static uint16_t seq_tempo = 120;			/**< seq speed in bpm*/
 
 static uint32_t	seq_lastTick = 0;			/**< stores the time the last step change occured*/
@@ -171,15 +619,56 @@ uint8_t seq_activePattern = 0;				/**< the currently playing pattern*/
 uint8_t seq_pendingPattern = 0;				/**< next pattern to play*/
 
 /*
- * Current per-track Pattern assignment stub.
+ * Per-track played-Scene map (S077 P2 §3.1).
  *
- * What: one resident Scene byte per track, currently all equal to the active
- * Pattern. Why: the stack service's single mutation target remains explicit
- * while a future sequencer revision may assign tracks independently. Inputs:
- * initialization and active-pattern changes. Output: playback-facing state;
- * no independent assignment behavior exists in S067. RAM: +7 bytes SRAM1.
+ * What: one resident Scene byte per track, the Scene playback reads for that
+ * track's sequence, instrument, and per-voice settings. Why: per-track Scene
+ * playback lets individual tracks read a Scene other than the global active
+ * one. Inputs: seq_init(), seq_selectActivePattern(),
+ * seq_alignActivePatternToScene(), seq_handleMasterBoundary(), and the PERF
+ * hold-VOICE+press-SEQ gesture through seq_setTrackPlayedScene(). Output:
+ * playback-facing state; every entry equals seq_activePattern when no override
+ * is set. RAM: +7 bytes SRAM1 (allocated in S067).
  */
 uint8_t seq_perTrackPattern[NUM_TRACKS];
+
+/*
+ * Per-track playback override flag (S077 P2 §3.1).
+ *
+ * What: nonzero when any entry in seq_perTrackPattern[] differs from
+ * seq_activePattern. Why: gates the fast path - when zero, all existing code
+ * paths that reference seq_activePattern are correct as-is and no per-track
+ * branching is needed. Recomputed by seq_recomputePerTrackActive() whenever
+ * seq_perTrackPattern[] changes. Inputs: seq_perTrackPattern[],
+ * seq_activePattern. Output: 0 or 1. RAM: +1 byte SRAM1. Owner: Sequencer.
+ * Lifetime: static. Affiliates: seq_setTrackPlayedScene(),
+ * seq_clearPerTrackOverrides(), seq_selectActivePattern(),
+ * seq_alignActivePatternToScene(), seq_handleMasterBoundary().
+ */
+uint8_t seq_perTrackActive = 0;
+
+/*
+ * Recompute the seq_perTrackActive convenience flag (S077 P2 §1.2).
+ *
+ * What: walks seq_perTrackPattern[] and sets seq_perTrackActive to 1 if any
+ * entry differs from seq_activePattern, 0 otherwise. Why: centralises the
+ * derivation so every mutation site calls one function rather than duplicating
+ * the scan. Inputs: seq_perTrackPattern[NUM_TRACKS], seq_activePattern.
+ * Output: seq_perTrackActive (0 or 1). Caller: seq_setTrackPlayedScene(),
+ * seq_clearPerTrackOverrides().
+ */
+static void seq_recomputePerTrackActive(void)
+{
+    uint8_t track;
+
+    for (track = 0u; track < NUM_TRACKS; track++) {
+        if (seq_perTrackPattern[track] != seq_activePattern) {
+            seq_perTrackActive = 1u;
+            return;
+        }
+    }
+    seq_perTrackActive = 0u;
+}
 
 uint8_t seq_recordActive = 0;				/**< set to 1 to activate the reording mode*/
 
@@ -273,6 +762,28 @@ static void seq_clearAutomationDirty(void)
 }
 
 /*
+ * Clear the Scene-target automation dirty bitmap (S076 Rule B).
+ *
+ * What: zeroes seq_scene_automation_dirty. Why: the dirty bits reference
+ * the previous Scene's mod-target table indices. After a Scene switch the
+ * new Scene's retained values are the correct transport-restore baseline,
+ * and old dirty bits that indexed into the previous Scene's target table
+ * could restore wrong entries or alias into the new table. Clearing here
+ * means a subsequent transport reset restores retained values for only
+ * those targets that the new Scene's automation actually wrote.
+ * Inputs: none. Output: seq_scene_automation_dirty = 0.
+ * Caller: seq_selectActivePattern() and seq_alignActivePatternToScene()
+ * on Scene change. Affiliates: seq_applySceneAutomation() (the setter),
+ * seq_restoreAllSceneAutomation() (the transport-boundary consumer),
+ * seq_clearAutomationDirty() (the boot/transport clear that zeroes both
+ * voice and Scene bitmaps).
+ */
+void seq_clearSceneAutomationDirty(void)
+{
+    seq_scene_automation_dirty = 0u;
+}
+
+/*
  * Restore every dirty automation overlay to its morph-interpolated base value.
  *
  * What: walks all instrument slots and, for each set bit in
@@ -309,7 +820,15 @@ static void seq_restoreAllAutomation(void)
 
         if (!mask)
             continue;
-        instrument = scene_instrumentSlotConst(seq_activePattern, slot);
+        /*
+         * All-slot automation restore uses per-track played Scene (S077 P2).
+         *
+         * What: the morph_interpolation[] restore base comes from the Scene
+         * whose instrument is actually loaded in each slot. Inputs:
+         * seq_perTrackPattern[slot] for slot 0..5. When no per-track override is
+         * set this equals seq_activePattern and behaviour is unchanged.
+         */
+        instrument = scene_instrumentSlotConst(seq_perTrackPattern[slot], slot);
         if (!instrument)
             continue;
         while (mask) {
@@ -360,6 +879,12 @@ static void seq_restoreAllSceneAutomation(void)
      */
     preset_clearAllAudioOutStepOverrides(scene_index);
     preset_clearAllFxSendStepOverrides();
+    /*
+     * S078 §5.5: drop every per-track timing overlay. Unlike the Scene-setting
+     * overlays above, the effective track getters read these directly, so the
+     * clear must happen before the retained-value pass below.
+     */
+    presetMorph_clearAllTrackParamStepOverrides();
 
     if (!scene)
         return;
@@ -391,6 +916,10 @@ static void seq_restoreAllSceneAutomation(void)
                 break;
             case SCENE_MOD_TARGET_KIND_FX_SEND:
             case SCENE_MOD_TARGET_KIND_SLOT6_TRACK7_AMP_DECAY:
+            /* S078 §5.5: track timing overlays are cleared above. */
+            case SCENE_MOD_TARGET_KIND_TRACK_LENGTH:
+            case SCENE_MOD_TARGET_KIND_TRACK_SCALE:
+            case SCENE_MOD_TARGET_KIND_TRACK_SHUFFLE:
             /* `fxm` is cleared by the foreground FX reset latch, not in TIM3. */
             case SCENE_MOD_TARGET_KIND_EFFECT_MORPH:
             default:
@@ -407,6 +936,10 @@ static void seq_sendProgChg(const uint8_t ptn);
 static void seq_processSchedulerTick(void);
 static void seq_setStepIndexToStart();
 static void seq_queueStepAutomations(uint8_t track, uint8_t step);
+/* S080 P2 looper engine (defined after seq_realignTrackToMasterClock()). */
+static void seq_loopRefreshSceneSnapshots(void);
+static void seq_loopRebaseToStart(void);
+static void seq_loopProcessTick(void);
 
 /*
  * Publish one FX-sequencer position from the pure master-clock timeline.
@@ -420,21 +953,36 @@ static void seq_queueStepAutomations(uint8_t track, uint8_t step);
 static void seq_fxClockTick(void)
 {
     const effect_record_t *record = scene_effectConst(scene_getActiveIndex());
-    uint16_t ticks;
+    uint16_t interval;
     uint8_t len;
     uint8_t index;
     uint32_t n;
 
+    /*
+     * FX sequencer DDA clock (S078 §2.4.4 Stage 3).
+     *
+     * What: replaces the integer modulo (seq_elapsedPpqTicks % ticks) with the
+     * same Q8.8 DDA accumulator model used by Pattern tracks. Why: the FX
+     * sequencer shares the 128-position curve and must handle fractional tick
+     * intervals. The step counter replaces the stateless n = ticks/elapsed
+     * computation because fractional intervals make that division ambiguous.
+     * Inputs: seq_fxAccumulator, interval from stepScale_ticksQ8(). Outputs:
+     * seq_fxPublishStep() on each boundary. Reset: seq_setStepIndexToStart().
+     * Affiliates: effects_service() foreground consumer.
+     */
     if (!record || record->seq_run_mode >= EFFECT_SEQ_RUN_MODE_COUNT ||
         record->seq_run_mode == EFFECT_SEQ_RUN_SEL)
         return;
-    ticks = stepScale_ticks(record->seq_step_scale);
-    if ((seq_elapsedPpqTicks % ticks) != 0u)
+    interval = stepScale_ticksQ8(record->seq_step_scale);
+    seq_fxAccumulator += 256u;
+    if (seq_fxAccumulator < interval)
         return;
+    seq_fxAccumulator -= interval;
     len = record->seq_length;
     if (len < EFFECT_SEQ_LENGTH_MIN || len > EFFECT_SEQ_LENGTH_MAX)
         len = EFFECT_SEQ_LENGTH_DEFAULT;
-    n = seq_elapsedPpqTicks / ticks;
+    n = seq_fxStepCounter;
+    seq_fxStepCounter++;
     switch (record->seq_run_mode) {
     case EFFECT_SEQ_RUN_REV:
         index = (uint8_t)(len - 1u - (n % len));
@@ -455,14 +1003,78 @@ static void seq_fxClockTick(void)
     seq_fxPublishStep(index);
 }
 
+/*
+ * Recompute the effective per-track timing cache (S078 §5.4).
+ *
+ * What: for every track, reads the Pattern Normal values from the track's
+ * played Scene region and interpolates them against that Scene's Morph
+ * endpoints at the associated voice's retained Morph amount, then stores the
+ * results in seq_effectiveTrackLength/Scale/Shuffle. Why: the sequencer reads
+ * the cache instead of the region so a Morph sweep changes playback without
+ * touching retained Pattern data. Inputs: seq_perTrackPattern[],
+ * presetMorph_getTrackEffective*(). Outputs: the three effective arrays.
+ * Callers: presetMorph_tick() (foreground Morph worker, every tick),
+ * seq_selectActivePattern(), seq_alignActivePatternToScene(),
+ * seq_setTrackPlayedScene(), and seq_setStepIndexToStart(). Foreground- or
+ * ISR-safe: pure SRAM reads with no allocation or I/O.
+ */
+void seq_refreshTrackEffectiveParams(void)
+{
+	uint8_t track;
+
+	for (track = 0u; track < NUM_TRACKS; track++) {
+		uint8_t scene_index = seq_perTrackPattern[track];
+
+		seq_effectiveTrackLength[track] =
+		    presetMorph_getTrackEffectiveLength(scene_index, track);
+		seq_effectiveTrackScale[track] =
+		    presetMorph_getTrackEffectiveScale(scene_index, track);
+		seq_effectiveTrackShuffle[track] =
+		    presetMorph_getTrackEffectiveShuffle(scene_index, track);
+	}
+}
+
 //------------------------------------------------------------------------------
 void seq_init()
 {
 	memset(seq_stepIndex,0,sizeof(seq_stepIndex));
 	memset(seq_lastMasterStep,0,NUM_TRACKS);
+	/* S078: clear every per-track DDA, shuffle, and play-mode byte at boot. */
+	memset(seq_trackAccumulator, 0, sizeof(seq_trackAccumulator));
+	memset(seq_trackShuffleDelay, 0, sizeof(seq_trackShuffleDelay));
+	memset(seq_trackShufflePending, 0, sizeof(seq_trackShufflePending));
+	memset(seq_trackShuffleVel, 0, sizeof(seq_trackShuffleVel));
+	memset(seq_trackShuffleNote, 0, sizeof(seq_trackShuffleNote));
+	memset(seq_trackPlayState, 0, sizeof(seq_trackPlayState));
+	/* S079: clear per-track condition and roll runtime state at boot. */
+	memset(seq_trackRepeatCount, 0, sizeof(seq_trackRepeatCount));
+	memset(seq_trackRndStepCount, 0, sizeof(seq_trackRndStepCount));
+	memset(seq_trackLastConditionFired, 0,
+	       sizeof(seq_trackLastConditionFired));
+	memset(seq_rollActive, 0, sizeof(seq_rollActive));
+	memset(seq_rollTickAccum, 0, sizeof(seq_rollTickAccum));
+	memset(seq_rollVelPos, 0, sizeof(seq_rollVelPos));
+	memset(seq_rollRemaining, 0, sizeof(seq_rollRemaining));
+	memset(seq_rollLastRate, 0, sizeof(seq_rollLastRate));
+	memset(seq_rollLastRhythm, 0, sizeof(seq_rollLastRhythm));
+	memset(seq_rollLastFill, 0, sizeof(seq_rollLastFill));
+	memset(seq_rollDuckActive, 0, sizeof(seq_rollDuckActive));
+	memset(seq_rollDuckDelay, 0, sizeof(seq_rollDuckDelay));
+	memset(seq_rollDuckDelta, 0, sizeof(seq_rollDuckDelta));
+	seq_fillActive = 0u;
+	seq_fxAccumulator = 0u;
+	seq_fxStepCounter = 0u;
+	/*
+	 * S078 §5.4: seed the effective track cache from the resident Normal
+	 * values. scene_initAll() has already run pat_initScene(), so the regions
+	 * carry the Normal defaults here.
+	 */
+	seq_refreshTrackEffectiveParams();
 	/* Keep the future per-track map aligned with the one active Scene. */
 	for (uint8_t track = 0u; track < NUM_TRACKS; track++)
 		seq_perTrackPattern[track] = seq_activePattern;
+	/* S077 P2: identical entries mean the per-track fast path is inactive. */
+	seq_perTrackActive = 0u;
 	seq_pending_automation_count = 0u;
 	seq_pending_automation_drain = 0u;
 	seq_clearAutomationDirty();
@@ -530,6 +1142,129 @@ static void seq_sendMidi(MidiMsg msg)
 
 
 //------------------------------------------------------------------------------
+/*
+ * Assign one track to play from a specific Scene (S077 P2 §1.3).
+ *
+ * What: sets seq_perTrackPattern[track] to scene_index and recalculates
+ * seq_perTrackActive. Tracks 5 and 6 (HiHat choke pair, indices 5 and 6 in
+ * the seven-track array) always switch together. Why: the PERF
+ * hold-VOICE+press-SEQ gesture calls this to override one track's playback
+ * Scene without changing the global active Scene. Inputs: track 0..6, a Scene
+ * index validated by pat_patternValid(). Output: seq_perTrackPattern[track]
+ * updated. ISR safety: foreground-only write to a single byte read by TIM3;
+ * ARM Cortex-M7 byte stores are atomic. Affiliates:
+ * seq_clearPerTrackOverrides(), seq_recomputePerTrackActive(),
+ * preset_startSingleVoiceApply() (called after this by the button handler).
+ */
+void seq_setTrackPlayedScene(uint8_t track, uint8_t scene_index)
+{
+    if (track >= NUM_TRACKS || !pat_patternValid(scene_index))
+        return;
+
+    seq_perTrackPattern[track] = scene_index;
+    /* The HiHat choke pair shares one played Scene (tracks 5 and 6). */
+    if (track >= 5u) {
+        seq_perTrackPattern[5] = scene_index;
+        seq_perTrackPattern[6] = scene_index;
+    }
+    /*
+     * Once-mode retrigger on per-track Scene assignment (S078 §4.3).
+     *
+     * What: clear the reassigned track's play-state byte so a stopped once /
+     * once-free track restarts its one-pass playback. Voice 6 assigns both
+     * tracks 5 and 6 together, so both are retriggered when either is
+     * reassigned. Why: per-track Scene reassignment is a defined retrigger
+     * event; the double-click realign gesture is not. Affiliates:
+     * seq_realignTrackToMasterClock() (the caller repositions the track).
+     */
+    seq_trackPlayState[track] = 0u;
+    if (track >= 5u) {
+        seq_trackPlayState[5] = 0u;
+        seq_trackPlayState[6] = 0u;
+    }
+    /*
+     * S079 §3.2/§3.4: a per-track Scene change resets that track's X:Y repeat
+     * counter, random step counter, and last-condition chain flag.
+     */
+    seq_trackRepeatCount[track] = 0u;
+    seq_trackRndStepCount[track] = 0u;
+    seq_trackLastConditionFired[track] = 0u;
+    if (track >= 5u) {
+        seq_trackRepeatCount[5] = 0u;
+        seq_trackRndStepCount[5] = 0u;
+        seq_trackLastConditionFired[5] = 0u;
+        seq_trackRepeatCount[6] = 0u;
+        seq_trackRndStepCount[6] = 0u;
+        seq_trackLastConditionFired[6] = 0u;
+    }
+    /* S079 P2 fix 4: per-track Scene change cancels the track's roll + duck. */
+    seq_rollActive[track] = 0u;
+    seq_rollTickAccum[track] = 0u;
+    seq_rollVelPos[track] = 0u;
+    seq_rollRemaining[track] = 0u;
+    seq_rollLastRate[track] = 0u;
+    seq_rollLastRhythm[track] = 0u;
+    seq_rollLastFill[track] = 0u;
+    seq_rollDuckActive[track] = 0u;
+    seq_rollDuckDelay[track] = 0u;
+    seq_rollDuckDelta[track] = 0u;
+    if (track >= 5u) {
+        uint8_t pair = (track == 5u) ? 6u : 5u;
+        seq_rollActive[pair] = 0u;
+        seq_rollTickAccum[pair] = 0u;
+        seq_rollVelPos[pair] = 0u;
+        seq_rollRemaining[pair] = 0u;
+        seq_rollLastRate[pair] = 0u;
+        seq_rollLastRhythm[pair] = 0u;
+        seq_rollLastFill[pair] = 0u;
+        seq_rollDuckActive[pair] = 0u;
+        seq_rollDuckDelay[pair] = 0u;
+        seq_rollDuckDelta[pair] = 0u;
+    }
+    /* S078 §5.4: the reassigned track's Scene changed, rebuild its cache. */
+    seq_refreshTrackEffectiveParams();
+    seq_recomputePerTrackActive();
+}
+
+/*
+ * Reset all per-track played-Scene entries to the active Scene (S077 P2 §1.5).
+ *
+ * What: sets every seq_perTrackPattern[] entry to seq_activePattern and clears
+ * seq_perTrackActive to 0. Why: any scene-level playback change (PERF SEQ
+ * press without a VOICE hold) coalesces all tracks back to one Scene
+ * (plan §4.3, Q2). Inputs: seq_activePattern. Output: all entries equal
+ * activePattern. Affiliates: the button handler coalesce gesture;
+ * seq_selectActivePattern()/seq_alignActivePatternToScene() already perform the
+ * same loop inline for their own Scene changes.
+ */
+void seq_clearPerTrackOverrides(void)
+{
+    uint8_t track;
+
+    for (track = 0u; track < NUM_TRACKS; track++)
+        seq_perTrackPattern[track] = seq_activePattern;
+    seq_perTrackActive = 0u;
+    /* S078 §5.4: all played Scenes were coalesced, rebuild the cache. */
+    seq_refreshTrackEffectiveParams();
+}
+
+/*
+ * Read one track's played Scene (S077 P2 §3.5).
+ *
+ * What: returns seq_perTrackPattern[track], or seq_activePattern for an
+ * out-of-range track. Why: Preset's mixer consumer resolves per-slot FX-send,
+ * fader-mode, and Morph-amount lookups through the track's played Scene rather
+ * than the global active Scene. Inputs: track/slot 0..6. Output: resident Scene
+ * index. Context: foreground only. Affiliates: preset_getSlotPlayedScene().
+ */
+uint8_t seq_getTrackPlayedScene(uint8_t track)
+{
+    if (track >= NUM_TRACKS)
+        return seq_activePattern;
+    return seq_perTrackPattern[track];
+}
+
+//------------------------------------------------------------------------------
 void seq_triggerVoice(uint8_t voiceNr, uint8_t vol, uint8_t note)
 {
 	uint8_t midiChan; // which midi channel to send a note on
@@ -562,14 +1297,23 @@ void seq_triggerVoice(uint8_t voiceNr, uint8_t vol, uint8_t note)
 	//Trigger internal synth voice
 	voiceControl_noteOn(voiceNr, note, vol);
 
-	midiChan = (uint8_t)(scene_getTrackMidiChannel(seq_activePattern, voiceNr) - 1u);
+	/*
+	 * Per-track MIDI output (S077 P2 §6.5).
+	 *
+	 * What: MIDI output uses the track's played Scene's channel, not the global
+	 * active Scene's. Why: each track sends MIDI on the channel configured in
+	 * the Scene it is playing from. Inputs: seq_perTrackPattern[voiceNr].
+	 * Output: MIDI note-on uses the correct Scene's channel. When no per-track
+	 * override is set this equals seq_activePattern and behaviour is unchanged.
+	 */
+	midiChan = (uint8_t)(scene_getTrackMidiChannel(seq_perTrackPattern[voiceNr], voiceNr) - 1u);
 
 	/*
 	 * MIDI output note/channel are PatternData-owned track settings now. A note
 	 * value of 0 preserves the old "use the triggered note" behavior; nonzero
 	 * values override the outgoing MIDI note for this pattern track.
 	 */
-	midiNote = scene_getTrackMidiNote(seq_activePattern, voiceNr);
+	midiNote = scene_getTrackMidiNote(seq_perTrackPattern[voiceNr], voiceNr);
 	if(midiNote == 0)
 		midiNote = note;
 
@@ -598,7 +1342,14 @@ void seq_previewVoice(uint8_t voiceNr)
 	if (voiceNr > 6u || seq_running)
 		return;
 
-	note = scene_getTrackMidiNote(seq_activePattern, voiceNr);
+	/*
+	 * Preview uses the track's played Scene for MIDI identity (S077 P2 §6.5).
+	 *
+	 * What: stopped-transport voice preview auditions through the MIDI
+	 * channel/note of whichever Scene the track is playing from. Inputs:
+	 * seq_perTrackPattern[voiceNr].
+	 */
+	note = scene_getTrackMidiNote(seq_perTrackPattern[voiceNr], voiceNr);
 	if (note == 0u)
 		note = MIDI_DEFAULT_TRIGGER_NOTE;
 
@@ -612,7 +1363,7 @@ void seq_previewVoice(uint8_t voiceNr)
 	voiceControl_noteOff(voiceNr);
 	voiceControl_noteOn(voiceNr, note, ROLL_VOLUME);
 
-	midiChan = (uint8_t)(scene_getTrackMidiChannel(seq_activePattern, voiceNr) - 1u);
+	midiChan = (uint8_t)(scene_getTrackMidiChannel(seq_perTrackPattern[voiceNr], voiceNr) - 1u);
 	seq_sendMidiNoteOn(midiChan, note, ROLL_VOLUME);
 }
 //------------------------------------------------------------------------------
@@ -648,17 +1399,97 @@ void seq_selectActivePattern(uint8_t pattern)
 	if (!pat_patternValid(pattern))
 		return;
 
+	/*
+	 * S080 G7/G12: a Scene selection starts a fresh chain.
+	 *
+	 * What: remembers the outgoing Scene for the >NN conditions (only on a
+	 * real change), restarts the bar/repetition counts and releases a `stp`
+	 * freeze. Why: counts are per Scene activation; any executed change -
+	 * manual, queued or chain - cancels pending conditional state (plan
+	 * §4.5). Affiliates: seq_chainServiceTick(), seq_chainEvaluate().
+	 */
+	if (pattern != seq_activePattern)
+		seq_previousScene = seq_activePattern;
+	seq_chainBarCount = 0u;
+	seq_chainRepCount = 0u;
+	seq_chainStopped = 0u;
 	seq_activePattern = pattern;
 	seq_pendingPattern = pattern;
 	/* S067 has one playback Scene, so every track follows the new target. */
 	for (uint8_t track = 0u; track < NUM_TRACKS; track++)
 		seq_perTrackPattern[track] = pattern;
+	/*
+	 * Scene-level switch always coalesces (S077 P2 §4.3, Q2).
+	 *
+	 * What: the loop above already set every seq_perTrackPattern[] entry to the
+	 * new pattern, so the per-track override flag is now necessarily 0.
+	 */
+	seq_perTrackActive = 0u;
 	seq_loadPendigFlag = 0u;
 	seq_newPatternAvailable = 0u;
-	seq_realignActivePatternToMasterClock();
+	/*
+	 * Once-mode retrigger on Scene change (S078 §4.3).
+	 *
+	 * What: clear every per-track play-state byte before realignment so a
+	 * stopped once/once-free track restarts its one-pass playback. The
+	 * realignment below then positions onc tracks on the master clock and
+	 * 1fr tracks at step zero.
+	 */
+	memset(seq_trackPlayState, 0, sizeof(seq_trackPlayState));
+	/*
+	 * S079 §3.2/§3.4: a Scene change resets the per-track X:Y repeat counters
+	 * and last-condition chain flags; the new Scene's conditions start fresh.
+	 */
+	memset(seq_trackRepeatCount, 0, sizeof(seq_trackRepeatCount));
+	memset(seq_trackRndStepCount, 0, sizeof(seq_trackRndStepCount));
+	memset(seq_trackLastConditionFired, 0,
+	       sizeof(seq_trackLastConditionFired));
+	/* S079 P2 fix 4: a Scene change cancels running rolls and pending ducks. */
+	memset(seq_rollActive, 0, sizeof(seq_rollActive));
+	memset(seq_rollTickAccum, 0, sizeof(seq_rollTickAccum));
+	memset(seq_rollVelPos, 0, sizeof(seq_rollVelPos));
+	memset(seq_rollRemaining, 0, sizeof(seq_rollRemaining));
+	memset(seq_rollLastRate, 0, sizeof(seq_rollLastRate));
+	memset(seq_rollLastRhythm, 0, sizeof(seq_rollLastRhythm));
+	memset(seq_rollLastFill, 0, sizeof(seq_rollLastFill));
+	memset(seq_rollDuckActive, 0, sizeof(seq_rollDuckActive));
+	memset(seq_rollDuckDelay, 0, sizeof(seq_rollDuckDelay));
+	memset(seq_rollDuckDelta, 0, sizeof(seq_rollDuckDelta));
+	/* S078 §5.4: the played Scenes changed, so rebuild the effective cache. */
+	seq_refreshTrackEffectiveParams();
+	{
+		/*
+		 * S080 P2 Defect 14: realign and re-snapshot the looper atomically.
+		 *
+		 * What: every track moves to its master-clock position in the new
+		 * Scene, and every looped track keeps its loop-start tick while its
+		 * snapshot is recomputed for the new Scene. Why: the TIM3 ISR must
+		 * never wrap a track to the outgoing Scene's snapshot after the
+		 * realign. Affiliates: seq_loopRefreshSceneSnapshots().
+		 */
+		uint32_t primask = __get_PRIMASK();
+
+		__disable_irq();
+		seq_realignActivePatternToMasterClock();
+		seq_loopRefreshSceneSnapshots();
+		__set_PRIMASK(primask);
+	}
 	led_notifyPatternChanged(seq_activePattern);
 	seq_sendProgChg(seq_activePattern);
 	voiceControl_noteOff(0xFF);
+	/*
+	 * S076 Rule B: clear the Scene-target automation dirty bitmap.
+	 *
+	 * What: the dirty bits reference mod-target table indices from the
+	 * previous Scene. The new Scene's retained values are the correct
+	 * transport-restore baseline, and stale bits could restore wrong
+	 * entries or alias into the new Scene's table. Clearing here means a
+	 * subsequent transport reset only restores targets that the new
+	 * Scene's own automation wrote.
+	 * Affiliate: seq_restoreAllSceneAutomation() (transport-boundary
+	 * restore, uses this bitmap).
+	 */
+	seq_clearSceneAutomationDirty();
 }
 
 void seq_alignActivePatternToScene(uint8_t scene_index)
@@ -689,14 +1520,52 @@ void seq_alignActivePatternToScene(uint8_t scene_index)
 	if (!pat_patternValid(scene_index))
 		return;
 
+	/* S080 G7: a Bank Load alignment starts a fresh chain with no history. */
+	seq_previousScene = 0xFFu;
+	seq_chainBarCount = 0u;
+	seq_chainRepCount = 0u;
+	seq_chainStopped = 0u;
 	seq_activePattern = scene_index;
 	seq_pendingPattern = scene_index;
 	/* Keep the future per-track assignment stub aligned during boot restore. */
 	for (uint8_t track = 0u; track < NUM_TRACKS; track++)
 		seq_perTrackPattern[track] = scene_index;
+	/*
+	 * Bank Load alignment also clears per-track overrides (S077 P2 §6.4).
+	 *
+	 * What: Bank Load coalesces all tracks to the loaded active Scene. Former
+	 * per-track overrides are stale because Scene indices now point at newly
+	 * loaded content.
+	 */
+	seq_perTrackActive = 0u;
 	seq_loadPendigFlag = 0u;
 	seq_newPatternAvailable = 0u;
-	seq_realignActivePatternToMasterClock();
+	/* S078 §4.3: a committed Scene change retriggers once-mode tracks. */
+	memset(seq_trackPlayState, 0, sizeof(seq_trackPlayState));
+	/* S078 §5.4: the committed Scene change rebuilds the effective cache. */
+	seq_refreshTrackEffectiveParams();
+	{
+		/*
+		 * S080 P2 Defect 14: realign and re-snapshot the looper atomically.
+		 *
+		 * What: every track moves to its master-clock position in the new
+		 * Scene, and every looped track keeps its loop-start tick while its
+		 * snapshot is recomputed for the new Scene (Bank Load alignment). Why:
+		 * the TIM3 ISR must never wrap a track to the outgoing Scene's snapshot
+		 * after the realign. Affiliates: seq_loopRefreshSceneSnapshots().
+		 */
+		uint32_t primask = __get_PRIMASK();
+
+		__disable_irq();
+		seq_realignActivePatternToMasterClock();
+		seq_loopRefreshSceneSnapshots();
+		__set_PRIMASK(primask);
+	}
+	/*
+	 * S076 Rule B: clear the Scene-target automation dirty bitmap.
+	 * Same rationale as seq_selectActivePattern() — see Change 15.
+	 */
+	seq_clearSceneAutomationDirty();
 }
 
 /*
@@ -723,7 +1592,16 @@ static void seq_queueStepAutomations(uint8_t track, uint8_t step)
     uint8_t i;
     uint16_t base;
 
-    region = pat_sceneRegion(seq_activePattern);
+    /*
+     * Per-track automation region (S077 P2 §3.2).
+     *
+     * What: reads the automation block from the track's own played Scene.
+     * Why: automation entries are authored per-Scene; a track playing from
+     * Scene B must queue Scene B's automation, not Scene A's. Inputs:
+     * seq_perTrackPattern[track]. When no per-track override is set this
+     * equals seq_activePattern and behaviour is unchanged.
+     */
+    region = pat_sceneRegion(seq_perTrackPattern[track]);
     if (!region || !pat_trackValid(track) || !pat_stepValid(step))
         return;
     address = region->address[track][step];
@@ -744,7 +1622,15 @@ static void seq_queueStepAutomations(uint8_t track, uint8_t step)
         value_count++;
     if (flags & PAT_SPECIAL_VEL_BIT)
         value_count++;
-    if (flags & PAT_SPECIAL_PROB_BIT)
+    if (flags & PAT_SPECIAL_COND_BIT)
+        value_count++;
+    if (flags & PAT_SPECIAL_ROLL_BIT)
+        value_count++;
+    if (flags & PAT_SPECIAL_TIMING_BIT)
+        value_count++;
+    if (flags & PAT_SPECIAL_RHYTHM_BIT)
+        value_count++;
+    if (flags & PAT_SPECIAL_FILL_BIT)
         value_count++;
     auto_count = (uint8_t)(block[1] & PAT_BLOCK_AUTO_COUNT_MASK);
     if ((uint32_t)offset +
@@ -783,11 +1669,51 @@ static void seq_queueStepAutomations(uint8_t track, uint8_t step)
  * rewritten by the owning track end their overlay. A full queue records the
  * same PatternTrace overflow witness as automation entries.
  */
+/*
+ * Effect-type match test for per-track FX automation (S077 P2 §3.6, Q9).
+ *
+ * What: compares the active Scene's retained effect type against one track's
+ * played Scene's retained effect type. Why: FX automation entries are authored
+ * for a specific effect type; applying them to a different type would write
+ * parameters into undefined slots. Inputs: seq_activePattern,
+ * seq_perTrackPattern[track]. Output: 1 when the types match (or either record
+ * is unavailable is treated as no-match), 0 otherwise. Context: safe in TIM3
+ * ISR - scene_effectConst() returns a const SRAM1 pointer with no allocation
+ * or I/O. Affiliates: seq_queueEffectStepMarker() and seq_drainPendingAutomation().
+ */
+static uint8_t seq_trackEffectTypeMatchesActive(uint8_t track)
+{
+    const effect_record_t *active;
+    const effect_record_t *played;
+
+    if (track >= NUM_TRACKS)
+        return 0u;
+    active = scene_effectConst(seq_activePattern);
+    played = scene_effectConst(seq_perTrackPattern[track]);
+    if (!active || !played)
+        return 0u;
+    return (uint8_t)(active->type == played->type);
+}
+
 static void seq_queueEffectStepMarker(uint8_t track, uint8_t step)
 {
     uint16_t step_id = (uint16_t)(track * NUM_STEPS + step);
 
     if ((seq_effectAutomationTracks & (uint8_t)(1u << track)) == 0u)
+        return;
+    /*
+     * Effect-type gate for per-track FX step markers (S077 P2 §3.6, Q9).
+     *
+     * What: before queueing an FX step boundary, compare the active Scene's
+     * retained effect type against the track's played Scene's retained effect
+     * type. If they differ, the marker is dropped so the foreground drain does
+     * not begin an overlay against the wrong effect type. Why: FX automation
+     * entries are authored for a specific effect type. Inputs:
+     * seq_activePattern, seq_perTrackPattern[track]. Output: marker queued only
+     * when types match. Fast path: when no per-track override is set the types
+     * are trivially equal, so the comparison is skipped behind seq_perTrackActive.
+     */
+    if (seq_perTrackActive && !seq_trackEffectTypeMatchesActive(track))
         return;
     if (seq_pending_automation_count < SEQ_PENDING_BUF_COUNT) {
         uint8_t pending_index = seq_pending_automation_count;
@@ -804,34 +1730,268 @@ static void seq_queueEffectStepMarker(uint8_t track, uint8_t step)
 }
 
 /*
- * Evaluate the conditional playback gate for one step.
+ * Evaluate the per-step trigger condition (S079 §3).
  *
- * Input: resolved PatternData specials read from the dynamic block before the
- * trigger-active check. Output: 1 when the complete step may participate in
- * playback, or 0 when both its trigger and automation are suppressed.
+ * What: the single gate before a step fires. Returns 1 (fire) or 0
+ * (suppress). Updates seq_trackLastConditionFired for conditional steps.
+ * Why: all condition logic lives at one entry point. Condition 0 and
+ * undefined values (37..255) always pass.
  *
- * Probability is currently the only conditional special. The PatternData
- * default (127, including an absent probability special) always passes; lower
- * values are compared against the same hardware-RNG conversion used by the
- * former trigger-local implementation. This is the single entry point for
- * future conditional-trigger evaluations, so named conditions can be added
- * here without reintroducing trigger-state-dependent automation queueing.
+ * Probability conditions 1..10 map to 10%..95% and are compared against the
+ * hardware RNG. Repeat-count conditions 11..20 fire when
+ * (seq_trackRepeatCount % Y) == (X - 1); value 20 ("1:-") fires only on the
+ * first play of the track. Fill conditions 21/22 read seq_fillActive.
+ * S080 B4 inserts loop conditions 23 ("lop") and 24 ("!lp") between fill and
+ * last; last conditions move to 25/26 and read seq_trackLastConditionFired.
+ * Mute conditions 27..40 test one voice's mute bit in seq_mutedTracks (27..33
+ * muted, 34..40 not muted). Total table size is 41 (indices 0..40).
  *
- * Common caller: seq_advanceTrackStep() in TIM3 ISR context. Affiliates:
- * pat_readStepSpecials() and GetRngValue().
+ * Inputs: specials struct (condition index), track index (for mute/repeat/
+ * last state). Outputs: gate result, side effect on
+ * seq_trackLastConditionFired. Context: TIM3 ISR. Affiliates:
+ * seq_advanceTrackStep(), GetRngValue(), seq_mutedTracks,
+ * seq_trackRepeatCount, seq_fillActive, seq_trackLastConditionFired.
  */
-static uint8_t seq_evaluateStepCondition(const pat_step_specials_t *sp)
+static uint8_t seq_evaluateStepCondition(const pat_step_specials_t *sp,
+                                          uint8_t track)
 {
-    /* Probability gate. */
-    if (sp->probability < 127u) {
+    uint8_t cond = sp->condition;
+    uint8_t result = 1u;
+
+    if (cond == 0u || cond > 40u)
+        return 1u;
+
+    if (cond <= 10u) {
+        /* Probability: 10%..95%, values 1..10. */
+        static const uint8_t prob_thresholds[10] = {
+            13u, 25u, 38u, 51u, 64u, 76u, 89u, 102u, 114u, 121u
+        };
+        uint8_t threshold = prob_thresholds[cond - 1u];
         uint8_t rnd = (uint8_t)(((uint16_t)(GetRngValue() & 0x7FFFu) *
                                  127u) / 32767u);
-        if (rnd >= sp->probability)
-            return 0u;
+
+        result = (uint8_t)(rnd < threshold);
+    } else if (cond <= 20u) {
+        /* Repeat count: X:Y, values 11..20. */
+        if (cond == 20u) {
+            result = (uint8_t)(seq_trackRepeatCount[track] == 0u);
+        } else {
+            static const uint8_t xy_table[9][2] = {
+                {1u,2u},{2u,2u},{1u,3u},{2u,3u},{3u,3u},
+                {1u,4u},{2u,4u},{3u,4u},{4u,4u}
+            };
+            uint8_t x = xy_table[cond - 11u][0];
+            uint8_t y = xy_table[cond - 11u][1];
+
+            result = (uint8_t)((seq_trackRepeatCount[track] % y) ==
+                               (uint8_t)(x - 1u));
+        }
+    } else if (cond <= 22u) {
+        /* Fill / not-fill, values 21..22. */
+        if (cond == 21u)
+            result = seq_fillActive;
+        else
+            result = (uint8_t)(!seq_fillActive);
+    } else if (cond <= 24u) {
+        /*
+         * Loop active / inactive, values 23..24 (S080 B4).
+         *
+         * What: index 23 ("lop") fires only while the PERF looper is engaged;
+         * 24 ("!lp") fires only while it is not. Why: lets pattern steps react
+         * to the looper. Input: seq_loopActive (single-byte, foreground set,
+         * ISR read). No boundary timing - evaluated on every step. Affiliates:
+         * conditionNames[] (MenuText.h B1), seq_loopEngage()/Disengage().
+         */
+        if (cond == 23u)
+            result = seq_loopActive;
+        else
+            result = (uint8_t)(!seq_loopActive);
+    } else if (cond <= 26u) {
+        /* Last / not-last conditional step, values 25..26 (S080 B4 shift). */
+        if (cond == 25u)
+            result = seq_trackLastConditionFired[track];
+        else
+            result = (uint8_t)(!seq_trackLastConditionFired[track]);
+    } else {
+        /*
+         * Mute / not-mute, values 27..40 (S080 B4 shift). 27..33 = "is voice N
+         * muted" for voices 1..7, 34..40 = "is voice N not muted". The
+         * zero-based voice index is (cond - 27) mod 7 over both halves.
+         */
+        uint8_t voice_idx = (uint8_t)((cond - 27u) % 7u);
+        uint8_t is_muted = (uint8_t)((seq_mutedTracks >> voice_idx) & 1u);
+
+        if (cond <= 33u)
+            result = is_muted;
+        else
+            result = (uint8_t)(!is_muted);
     }
 
-    /* Future conditional-trigger evaluations belong at this single gate. */
-    return 1u;
+    seq_trackLastConditionFired[track] = result;
+    return result;
+}
+
+/*
+ * Convert a roll rate index to its PPQ tick interval (S079 §4.1).
+ *
+ * Absolute note values at 96 PPQ: off 0, 1/8 12, 8tr 8, 16 6, 16t 4, 32 3,
+ * 32t 2, 48 2, 64 1 (the 64th's 1.5 PPQ is quantised to 1). Inputs: roll
+ * rate index 0..8. Output: ticks between retriggers, 0 for off.
+ */
+static uint8_t seq_rollPpq(uint8_t rate)
+{
+    static const uint8_t table[9] = {
+        0u, 12u, 8u, 6u, 4u, 3u, 2u, 2u, 1u
+    };
+
+    if (rate > 8u)
+        return 0u;
+    return table[rate];
+}
+
+/*
+ * Compute the velocity for the current roll retrigger position (S079 §5).
+ *
+ * What: decode the rhythm byte (bits 7..4 cycle length, bit 3 direction, bits
+ * 2..0 full count) and return the velocity for the current position in the
+ * cycle. Within the full-count window the step velocity applies; beyond it the
+ * velocity is halved (direction 0) or doubled (direction 1). Halved velocity
+ * floors at 1; doubled clamps at 127. Byte 0x00 and any full >= cycle decode as
+ * off (no velocity change: every retrigger at step velocity). Inputs:
+ * seq_rollVelPos, seq_rollStepVel, seq_rollLastRhythm. Output: velocity
+ * 1..127.
+ */
+static uint8_t seq_rollComputeVelocity(uint8_t track)
+{
+    uint8_t r = seq_rollLastRhythm[track];
+    uint8_t cycle = (uint8_t)((r >> 4u) & 0x0Fu);
+    uint8_t dir = (uint8_t)((r >> 3u) & 1u);
+    uint8_t full = (uint8_t)(r & 0x07u);
+    uint8_t vel = seq_rollStepVel[track];
+    uint8_t pos;
+
+    if (cycle == 0u)
+        cycle = 1u;
+    if (full == 0u)
+        full = 1u;
+    if (full > cycle) {         /* off-equivalent / invalid -> step velocity */
+        full = 1u;
+        cycle = 1u;
+    }
+    pos = (uint8_t)(seq_rollVelPos[track] % cycle);
+    if (pos < full)
+        return vel;
+    if (dir == 0u) {
+        vel = (uint8_t)(vel / 2u);
+        if (vel == 0u)
+            vel = 1u;
+        return vel;
+    }
+    vel = (uint8_t)(vel * 2u);
+    if (vel > 127u)
+        vel = 127u;
+    return vel;
+}
+
+/*
+ * Test whether an incoming roll step continues the running roll (S079 §4.2).
+ *
+ * A carry requires an active chain and identical rate, rhythm, and fill.
+ * Inputs: track, incoming specials. Output: nonzero for a carry.
+ */
+static uint8_t seq_rollCarries(uint8_t track, const pat_step_specials_t *sp)
+{
+    return (uint8_t)(seq_rollActive[track] && sp->roll != 0u &&
+                     seq_rollLastRate[track] == sp->roll &&
+                     seq_rollLastRhythm[track] == sp->rhythm &&
+                     seq_rollLastFill[track] == sp->fill);
+}
+
+/*
+ * Arm the fill-window duck for one track (S079 P2 fix 4).
+ *
+ * What: starts the duck countdown from the step's stored delta when the roll
+ * is active and the fill is below 100. Why: the duck is scheduled when the
+ * last retrigger of the fill window has fired. Inputs: per-track roll state.
+ * Output: seq_rollDuckDelay/Active armed. Affiliates: seq_processRollTicks().
+ */
+static void seq_rollArmDuck(uint8_t track)
+{
+    if (!seq_rollActive[track] || seq_rollLastFill[track] >= 100u)
+        return;
+    seq_rollDuckDelay[track] = seq_rollDuckDelta[track];
+    seq_rollDuckActive[track] = 1u;
+}
+
+/*
+ * Begin or continue a per-step roll at the step's fire time (S079 §4, §6).
+ *
+ * What: computes the number of retrigger slots for the step's fill window
+ * (interval x fill / 100, at the roll's PPQ spacing) and fires retrigger #1
+ * unless this step carries the previous chain. Every retrigger fires normally;
+ * a fill < 100 window instead arms a duck countdown so the sounding voice is
+ * faded out (S079 P2 fix 4) at the fill-window end. fill 0 collapses to a
+ * single hit ducked within the first block. The remaining slots are queued for
+ * seq_processRollTicks(). On a carry the velocity-pattern position and tick
+ * accumulator are preserved and only the slot count is extended, so the roll
+ * is seamless across the step boundary. Inputs: track and resolved specials.
+ * Outputs: the per-track roll state arrays. Context: TIM3 ISR. Affiliates:
+ * seq_processRollTicks(), seq_rollArmDuck().
+ */
+static void seq_rollBegin(uint8_t track, const pat_step_specials_t *sp)
+{
+    uint8_t ppq = seq_rollPpq(sp->roll);
+    uint8_t carry = seq_rollCarries(track, sp);
+    uint16_t interval;
+    uint16_t filled;
+    uint16_t slots;
+
+    if (ppq == 0u) {
+        seq_rollActive[track] = 0u;
+        return;
+    }
+    interval = (uint16_t)(stepScale_ticksQ8(seq_effectiveTrackScale[track])
+                          >> 8u);
+    if (interval == 0u)
+        interval = 1u;
+    filled = (uint16_t)(((uint32_t)interval * sp->fill) / 100u);
+    if (sp->fill == 0u)
+        slots = 1u;                             /* single retrigger */
+    else
+        slots = (uint16_t)((filled + ppq - 1u) / ppq);
+    if (slots == 0u)
+        slots = 1u;
+    if (slots > 255u)
+        slots = 255u;
+
+    if (!carry) {
+        seq_rollTickAccum[track] = ppq;
+        seq_rollVelPos[track] = 0u;
+        seq_rollRemaining[track] = (uint8_t)(slots - 1u);
+        /* Retrigger #1 is the step's own hit; it always fires normally. */
+        seq_triggerVoice(track, sp->velocity, sp->note);
+        seq_rollVelPos[track] = 1u;
+    } else {
+        seq_rollRemaining[track] =
+            (uint8_t)(seq_rollRemaining[track] + (uint8_t)(slots - 1u));
+    }
+    seq_rollActive[track] = 1u;
+    seq_rollLastRate[track] = sp->roll;
+    seq_rollLastRhythm[track] = sp->rhythm;
+    seq_rollLastFill[track] = sp->fill;
+    seq_rollStepVel[track] = sp->velocity;
+    seq_rollStepNote[track] = sp->note;
+
+    /* S079 P2 fix 4: the fill-window end schedules a duck, not a gated hit. */
+    seq_rollDuckActive[track] = 0u;              /* cancel any interior duck */
+    if (sp->fill < 100u)
+        seq_rollDuckDelta[track] = (uint8_t)(
+            filled - (uint16_t)((slots - 1u) * ppq));
+    else
+        seq_rollDuckDelta[track] = 0u;
+
+    if (seq_rollRemaining[track] == 0u)
+        seq_rollArmDuck(track);                  /* slots == 1 case */
 }
 
 /*
@@ -864,14 +2024,121 @@ static void seq_advanceTrackStep(uint8_t track)
 	 * I/O, so this is safe in TIM3 ISR context (priority 2). A NULL region or
 	 * a zero-length field falls back to the historic 16-step bar.
 	 */
-	const pat_scene_region_t *region = pat_sceneRegion(seq_activePattern);
-	uint8_t len = (region && region->track_length[track] > 0u)
-	              ? region->track_length[track]
-	              : NUM_STEPS_PER_BAR;
+	/*
+	 * Per-track played-Scene read (S077 P2 §3.2).
+	 *
+	 * What: reads the track's own played Scene instead of the global active
+	 * Scene for pattern region, step activity, step specials, and automation.
+	 * Why: when a track plays from a Scene other than the active one, its
+	 * sequence data (loop length, step triggers, automation) must come from that
+	 * track's assigned Scene. Inputs: seq_perTrackPattern[track] - a single-byte
+	 * SRAM1 read, atomic on Cortex-M7. Output: region, step checks, and
+	 * automation all resolve against the track's played Scene. When no per-track
+	 * override is set this equals seq_activePattern and behaviour is identical.
+	 */
+	const pat_scene_region_t *region = pat_sceneRegion(seq_perTrackPattern[track]);
+	/*
+	 * Effective (morphed) loop length (S078 §5.4).
+	 *
+	 * What: the DDA owns when a step fires; the loop boundary is the cached
+	 * effective length produced by seq_refreshTrackEffectiveParams() (Normal
+	 * interpolated against the Scene Morph endpoint, or a step-automation
+	 * overlay). Why: reading the cache lets a Morph sweep shorten or lengthen
+	 * the phrase without writing the retained Pattern region. Inputs:
+	 * seq_effectiveTrackLength[track]. Affiliates:
+	 * presetMorph_getTrackEffectiveLength() (the cache producer).
+	 */
+	uint8_t len = seq_effectiveTrackLength[track];
+	if (len < 1u)
+		len = NUM_STEPS_PER_BAR;
+	uint8_t play_mode = (region) ? region->track_play_mode[track] : 0u;
 
-	seq_stepIndex[track]++;
+	/*
+	 * Wrap immediately when a Morph sweep shortens the loop (S078 §5.1).
+	 *
+	 * What: an index left beyond the new effective length is parked at the last
+	 * step before the mode advance below, so forward mode wraps to step 0 on
+	 * this boundary and reverse/pip modes cannot crawl backwards to re-enter
+	 * range over many steps. Why: a Morph that shrinks the phrase must take
+	 * effect at once. Inputs: seq_stepIndex[track], effective len. Output:
+	 * index clamped into 0..len-1.
+	 */
 	if (seq_stepIndex[track] >= (int16_t)len)
-		seq_stepIndex[track] = 0;
+		seq_stepIndex[track] = (int16_t)(len - 1u);
+
+	/*
+	 * Play mode direction logic (S078 §4.4).
+	 *
+	 * What: replaces the unconditional increment-and-wrap with a per-track
+	 * direction switch. FWD: existing behaviour. REV: decrement, wrap at 0 to
+	 * length-1. PIP: cycle of 2×length, boundaries play twice; the direction
+	 * bit in seq_trackPlayState[] disambiguates the two occurrences of each
+	 * boundary index. RND: uniform random within length. ONC/1FR: forward
+	 * one-pass, set the stopped flag at the end. Why: allows each track to have
+	 * an independent playback direction and mode. Values >= 6 are treated as
+	 * fwd for forward compatibility. Inputs: region->track_play_mode[track],
+	 * seq_trackPlayState[track]. Outputs: seq_stepIndex[track] updated,
+	 * stopped flag set for once modes. Affiliates: seq_trackPlayState[]
+	 * retrigger logic, seq_setTrackPlayedScene().
+	 */
+	if (play_mode >= 6u)
+		play_mode = 0u;
+	if ((play_mode == 4u || play_mode == 5u) &&
+	    (seq_trackPlayState[track] & SEQ_PLAY_STATE_STOPPED))
+		return;
+	switch (play_mode) {
+	case 1u: /* rev */
+		seq_stepIndex[track]--;
+		if (seq_stepIndex[track] < 0) {
+			seq_stepIndex[track] = (int16_t)(len - 1u);
+			/* Wrap 0 -> len-1 counts as one traversal (S079 §3.2). */
+			seq_trackRepeatCount[track]++;
+		}
+		break;
+	case 2u: /* pip */
+		if (seq_trackPlayState[track] & SEQ_PLAY_STATE_PIP_REV) {
+			if (seq_stepIndex[track] <= 0) {
+				seq_trackPlayState[track] &=
+				    (uint8_t)~SEQ_PLAY_STATE_PIP_REV;
+				seq_trackRepeatCount[track]++;
+			} else {
+				seq_stepIndex[track]--;
+			}
+		} else {
+			if (seq_stepIndex[track] >= (int16_t)(len - 1u)) {
+				seq_trackPlayState[track] |= SEQ_PLAY_STATE_PIP_REV;
+				seq_trackRepeatCount[track]++;
+			} else {
+				seq_stepIndex[track]++;
+			}
+		}
+		break;
+	case 3u: /* rnd */
+		seq_stepIndex[track] =
+		    (int16_t)(((uint16_t)GetRngValue() & 0x7FFFu) % len);
+		if (++seq_trackRndStepCount[track] >= len) {
+			seq_trackRndStepCount[track] = 0u;
+			seq_trackRepeatCount[track]++;
+		}
+		break;
+	case 4u: /* onc — once, aligned to the master clock at entry */
+	case 5u: /* 1fr — once, always from step zero */
+		seq_stepIndex[track]++;
+		if (seq_stepIndex[track] >= (int16_t)len) {
+			seq_stepIndex[track] = (int16_t)(len - 1u);
+			seq_trackPlayState[track] |= SEQ_PLAY_STATE_STOPPED;
+			return;
+		}
+		break;
+	case 0u: /* fwd */
+	default:
+		seq_stepIndex[track]++;
+		if (seq_stepIndex[track] >= (int16_t)len) {
+			seq_stepIndex[track] = 0;
+			seq_trackRepeatCount[track]++;
+		}
+		break;
+	}
 
 	if (seq_SomModeActive) {
 		if (track == 0u)
@@ -879,29 +2146,149 @@ static void seq_advanceTrackStep(uint8_t track)
 		return;
 	}
 
-	if (!(seq_mutedTracks & (1u << track))) {
+	{
+		uint8_t track_muted = (uint8_t)((seq_mutedTracks >> track) & 1u);
+		uint8_t process_step = (uint8_t)(!track_muted);
+
+		/*
+		 * Mute gate with self-mute bypass (S079 §3.5).
+		 *
+		 * What: muted tracks normally skip all step processing. However, if a
+		 * step on a muted track has a mute condition that tests its own track
+		 * (e.g. "3mu" on track 3), the mute is bypassed and the condition is
+		 * evaluated. Why: a self-mute condition is meaningless without bypass -
+		 * the step would never be reached. Self-mute conditions test the
+		 * zero-based voice index equal to this track. Inputs: seq_mutedTracks
+		 * bitmask, the step's address entry, and its pool condition byte.
+		 * Output: process_step is set when the step should run despite the
+		 * mute. Affiliates: pat_readStepSpecials(), seq_evaluateStepCondition().
+		 */
+		if (track_muted) {
+			const pat_scene_region_t *mute_region =
+			    pat_sceneRegion(seq_perTrackPattern[track]);
+			uint16_t mute_addr = mute_region
+			    ? mute_region->address[track][(uint8_t)seq_stepIndex[track]]
+			    : PAT_ADDR_SENTINEL;
+
+			if ((mute_addr & PAT_ADDR_SPECIALS_BIT) != 0u) {
+				pat_step_specials_t msp = pat_readStepSpecials(
+				    seq_perTrackPattern[track], track,
+				    (uint8_t)seq_stepIndex[track]);
+				uint8_t cond = msp.condition;
+				uint8_t self_mute = 0u;
+
+				/* S080 B4: mute condition ranges shifted +2 by lop/!lp. */
+				if (cond >= 27u && cond <= 33u &&
+				    (uint8_t)(cond - 27u) == track)
+					self_mute = 1u;
+				else if (cond >= 34u && cond <= 40u &&
+				    (uint8_t)(cond - 34u) == track)
+					self_mute = 1u;
+				if (self_mute &&
+				    seq_evaluateStepCondition(&msp, track))
+					process_step = 1u;
+			}
+		}
+
+		if (process_step) {
 		/*
 		 * Resolve specials and evaluate the step gate before checking bit 15.
 		 * Bit 14 owns both conditional values and automation, so a non-trigger
 		 * step is still a complete playback step for automation purposes.
 		 */
 		pat_step_specials_t sp = pat_readStepSpecials(
-		    seq_activePattern, track, (uint8_t)seq_stepIndex[track]);
-		uint8_t step_allowed = seq_evaluateStepCondition(&sp);
+		    seq_perTrackPattern[track], track, (uint8_t)seq_stepIndex[track]);
+		uint8_t step_allowed = seq_evaluateStepCondition(&sp, track);
 
-		if (pat_isStepActive(track, (uint8_t)seq_stepIndex[track], seq_activePattern)) {
+		/* A step with no roll ends any running per-step roll and duck
+		 * (S079 §4.2, S079 P2 fix 4). */
+		if (sp.roll == 0u) {
+			seq_rollActive[track] = 0u;
+			seq_rollDuckActive[track] = 0u;
+		}
+
+		if (pat_isStepActive(track, (uint8_t)seq_stepIndex[track], seq_perTrackPattern[track])) {
 			if (seq_eraseActive && track == menu_getActiveVoice()) {
 				/*
 				 * Live erase clears only the static trigger in TIM3. Pool
 				 * reclamation is a foreground PatternStackService event so this
 				 * ISR never mutates pool bytes or bitmap state.
+				 *
+				 * S077 P2 §3.2: erase targets the pattern data the track is
+				 * actually playing, not necessarily the global active Scene.
+				 * Erasing from the active Scene while the track plays from a
+				 * different Scene would clear steps that are not audible.
 				 */
-				pat_setStepActive(seq_activePattern, track,
+				pat_setStepActive(seq_perTrackPattern[track], track,
 				                  (uint8_t)seq_stepIndex[track], 0u);
-				patSvc_enqueueErase(seq_activePattern, track,
+				patSvc_enqueueErase(seq_perTrackPattern[track], track,
 				                    (uint8_t)seq_stepIndex[track]);
 			} else if (step_allowed) {
-				seq_triggerVoice(track, sp.velocity, sp.note);
+				/*
+				 * Trigger emission: per-step roll or shuffle/micro-timing
+				 * deferral (S078 §3.2, S079 §4, §7).
+				 *
+				 * What: a step with a roll rate hands its complete trigger
+				 * stream to seq_rollBegin() (which fires retrigger #1 and
+				 * arms the tick engine). Otherwise odd-indexed steps with
+				 * nonzero shuffle are deferred by (shuffle x 24) / 256 PPQ
+				 * ticks and micro-timing adds (step_interval x timing) / 100
+				 * ticks on top. Why: shuffle is a 1/16-grid groove; micro-timing
+				 * is relative to the track's own step interval. Inputs:
+				 * seq_effectiveTrackShuffle[track], sp.roll, sp.timing,
+				 * seq_stepIndex[track] parity. Outputs: roll start, immediate
+				 * trigger, or combined deferred trigger setup. A pending
+				 * deferral is flushed first so a fast track cannot lose an
+				 * un-fired odd step. Affiliates: seq_processDeferredTriggers(),
+				 * seq_rollBegin().
+				 */
+				/*
+				 * Effective (morphed) shuffle (S078 §5.1/§3.2): the
+				 * Normal amount interpolated against the Scene Morph
+				 * endpoint, or a step-automation overlay.
+				 */
+				uint8_t shuffle_val = seq_effectiveTrackShuffle[track];
+				uint8_t is_odd_step =
+				    (uint8_t)(seq_stepIndex[track] & 1);
+
+				if (sp.roll > 0u) {
+					seq_rollBegin(track, &sp);
+				} else {
+					if (seq_trackShufflePending[track]) {
+						seq_trackShufflePending[track] = 0u;
+						seq_triggerVoice(track,
+						                 seq_trackShuffleVel[track],
+						                 seq_trackShuffleNote[track]);
+					}
+					{
+						uint8_t total_delay = 0u;
+
+						if (shuffle_val > 0u && is_odd_step &&
+						    len > 0u)
+							total_delay = (uint8_t)(
+							    ((uint16_t)shuffle_val * 24u) / 256u);
+						if (sp.timing > 0u) {
+							uint16_t mt_interval = (uint16_t)(
+							    stepScale_ticksQ8(
+							        seq_effectiveTrackScale[track])
+							    >> 8u);
+							total_delay = (uint8_t)(total_delay +
+							    (uint8_t)(((uint32_t)mt_interval *
+							               sp.timing) / 100u));
+						}
+						if (total_delay > 0u) {
+							seq_trackShuffleDelay[track] =
+							    (uint8_t)(total_delay - 1u);
+							seq_trackShufflePending[track] = 1u;
+							seq_trackShuffleVel[track] =
+							    sp.velocity;
+							seq_trackShuffleNote[track] = sp.note;
+						} else {
+							seq_triggerVoice(track, sp.velocity,
+							                 sp.note);
+						}
+					}
+				}
 			}
 		}
 
@@ -917,9 +2304,11 @@ static void seq_advanceTrackStep(uint8_t track)
                                       (uint8_t)seq_stepIndex[track]);
             seq_queueStepAutomations(track, (uint8_t)seq_stepIndex[track]);
         }
+		}
 	}
 
-	if (seq_rollRate != 0xffu && (seq_rollState & (1u << track))) {
+	if (seq_rollRate != 0xffu && (seq_rollState & (1u << track)) &&
+	    !seq_rollActive[track]) {
 		if ((seq_stepIndex[track] % seq_rollRate) == 0) {
 			const uint8_t vol = ROLL_VOLUME;
 			seq_triggerVoice(track, vol, MIDI_DEFAULT_TRIGGER_NOTE);
@@ -984,6 +2373,51 @@ static uint8_t seq_applySceneAutomation(uint16_t target, uint8_t value)
 		/* `fxm` expands like voice Morph and stays runtime-only until reset. */
 		effects_setMorphAutomation(effect_expand7Linear(value));
 		break;
+	case SCENE_MOD_TARGET_KIND_TRACK_LENGTH:
+	case SCENE_MOD_TARGET_KIND_TRACK_SCALE:
+	case SCENE_MOD_TARGET_KIND_TRACK_SHUFFLE: {
+		/*
+		 * Per-track timing step automation (S078 §5.5).
+		 *
+		 * What: routes the 7-bit Pattern value to a runtime-only overlay
+		 * for the target track's length, scale, or shuffle. Why: the
+		 * overlay is consumed by the effective track getters, so step
+		 * automation changes playback without overwriting the retained
+		 * Pattern Normal values or raising a Pattern dirty bit.
+		 * Inputs: descriptor->voice_slot carries the track index.
+		 * Outputs: presetMorph overlay set. Affiliates:
+		 * presetMorph_setTrackParamStepOverride(),
+		 * seq_restoreAllSceneAutomation() (the transport clear).
+		 */
+		presetMorph_trackParam_t param;
+
+		if (descriptor->voice_slot >= NUM_TRACKS)
+			return 0u;
+		switch (descriptor->kind) {
+		case SCENE_MOD_TARGET_KIND_TRACK_LENGTH:
+			param = PRESETMORPH_TRACK_LENGTH;
+			break;
+		case SCENE_MOD_TARGET_KIND_TRACK_SCALE:
+			param = PRESETMORPH_TRACK_SCALE;
+			break;
+		default:
+			param = PRESETMORPH_TRACK_SHUFFLE;
+			break;
+		}
+		presetMorph_setTrackParamStepOverride(descriptor->voice_slot,
+		                                      param, value);
+		/*
+		 * S078 §5.10: step automation writes the effective cache directly so
+		 * playback changes on the next DDA tick; the overlay keeps the value
+		 * stable until the transport/Pattern restore recomputes it.
+		 */
+		if (param == PRESETMORPH_TRACK_LENGTH)
+			seq_effectiveTrackLength[descriptor->voice_slot] = value;
+		else if (param == PRESETMORPH_TRACK_SCALE)
+			seq_effectiveTrackScale[descriptor->voice_slot] = value;
+		else
+			seq_effectiveTrackShuffle[descriptor->voice_slot] = value;
+		break; }
 	default:
 		return 0u;
 	}
@@ -1035,18 +2469,31 @@ void seq_drainPendingAutomation(void)
             /* Automation storage is already in descriptor parameter space;
              * do not apply MIDI-CC-style 7-bit-to-8-bit expansion here. */
             uint8_t value = (uint8_t)((packed >> 9u) & 0x7Fu);
+            /*
+             * Per-track ownership for this entry (S077 P2 §1.16).
+             *
+             * What: the writing track is embedded in the packed step
+             * identity as (step_id / NUM_STEPS); its played Scene selects the
+             * instrument image used for validation and the effect type used by
+             * the FX gate. Output: owner_track 0..6, owner_scene resident
+             * index. When no per-track override is set owner_scene equals
+             * seq_activePattern and behaviour is unchanged.
+             */
+            uint8_t owner_track = (uint8_t)((identity &
+                                             SEQ_PENDING_STEP_ID_MASK) /
+                                            NUM_STEPS);
+            uint8_t owner_scene = seq_getTrackPlayedScene(owner_track);
 
             if ((identity & SEQ_PENDING_TYPE_FX_STEP_BIT) != 0u) {
                 /* One owning track's step boundary precedes its entries. */
-                effects_automationStepBegin((uint8_t)(
-                    (identity & SEQ_PENDING_STEP_ID_MASK) / NUM_STEPS));
+                effects_automationStepBegin(owner_track);
             } else if ((identity & SEQ_PENDING_TYPE_AUTOMATION_BIT) != 0u) {
                 if (instrumentParam_isVoiceParameter(target) &&
-                    instrumentManager_targetValid(seq_activePattern, target,
+                    instrumentManager_targetValid(owner_scene, target,
                                                   INSTRUMENT_TARGET_AUTOMATION)) {
                     uint8_t slot = instrumentParam_slot(target);
                     const kit_instrument_slot_t *instrument =
-                        scene_instrumentSlotConst(seq_activePattern, slot);
+                        scene_instrumentSlotConst(owner_scene, slot);
                     const ParamDescriptor *descriptor = instrument
                         ? instrumentManager_descriptor(
                               instrument->type, instrumentParam_local(target))
@@ -1061,11 +2508,23 @@ void seq_drainPendingAutomation(void)
                 } else if (sceneModTarget_isSceneTarget(target)) {
                     (void)seq_applySceneAutomation(target, value);
                 } else if (effectTarget_isEffectId(target)) {
-                    /* Block-7 entries are owned by the writing track. */
-                    (void)effects_applyAutomation(
-                        (uint8_t)((identity & SEQ_PENDING_STEP_ID_MASK) /
-                                  NUM_STEPS),
-                        effectTarget_local(target), value);
+                    /*
+                     * Effect automation type gate (S077 P2 §1.17, Q9).
+                     *
+                     * What: before applying a block-7 (Effect) entry, compare
+                     * the active Scene's effect type against the owning
+                     * track's played Scene's effect type. If the types differ,
+                     * drop the entry. Why: effect parameters are type-specific;
+                     * writing values authored for one effect type into another
+                     * would touch undefined slots. Fast path: when no per-track
+                     * override is set the types are trivially equal, so the
+                     * comparison is skipped. Block-7 entries are owned by the
+                     * writing track via effects_applyAutomation().
+                     */
+                    if (!seq_perTrackActive ||
+                        seq_trackEffectTypeMatchesActive(owner_track))
+                        (void)effects_applyAutomation(owner_track,
+                            effectTarget_local(target), value);
                 }
             }
             i++;
@@ -1116,7 +2575,16 @@ void seq_restoreAutomatedParameters(uint8_t trigger_track)
     if (!mask)
         return;
 
-    instrument = scene_instrumentSlotConst(seq_activePattern, slot);
+    /*
+     * Retrigger restore reads the track's played Scene (S077 P2 §3.2).
+     *
+     * What: the morph_interpolation[] values used to restore automation
+     * overlays must come from the Scene whose instrument is actually loaded in
+     * this slot - the track's played Scene, not the global active Scene. Why:
+     * if a track plays from Scene B, restoring from Scene A's image would apply
+     * wrong values. Inputs: seq_perTrackPattern[trigger_track].
+     */
+    instrument = scene_instrumentSlotConst(seq_perTrackPattern[trigger_track], slot);
     if (instrument) {
         while (mask) {
             uint8_t local = (uint8_t)__builtin_ctzll(mask);
@@ -1164,6 +2632,13 @@ static uint8_t seq_handleMasterBoundary(void)
 			/* The S067 stub follows the instant master-boundary switch. */
 			for (uint8_t track = 0u; track < NUM_TRACKS; track++)
 				seq_perTrackPattern[track] = seq_activePattern;
+			/*
+			 * Master-boundary commit clears per-track overrides (S077 P2).
+			 *
+			 * What: the loop above already set every entry to the committed
+			 * active pattern, so the override flag is necessarily 0.
+			 */
+			seq_perTrackActive = 0u;
 			seq_setStepIndexToStart();
 			seq_resetStepScheduler();
 			led_notifyPatternChanged(seq_activePattern);
@@ -1181,8 +2656,64 @@ static uint8_t seq_handleMasterBoundary(void)
 		seq_ledState.dirty |= SEQ_LED_DIRTY_BEAT;
 	}
 
+	/*
+	 * S080 F8: deferred / queued scene-change boundary detection.
+	 *
+	 * What: while a direct (scd) or queued (qcd) scene change is pending, watch
+	 * the master 1/16 clock for the selected division boundary (1/8 note .. 4
+	 * bars) and raise seq_sceneFireFlag for the foreground executor. Why: the
+	 * TIM3 ISR owns sample-accurate boundary detection; the foreground owns the
+	 * actual DSP/LED change. Inputs: seq_pendingSceneChange/Queue, the pending
+	 * division, seq_masterStepClock. Outputs: seq_sceneFireFlag. A queued
+	 * change converts qcd through its own longer list (S080 P2: up to 16
+	 * bars). Affiliates: seq_sceneChangeDivUnits(), seq_queueChangeDivUnits(),
+	 * menu_serviceDeferredSceneChange().
+	 */
+	if (seq_pendingSceneChange || seq_pendingSceneQueue) {
+		uint16_t units = seq_pendingSceneQueue
+		    ? seq_queueChangeDivUnits(seq_pendingQueueDiv)
+		    : seq_sceneChangeDivUnits(seq_pendingSceneDiv);
+
+		if (units != 0u && seq_masterStepClock != 0u &&
+		    (seq_masterStepClock % units) == 0u)
+			seq_sceneFireFlag = 1u;
+	}
+
 	trigger_clockTick((uint8_t)((seq_masterStepClock % NUM_STEPS) + 1u));
 	return 0u;
+}
+
+/*
+ * Map one position on the master cycle to a track step index for a play mode.
+ *
+ * What: pure position-to-index mapping shared by the realign paths. FWD/ONC
+ * use position % length; REV mirrors it; PIP folds a 2×length cycle; 1FR always
+ * starts at zero; RND draws a fresh random index. Why: realignment must land a
+ * non-forward track on the step its play mode would have reached, not the
+ * forward index. Inputs: play mode 0..5, integer position in steps, length.
+ * Output: a step index 0..length-1. Affiliates:
+ * seq_realignActivePatternToMasterClock(),
+ * seq_realignTrackToMasterClock().
+ */
+static int16_t seq_stepIndexForMode(uint8_t play_mode, uint32_t position,
+                                    uint8_t len)
+{
+	switch (play_mode) {
+	case 1u: /* rev */
+		return (int16_t)((uint32_t)(len - 1u) - (position % len));
+	case 2u: { /* pip */
+		uint32_t p = position % ((uint32_t)len * 2u);
+
+		return (int16_t)(p < len ? p : ((uint32_t)len * 2u - 1u - p));
+	}
+	case 3u: /* rnd */
+		return (int16_t)(((uint16_t)GetRngValue() & 0x7FFFu) % len);
+	case 5u: /* 1fr */
+		return 0;
+	case 4u: /* onc */
+	default: /* fwd */
+		return (int16_t)(position % len);
+	}
 }
 
 void seq_realignActivePatternToMasterClock(void)
@@ -1211,17 +2742,1045 @@ void seq_realignActivePatternToMasterClock(void)
 	 * context), seq_advanceTrackStep() (uses the same per-track length for its
 	 * wrap boundary), led_processSeqLedState() (drains the chase dirty bit).
 	 */
-	const pat_scene_region_t *region = pat_sceneRegion(seq_activePattern);
-
+	/*
+	 * Per-track realignment uses each track's played Scene (S077 P2 §3.2).
+	 *
+	 * What: each track derives its step position from the master clock using its
+	 * own played Scene's track_length, not the global active Scene's. Why: tracks
+	 * playing from different Scenes may have different track lengths; a global
+	 * region read would position tracks at step offsets for the wrong loop
+	 * length. Inputs: seq_perTrackPattern[track], seq_masterStepClock. Output:
+	 * seq_stepIndex[track] = masterStepClock % that track's length. Note:
+	 * pat_sceneRegion() returns an SRAM1 pointer with no allocation, so moving
+	 * the call inside the loop is safe in any context.
+	 */
 	for (track = 0u; track < NUM_TRACKS; track++) {
-		uint8_t len = (region && region->track_length[track] > 0u)
-		              ? region->track_length[track]
-		              : NUM_STEPS_PER_BAR;
-		seq_stepIndex[track] = (int16_t)(seq_masterStepClock % len);
+		const pat_scene_region_t *region =
+		    pat_sceneRegion(seq_perTrackPattern[track]);
+		/* Effective (morphed) length and scale from the S078 §5.4 cache. */
+		uint8_t len = seq_effectiveTrackLength[track];
+		if (len < 1u)
+			len = NUM_STEPS_PER_BAR;
+		uint8_t play_mode = (region) ? region->track_play_mode[track] : 0u;
+		uint16_t interval;
+		uint32_t master_q8;
+		uint32_t position;
+
+		if (play_mode >= 6u)
+			play_mode = 0u;
+		if ((play_mode == 4u || play_mode == 5u) &&
+		    (seq_trackPlayState[track] & SEQ_PLAY_STATE_STOPPED)) {
+			/*
+			 * A stopped once-mode track is not restarted by realignment
+			 * (S078 §4.3): leave its parked cursor and DDA alone.
+			 */
+			continue;
+		}
+		/*
+		 * DDA accumulator phase realignment (S078 §2.4.5): the accumulator
+		 * takes the fractional remainder of the master Q8.8 timeline so a
+		 * realigned track picks up exactly where it would have been if it had
+		 * been running from the start. The step index comes from the same
+		 * Q8.8 timeline through the play mode, so a non-forward track lands on
+		 * the step its mode would have reached.
+		 */
+		interval = stepScale_ticksQ8(seq_effectiveTrackScale[track]);
+		master_q8 = (uint32_t)seq_elapsedPpqTicks << 8u;
+		position = master_q8 / interval;
+		seq_stepIndex[track] = seq_stepIndexForMode(play_mode, position, len);
+		seq_trackAccumulator[track] = (uint16_t)(master_q8 % interval);
+		if (play_mode == 2u) {
+			if ((position % ((uint32_t)len * 2u)) >= len)
+				seq_trackPlayState[track] |= SEQ_PLAY_STATE_PIP_REV;
+			else
+				seq_trackPlayState[track] &=
+				    (uint8_t)~SEQ_PLAY_STATE_PIP_REV;
+		}
 		seq_lastMasterStep[track] = (uint8_t)seq_stepIndex[track];
 	}
 	seq_ledState.chaseStep = seq_stepIndex[menu_getActiveVoice()];
 	seq_ledState.dirty |= SEQ_LED_DIRTY_CHASE;
+}
+
+/*
+ * Realign a single track's step position against the master clock
+ * (S077 P2 §1.4).
+ *
+ * What: derives one track's seq_stepIndex from seq_masterStepClock using that
+ * track's own played Scene's track_length from PatternData's
+ * pat_sceneRegion(seq_perTrackPattern[track]). Why: when a per-track Scene
+ * assignment changes a track's loop length, the track must be repositioned
+ * against the master clock to avoid phase discontinuities; also used by the
+ * double-click single-track realign gesture. Inputs: track 0..6,
+ * seq_masterStepClock (global). Output: seq_stepIndex[track] and
+ * seq_lastMasterStep[track] updated; the chase LED dirty bit is set when the
+ * track is the UI-selected voice. Affiliates: pat_sceneRegion(),
+ * seq_realignActivePatternToMasterClock() (the all-track variant).
+ */
+void seq_realignTrackToMasterClock(uint8_t track)
+{
+	const pat_scene_region_t *region;
+	uint8_t len;
+	uint8_t play_mode;
+	uint16_t interval;
+	uint32_t master_q8;
+	uint32_t position;
+
+	if (track >= NUM_TRACKS)
+		return;
+	region = pat_sceneRegion(seq_perTrackPattern[track]);
+	/* Effective (morphed) length and scale from the S078 §5.4 cache. */
+	len = seq_effectiveTrackLength[track];
+	if (len < 1u)
+		len = NUM_STEPS_PER_BAR;
+	play_mode = (region) ? region->track_play_mode[track] : 0u;
+	if (play_mode >= 6u)
+		play_mode = 0u;
+	if ((play_mode == 4u || play_mode == 5u) &&
+	    (seq_trackPlayState[track] & SEQ_PLAY_STATE_STOPPED)) {
+		/* Stopped once-mode tracks are not restarted by realignment. */
+		return;
+	}
+	/*
+	 * Single-track DDA phase realignment (S078 §2.4.5). Same Q8.8 phase and
+	 * play-mode mapping as the all-track variant above. Used by per-track Scene
+	 * assignment and the double-click realign gesture.
+	 */
+	interval = stepScale_ticksQ8(seq_effectiveTrackScale[track]);
+	master_q8 = (uint32_t)seq_elapsedPpqTicks << 8u;
+	position = master_q8 / interval;
+	seq_stepIndex[track] = seq_stepIndexForMode(play_mode, position, len);
+	seq_trackAccumulator[track] = (uint16_t)(master_q8 % interval);
+	if (play_mode == 2u) {
+		if ((position % ((uint32_t)len * 2u)) >= len)
+			seq_trackPlayState[track] |= SEQ_PLAY_STATE_PIP_REV;
+		else
+			seq_trackPlayState[track] &= (uint8_t)~SEQ_PLAY_STATE_PIP_REV;
+	}
+	seq_lastMasterStep[track] = (uint8_t)seq_stepIndex[track];
+	if (track == menu_getActiveVoice()) {
+		seq_ledState.chaseStep = seq_stepIndex[track];
+		seq_ledState.dirty |= SEQ_LED_DIRTY_CHASE;
+	}
+}
+
+/* =====================================================================
+ * S080 P2 looper engine (Defects 7, 8, 14)
+ * ===================================================================== */
+
+/*
+ * Convert a looper division + modifier to a master-clock tick count (S080 C2).
+ *
+ * What: division 0..7 maps to 1 bar (16 x 24 = 384 PPQ ticks at 96 PPQ) down
+ * to 1/128 (3 ticks); modifier 1 (dot) scales x3/2 and modifier 2 (triplet)
+ * scales x2/3. Why: the loop period is measured on the master step clock, the
+ * same grid used by bar-based conditions. Inputs: division 0..7 (clamped),
+ * modifier 0..2. Output: tick count >= 1. Affiliates: seq_loopProcessTick().
+ */
+static uint16_t seq_loopLengthTicks(uint8_t division, uint8_t modifier)
+{
+	static const uint16_t base[8] = {
+		384u, 192u, 96u, 48u, 24u, 12u, 6u, 3u
+	};
+	uint16_t ticks;
+
+	if (division > 7u)
+		division = 0u;
+	ticks = base[division];
+	if (modifier == 1u)             /* dot: +50% */
+		ticks = (uint16_t)((ticks * 3u) / 2u);
+	else if (modifier == 2u)        /* triplet: x2/3 */
+		ticks = (uint16_t)((ticks * 2u) / 3u);
+	return (ticks != 0u) ? ticks : 1u;
+}
+
+/*
+ * One track's position image (S080 P2).
+ *
+ * What: step cursor, Q8.8 DDA accumulator and play-state bits (once-stopped,
+ * pip direction) - everything seq_advanceTrackStep() needs to continue from a
+ * point in time. Used for the loop snapshot and the rewind/projection maths.
+ */
+typedef struct {
+	int16_t  step;
+	uint16_t accum;
+	uint8_t  play_state;
+} seq_loop_pos_t;
+
+/*
+ * Move a track position by a signed number of master ticks (S080 P2).
+ *
+ * What: applies `ticks` PPQ ticks (negative = rewind) to the DDA accumulator
+ * and walks the step cursor by the resulting number of step advances under
+ * the track's play mode: fwd/rev wrap modulo the effective length (from the
+ * pre-start cursor -1 the first forward step is 0 and the first reverse step
+ * is len-1); pip walks its 2 x len cycle and sets the direction bit; rnd draws
+ * a new random step; onc/1fr clamp at the ends and set or clear the stopped
+ * bit. Why: the looper must find a track's state at a past tick (loop start,
+ * D4) and where a looped track would be now (resume, D3) without keeping a
+ * shadow DDA running for every track. Uses the current effective scale and
+ * length for the whole span (a Morph change during the span is approximated).
+ * Inputs: track 0..6, position image, signed ticks. Outputs: position image
+ * updated. Context: foreground (64-bit arithmetic; never called from TIM3).
+ * Accessors: seq_loopSnapshotTracks(), seq_loopResumeTrack(). Affiliates:
+ * seq_advanceTrackStep() (the per-step semantics mirrored here),
+ * stepScale_ticksQ8().
+ */
+static void seq_loopShiftPosition(uint8_t track, seq_loop_pos_t *pos,
+                                  int32_t ticks)
+{
+	const pat_scene_region_t *region =
+	    pat_sceneRegion(seq_perTrackPattern[track]);
+	uint8_t len = seq_effectiveTrackLength[track];
+	uint8_t mode = region ? region->track_play_mode[track] : 0u;
+	int64_t interval =
+	    (int64_t)stepScale_ticksQ8(seq_effectiveTrackScale[track]);
+	int64_t total;
+	int64_t steps;
+	int64_t rem;
+
+	if (len < 1u)
+		len = NUM_STEPS_PER_BAR;
+	if (mode >= 6u)
+		mode = 0u;
+	total = (int64_t)pos->accum + (int64_t)ticks * 256;
+	steps = total / interval;
+	rem = total % interval;
+	if (rem < 0) {
+		rem += interval;
+		steps--;
+	}
+	pos->accum = (uint16_t)rem;
+	if (steps == 0)
+		return;
+
+	switch (mode) {
+	case 1u: { /* rev */
+		int64_t base = (pos->step < 0) ? 0 : pos->step;
+		int64_t idx = (base - steps) % (int64_t)len;
+
+		if (idx < 0)
+			idx += len;
+		pos->step = (int16_t)idx;
+		break;
+	}
+	case 2u: { /* pip: positions 0..len-1 forward, len..2len-1 reverse */
+		int64_t cycle = (int64_t)len * 2;
+		int64_t p;
+
+		if (pos->step < 0)
+			p = -1;
+		else if (pos->play_state & SEQ_PLAY_STATE_PIP_REV)
+			p = cycle - 1 - pos->step;
+		else
+			p = pos->step;
+		p = (p + steps) % cycle;
+		if (p < 0)
+			p += cycle;
+		if (p < (int64_t)len) {
+			pos->step = (int16_t)p;
+			pos->play_state &= (uint8_t)~SEQ_PLAY_STATE_PIP_REV;
+		} else {
+			pos->step = (int16_t)(cycle - 1 - p);
+			pos->play_state |= SEQ_PLAY_STATE_PIP_REV;
+		}
+		break;
+	}
+	case 3u: /* rnd */
+		pos->step = (int16_t)(((uint16_t)GetRngValue() & 0x7FFFu) % len);
+		break;
+	case 4u: /* onc */
+	case 5u: { /* 1fr: virtual position len = stopped after the last step */
+		int64_t v = (pos->play_state & SEQ_PLAY_STATE_STOPPED)
+		    ? (int64_t)len : (int64_t)pos->step;
+
+		v += steps;
+		if (v >= (int64_t)len) {
+			pos->step = (int16_t)(len - 1u);
+			pos->play_state |= SEQ_PLAY_STATE_STOPPED;
+		} else {
+			if (v < -1)
+				v = -1;
+			pos->step = (int16_t)v;
+			pos->play_state &= (uint8_t)~SEQ_PLAY_STATE_STOPPED;
+		}
+		break;
+	}
+	case 0u: /* fwd */
+	default: {
+		int64_t idx = ((int64_t)pos->step + steps) % (int64_t)len;
+
+		if (idx < 0)
+			idx += len;
+		pos->step = (int16_t)idx;
+		break;
+	}
+	}
+}
+
+/*
+ * Canonical position just before a master tick's advance (S080 P2 Defect 14).
+ *
+ * What: the master-clock position mapping of seq_realignTrackToMasterClock()
+ * (position = (tick << 8) / interval, accumulator = remainder, play mode
+ * applied to the index, pip direction from the 2 x len cycle) evaluated at
+ * `anchor - 1`, i.e. the state the DDA would hold just before tick `anchor`
+ * advances. Anchor 0 is the transport-start seed (cursor -1, accumulator
+ * interval - 256). Why: after a scene change the looped track's loop start
+ * stays at the same master-clock tick; this computes the incoming Scene's
+ * content at that tick with the incoming Scene's own scale and length (plan
+ * §3.6 corrected). Inputs: track, anchor tick. Output: position image.
+ * Accessors: seq_loopRefreshSceneSnapshots(). Affiliates:
+ * seq_stepIndexForMode(), seq_realignTrackToMasterClock().
+ */
+static void seq_loopCanonicalPreAdvance(uint8_t track, uint32_t anchor,
+                                        seq_loop_pos_t *pos)
+{
+	const pat_scene_region_t *region =
+	    pat_sceneRegion(seq_perTrackPattern[track]);
+	uint8_t len = seq_effectiveTrackLength[track];
+	uint8_t mode = region ? region->track_play_mode[track] : 0u;
+	uint16_t interval = stepScale_ticksQ8(seq_effectiveTrackScale[track]);
+	uint64_t master_q8;
+	uint64_t position;
+
+	if (len < 1u)
+		len = NUM_STEPS_PER_BAR;
+	if (mode >= 6u)
+		mode = 0u;
+	pos->play_state = 0u;
+	if (anchor == 0u) {
+		pos->step = -1;
+		pos->accum = (uint16_t)(interval - 256u);
+		return;
+	}
+	master_q8 = (uint64_t)(anchor - 1u) << 8u;
+	position = master_q8 / interval;
+	pos->step = seq_stepIndexForMode(mode, (uint32_t)position, len);
+	pos->accum = (uint16_t)(master_q8 % interval);
+	if (mode == 2u && (position % ((uint64_t)len * 2u)) >= len)
+		pos->play_state = SEQ_PLAY_STATE_PIP_REV;
+}
+
+/*
+ * Loop start tick for an engage / add event (S080 plan §3.4, P2 D4).
+ *
+ * What: with recording quantisation on (qnt 8/16/32/64), the last quantise
+ * boundary on the master clock (it may lie more than one loop length back:
+ * the track then jumps back at the next wrap, plan §3.4 note). With qnt off,
+ * the tick at which the fastest track of `mask` last advanced, i.e.
+ * now - floor(accumulator / 256). Before the first scheduler tick the anchor
+ * is 0. Why: the loop must start at the beginning of a step, not wherever the
+ * button landed, so the first repeat plays the step that was sounding.
+ * Inputs: mask (non-zero), seq_elapsedPpqTicks, seq_quantisation, the DDA
+ * accumulators. Output: anchor tick <= now. Context: foreground under
+ * PRIMASK. Accessors: seq_loopSnapshotTracks().
+ */
+static uint32_t seq_loopEventAnchor(uint8_t mask)
+{
+	uint32_t now = seq_elapsedPpqTicks;
+	uint16_t q;
+	uint16_t best = 0xFFFFu;
+	uint8_t fastest = 0u;
+	uint8_t track;
+	uint32_t back;
+
+	if (seq_initialSchedulerTick)
+		return 0u;
+	switch (seq_quantisation) {
+	case QUANT_8:  q = 48u; break;
+	case QUANT_16: q = 24u; break;
+	case QUANT_32: q = 12u; break;
+	case QUANT_64: q = 6u;  break;
+	default:       q = 0u;  break;
+	}
+	if (q != 0u)
+		return now - (now % q);
+	for (track = 0u; track < NUM_TRACKS; track++) {
+		uint16_t interval;
+
+		if ((mask & (uint8_t)(1u << track)) == 0u)
+			continue;
+		interval = stepScale_ticksQ8(seq_effectiveTrackScale[track]);
+		if (interval < best) {
+			best = interval;
+			fastest = track;
+		}
+	}
+	back = (uint32_t)(seq_trackAccumulator[fastest] >> 8u);
+	return (back > now) ? 0u : (now - back);
+}
+
+/*
+ * Snapshot the tracks of one engage / add event (S080 P2 Defect 7, D4).
+ *
+ * What: computes one anchor for the event and, for every track in `mask`,
+ * rewinds its live state to just before that anchor's advance and stores it as
+ * the loop snapshot. Why: tracks added in the same gesture share one loop
+ * start; tracks already looping are untouched. Inputs: mask, live DDA state.
+ * Outputs: seq_loopAnchor/StartStep/StartAccum/StartPlayState for `mask`.
+ * Context: foreground under PRIMASK. Accessors: seq_loopEngage(),
+ * seq_loopUpdateMask().
+ */
+static void seq_loopSnapshotTracks(uint8_t mask)
+{
+	uint32_t anchor;
+	int32_t back;
+	uint8_t track;
+
+	if (mask == 0u)
+		return;
+	anchor = seq_loopEventAnchor(mask);
+	back = seq_initialSchedulerTick
+	    ? 0 : -(int32_t)(seq_elapsedPpqTicks - anchor + 1u);
+	for (track = 0u; track < NUM_TRACKS; track++) {
+		seq_loop_pos_t pos;
+
+		if ((mask & (uint8_t)(1u << track)) == 0u)
+			continue;
+		pos.step = seq_stepIndex[track];
+		pos.accum = seq_trackAccumulator[track];
+		pos.play_state = seq_trackPlayState[track];
+		seq_loopShiftPosition(track, &pos, back);
+		seq_loopAnchor[track] = anchor;
+		seq_loopStartStep[track] = pos.step;
+		seq_loopStartAccum[track] = pos.accum;
+		seq_loopStartPlayState[track] = pos.play_state;
+	}
+}
+
+/*
+ * Resume one track where it would have been without the loop (S080 P2 D3).
+ *
+ * What: projects the track's loop snapshot (state just before its anchor
+ * tick) forward to the current tick and writes it to the live cursor,
+ * accumulator and play state, then refreshes the chase LED for the selected
+ * voice. Why: dropped or released tracks must stay in time with the tracks
+ * that never looped; projecting from the snapshot is exact even when the
+ * track was not on its canonical master-clock position (the P2 realign was
+ * not). After a scene change the snapshot is the incoming Scene's canonical
+ * position, so the projection equals the incoming Scene's master-clock
+ * position. Inputs: track, snapshot, anchor, seq_elapsedPpqTicks. Outputs:
+ * live track state. Context: foreground under PRIMASK. Accessors:
+ * seq_loopUpdateMask(), seq_loopDisengage().
+ */
+static void seq_loopResumeTrack(uint8_t track)
+{
+	seq_loop_pos_t pos;
+	uint32_t ahead;
+
+	pos.step = seq_loopStartStep[track];
+	pos.accum = seq_loopStartAccum[track];
+	pos.play_state = seq_loopStartPlayState[track];
+	ahead = seq_initialSchedulerTick
+	    ? 0u : (seq_elapsedPpqTicks - seq_loopAnchor[track] + 1u);
+	if (ahead > 0x7FFFFFFFu)
+		ahead = 0x7FFFFFFFu;
+	seq_loopShiftPosition(track, &pos, (int32_t)ahead);
+	seq_stepIndex[track] = pos.step;
+	seq_trackAccumulator[track] = pos.accum;
+	seq_trackPlayState[track] = pos.play_state;
+	seq_lastMasterStep[track] = (uint8_t)((pos.step < 0) ? 0 : pos.step);
+	if (track == menu_getActiveVoice()) {
+		seq_ledState.chaseStep = seq_stepIndex[track];
+		seq_ledState.dirty |= SEQ_LED_DIRTY_CHASE;
+	}
+}
+
+uint8_t seq_loopEngage(uint8_t trackMask, uint8_t division, uint8_t modifier)
+{
+	uint32_t primask;
+	uint8_t mask;
+
+	/*
+	 * Start a loop (S080 C2, P2 D3/D4/D17).
+	 *
+	 * What: filters trackMask by the loopable flags, snapshots the tracks at
+	 * one anchor, publishes division/modifier/mask and sets seq_loopActive
+	 * last, all under PRIMASK so the TIM3 ISR never sees a partial loop.
+	 * Recording is turned off first (looping and recording are mutually
+	 * exclusive, plan §9.2-2). Engages only while the transport runs; returns
+	 * the mask now looping (0 when stopped). Inputs: 7-bit mask, division
+	 * 0..7, modifier 0..2. Outputs: looper state. Accessors: buttonHandler
+	 * SELECT press (PERF). Affiliates: seq_loopableTrackMask(),
+	 * seq_loopSnapshotTracks().
+	 */
+	if (!seq_running)
+		return 0u;
+	if (division > 7u)
+		division = 0u;
+	if (modifier > 2u)
+		modifier = 0u;
+	if (seq_recordActive)
+		seq_setRecordingMode(0u);
+	mask = (uint8_t)(trackMask & seq_loopableTrackMask() & 0x7Fu);
+	primask = __get_PRIMASK();
+	__disable_irq();
+	seq_loopActive = 0u;
+	seq_loopDivision = division;
+	seq_loopModifier = modifier;
+	seq_loopSnapshotTracks(mask);
+	seq_loopTrackMask = mask;
+	seq_loopActive = 1u;            /* final gate */
+	__set_PRIMASK(primask);
+	return mask;
+}
+
+uint8_t seq_loopUpdateMask(uint8_t newMask)
+{
+	uint32_t primask;
+	uint8_t old;
+	uint8_t track;
+
+	/*
+	 * Change the looped track set while engaged (S080 P2 Defect 7, D1/D2).
+	 *
+	 * What: tracks leaving the set resume where they would have been (inside
+	 * this call, before the mask is committed - the P2 ordering bug); tracks
+	 * staying keep their anchors and snapshots; tracks joining get one fresh
+	 * anchor for this event. Division and modifier are untouched. Inputs:
+	 * desired 7-bit mask (filtered by the loopable flags). Outputs: looper
+	 * state; returns the committed mask (0 when not engaged). Context:
+	 * foreground; PRIMASK held for the whole update. Accessors: buttonHandler
+	 * VOICE press/release (PERF). Affiliates: seq_loopResumeTrack(),
+	 * seq_loopSnapshotTracks().
+	 */
+	newMask = (uint8_t)(newMask & seq_loopableTrackMask() & 0x7Fu);
+	primask = __get_PRIMASK();
+	__disable_irq();
+	if (!seq_loopActive) {
+		__set_PRIMASK(primask);
+		return 0u;
+	}
+	old = seq_loopTrackMask;
+	for (track = 0u; track < NUM_TRACKS; track++) {
+		uint8_t bit = (uint8_t)(1u << track);
+
+		if ((old & bit) != 0u && (newMask & bit) == 0u)
+			seq_loopResumeTrack(track);
+	}
+	seq_loopSnapshotTracks((uint8_t)(newMask & (uint8_t)~old));
+	seq_loopTrackMask = newMask;
+	__set_PRIMASK(primask);
+	return newMask;
+}
+
+void seq_loopDisengage(void)
+{
+	uint32_t primask;
+	uint8_t mask;
+	uint8_t track;
+
+	/*
+	 * End the loop (S080 C2, P2 D3).
+	 *
+	 * What: clears the gate and the mask, then resumes every looped track
+	 * where it would have been, under PRIMASK. With the transport stopped
+	 * there is nothing to resume (the stop already reset every cursor).
+	 * Accessors: buttonHandler_loopCheckDisengage()/loopForceRelease().
+	 */
+	primask = __get_PRIMASK();
+	__disable_irq();
+	mask = seq_loopTrackMask;
+	seq_loopActive = 0u;
+	seq_loopTrackMask = 0u;
+	if (seq_running) {
+		for (track = 0u; track < NUM_TRACKS; track++) {
+			if ((mask & (uint8_t)(1u << track)) != 0u)
+				seq_loopResumeTrack(track);
+		}
+	}
+	__set_PRIMASK(primask);
+}
+
+void seq_loopUpdateDivision(uint8_t division, uint8_t modifier)
+{
+	/*
+	 * Change the loop length (S080 C2; P2 Defect 7: never moves a loop
+	 * start). Single-byte stores; the ISR picks up the new length on its next
+	 * tick and keeps wrapping on each track's anchor grid. Accessors:
+	 * buttonHandler SELECT press/release and BAR press/release (PERF).
+	 */
+	if (division > 7u)
+		division = 0u;
+	if (modifier > 2u)
+		modifier = 0u;
+	seq_loopDivision = division;
+	seq_loopModifier = modifier;
+}
+
+/*
+ * Recompute loop snapshots for a newly selected Scene (S080 P2 Defect 14).
+ *
+ * What: keeps every looped track's anchor tick and replaces its snapshot with
+ * the incoming Scene's canonical position just before that tick (its own
+ * scale, length and play mode). Example: outgoing 1/16 loop start at step 5
+ * (tick 96), incoming 1/8 -> step 3. Why: the loop start stays at the same
+ * master-clock position across scene changes (plan §3.6 corrected). The caller
+ * has just refreshed the effective-timing cache and realigned every track.
+ * Inputs: seq_loopAnchor[], effective cache. Outputs: snapshots. Context:
+ * foreground; caller holds PRIMASK. Accessors: seq_selectActivePattern(),
+ * seq_alignActivePatternToScene(), seq_chainRepeatSelf().
+ */
+static void seq_loopRefreshSceneSnapshots(void)
+{
+	uint8_t track;
+
+	if (!seq_loopActive)
+		return;
+	for (track = 0u; track < NUM_TRACKS; track++) {
+		seq_loop_pos_t pos;
+
+		if ((seq_loopTrackMask & (uint8_t)(1u << track)) == 0u)
+			continue;
+		seq_loopCanonicalPreAdvance(track, seq_loopAnchor[track], &pos);
+		seq_loopStartStep[track] = pos.step;
+		seq_loopStartAccum[track] = pos.accum;
+		seq_loopStartPlayState[track] = pos.play_state;
+	}
+}
+
+/*
+ * Rebase an engaged loop to the start (S080 P2 Defect 14, decided).
+ *
+ * What: every looped track's anchor becomes tick 0 and its snapshot the
+ * freshly seeded start state (cursor -1, accumulator interval - 256). Why: a
+ * resetting scene change (pcr on for direct/chain changes, a qac reset for
+ * queued ones) or an external/boundary reset restarts the master clock, so
+ * the old anchor ticks no longer exist; the loop start becomes the beginning
+ * of the incoming Scene. Inputs: seeded live state. Outputs: anchors and
+ * snapshots. Context: called at the end of seq_setStepIndexToStart() (TIM3 or
+ * foreground). The transport-stop path clears seq_loopActive first, so this is
+ * a no-op there.
+ */
+static void seq_loopRebaseToStart(void)
+{
+	uint8_t track;
+
+	if (!seq_loopActive)
+		return;
+	for (track = 0u; track < NUM_TRACKS; track++) {
+		if ((seq_loopTrackMask & (uint8_t)(1u << track)) == 0u)
+			continue;
+		seq_loopAnchor[track] = 0u;
+		seq_loopStartStep[track] = seq_stepIndex[track];
+		seq_loopStartAccum[track] = seq_trackAccumulator[track];
+		seq_loopStartPlayState[track] = seq_trackPlayState[track];
+	}
+}
+
+/*
+ * Looper wrap (S080 C3, rewritten S080 P2 D3).
+ *
+ * What: for every looped track whose (elapsed - anchor) is a positive
+ * multiple of the loop length, restores the snapshot. Called once per master
+ * tick before the DDA advance, so the step that fires at the anchor tick is
+ * part of the loop and replays on every wrap. Why: in the TIM3 ISR so tight
+ * divisions (1/64, 1/128) loop sample-accurately; per-track anchors keep
+ * every wrap on the anchor's master-clock grid. Inputs: seq_loopActive,
+ * division/modifier, mask, anchors, snapshots, seq_elapsedPpqTicks. Outputs:
+ * seq_stepIndex[]/seq_trackAccumulator[]/seq_trackPlayState[] of wrapped
+ * tracks. Context: TIM3 ISR. Affiliates: seq_processSchedulerTick().
+ */
+static void seq_loopProcessTick(void)
+{
+	uint16_t loop_ticks;
+	uint8_t mask;
+	uint8_t track;
+
+	if (!seq_loopActive)
+		return;
+	mask = seq_loopTrackMask;
+	if (mask == 0u)
+		return;
+	loop_ticks = seq_loopLengthTicks(seq_loopDivision, seq_loopModifier);
+	for (track = 0u; track < NUM_TRACKS; track++) {
+		uint32_t since;
+
+		if ((mask & (uint8_t)(1u << track)) == 0u)
+			continue;
+		if (seq_loopAnchor[track] >= seq_elapsedPpqTicks)
+			continue;
+		since = seq_elapsedPpqTicks - seq_loopAnchor[track];
+		if ((since % loop_ticks) != 0u)
+			continue;
+		seq_stepIndex[track] = seq_loopStartStep[track];
+		seq_trackAccumulator[track] = seq_loopStartAccum[track];
+		seq_trackPlayState[track] = seq_loopStartPlayState[track];
+	}
+}
+
+/*
+ * Tracks the looper may capture (S080 P2 Defect 8a).
+ *
+ * What: bit N set when track N's played Scene does not exclude it from
+ * looping (pat_scene_region_t.track_loop_exclude). Why: excluded tracks are
+ * silently left out of every engage/add, with no LED or error. Read at
+ * gesture time; a later scene change does not drop a track already looping.
+ * Inputs: seq_perTrackPattern[], resident regions. Output: 7-bit mask.
+ * Accessors: seq_loopEngage(), seq_loopUpdateMask().
+ */
+uint8_t seq_loopableTrackMask(void)
+{
+	uint8_t mask = 0u;
+	uint8_t track;
+
+	for (track = 0u; track < NUM_TRACKS; track++) {
+		const pat_scene_region_t *region =
+		    pat_sceneRegion(seq_perTrackPattern[track]);
+
+		if (!region ||
+		    (region->track_loop_exclude & (uint8_t)(1u << track)) == 0u)
+			mask |= (uint8_t)(1u << track);
+	}
+	return mask;
+}
+
+/* =====================================================================
+ * S080 Phase G scene chain engine
+ * ===================================================================== */
+
+#define SEQ_CHAIN_BAR_TICKS 384u    /* 16 x 1/16 at 96 PPQ */
+
+/*
+ * True on the tick at which the longest track completes a repetition
+ * (S080 G7, P2 D10).
+ *
+ * What: the repetition length is the largest effective length x Q8.8 step
+ * interval over the seven tracks; the boundary is the first master tick
+ * at or after each multiple of it. Why: "end of repetition = end of the
+ * longest track by scale x length" (plan §4.5), on the master clock so
+ * realigned and reset Scenes agree. Inputs: effective cache,
+ * seq_elapsedPpqTicks. Output: 0/1. Context: TIM3 ISR.
+ */
+static uint8_t seq_chainAtRepetitionEnd(void)
+{
+	uint32_t longest = 0u;
+	uint8_t track;
+
+	for (track = 0u; track < NUM_TRACKS; track++) {
+		uint8_t len = seq_effectiveTrackLength[track];
+		uint32_t cycle;
+
+		if (len < 1u)
+			len = NUM_STEPS_PER_BAR;
+		cycle = (uint32_t)len *
+		        stepScale_ticksQ8(seq_effectiveTrackScale[track]);
+		if (cycle > longest)
+			longest = cycle;
+	}
+	if (longest == 0u)
+		return 0u;
+	return (uint8_t)((((uint64_t)seq_elapsedPpqTicks << 8u) % longest) < 256u);
+}
+
+/*
+ * Weight of one chain condition at this boundary (S080 G7).
+ *
+ * What: 0 = does not fire here, 100 = fires, 10..90 = probability (r1x..r9b).
+ * Index order matches chainConditionNames[] (MenuText.h): 0 nul, 1 xal, 2 bal,
+ * 3..13 xNN, 14..24 bNN, 25..33 rNx, 34..42 rNb, 43..46 X:4, 47..54 X:8,
+ * 55..70 >NN, 71 fix, 72 fib, 73 !fx, 74 !fb, 75 lox, 76 lob, 77 !lx, 78 !lb.
+ * Repetition-kind conditions only count at a repetition end, bar-kind only at
+ * a bar end. Counts fire when equal (D11). X:4 / X:8 use the master bar just
+ * completed. Inputs: condition, boundary flags, chain counters, fill/loop
+ * flags, seq_previousScene. Output: weight. Context: TIM3 ISR.
+ */
+static uint8_t seq_chainConditionWeight(uint8_t cond, uint8_t at_bar,
+                                        uint8_t at_rep)
+{
+	static const uint8_t counts[11] = {
+		1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 16u, 32u, 64u
+	};
+	uint32_t bar_done = seq_elapsedPpqTicks / SEQ_CHAIN_BAR_TICKS;
+
+	if (cond == 0u)
+		return 0u;
+	if (cond == 1u)
+		return at_rep ? 100u : 0u;
+	if (cond == 2u)
+		return at_bar ? 100u : 0u;
+	if (cond <= 13u)
+		return (at_rep && seq_chainRepCount == counts[cond - 3u]) ? 100u : 0u;
+	if (cond <= 24u)
+		return (at_bar && seq_chainBarCount == counts[cond - 14u]) ? 100u : 0u;
+	if (cond <= 33u)
+		return at_rep ? (uint8_t)((cond - 24u) * 10u) : 0u;
+	if (cond <= 42u)
+		return at_bar ? (uint8_t)((cond - 33u) * 10u) : 0u;
+	if (cond <= 46u)
+		return (at_bar && bar_done != 0u &&
+		        ((bar_done - 1u) % 4u) == (uint32_t)(cond - 43u)) ? 100u : 0u;
+	if (cond <= 54u)
+		return (at_bar && bar_done != 0u &&
+		        ((bar_done - 1u) % 8u) == (uint32_t)(cond - 47u)) ? 100u : 0u;
+	if (cond <= 70u)
+		return (at_rep && seq_previousScene == (uint8_t)(cond - 55u))
+		    ? 100u : 0u;
+	switch (cond) {
+	case 71u: return (at_rep && seq_fillActive) ? 100u : 0u;
+	case 72u: return (at_bar && seq_fillActive) ? 100u : 0u;
+	case 73u: return (at_rep && !seq_fillActive) ? 100u : 0u;
+	case 74u: return (at_bar && !seq_fillActive) ? 100u : 0u;
+	case 75u: return (at_rep && seq_loopActive) ? 100u : 0u;
+	case 76u: return (at_bar && seq_loopActive) ? 100u : 0u;
+	case 77u: return (at_rep && !seq_loopActive) ? 100u : 0u;
+	case 78u: return (at_bar && !seq_loopActive) ? 100u : 0u;
+	default:  return 0u;
+	}
+}
+
+/*
+ * Resolve a next-scene value to a Scene index (S080 G7, D12).
+ *
+ * What: 0 slf, 1 nxt (wraps 16->1), 2 prv (wraps 1->16), 3..18 s01..s16,
+ * 19..34 rNN (random among Scenes 1..NN), 35..38 r+N (random among the next N,
+ * excluding the current), 39..42 r-N (previous N). Returns 0xFF for stp or an
+ * absent target (no change). Order matches chainNextNames[]. Inputs: next
+ * value, current Scene. Output: Scene 0..15 or 0xFF. Context: TIM3 ISR
+ * (GetRngValue() and bank_scenePresent() are ISR-safe reads).
+ */
+static uint8_t seq_chainResolveNext(uint8_t next, uint8_t cur)
+{
+	uint8_t target;
+	uint16_t rnd = (uint16_t)GetRngValue() & 0x7FFFu;
+
+	if (next == 0u)
+		target = cur;
+	else if (next == 1u)
+		target = (uint8_t)((cur + 1u) & 0x0Fu);
+	else if (next == 2u)
+		target = (uint8_t)((cur + 15u) & 0x0Fu);
+	else if (next <= 18u)
+		target = (uint8_t)(next - 3u);
+	else if (next <= 34u)
+		target = (uint8_t)(rnd % (uint16_t)(next - 18u));
+	else if (next <= 38u)
+		target = (uint8_t)((cur + 1u + (rnd % (uint16_t)(next - 34u))) & 0x0Fu);
+	else if (next <= 42u)
+		target = (uint8_t)((cur + 15u - (rnd % (uint16_t)(next - 38u))) & 0x0Fu);
+	else
+		return 0xFFu;               /* stp is handled by the caller */
+	return bank_scenePresent(target) ? target : 0xFFu;
+}
+
+/*
+ * Evaluate the active Scene's chain at a boundary and fire (S080 G7).
+ *
+ * What: weights both conditions; condition 1 has priority. w1 = 100 fires 1.
+ * Two probabilities summing over 100 are weighted proportionally (one always
+ * fires). Otherwise one draw r in 0..99: r < w1 fires 1, r < w1 + w2 fires 2,
+ * else nothing (the Scene repeats). A `stp` result freezes every track; any
+ * other result raises a chain-marked direct change that the foreground runs at
+ * once (not re-quantised by scd, D9). Why: plan §4.5 evaluation rules. Inputs:
+ * scene_getChainCondition()/Next() of seq_activePattern, boundary flags.
+ * Outputs: seq_chainStopped or the pending-change fields + fire flag (set
+ * last). Context: TIM3 ISR. Affiliates: menu_serviceDeferredSceneChange().
+ */
+static void seq_chainEvaluate(uint8_t at_bar, uint8_t at_rep)
+{
+	uint8_t scene = seq_activePattern;
+	uint8_t w1 = seq_chainConditionWeight(
+	    scene_getChainCondition(scene, 0u), at_bar, at_rep);
+	uint8_t w2 = seq_chainConditionWeight(
+	    scene_getChainCondition(scene, 1u), at_bar, at_rep);
+	uint8_t which = 0u;
+	uint8_t next;
+	uint8_t target;
+
+	if (w1 == 0u && w2 == 0u)
+		return;
+	if (w1 >= 100u) {
+		which = 1u;
+	} else if (w1 != 0u && w2 != 0u && w2 < 100u &&
+	           (uint16_t)w1 + w2 > 100u) {
+		uint16_t r = (uint16_t)(((uint16_t)GetRngValue() & 0x7FFFu) %
+		                        (uint16_t)(w1 + w2));
+		which = (r < w1) ? 1u : 2u;
+	} else {
+		uint16_t r = (uint16_t)(((uint16_t)GetRngValue() & 0x7FFFu) % 100u);
+		uint16_t sum = (uint16_t)w1 + w2;
+
+		if (sum > 100u)
+			sum = 100u;
+		if (r < w1)
+			which = 1u;
+		else if (r < sum)
+			which = 2u;
+	}
+	if (which == 0u)
+		return;
+	next = scene_getChainNext(scene, (uint8_t)(which - 1u));
+	if (next == SCENE_CHAIN_NEXT_STOP) {
+		seq_chainStopped = 1u;
+		return;
+	}
+	target = seq_chainResolveNext(next, scene);
+	if (target == 0xFFu)
+		return;
+	seq_pendingSceneIndex = target;
+	seq_pendingSceneDiv = 0u;
+	seq_pendingSceneChange = 1u;
+	seq_pendingChainFire = 1u;
+	seq_sceneFireFlag = 1u;         /* published last */
+}
+
+/*
+ * Per-tick chain boundary service (S080 G7).
+ *
+ * What: on each master tick after the first, detects bar and repetition
+ * boundaries, advances the counters, and evaluates the chain unless a direct,
+ * queued or chain change is already pending (a manual or queued switch
+ * cancels conditional changes, plan §4.5). Inputs: seq_elapsedPpqTicks,
+ * pending flags. Outputs: counters, seq_chainEvaluate(). Context: TIM3 ISR via
+ * seq_processSchedulerTick().
+ */
+static void seq_chainServiceTick(void)
+{
+	uint8_t at_bar;
+	uint8_t at_rep;
+
+	if (seq_elapsedPpqTicks == 0u)
+		return;
+	at_bar = (uint8_t)((seq_elapsedPpqTicks % SEQ_CHAIN_BAR_TICKS) == 0u);
+	at_rep = seq_chainAtRepetitionEnd();
+	if (!at_bar && !at_rep)
+		return;
+	if (at_bar && seq_chainBarCount < 255u)
+		seq_chainBarCount++;
+	if (at_rep && seq_chainRepCount < 255u)
+		seq_chainRepCount++;
+	if (seq_pendingSceneChange || seq_pendingSceneQueue || seq_sceneFireFlag)
+		return;
+	seq_chainEvaluate(at_bar, at_rep);
+}
+
+/*
+ * Chain repeat of the playing Scene (S080 G7, P2 D13).
+ *
+ * What: resets the chain counters and `stp` freeze, retriggers once-mode
+ * tracks and the per-track condition counters, and realigns every track to the
+ * master clock (keeping loop anchors), or restarts tracks and master clock
+ * when `restart` (pcr) is set. Why: a chain fire to the playing Scene (slf, or
+ * a resolved target equal to it) is a repeat - plan §4.5 "3 bars, stop 1 bar,
+ * then repeat" - and must not re-run the bounded DSP Scene apply. Inputs:
+ * restart. Outputs: sequencer state. Context: foreground. Accessors:
+ * menu_serviceDeferredSceneChange(). Affiliates: seq_resetToPatternStart(),
+ * seq_loopRefreshSceneSnapshots().
+ */
+void seq_chainRepeatSelf(uint8_t restart)
+{
+	uint32_t primask;
+
+	seq_chainBarCount = 0u;
+	seq_chainRepCount = 0u;
+	seq_chainStopped = 0u;
+	if (restart) {
+		seq_resetToPatternStart();
+		return;
+	}
+	primask = __get_PRIMASK();
+	__disable_irq();
+	memset(seq_trackPlayState, 0, sizeof(seq_trackPlayState));
+	memset(seq_trackRepeatCount, 0, sizeof(seq_trackRepeatCount));
+	memset(seq_trackRndStepCount, 0, sizeof(seq_trackRndStepCount));
+	memset(seq_trackLastConditionFired, 0,
+	       sizeof(seq_trackLastConditionFired));
+	seq_realignActivePatternToMasterClock();
+	seq_loopRefreshSceneSnapshots();
+	__set_PRIMASK(primask);
+}
+
+/*
+ * Deferred trigger tick-down (S078 §3.2, S079 §7.4).
+ *
+ * What: each PPQ tick decrements the delay counter for any track with a
+ * pending deferred trigger. When the counter reaches zero, the deferred
+ * trigger fires with the velocity/note captured at the original step. Why:
+ * the delay carries the combined shuffle and micro-timing offset for a step,
+ * which must operate at PPQ tick resolution for smooth timing. The shuffle
+ * part is (shuffle_value * 24) / 256 (0..11 ticks at 96 PPQ); micro-timing
+ * adds (step_interval x timing) / 100 on top. A pending deferral fires even if
+ * its track stopped in the meantime (S078 §10.2): the step was already
+ * reached; the delay only postpones execution. Inputs:
+ * seq_trackShufflePending[], seq_trackShuffleDelay[]. Outputs:
+ * seq_triggerVoice() when a delay expires. Affiliates: seq_advanceTrackStep()
+ * sets up the deferred trigger.
+ */
+static void seq_processDeferredTriggers(void)
+{
+	uint8_t track;
+
+	for (track = 0u; track < NUM_TRACKS; track++) {
+		if (!seq_trackShufflePending[track])
+			continue;
+		if (seq_trackShuffleDelay[track] == 0u) {
+			seq_trackShufflePending[track] = 0u;
+			seq_triggerVoice(track, seq_trackShuffleVel[track],
+			                 seq_trackShuffleNote[track]);
+		} else {
+			seq_trackShuffleDelay[track]--;
+		}
+	}
+}
+
+/*
+ * Tick-driven per-step roll retrigger engine (S079 §4).
+ *
+ * What: services the per-track fill-window duck countdown, then for each track
+ * with an active roll and queued retriggers decrements the tick accumulator.
+ * When it reaches zero, fires one retrigger with rhythm-modified velocity,
+ * resets the accumulator to the roll rate's PPQ interval, advances the
+ * velocity-pattern position, and decrements the queued count. When the queued
+ * count reaches zero on a step whose fill is below 100, the duck is armed so
+ * the voice fades out at the fill-window end (S079 P2 fix 4). Why: roll
+ * retriggers run from the PPQ tick clock, same as the deferred-trigger engine,
+ * at absolute note rates. A chain whose slots are exhausted stays "active" (so
+ * the next step can carry it over) until the next step's begin clears or
+ * extends it (the duck countdown lives outside that remaining check so it can
+ * still expire). Inputs: seq_rollActive, seq_rollTickAccum, seq_rollVelPos,
+ * seq_rollRemaining, seq_rollStepVel/Note, seq_rollLastRate/Fill,
+ * seq_rollDuck*. Outputs: seq_triggerVoice() and
+ * instrumentManager_requestGateDuck(). Context: TIM3 ISR via
+ * seq_processSchedulerTick(). Affiliates: seq_rollBegin() roll setup.
+ */
+static void seq_processRollTicks(void)
+{
+	uint8_t track;
+
+	for (track = 0u; track < NUM_TRACKS; track++) {
+		uint8_t ppq;
+		uint8_t vel;
+
+		if (!seq_rollActive[track])
+			continue;
+		if (seq_rollDuckActive[track]) {
+			if (seq_rollDuckDelay[track] == 0u) {
+				instrumentManager_requestGateDuck(track);
+				seq_rollDuckActive[track] = 0u;
+			} else {
+				seq_rollDuckDelay[track]--;
+			}
+		}
+		if (seq_rollRemaining[track] == 0u)
+			continue;               /* chain idle, awaiting next step */
+		ppq = seq_rollPpq(seq_rollLastRate[track]);
+		if (ppq == 0u) {
+			seq_rollActive[track] = 0u;
+			continue;
+		}
+		if (seq_rollTickAccum[track] > 0u) {
+			seq_rollTickAccum[track]--;
+			continue;
+		}
+		vel = seq_rollComputeVelocity(track);
+		seq_rollRemaining[track]--;
+		if (seq_rollRemaining[track] == 0u)
+			seq_rollArmDuck(track);
+		seq_triggerVoice(track, vel, seq_rollStepNote[track]);
+		seq_rollTickAccum[track] = (uint8_t)(ppq - 1u);
+		seq_rollVelPos[track]++;
+	}
 }
 
 static void seq_processSchedulerTick(void)
@@ -1257,17 +3816,76 @@ static void seq_processSchedulerTick(void)
 		}
 	}
 
-	if (seq_initialSchedulerTick == 0u &&
-	    (seq_elapsedPpqTicks % SEQ_INTERNAL_TICKS_PER_DEFAULT_STEP) == 0u) {
-		for (track = 0u; track < NUM_TRACKS; track++)
-			seq_advanceTrackStep(track);
-		anyAdvanced = 1u;
+	/*
+	 * S080 G7: scene chain boundaries (bar / repetition) are evaluated on the
+	 * master clock before any track moves (Step 11).
+	 */
+	seq_chainServiceTick();
+
+	/* Shuffle deferral tick-down runs before this tick's DDA advance. */
+	seq_processDeferredTriggers();
+
+	/*
+	 * S080 G11: a chain `stp` freezes every track in place (transport keeps
+	 * running, deferred triggers and rolls finish). Neither the loop wrap nor
+	 * the DDA advance runs while frozen.
+	 */
+	if (!seq_chainStopped) {
+		/*
+		 * S080 P2 D3: looper wrap BEFORE the DDA advance, so a wrap at tick T
+		 * restores the pre-advance snapshot and this tick's advance replays
+		 * the anchor tick's step (P1 wrapped after the advance and replayed
+		 * the step after the one that was sounding).
+		 */
+		seq_loopProcessTick();
+
+		/*
+		 * Per-track DDA step advance (S078 §2.4.1, replacing the global divisor).
+		 *
+		 * What: each PPQ tick adds 1.0 (256 in Q8.8) to every track's accumulator.
+		 * When accumulator >= interval, a step advance fires and the interval is
+		 * subtracted. The fractional remainder carries forward for drift-free
+		 * fractional timing. Why: allows each track to run at its own rate from the
+		 * 128-position log curve. The old global modulo test
+		 * (seq_elapsedPpqTicks % SEQ_INTERNAL_TICKS_PER_DEFAULT_STEP) is removed
+		 * from track advance; seq_masterStepClock still uses it for bar display,
+		 * boundaries, trigger clock, and MIDI beat. Inputs: seq_trackAccumulator
+		 * [track], track_scale from the track's played Scene region,
+		 * stepScale_ticksQ8(). Outputs: seq_advanceTrackStep() when the threshold
+		 * is met; anyAdvanced set for LED chase update. The while loop handles the
+		 * minimum-interval case (CC 0 = 1536 > 256, so at most one iteration per
+		 * tick). Affiliates: seq_advanceTrackStep(), seq_processShuffleDelays().
+		 */
+		if (seq_initialSchedulerTick == 0u) {
+			for (track = 0u; track < NUM_TRACKS; track++) {
+				/*
+				 * Effective (morphed) step-scale CC (S078 §5.4): the cached
+				 * value follows a Morph sweep or step-automation overlay without
+				 * touching the retained Pattern region.
+				 */
+				uint8_t cc = seq_effectiveTrackScale[track];
+				uint16_t interval = stepScale_ticksQ8(cc);
+	
+				seq_trackAccumulator[track] += 256u;
+				while (seq_trackAccumulator[track] >= interval) {
+					seq_trackAccumulator[track] -= interval;
+					seq_advanceTrackStep(track);
+					anyAdvanced = 1u;
+				}
+			}
+		}
 	}
 
     if (anyAdvanced) {
         seq_ledState.chaseStep = seq_stepIndex[menu_getActiveVoice()];
         seq_ledState.dirty |= SEQ_LED_DIRTY_CHASE;
     }
+
+    /*
+     * S079 §4: roll retriggers run after the DDA advance so a carry-over step
+     * can extend its chain before the tick that would otherwise exhaust it.
+     */
+    seq_processRollTicks();
 
     /* FX sequencer follows the same master PPQ clock, independent of Pattern. */
     seq_fxClockTick();
@@ -1468,6 +4086,27 @@ void seq_setRunning(uint8_t isRunning)
 		seq_barCounter = 0;
 		seq_resetStepScheduler();
 		seq_deltaT = 0;
+		/*
+		 * S080 B5 / P2: the looper is runtime-only; a transport stop ends it
+		 * (before seq_setStepIndexToStart(), so no rebase happens). The
+		 * buttonHandler hold state is reconciled on the next looper button
+		 * edge (seq_loopActive reads 0).
+		 */
+		seq_loopActive = 0u;
+		seq_loopTrackMask = 0u;
+		/*
+		 * S080 G12 / P2: a transport stop cancels pending, queued and
+		 * chain-fired scene changes and clears all chain state (the only
+		 * thing that stops a queued change, plan §5.3).
+		 */
+		seq_pendingSceneChange = 0u;
+		seq_pendingSceneQueue = 0u;
+		seq_pendingChainFire = 0u;
+		seq_sceneFireFlag = 0u;
+		seq_chainBarCount = 0u;
+		seq_chainRepCount = 0u;
+		seq_chainStopped = 0u;
+		seq_previousScene = 0xFFu;
 		seq_sendRealtime(MIDI_STOP);
 
 		voiceControl_noteOff(0xFF);
@@ -1487,6 +4126,10 @@ void seq_setRunning(uint8_t isRunning)
 		seq_resetStepScheduler();
 		seq_sendRealtime(MIDI_START);
 		trigger_reset(1);
+		/* S080 G7: counts start at zero with the transport. */
+		seq_chainBarCount = 0u;
+		seq_chainRepCount = 0u;
+		seq_chainStopped = 0u;
 	}
 
 	seq_setStepIndexToStart();
@@ -1708,6 +4351,18 @@ void seq_recordTrigger(uint8_t trackNr)
 //------------------------------------------------------------------------
 void seq_setRecordingMode(uint8_t active)
 {
+	/*
+	 * Record-arm gate on per-track overrides (S077 P2 §3.7).
+	 *
+	 * What: refuses to arm live recording when any track plays from a Scene
+	 * other than the active Scene. Why: recording into a track whose played
+	 * Scene differs from the viewed Scene would write steps into the wrong
+	 * Scene's pattern data. Inputs: seq_perTrackActive. Output: seq_recordActive
+	 * unchanged when per-track overrides exist; disarming (active == 0) is always
+	 * honoured.
+	 */
+	if (active && seq_perTrackActive)
+		return;
 	seq_recordActive = active;
 }
 
@@ -1848,9 +4503,71 @@ static void seq_setStepIndexToStart()
 	seq_restoreAllSceneAutomation();
 	seq_restoreAllAutomation();
 	seq_clearAutomationDirty();
+	/*
+	 * S078 §5.5: recompute the effective track cache after the restore cleared
+	 * every step-automation overlay, so the DDA seed below starts from the
+	 * Normal/Morph base rather than a stale automated value.
+	 */
+	seq_refreshTrackEffectiveParams();
 	for(i=0;i<NUM_TRACKS;i++) {
+		/* Seed from the effective (morphed) scale cache, S078 §5.4. */
+		uint8_t cc = seq_effectiveTrackScale[i];
+		uint16_t interval = stepScale_ticksQ8(cc);
+
 		seq_lastMasterStep[i] = 0u;
 		seq_stepIndex[i] = -1;
+		/*
+		 * Seed the DDA so the first scheduler tick fires step zero (S078).
+		 *
+		 * What: the accumulator starts one Q8.8 tick below the track's
+		 * interval, so the very first "+= 256" crosses the threshold exactly
+		 * and the step-0 trigger plays on the initial scheduler tick with a
+		 * zero remainder. Why: a zero seed would delay the first step by one
+		 * full step interval. Affiliates: seq_processSchedulerTick() DDA loop.
+		 */
+		seq_trackAccumulator[i] = (uint16_t)(interval - 256u);
+		seq_trackShuffleDelay[i] = 0u;
+		seq_trackShufflePending[i] = 0u;
+		seq_trackPlayState[i] = 0u;
+		/* S079: reset per-track condition and roll runtime state. */
+		seq_trackRepeatCount[i] = 0u;
+		seq_trackRndStepCount[i] = 0u;
+		seq_trackLastConditionFired[i] = 0u;
+		seq_rollActive[i] = 0u;
+		seq_rollTickAccum[i] = 0u;
+		seq_rollVelPos[i] = 0u;
+		seq_rollRemaining[i] = 0u;
+		seq_rollLastRate[i] = 0u;
+		seq_rollLastRhythm[i] = 0u;
+		seq_rollLastFill[i] = 0u;
+		seq_rollDuckActive[i] = 0u;
+		seq_rollDuckDelay[i] = 0u;
+		seq_rollDuckDelta[i] = 0u;
 	}
+	/*
+	 * Seed the FX DDA the same way so its step zero plays on the first tick,
+	 * and restart its step counter.
+	 */
+	{
+		const effect_record_t *fx = scene_effectConst(scene_getActiveIndex());
+
+		seq_fxAccumulator =
+		    (uint16_t)(stepScale_ticksQ8(fx ? fx->seq_step_scale
+		                                    : STEP_SCALE_DEFAULT) - 256u);
+		seq_fxStepCounter = 0u;
+	}
+
+	/*
+	 * S080 P2 Defect 14: an engaged loop survives a cursor reset.
+	 *
+	 * What: rebase every looped track to the seeded start (anchor 0). Why: a
+	 * resetting scene change, an external reset or a boundary pattern commit
+	 * restarts the master clock; the loop start becomes the beginning of the
+	 * Scene instead of the loop dying with stale buttonHandler state (P1
+	 * cleared seq_loopActive here). Transport stop clears seq_loopActive before
+	 * calling this, so a stop still ends the loop. Affiliates:
+	 * seq_loopRebaseToStart(), seq_setRunning().
+	 */
+	seq_loopRebaseToStart();
 
 }

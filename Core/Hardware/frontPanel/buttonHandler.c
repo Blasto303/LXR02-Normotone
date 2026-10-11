@@ -24,12 +24,16 @@
 #include "timebase.h"
 #include "copyClearSession.h"
 #include "PatternData.h"
+#include "BankData.h"
+#include "SceneData.h"
 #include "menuEffects.h"
 #if ENABLE_EUKLID_PAGE
 #include "EuklidGenerator.h"
 #endif
 #include "sequencer.h"
 #include "presetManager.h"
+#include "MidiVoiceControl.h"
+#include "MidiNoteNumbers.h"
 #include <string.h>
 #include <stdint.h>
 #include "MidiParser.h"
@@ -216,6 +220,145 @@ static uint16_t buttonHandler_loadSceneSeqPressedMask = 0u;
  */
 static uint8_t buttonHandler_fxVoiceMixTrackMask = 0u;
 
+/*
+ * PERF mode held-VOICE bitmask for per-track Scene assignment (S077 P2 §3.1).
+ *
+ * What: one bit per VOICE button (bits 0..6) set while that VOICE button is
+ * physically held in PERF mode. While any bit is set, SEQ presses are
+ * intercepted for per-track assignment instead of scene-level switching. Why:
+ * the hold-VOICE+press-SEQ gesture enables per-track Scene playback (plan
+ * §4.1). Multiple VOICE buttons may be held simultaneously for multi-track
+ * assignment (Q11). RAM: +1 byte SRAM1. Owner: buttonHandler.c. Affiliates:
+ * perf_voiceActionOccurred, buttonHandler_perfVoiceHeldSeqPressed(),
+ * buttonHandler_perfVoiceReleased().
+ */
+static uint8_t perf_heldVoiceMask = 0u;
+
+/*
+ * PERF VOICE action-occurred flag for mute-toggle cancellation (S077 P2 §3.1).
+ *
+ * What: set to 1 when a held VOICE button's hold produced a per-track
+ * assignment (a SEQ press during the hold) or when a non-VOICE, non-SEQ button
+ * was pressed during the hold. When set, VOICE releases do not toggle mute.
+ * Why: the VOICE release is a single-track mute toggle only when no per-track
+ * assignment or other unrelated action occurred (plan §4.1, Q8). RAM: +1 byte
+ * SRAM1. Owner: buttonHandler.c. Affiliates: perf_heldVoiceMask.
+ */
+static uint8_t perf_voiceActionOccurred = 0u;
+
+/*
+ * General-purpose double-click detector (S077 P2 §3.2, Q7).
+ *
+ * What: detects a second press of the same button within DOUBLE_CLICK_TIMEOUT
+ * of the first. Only one button can be in a double-click window at a time. The
+ * first click fires its single-click action immediately (no latency); the second
+ * click within the timeout returns DBLCLICK_DOUBLE so the caller can apply the
+ * additive double-click action. Why: PERF mode needs double-click on SEQ
+ * buttons for realignment; the detector is general-purpose for future reuse.
+ * Protocol: dblclick_onPress(buttonNr) is called on every press and returns
+ * DBLCLICK_FIRST or DBLCLICK_DOUBLE; dblclick_cancel() clears the window when
+ * any non-SEQ action intervenes. A router that runs after onPress can also
+ * recognise a double by (!dblclick_armed && dblclick_button == buttonNr).
+ * RAM: +3 bytes SRAM1 (button id, deadline, armed flag). Affiliates:
+ * DOUBLE_CLICK_TIMEOUT, time_sysTick.
+ */
+static uint8_t dblclick_button = 0u;
+static uint16_t dblclick_deadline = 0u;
+static uint8_t dblclick_armed = 0u;
+
+/*
+ * Looper foreground state (S080 C5, P2 Defects 7/8).
+ *
+ * What: bh_loopSelectHeldMask - SELECT buttons (1..8) held as looper
+ * divisions. bh_loopLastSelectButton - the most recently pressed SELECT (owns
+ * the active division, last-pressed-wins). bh_loopTrackMask - the track set
+ * the sequencer actually loops (returned by seq_loopEngage()/UpdateMask()).
+ * bh_loopBarModifier - momentary BAR modifier (0 none, 1 dot, 2 triplet).
+ * bh_loopBarHeld - BAR1 (bit 0) / BAR2 (bit 1) physically held in PERF,
+ * tracked in event order. Why: the loop stays engaged while any SELECT, any
+ * VOICE of a looped track, or any BAR is held (Defect 8); event-order BAR
+ * state replaces btn_held[], which the ISR updates ahead of the queued edges.
+ * Inputs: SELECT/VOICE/BAR press/release in PERF. Outputs: seq_loop*() calls,
+ * SELECT/BAR LEDs. RAM: +5 bytes SRAM1 (S080 P2 adds bh_loopBarHeld).
+ * Affiliates: buttonHandler_loopCheckDisengage(), buttonHandler_loopForceRelease(),
+ * buttonHandler_loopSelectLed().
+ */
+static uint8_t bh_loopSelectHeldMask   = 0u;
+static uint8_t bh_loopLastSelectButton = 0u;
+static uint8_t bh_loopTrackMask        = 0u;
+static uint8_t bh_loopBarModifier      = 0u;
+static uint8_t bh_loopBarHeld          = 0u;
+
+/*
+ * SHIFT+REC settings menu state (S080 E7, P2 Defect 3).
+ *
+ * What: bh_shiftRecMenuActive is set while the SHIFT+REC overlay (repurposed
+ * RECORDING_PAGE) is latched open. bh_shiftRecSavedPage/SubPg remember where
+ * to return on exit. bh_shiftReleaseConsume swallows the SHIFT release that
+ * pairs with a SHIFT press used to close a latched menu (SHIFT+REC or the
+ * chain editor). Why: latched menus open on SHIFT+REC / SHIFT+PLAY+SEQ, stay
+ * open after every button is released, and close on the next SHIFT press (or
+ * REC for SHIFT+REC). The closing press's release must not run the
+ * mode-specific SHIFT release path (which, in PERF, would re-enter the page
+ * and clear looper LEDs). Inputs: SHIFT/REC/PLAY/SEQ events. Outputs:
+ * page/sub-page switch and LED state. RAM: +4 bytes SRAM1 (S080 P2 adds
+ * bh_shiftReleaseConsume). Affiliates: processPress()/processRelease()
+ * BUT_SHIFT, BUT_REC, menu_chainMenuClose().
+ */
+static uint8_t bh_shiftRecMenuActive  = 0u;
+static uint8_t bh_shiftRecSavedPage   = 0u;
+static uint8_t bh_shiftRecSavedSubPg  = 0u;
+static uint8_t bh_shiftReleaseConsume = 0u;
+
+/*
+ * SHIFT+PLAY chord arm (S080 G8).
+ *
+ * What: 1 between a PLAY press made with SHIFT held in PERF and the PLAY
+ * release. Why: SHIFT+PLAY+SEQ opens the chain editor; PLAY in the chord never
+ * toggles the transport (plan §4.1). Inputs: PLAY press/release. Outputs:
+ * the SHIFT+SEQ PERF branch opens the editor instead of queuing. RAM: +1 byte
+ * SRAM1. Affiliates: menu_chainMenuOpen().
+ */
+static uint8_t bh_chainPlayArmed = 0u;
+
+/*
+ * BAR overlay state (S080 E8).
+ *
+ * What: 0 = no overlay, 1 = LEFT overlay (`<`), 2 = RIGHT overlay (`>`). While
+ * an overlay is active and SHIFT is not held, PERF VOICE buttons fire triggers
+ * instead of toggling mutes. Why: the overlay converts the VOICE row into a
+ * performance trigger row; it is runtime-only (not saved) and is suppressed by
+ * the looper. Inputs: BAR1/BAR2 presses in PERF mode. Outputs: VOICE trigger
+ * dispatch (E12) and BAR LED state. RAM: +1 byte SRAM1.
+ */
+static uint8_t bh_overlayActive = 0u;
+
+/*
+ * BAR overlay trigger runtime state (S080 E12).
+ *
+ * What: bh_overlayVoiceMask marks VOICE buttons currently firing an overlay
+ * trigger (for release/note-off). bh_overlayTrack/Note/Vel describe the track
+ * and payload of the active repeat (roll) or pending second flam hit.
+ * bh_overlayInterval is the repeat period in 1 ms time_sysTick units;
+ * bh_overlayNext is its deadline; bh_overlayCount is the remaining repeat count
+ * (0 = idle, 0xFF = held roll). Why: rolls repeat while the VOICE is held and
+ * flams need one delayed second hit; a single foreground 1 ms timer slot is
+ * enough because only the most recent overlay track can be repeating. RAM: +8
+ * bytes SRAM1 (runtime-only). Affiliates: handleVoiceButton(),
+ * buttonHandler_tick(), processRelease().
+ */
+static uint8_t  bh_overlayVoiceMask = 0u;
+static uint8_t  bh_overlayTrack     = 0u;
+static uint8_t  bh_overlayNote      = 0u;
+static uint8_t  bh_overlayVel       = 0u;
+static uint8_t  bh_overlayCount     = 0u;
+static uint16_t bh_overlayInterval  = 0u;
+static uint16_t bh_overlayNext      = 0u;
+
+
+#define DBLCLICK_FIRST  0u
+#define DBLCLICK_DOUBLE 1u
+
 /* -----------------------------------------------------------------------
 ** Helpers
 ** ----------------------------------------------------------------------- */
@@ -312,6 +455,28 @@ void buttonHandler_showMuteLEDs(void)
     menu_muteModeActive = 1;
 }
 
+/*
+ * Clear every VOICE mute mirror (S080 P2 Defect 11).
+ *
+ * What: zeroes buttonHandler_mutedVoices and, when the VOICE row is currently
+ * showing mute state, repaints it. Why: a queued scene change with a mute
+ * reset (qac mut/u+r/mmr/rld/r+r) unmutes the Sequencer through
+ * seq_setMute(7, 0), but the VOICE LEDs read this mirror; without the clear
+ * they keep showing the old mutes, and the next VOICE release would toggle
+ * from the stale state. The repaint is gated on menu_muteModeActive so a
+ * queued change firing while another page owns the VOICE row does not
+ * overwrite that page's LEDs. Inputs: none. Outputs: mirror cleared, VOICE
+ * row repainted when it shows mutes. Accessors: menu_applyQueuedSceneAction().
+ * Affiliates: seq_setMute(), buttonHandler_showMuteLEDs(),
+ * buttonHandler_muteVoice().
+ */
+void buttonHandler_clearAllMutes(void)
+{
+    buttonHandler_mutedVoices = 0u;
+    if (menu_muteModeActive)
+        buttonHandler_showMuteLEDs();
+}
+
 /* Map button number to 0-based SEQ index, or -1. */
 static int8_t btn_to_seq(uint8_t buttonNr)
 {
@@ -358,6 +523,48 @@ static int8_t btn_to_voice(uint8_t buttonNr)
     case BUT_VOICE_7: return 6;
     default: return -1;
     }
+}
+
+/*
+ * Register one button press with the double-click detector (S077 P2 §3.2).
+ *
+ * What: returns DBLCLICK_DOUBLE when the same button was armed within
+ * DOUBLE_CLICK_TIMEOUT; otherwise arms this button and returns DBLCLICK_FIRST.
+ * A press of a different button restarts the window for that button. Why: the
+ * first click must always fire its single-click action immediately, so the
+ * detector never delays a press. Inputs: buttonNr. Output: DBLCLICK_FIRST or
+ * DBLCLICK_DOUBLE. A caller running after this can recognise a double by
+ * checking (!dblclick_armed && dblclick_button == buttonNr). Uses time_sysTick
+ * with the unsigned 16-bit wrap-safe subtraction used elsewhere in this file.
+ * Affiliates: dblclick_cancel(), DOUBLE_CLICK_TIMEOUT.
+ */
+static uint8_t dblclick_onPress(uint8_t buttonNr)
+{
+    uint8_t result = DBLCLICK_FIRST;
+
+    if (dblclick_armed && dblclick_button == buttonNr &&
+        (uint16_t)(dblclick_deadline - time_sysTick) < 32768u) {
+        /* Second press of the same button inside the window. */
+        result = DBLCLICK_DOUBLE;
+        dblclick_armed = 0u;
+    } else {
+        dblclick_button = buttonNr;
+        dblclick_deadline = (uint16_t)(time_sysTick + DOUBLE_CLICK_TIMEOUT);
+        dblclick_armed = 1u;
+    }
+    return result;
+}
+
+/*
+ * Cancel any pending double-click window (S077 P2 §3.2).
+ *
+ * What: clears the armed flag so the next press of the previously armed button
+ * starts a fresh single-click window. Why: any action other than the same
+ * button press cancels the window. Inputs: none. Output: dblclick_armed = 0.
+ */
+static void dblclick_cancel(void)
+{
+    dblclick_armed = 0u;
 }
 
 /*
@@ -604,8 +811,169 @@ static void buttonHandler_setTimeraction(uint8_t buttonNr)
     buttonHandler_buttonTimerStepNr = (int8_t)buttonNr;
 }
 
+/*
+ * PERF-button fill-hold state (S079 §3.3).
+ *
+ * What: bh_fillArmed is set while the PERF (MODE2) button is held and the
+ * fill hold has not yet elapsed; bh_fillPressTick records the press time in
+ * the shared millisecond clock. Why: fill mode must activate only after the
+ * double-click timeout of continuous hold, so a normal mode-switch tap never
+ * triggers fill. Fill activates when the elapsed hold reaches
+ * DOUBLE_CLICK_TIMEOUT and deactivates on release. Using time_sysTick (rather
+ * than counting tick calls) keeps the hold independent of the main-loop
+ * cadence. Inputs: buttonHandler_tick(), handleModeButtons(), processRelease().
+ * Outputs: seq_fillActive (read by the TIM3 ISR). RAM: 3 B SRAM1 static.
+ */
+static uint16_t bh_fillPressTick;
+static uint8_t bh_fillArmed;
+
+/*
+ * S080 E12: BAR overlay trigger helpers.
+ *
+ * buttonHandler_overlayDivisionMs() converts a SELECT-style division index
+ * (0 = 1 bar .. 7 = 1/128) to milliseconds from the current BPM (15000/BPM ms
+ * per 1/16 note). buttonHandler_overlayTrigger() fires the configured overlay
+ * trigger (single velocity, flam, or held roll) for one VOICE. Flams fire a
+ * soft leading hit plus one delayed main hit; rolls fire immediately and then
+ * repeat from buttonHandler_tick() until release. buttonHandler_overlayRelease()
+ * stops the repeat and sends note-off. Why: the overlay turns the VOICE row
+ * into a performance trigger row while a BAR overlay is active; rolls use a 1 ms
+ * foreground timer (only one track repeats at a time). Inputs: overlay params,
+ * VOICE index, BPM. Outputs: seq_triggerVoice()/voiceControl_noteOff() calls and
+ * the bh_overlay* repeat state. Affiliates: handleVoiceButton() (E12),
+ * processRelease(), buttonHandler_tick().
+ */
+static uint16_t buttonHandler_overlaySixteenthMs(void)
+{
+    uint16_t bpm = parameter_values[PAR_BPM];
+
+    if (bpm == 0u)
+        bpm = 120u;
+    return (uint16_t)(15000u / bpm);
+}
+
+static uint16_t buttonHandler_overlayDivisionMs(uint8_t idx)
+{
+    uint16_t base = buttonHandler_overlaySixteenthMs();
+
+    switch (idx) {
+    case 0u: return (uint16_t)(base * 16u);   /* 1 bar */
+    case 1u: return (uint16_t)(base * 8u);    /* 1/2 bar */
+    case 2u: return (uint16_t)(base * 4u);    /* 1/4 bar */
+    case 3u: return (uint16_t)(base * 2u);    /* 1/8 bar (eighth note) */
+    case 4u: return base;                     /* 1/16 */
+    case 5u: return (uint16_t)(base / 2u);    /* 1/32 */
+    case 6u: return (uint16_t)(base / 4u);    /* 1/64 */
+    default: return (uint16_t)(base / 8u);    /* 1/128 */
+    }
+}
+
+static void buttonHandler_overlayTrigger(uint8_t voiceNr)
+{
+    uint8_t type;
+    uint8_t note;
+    uint8_t vel;
+    uint8_t count;
+    uint16_t interval;
+
+    if (bh_overlayActive == 1u) {
+        type = parameter_values[PAR_PERF_BTN_LT];
+        note = parameter_values[PAR_PERF_NOTE_LT];
+    } else {
+        type = parameter_values[PAR_PERF_BTN_RT];
+        note = parameter_values[PAR_PERF_NOTE_RT];
+    }
+    if (type > 11u)
+        type = 0u;
+    if (note == 0u)
+        note = scene_getTrackMidiNote(seq_getTrackPlayedScene(voiceNr), voiceNr);
+    if (note == 0u)
+        note = MIDI_DEFAULT_TRIGGER_NOTE;
+
+    bh_overlayVoiceMask |= (uint8_t)(1u << voiceNr);
+
+    if (type <= 3u) {
+        /* Single trigger at vmx/v10/v64/v32. */
+        static const uint8_t singleVel[4] = {127u, 100u, 64u, 32u};
+
+        seq_triggerVoice(voiceNr, singleVel[type], note);
+        return;
+    }
+    if (type == 4u || type == 5u) {
+        /* Flam: soft leading hit now, main hit one 1/32 later. */
+        seq_triggerVoice(voiceNr, 64u, note);
+        interval = buttonHandler_overlayDivisionMs(5u);
+        vel = 100u;
+        count = 1u;
+    } else {
+        /* Held roll: r/8, r16, r32, r64, r6t, 128. */
+        static const uint8_t rollDiv[6] = {3u, 4u, 5u, 6u, 6u, 7u};
+        uint8_t idx = (uint8_t)(type - 6u);
+
+        interval = buttonHandler_overlayDivisionMs(rollDiv[idx]);
+        if (idx == 4u)                                  /* r6t triplet */
+            interval = (uint16_t)((interval * 2u) / 3u);
+        seq_triggerVoice(voiceNr, 100u, note);          /* first repeat now */
+        vel = 100u;
+        count = 0xFFu;                                  /* repeat while held */
+    }
+
+    bh_overlayTrack = voiceNr;
+    bh_overlayNote = note;
+    bh_overlayVel = vel;
+    bh_overlayInterval = (interval != 0u) ? interval : 1u;
+    bh_overlayNext = (uint16_t)(time_sysTick + bh_overlayInterval);
+    bh_overlayCount = count;
+}
+
+static void buttonHandler_overlayRelease(uint8_t voiceNr)
+{
+    uint8_t bit = (uint8_t)(1u << voiceNr);
+
+    if ((bh_overlayVoiceMask & bit) == 0u)
+        return;
+    bh_overlayVoiceMask = (uint8_t)(bh_overlayVoiceMask & ~bit);
+    if (voiceNr == bh_overlayTrack) {
+        bh_overlayTrack = 0u;
+        bh_overlayCount = 0u;
+    }
+    /* Drum voices are one-shots, but a note-off keeps MIDI-out correct. */
+    voiceControl_noteOff(voiceNr);
+}
+
+static void buttonHandler_overlayTick(void)
+{
+    if (bh_overlayCount == 0u)
+        return;
+    if ((uint16_t)(time_sysTick - bh_overlayNext) >= 32768u)
+        return;
+    seq_triggerVoice(bh_overlayTrack, bh_overlayVel, bh_overlayNote);
+    if (bh_overlayCount != 0xFFu) {
+        bh_overlayCount--;
+        if (bh_overlayCount == 0u)
+            return;
+    }
+    bh_overlayNext = (uint16_t)(bh_overlayNext + bh_overlayInterval);
+}
+
 void buttonHandler_tick(void)
 {
+    /* S080 E12: service the overlay flam/roll repeat timer. */
+    buttonHandler_overlayTick();
+    /* S080 F9: run a deferred/queued scene change when its boundary has fired. */
+    menu_serviceDeferredSceneChange();
+    /*
+     * PERF fill-hold promotion (S079 §3.3).
+     *
+     * Inputs: bh_fillArmed/bh_fillPressTick set at PERF press. Output:
+     * seq_fillActive is set once the hold reaches DOUBLE_CLICK_TIMEOUT. The
+     * unsigned elapsed comparison stays correct across the 16-bit clock wrap.
+     */
+    if (bh_fillArmed &&
+        (uint16_t)(time_sysTick - bh_fillPressTick) >= DOUBLE_CLICK_TIMEOUT &&
+        !seq_fillActive)
+        seq_fillActive = 1u;
+
     /*
      * Foreground long-press poll using the wrapping 16-bit millisecond clock.
      *
@@ -745,6 +1113,254 @@ static void buttonHandler_setRemoveStep(uint8_t ledNr, uint8_t seqButtonPressed)
                  ledNr);
 }
 
+/* Forward declaration: defined below with the other PERF gesture handlers. */
+static void buttonHandler_perfRefreshHeldSceneLeds(void);
+
+/*
+ * Per-track Scene assignment: VOICE held + SEQ pressed (S077 P2 §4.1).
+ *
+ * What: for every VOICE bit set in perf_heldVoiceMask, calls
+ * seq_setTrackPlayedScene(track, scene) and seq_realignTrackToMasterClock(track),
+ * then arms preset_startSingleVoiceApply() for the affected slot. Why: the user
+ * holds one or more VOICE buttons and presses a SEQ button to assign those
+ * tracks to play from the pressed Scene. Inputs: seqButtonPressed 0..15 (the
+ * Scene index) and perf_heldVoiceMask. Output: per-track playback state updated,
+ * instrument apply armed, perf_voiceActionOccurred set so the subsequent VOICE
+ * release does not toggle mute, and the double-click window cancelled. HiHat
+ * link: tracks 5 and 6 always switch together inside seq_setTrackPlayedScene()
+ * and share slot 5. Validation: the Scene must be resident (bank_scenePresent).
+ * Affiliates: seq_setTrackPlayedScene(), seq_realignTrackToMasterClock(),
+ * preset_startSingleVoiceApply().
+ */
+static void buttonHandler_perfVoiceHeldSeqPressed(uint8_t seqButtonPressed)
+{
+    uint8_t track;
+
+    if (seqButtonPressed >= SCENE_COUNT || seqButtonPressed >= 16u ||
+        !bank_scenePresent(seqButtonPressed))
+        return;
+
+    for (track = 0u; track < NUM_TRACKS; track++) {
+        uint8_t slot;
+
+        if ((perf_heldVoiceMask & (uint8_t)(1u << track)) == 0u)
+            continue;
+        seq_setTrackPlayedScene(track, seqButtonPressed);
+        seq_realignTrackToMasterClock(track);
+        /* Track 7 (index 6) shares the HiHat slot 5. */
+        slot = (track >= INSTRUMENT_SLOT_COUNT)
+            ? (uint8_t)(INSTRUMENT_SLOT_COUNT - 1u) : track;
+        preset_startSingleVoiceApply(slot, seqButtonPressed);
+    }
+    perf_voiceActionOccurred = 1u;
+    dblclick_cancel();
+    /* Re-blink each held track's (now updated) played Scene (S077 P2 §5.4). */
+    buttonHandler_perfRefreshHeldSceneLeds();
+}
+
+/*
+ * PERF Scene press with double-click detection (S077 P2 §4.2, §4.3).
+ *
+ * What: handles a SEQ press in PERF mode when no VOICE is held.
+ *       PAR_FOLLOW on, single click: scene-level switch via
+ *         menu_perfModeSceneButtonPressed() (coalesces all tracks + realigns).
+ *       PAR_FOLLOW on, double click: same plus an explicit realign.
+ *       PAR_FOLLOW off, single click: view change only via menu_setShownPattern()
+ *         + menu_refreshPerfSceneLeds(); playback and per-track overrides stay.
+ *       PAR_FOLLOW off, double click: full Scene change + coalesce + realign.
+ * Why: PAR_FOLLOW off lets the user navigate the viewed Scene without changing
+ * playback; a deliberate double-click then commits the change. Inputs:
+ * seqButtonPressed 0..15, parameter_values[PAR_FOLLOW], and the double-click
+ * detector state (set by processPress, which calls dblclick_onPress() for this
+ * press). Output: Scene/view state updated per the rules above.
+ * Affiliates: menu_perfModeSceneButtonPressed(), menu_setShownPattern(),
+ * menu_refreshPerfSceneLeds(), seq_realignActivePatternToMasterClock().
+ */
+static void buttonHandler_perfScenePressed(uint8_t seqButtonPressed)
+{
+    /* A double is an onPress result of DOUBLE: the window was just consumed. */
+    uint8_t isDouble = (uint8_t)(!dblclick_armed &&
+                                 dblclick_button == seqButtonPressed);
+
+    if (seqButtonPressed >= SCENE_COUNT || seqButtonPressed >= 16u ||
+        !bank_scenePresent(seqButtonPressed))
+        return;
+
+    if (parameter_values[PAR_FOLLOW]) {
+        /* A full Scene-level switch coalesces all tracks and always realigns. */
+        menu_perfModeSceneButtonPressed(seqButtonPressed);
+        if (isDouble)
+            seq_realignActivePatternToMasterClock();
+    } else {
+        /* Single click changes only the viewed Scene, not playback. */
+        menu_setShownPattern(seqButtonPressed);
+        menu_refreshPerfSceneLeds();
+        if (isDouble)
+            menu_perfModeSceneButtonPressed(seqButtonPressed);
+    }
+}
+
+/*
+ * Repaint the transient per-track Scene indication for a PERF VOICE hold
+ * (S077 P2 §5.4).
+ *
+ * What: clears every SEQ LED's blink layer and blinks the SEQ LED of each Scene
+ * that a currently held VOICE track is playing from. When the last VOICE is
+ * released it restores the ordinary PERF Scene row via
+ * menu_refreshPerfSceneLeds(). Why: while holding VOICE for per-track
+ * assignment the user should see which Scene each held track plays from before
+ * changing it; the indication is transient and vanishes on release. Inputs:
+ * perf_heldVoiceMask, seq_getTrackPlayedScene(). Output: SEQ LED blink state.
+ * Affiliates: menu_refreshPerfSceneLeds().
+ */
+static void buttonHandler_perfRefreshHeldSceneLeds(void)
+{
+    uint8_t i;
+
+    for (i = 0u; i < 16u; i++)
+        led_setBlinkLed((uint8_t)(LED_SEQ1 + i), 0u);
+    for (i = 0u; i < NUM_TRACKS; i++) {
+        uint8_t played;
+
+        if ((perf_heldVoiceMask & (uint8_t)(1u << i)) == 0u)
+            continue;
+        played = seq_getTrackPlayedScene(i);
+        if (played < 16u)
+            led_setBlinkLed((uint8_t)(LED_SEQ1 + played), 1u);
+    }
+    if (perf_heldVoiceMask == 0u)
+        menu_refreshPerfSceneLeds();
+}
+
+/*
+ * Report the SELECT LED the PERF looper owns (S080 P2 Defect 4).
+ *
+ * What: returns the zero-based SELECT index of the active loop division while
+ * any looper SELECT is held or the loop is engaged (sustained by VOICE/BAR),
+ * otherwise 0xFF. Why: in PERF the SELECT row is the looper's division
+ * display and must be dark when the looper is idle; Menu needs this to repaint
+ * the row on page changes without owning looper state. Inputs:
+ * bh_loopSelectHeldMask, seq_loopActive, bh_loopLastSelectButton. Output:
+ * 0..7 or 0xFF. Accessors: menu_syncPerfSelectLed(). Affiliates:
+ * led_setActiveSelectButton(), led_clearSelectLeds().
+ */
+uint8_t buttonHandler_loopSelectLed(void)
+{
+    if (bh_loopSelectHeldMask != 0u || seq_loopActive)
+        return bh_loopLastSelectButton;
+    return 0xFFu;
+}
+
+/*
+ * End the loop when nothing sustains it any more (S080 P2 Defect 8).
+ *
+ * What: returns while any looper SELECT, any VOICE of a still-looped track,
+ * or any BAR button is held. Otherwise disengages the loop (every looped track
+ * resumes where it would have been), clears the modifier and track mirror, and
+ * restores the SELECT row (dark) and the BAR overlay LEDs. Why: the loop must
+ * survive a SELECT release while a looped VOICE or a BAR is still held (plan
+ * Defect 8 example). Inputs: bh_loopSelectHeldMask, perf_heldVoiceMask,
+ * bh_loopTrackMask, bh_loopBarHeld. Outputs: seq_loopDisengage(), LEDs.
+ * Accessors: SELECT, VOICE and BAR release paths. Affiliates:
+ * menu_syncPerfSelectLed(), bh_overlayActive.
+ */
+static void buttonHandler_loopCheckDisengage(void)
+{
+    if (bh_loopSelectHeldMask != 0u)
+        return;
+    if ((perf_heldVoiceMask & bh_loopTrackMask) != 0u)
+        return;
+    if (bh_loopBarHeld != 0u)
+        return;
+    if (seq_loopActive)
+        seq_loopDisengage();
+    bh_loopTrackMask = 0u;
+    bh_loopBarModifier = 0u;
+    if (bh_state.selectButtonMode == SELECT_MODE_PERF) {
+        menu_syncPerfSelectLed();
+        led_setValue((uint8_t)(bh_overlayActive == 1u), LED_BAR1);
+        led_setValue((uint8_t)(bh_overlayActive == 2u), LED_BAR2);
+    }
+}
+
+/*
+ * Force the looper off and forget every hold (S080 P2).
+ *
+ * What: clears the SELECT and BAR hold state, disengages the loop (tracks
+ * resume where they would have been) and clears the mirrors. Why: leaving
+ * PERF and an event-ring overflow both lose the release edges that would end
+ * the loop normally. Accessors: handleModeButtons(),
+ * buttonHandler_processEvents() overflow path.
+ */
+static void buttonHandler_loopForceRelease(void)
+{
+    bh_loopSelectHeldMask = 0u;
+    bh_loopBarHeld = 0u;
+    if (seq_loopActive)
+        seq_loopDisengage();
+    bh_loopTrackMask = 0u;
+    bh_loopBarModifier = 0u;
+}
+
+/*
+ * PERF VOICE release: single-track mute toggle (S077 P2 §4.1, Q8, Q12).
+ *
+ * What: clears this VOICE bit from perf_heldVoiceMask. If perf_voiceActionOccurred
+ * is 0 (no per-track assignment or unrelated button press during the hold),
+ * toggles mute for this single track. Each VOICE button's mute fires on its own
+ * release independently (Q12). Why: replaces the old cumulative unmute; the
+ * mute toggle is cancelled when the hold produced a per-track assignment or an
+ * unrelated button was pressed. Inputs: voiceNr 0..6. Output: mute toggled or
+ * not; the mask bit cleared; perf_voiceActionOccurred reset when the last VOICE
+ * is released. Affiliates: seq_setMute(), buttonHandler_muteVoice().
+ */
+static void buttonHandler_perfVoiceReleased(uint8_t voiceNr)
+{
+    uint8_t bit = (uint8_t)(1u << voiceNr);
+
+    if ((perf_heldVoiceMask & bit) == 0u)
+        return;
+    perf_heldVoiceMask = (uint8_t)(perf_heldVoiceMask & ~bit);
+    /*
+     * S080 P2 Defect 8 (D1): releasing a looped track's VOICE drops it.
+     *
+     * What: the track leaves the loop at once and resumes where it would have
+     * been (inside seq_loopUpdateMask(), before the mask is committed); the
+     * other looped tracks keep their loop starts. Then the loop ends if
+     * nothing sustains it any more. Why: real-time control of which tracks
+     * loop (Defect 8 follow-up). The mute toggle below is already suppressed
+     * because the loop gesture set perf_voiceActionOccurred. Inputs: bit,
+     * bh_loopTrackMask, seq_loopActive. Outputs: seq_loopUpdateMask(),
+     * possibly seq_loopDisengage(). Affiliates:
+     * buttonHandler_loopCheckDisengage().
+     */
+    if (seq_loopActive && (bh_loopTrackMask & bit) != 0u) {
+        bh_loopTrackMask =
+            seq_loopUpdateMask((uint8_t)(bh_loopTrackMask & (uint8_t)~bit));
+        /*
+         * Mark the release as a looper gesture so the mute toggle below stays
+         * suppressed, including the VOICE-then-SELECT engage order (the VOICE
+         * press predated the loop, so it could not set the flag itself).
+         */
+        perf_voiceActionOccurred = 1u;
+        buttonHandler_loopCheckDisengage();
+    }
+    if (perf_voiceActionOccurred == 0u) {
+        if (buttonHandler_mutedVoices & bit) {
+            buttonHandler_muteVoice(voiceNr, 0);
+            seq_setMute(voiceNr, 0);
+        } else {
+            buttonHandler_muteVoice(voiceNr, 1);
+            seq_setMute(voiceNr, 1);
+        }
+        /* Repaint the VOICE mute row deterministically in PERF mode. */
+        buttonHandler_showMuteLEDs();
+    }
+    if (perf_heldVoiceMask == 0u)
+        perf_voiceActionOccurred = 0u;
+    buttonHandler_perfRefreshHeldSceneLeds();
+}
+
 static void buttonHandler_seqButtonPressed(uint8_t seqButtonPressed)
 {
     uint8_t ledNr = (uint8_t)(seqButtonPressed + LED_STEP1);
@@ -756,6 +1372,33 @@ static void buttonHandler_seqButtonPressed(uint8_t seqButtonPressed)
             break;
         case SELECT_MODE_STEP:
             buttonHandler_setRemoveStep(ledNr, seqButtonPressed);
+            break;
+        case SELECT_MODE_PERF:
+            /*
+             * S080 F9 / Phase G / P2 Defect 10: SHIFT+SEQ in PERF.
+             *
+             * What: with PLAY held in the SHIFT+PLAY chord, opens the chain
+             * editor for this Scene (Phase G). Otherwise queues a change to
+             * this Scene at the qcd division. The queued Scene's SEQ LED
+             * flashes at double rate until the change fires; that LED is
+             * owned by menu_syncQueuedSceneLed() on the next tick, so no blink
+             * is started here. Why: queuing lets the user pre-program the
+             * next Scene during performance; the chord shares the SHIFT+SEQ
+             * gesture space. Inputs: seqButtonPressed, bh_chainPlayArmed,
+             * PAR_SCENE_QUEUE_DIV. Outputs: menu_chainMenuOpen() or
+             * seq_queueSceneChange(). Affiliates: seq_queueSceneChange()
+             * (Step 6), menu_serviceDeferredSceneChange(), menu_chainMenuOpen()
+             * (Step 11).
+             */
+            if (bh_chainPlayArmed) {
+                (void)menu_chainMenuOpen(seqButtonPressed);
+                break;
+            }
+            if (seqButtonPressed < SCENE_COUNT &&
+                bank_scenePresent(seqButtonPressed)) {
+                seq_queueSceneChange(seqButtonPressed,
+                                     parameter_values[PAR_SCENE_QUEUE_DIV]);
+            }
             break;
         default:
             break;
@@ -773,11 +1416,55 @@ static void buttonHandler_seqButtonPressed(uint8_t seqButtonPressed)
             }
             break;
         case SELECT_MODE_STEP:
-            led_clearAllBlinkLeds();
-            buttonHandler_selectActiveStep(ledNr, seqButtonPressed);
+            /*
+             * Re-press of the selected step toggles the two step pages
+             * (S079 P2 fix 1).
+             *
+             * What: a press on the step that is already selected while the
+             * STEP edit page is showing alternates SEQ subpage 1 and 2; any
+             * other press selects the step and opens subpage 1 as before. Why:
+             * the roll settings must be reachable from the step row without
+             * the scroll gesture. Inputs: the visible step, the selected step,
+             * and the current subpage. Output: menu_toggleStepEditSubpage() or
+             * buttonHandler_selectActiveStep(). Affiliates:
+             * menu_toggleStepEditSubpage(), menu_showStepEditPage().
+             */
+            if (buttonHandler_visibleStep(seqButtonPressed) ==
+                    buttonHandler_selectedStep &&
+                menu_activePage == SEQ_PAGE &&
+                (menu_getSubPage() == 1u || menu_getSubPage() == 2u)) {
+                menu_toggleStepEditSubpage();
+            } else {
+                led_clearAllBlinkLeds();
+                buttonHandler_selectActiveStep(ledNr, seqButtonPressed);
+            }
             break;
         case SELECT_MODE_PERF:
-            menu_perfModeSceneButtonPressed(seqButtonPressed);
+            /*
+             * PERF SEQ press routing (S077 P2 §4.1, §4.2; S080 P2 Defect 9,
+             * Phase G).
+             *
+             * What: while the chain editor is open, a SEQ press selects which
+             * Scene's chain is viewed (no scene change). Otherwise a held
+             * VOICE routes to per-track assignment, unless the looper is
+             * engaged: then SEQ is always a full scene change. Without a held
+             * VOICE the press is a scene-level switch with double-click
+             * detection. Why: during a loop the VOICE buttons choose looped
+             * tracks, so per-track assignment would hijack every scene change
+             * (Defect 9). Inputs: seqButtonPressed, perf_heldVoiceMask,
+             * seq_loopActive, menu_chainMenuIsOpen(). Outputs: chain view
+             * switch, per-track assignment or scene change. Affiliates:
+             * menu_chainMenuView() (Step 11), buttonHandler_perfVoiceHeldSeqPressed(),
+             * buttonHandler_perfScenePressed().
+             */
+            if (menu_chainMenuIsOpen()) {
+                menu_chainMenuView(seqButtonPressed);
+                break;
+            }
+            if (perf_heldVoiceMask != 0u && !seq_loopActive)
+                buttonHandler_perfVoiceHeldSeqPressed(seqButtonPressed);
+            else
+                buttonHandler_perfScenePressed(seqButtonPressed);
             break;
         case SELECT_MODE_FX:
             /*
@@ -837,6 +1524,10 @@ static void buttonHandler_seqButtonReleased(uint8_t seqButtonPressed)
     }
 }
 
+/* Forward declarations for the latched SHIFT+REC menu helpers (S080 E7/P2). */
+static void buttonHandler_shiftRecMenuEnter(void);
+static void buttonHandler_shiftRecMenuExit(void);
+
 static void handleModeButtons(uint8_t mode)
 {
     if (menu_loadInstrumentTransactionBusy()) {
@@ -850,6 +1541,38 @@ static void handleModeButtons(uint8_t mode)
          * second press cannot detach UI context from the in-flight operation.
          */
         return;
+    }
+    /*
+     * S080 P2: a MODE press ends latched PERF surfaces first.
+     *
+     * What: closes the SHIFT+REC settings menu and the chain editor, and, when
+     * the mode is about to leave PERF, releases the looper (tracks resume where
+     * they would have been) and clears the looper hold state. Why: both menus
+     * keep page state that a mode switch would otherwise strand (a later REC
+     * press would "restore" a stale page), and the SELECT/BAR rows change
+     * meaning outside PERF, so their release edges would never reach the
+     * looper. Inputs: bh_shiftRecMenuActive, menu_chainMenuIsOpen(), current
+     * and requested mode. Outputs: menus closed; looper released.
+     * Affiliates: buttonHandler_shiftRecMenuExit(), menu_chainMenuClose(),
+     * buttonHandler_loopForceRelease() (Step 9).
+     */
+    if (bh_shiftRecMenuActive)
+        buttonHandler_shiftRecMenuExit();
+    if (menu_chainMenuIsOpen())
+        menu_chainMenuClose();
+    {
+        /* Same mode arithmetic as below; SHIFT+MODE1 stays in VOICE. */
+        uint8_t next;
+
+        if (buttonHandler_getShift() && mode == SELECT_MODE_VOICE)
+            next = SELECT_MODE_VOICE;
+        else if (buttonHandler_getShift())
+            next = (uint8_t)((mode + 4u) & 0x07u);
+        else
+            next = (uint8_t)(mode & 0x07u);
+        if (bh_state.selectButtonMode == SELECT_MODE_PERF &&
+            next != SELECT_MODE_PERF)
+            buttonHandler_loopForceRelease();
     }
     if (!buttonHandler_getShift() &&
         mode == SELECT_MODE_LOAD_SAVE &&
@@ -904,11 +1627,34 @@ static void handleModeButtons(uint8_t mode)
 
     switch (bh_state.selectButtonMode) {
     case SELECT_MODE_PERF:
+        /* Arm the fill hold timer (S079 §3.3); fill activates after the hold. */
+        bh_fillArmed = 1u;
+        bh_fillPressTick = time_sysTick;
         led_clearSequencerLeds();
         led_clearSelectLeds();
         lastActiveSubPage = menu_getSubPage();
         menu_switchPage(PERFORMANCE_PAGE);
         menu_switchSubPage(0);
+        /*
+         * S080 A2: reset the within-subpage cursor on PERF entry.
+         *
+         * What:      calls menu_resetActiveParameter() after the subpage
+         *            switch so the display opens on cell 0 (mrp) of
+         *            PERFORMANCE_PAGE subpage 0.
+         * Why:       the old single-subpage layout used menu_switchSubPage(0)'s
+         *            same-subpage toggle to jump between the first and second
+         *            four-cell halves, so a fresh PERF entry could land on cell
+         *            4 (4VM) instead of mrp. The S080 A1 split removes that
+         *            second half, and this explicit reset guarantees the cursor
+         *            is zero regardless of the prior page's menuIndex.
+         * Inputs:    none; reads/writes menuIndex internally.
+         * Outputs:   menuIndex parameter bits set to cell 0 of the active
+         *            subpage.
+         * Accessors: handleModeButtons() SELECT_MODE_PERF case (here);
+         *            menu_resetActiveParameter() (menu.c).
+         * Affiliates: PERFORMANCE_PAGE table (menuPages.h A1).
+         */
+        menu_resetActiveParameter();
         menu_repaintAll();
         break;
 
@@ -952,6 +1698,54 @@ static void handleSelectButton(uint8_t selectNr)
     if (buttonHandler_getShift()) {
         switch (bh_state.selectButtonMode) {
         case SELECT_MODE_STEP:
+            /*
+             * SHIFT+SELECT in STEP mode: set the active track's pattern
+             * length to the end of the bar represented by this SELECT button.
+             *
+             * What:       the active track's track_length is set to
+             *             (selectNr + 1) * NUM_STEPS_PER_BAR, so SELECT 1
+             *             gives 16 steps (one bar), SELECT 8 gives 128 steps
+             *             (eight bars). The viewed bar clamps downward if it
+             *             would exceed the new length, and the STEP/SELECT LEDs
+             *             and the menu parameter display repaint.
+             * Why:        provides a fast physical gesture for setting the
+             *             per-track loop length from the front panel, matching
+             *             the natural SELECT=bar mapping in STEP mode.
+             * Inputs:     selectNr 0..7 from handleSelectButton(); the active
+             *             Scene is menu_getViewedPattern(); the active track is
+             *             menu_getActiveVoice().
+             * Outputs:    pat_setTrackLength() commits the value and marks the
+             *             Scene dirty (AutoSave). PAR_TRACK_LENGTH is refreshed
+             *             by pat_applyTrackSettingsToMenu(). If the viewed bar
+             *             was beyond the new length, buttonHandler_selectBar()
+             *             clamps it, updating menu_currentBar, selectedStep, and
+             *             repainting STEP/SELECT LEDs. menu_repaintAll()
+             *             redraws the current LCD page.
+             * Accessors:  menu_getViewedPattern(), menu_getActiveVoice(),
+             *             menu_currentBar, menu_repaintAll().
+             * Affiliates: pat_setTrackLength() (PatternData.c:1106),
+             *             pat_applyTrackSettingsToMenu() (PatternData.c:1093),
+             *             buttonHandler_selectBar() (buttonHandler.c:398),
+             *             seq_advanceTrackStep() reads track_length at
+             *             playback (sequencer.c:908).
+             */
+        {
+            uint8_t newLen = (uint8_t)((selectNr + 1u) * NUM_STEPS_PER_BAR);
+            uint8_t scene  = menu_getViewedPattern();
+            uint8_t track  = menu_getActiveVoice();
+
+            pat_setTrackLength(scene, track, newLen);
+
+            /* Snap the viewed bar back into range when the new length is
+             * shorter than the bar the user was viewing. */
+            if (menu_currentBar >= (uint8_t)(selectNr + 1u))
+                buttonHandler_selectBar(selectNr);
+
+            pat_applyTrackSettingsToMenu(scene, track);
+            menu_repaintAll();
+        }
+            break;
+
         case SELECT_MODE_VOICE:
             buttonHandler_selectBar(selectNr);
             break;
@@ -1015,22 +1809,50 @@ static void handleSelectButton(uint8_t selectNr)
         break; }
 
     case SELECT_MODE_PERF:
+    {
         /*
-         * Single-pattern bridge re-align gesture.
+         * S080 C4 / P2: SELECT buttons are the PERF performance looper.
          *
-         * PERF SELECT1 is the only active pattern button while NUM_PATTERN is
-         * one. Pressing it again does not queue a pattern; it asks Sequencer to
-         * re-derive every track counter from the master step clock, track
-         * length, rotation, and scale. Other SELECT buttons stay inactive until
-         * the later Scene/pattern-selection trigger design replaces this.
+         * What:       SELECT1..8 select the loop division (0 = 1 bar ..
+         *             7 = 1/128). The first press engages the loop: on the
+         *             held VOICE tracks (VOICE then SELECT) or on all seven
+         *             tracks, filtered by the loopable flags. Later presses
+         *             only change the division (last pressed wins) - loop
+         *             starts never move (Defect 7). While the transport is
+         *             stopped the press only lights its LED (D17).
+         * Why:        SELECT is otherwise unused in PERF.
+         * Inputs:     selectNr 0..7, perf_heldVoiceMask, seq_loopActive.
+         * Outputs:    seq_loopEngage()/seq_loopUpdateDivision(); the pressed
+         *             SELECT LED lit; REC forced off; BAR LEDs off.
+         * Accessors:  handleSelectButton() PERF case (here); the release half
+         *             is buttonHandler_partButtonReleased().
+         * Affiliates: seq_loopEngage(), buttonHandler_loopCheckDisengage().
          */
-        if (selectNr == 0u &&
-            seq_activePattern == 0u &&
-            menu_getViewedPattern() == 0u) {
-            seq_realignActivePatternToMasterClock();
-            led_flashGroup(LED_FLASH_GROUP_SELECT, 0x0001u);
+        uint8_t division = selectNr;
+
+        bh_loopSelectHeldMask |= (uint8_t)(1u << selectNr);
+        bh_loopLastSelectButton = selectNr;
+        if (!seq_loopActive) {
+            uint8_t trackMask = (perf_heldVoiceMask != 0u)
+                ? perf_heldVoiceMask : 0x7Fu;
+
+            bh_loopBarModifier = 0u;
+            bh_loopTrackMask = seq_loopEngage(trackMask, division,
+                                              bh_loopBarModifier);
+        } else {
+            seq_loopUpdateDivision(division, bh_loopBarModifier);
         }
+        /* Looping and recording are mutually exclusive (S080 §3, C7). */
+        if (seq_loopActive && bh_state.seqRecording) {
+            bh_state.seqRecording = 0u;
+            led_setValue(0u, LED_REC);
+        }
+        led_setActiveSelectButton(selectNr);
+        /* S080 §3.3: both BAR LEDs are forced off while the looper runs. */
+        led_setValue(0u, LED_BAR1);
+        led_setValue(0u, LED_BAR2);
         break;
+    }
 
     case SELECT_MODE_LOAD_SAVE:
         /* _SEQUENCER_ADD_SPIKE_: AVR parity for load/save page select LED. */
@@ -1049,12 +1871,98 @@ static void buttonHandler_partButtonPressed(uint8_t partNr)
 
 static void buttonHandler_partButtonReleased(uint8_t partNr)
 {
-    (void)partNr;
+    /*
+     * S080 C6 / P2 Defect 8: PERF looper SELECT release.
+     *
+     * What:      clears this SELECT's hold bit. If other SELECTs remain, the
+     *            division moves to the highest remaining one when the
+     *            released button owned it. When the last SELECT is released
+     *            the loop ends only if no looped VOICE and no BAR is held;
+     *            otherwise it keeps running and the SELECT row keeps showing
+     *            its division.
+     * Why:       the loop is sustained by SELECT, looped VOICE or BAR holds
+     *            (Defect 8). SHIFT+SELECT never sets a hold bit, so its
+     *            release skips this block.
+     * Inputs:    partNr 0..7, bh_loopSelectHeldMask.
+     * Outputs:   seq_loopUpdateDivision(), possibly seq_loopDisengage(),
+     *            SELECT LED.
+     * Accessors: processRelease() SELECT routing.
+     * Affiliates: buttonHandler_loopCheckDisengage(), menu_syncPerfSelectLed().
+     */
+    if (bh_state.selectButtonMode == SELECT_MODE_PERF &&
+        (bh_loopSelectHeldMask & (uint8_t)(1u << partNr)) != 0u) {
+        uint8_t bit = (uint8_t)(1u << partNr);
+
+        bh_loopSelectHeldMask = (uint8_t)(bh_loopSelectHeldMask & ~bit);
+        if (bh_loopSelectHeldMask != 0u) {
+            if (partNr == bh_loopLastSelectButton) {
+                uint8_t i;
+
+                for (i = 8u; i > 0u; i--) {
+                    if ((bh_loopSelectHeldMask &
+                         (uint8_t)(1u << (i - 1u))) != 0u) {
+                        bh_loopLastSelectButton = (uint8_t)(i - 1u);
+                        break;
+                    }
+                }
+            }
+            if (seq_loopActive)
+                seq_loopUpdateDivision(bh_loopLastSelectButton,
+                                       bh_loopBarModifier);
+            led_setActiveSelectButton(bh_loopLastSelectButton);
+        } else {
+            buttonHandler_loopCheckDisengage();
+            if (seq_loopActive)
+                led_setActiveSelectButton(bh_loopLastSelectButton);
+        }
+    }
 
     if (buttonHandler_TimerActionOccured())
         return;
 
     buttonHandler_buttonTimerStepNr = NO_STEP_SELECTED;
+}
+
+/*
+ * SHIFT+REC settings menu entry/exit (S080 E7).
+ *
+ * What: buttonHandler_shiftRecMenuEnter() saves the current page and sub-page,
+ * switches to the repurposed RECORDING_PAGE on sub-page 0 with the cursor at
+ * cell 0, arms bh_shiftRecMenuActive, lights both SHIFT and REC LEDs, and
+ * repaints. buttonHandler_shiftRecMenuExit() clears the flag, restores the
+ * saved page/sub-page, returns the REC LED to the record state (and SHIFT to
+ * its held state), and repaints. Why: the SHIFT+REC overlay must not disturb
+ * normal SHIFT (Morph view / pattern settings) or REC (record toggle)
+ * behaviour, so state is saved and restored. Inputs: current Menu page/sub-page
+ * and the record/shift state. Outputs: page switch + LED state.
+ * Accessors: processPress() BUT_REC (entry/exit) and BUT_SHIFT (exit; S080 P2
+ * Defect 3: the menu latches open and SHIFT release never exits),
+ * handleModeButtons() (exit before a mode switch). Affiliates:
+ * menu_switchPage(), menu_switchSubPage(), menuPages.h RECORDING_PAGE (E3).
+ */
+static void buttonHandler_shiftRecMenuEnter(void)
+{
+    bh_shiftRecSavedPage = menu_getActivePage();
+    bh_shiftRecSavedSubPg = menu_getSubPage();
+    menu_switchPage(RECORDING_PAGE);
+    menu_switchSubPage(0u);
+    menu_resetActiveParameter();
+    bh_shiftRecMenuActive = 1u;
+    led_setValue(1u, LED_SHIFT);
+    led_setValue(1u, LED_REC);
+    menu_repaintAll();
+}
+
+static void buttonHandler_shiftRecMenuExit(void)
+{
+    bh_shiftRecMenuActive = 0u;
+    menu_switchPage(bh_shiftRecSavedPage);
+    menu_switchSubPage(bh_shiftRecSavedSubPg);
+    menu_resetActiveParameter();
+    /* REC returns to its record state; SHIFT reflects whether it is held. */
+    led_setValue((uint8_t)(bh_state.seqRecording ? 1u : 0u), LED_REC);
+    led_setValue(buttonHandler_getShift(), LED_SHIFT);
+    menu_repaintAll();
 }
 
 static void handleVoiceButton(uint8_t voiceNr)
@@ -1128,6 +2036,69 @@ static void handleVoiceButton(uint8_t voiceNr)
     wasSelectedVoice = (uint8_t)(voiceNr == menu_getActiveVoice());
     shouldPreviewVoice = (uint8_t)(wasSelectedVoice && !seq_isRunning());
 
+    /*
+     * PERF VOICE button press: per-track hold arm (S077 P2 §4.1, Q8).
+     *
+     * What: sets this VOICE's bit in perf_heldVoiceMask and clears any pending
+     * double-click window. While any VOICE bit is set, SEQ presses become
+     * per-track assignments instead of Scene switches, and the mute toggle is
+     * deferred to release. Why: this replaces the old cumulative unmute
+     * (tracks 0..N, SHIFT+VOICE) and the immediate press-time single-track mute
+     * so one feature owns the PERF VOICE gesture: a press arms the hold, a SEQ
+     * press during the hold assigns playback, and a plain release toggles this
+     * track's mute. Inputs: voiceNr 0..6. Output: perf_heldVoiceMask updated.
+     * Affiliates: buttonHandler_perfVoiceReleased(),
+     * buttonHandler_perfVoiceHeldSeqPressed().
+     */
+    if (bh_state.selectButtonMode == SELECT_MODE_PERF) {
+        /*
+         * S080 D1 / P2 Defect 7: VOICE pressed while a looper SELECT is held.
+         *
+         * What:      the loop moves to the set of currently held VOICE tracks
+         *            (including this one): tracks leaving it resume where
+         *            they would have been, tracks already looping keep their
+         *            loop starts, new tracks get a fresh loop start at this
+         *            press. Why: real-time track swapping without disturbing
+         *            the tracks that stay (Defect 7). Inputs: voiceNr,
+         *            seq_loopActive, bh_loopSelectHeldMask, perf_heldVoiceMask.
+         *            Outputs: seq_loopUpdateMask(); the press never toggles a
+         *            mute. Affiliates: buttonHandler_perfVoiceReleased().
+         */
+        if (seq_loopActive && bh_loopSelectHeldMask != 0u) {
+            perf_heldVoiceMask |= (uint8_t)(1u << voiceNr);
+            bh_loopTrackMask = seq_loopUpdateMask(perf_heldVoiceMask);
+            perf_voiceActionOccurred = 1u;
+            dblclick_cancel();
+            return;
+        }
+        /*
+         * S080 E12: BAR overlay trigger dispatch.
+         *
+         * What:      while a BAR overlay is active and SHIFT is not held, a
+         *            VOICE down-press fires the overlay's configured trigger
+         *            for that track instead of arming a mute toggle. Why: the
+         *            overlay converts the VOICE row into a performance trigger
+         *            row. SHIFT+VOICE falls through to the normal PERF
+         *            behaviour (mute toggle on release). Inputs:
+         *            bh_overlayActive, buttonHandler_getShift(), voiceNr.
+         *            Outputs: buttonHandler_overlayTrigger(); the release half
+         *            is handled in processRelease(). Affiliates:
+         *            bh_overlayActive (E8), the overlay params (E1).
+         */
+        if (bh_overlayActive != 0u && !buttonHandler_getShift()) {
+            buttonHandler_overlayTrigger(voiceNr);
+            return;
+        }
+        perf_heldVoiceMask |= (uint8_t)(1u << voiceNr);
+        dblclick_cancel();
+        /*
+         * Transient per-track Scene indication during the hold (S077 P2 §5.4):
+         * blink the SEQ LED of the Scene each held track is playing from.
+         */
+        buttonHandler_perfRefreshHeldSceneLeds();
+        return;
+    }
+
     {
         uint8_t muteModeActive = buttonHandler_getShift();
         if (bh_state.selectButtonMode == SELECT_MODE_PERF ||
@@ -1187,26 +2158,6 @@ static void handleVoiceButton(uint8_t voiceNr)
             return;
         }
 
-        if (bh_state.selectButtonMode == SELECT_MODE_PERF) {
-            /*
-             * PERF voice buttons clear mutes up to the selected voice and then
-             * repaint mute LEDs. The actual audible mute state belongs to
-             * Sequencer, while buttonHandler_mutedVoices is the front-panel
-             * shadow used to draw the current mute view.
-             */
-            uint8_t i;
-            for (i = 0; i <= voiceNr; i++) {
-                if (buttonHandler_mutedVoices & (1u << i)) {
-                    seq_setMute(i, 0);
-                    buttonHandler_mutedVoices &= (uint8_t)~(1u << i);
-                }
-            }
-            buttonHandler_showMuteLEDs();
-            if (shouldPreviewVoice)
-                seq_previewVoice(voiceNr);
-            return;
-        }
-
         if (bh_state.selectButtonMode == SELECT_MODE_FX) {
             /*
              * SHIFT+TRACK selects the active track without leaving FX mode and
@@ -1230,6 +2181,27 @@ static void handleVoiceButton(uint8_t voiceNr)
         if (bh_state.selectButtonMode == SELECT_MODE_VOICE) {
             menu_switchPage(voiceNr);
             led_setActiveSelectButton(menu_getSubPage());
+            /*
+             * View-follows-track when PAR_FOLLOW is on (S077 P2 §6.1).
+             *
+             * What: if PAR_FOLLOW is on and the selected track plays from a
+             * Scene other than the viewed one, switch the viewed Scene to that
+             * track's played Scene. Why: VOICE/STEP views should present the
+             * settings of the track that is actually sounding so the user edits
+             * the right instrument. Inputs: parameter_values[PAR_FOLLOW],
+             * seq_perTrackActive, seq_getTrackPlayedScene(voiceNr). Output:
+             * menu_setShownPattern() moves the viewed Scene. Guard: only when a
+             * per-track override exists, so there is no overhead otherwise.
+             * Note: the retained Scene write target still follows the active
+             * Scene (bank edit mask); this phase moves the view only.
+             * Affiliates: menu_setShownPattern(), menu_getViewedPattern().
+             */
+            if (parameter_values[PAR_FOLLOW] && seq_perTrackActive) {
+                uint8_t played = seq_getTrackPlayedScene(voiceNr);
+
+                if (played != menu_getViewedPattern())
+                    menu_setShownPattern(played);
+            }
         }
 
         /*
@@ -1243,6 +2215,24 @@ static void handleVoiceButton(uint8_t voiceNr)
 
         if (bh_state.selectButtonMode == SELECT_MODE_STEP ||
             menu_activePage == SEQ_PAGE) {
+            /*
+             * Held steps + TRACK = STEP track automation overlay (S078 P2 §B).
+             *
+             * What: while one or more SEQ steps are physically held, a TRACK
+             * (VOICE) press opens the held-step track automation overlay for
+             * the pressed track instead of the ordinary track-settings page
+             * switch. Why: the overlay edits automatable track timing
+             * parameters (length, scale, shuffle) as per-step automation on
+             * the held steps, so the TRACK press must not also reset the
+             * front-page half or repaint the plain settings view. Inputs:
+             * physical held-step mask. Output: Menu overlay entry; this press
+             * returns before the ordinary half-toggle/page-switch path.
+             * Affiliates: menu_enterStepTrackAutomationOverlay().
+             */
+            if (buttonHandler_seqHeldMask() != 0u) {
+                menu_enterStepTrackAutomationOverlay(voiceNr);
+                return;
+            }
             led_clearAllBlinkLeds();
             /*
              * STEP-mode VOICE presses own the track-settings front-page half.
@@ -1276,6 +2266,22 @@ static void handleVoiceButton(uint8_t voiceNr)
 /* Process one press event */
 static void processPress(uint8_t buttonNr)
 {
+    /*
+     * Double-click detection and PERF VOICE gesture bookkeeping (S077 P2 §3.8,
+     * §3.9).
+     *
+     * Every press is offered to the general-purpose double-click detector; a
+     * non-SEQ press cancels any pending SEQ window. While a PERF VOICE hold is
+     * active, a button that is neither a VOICE nor a SEQ button cancels the mute
+     * gesture by marking the hold as action-occurred.
+     */
+    (void)dblclick_onPress(buttonNr);
+    if (btn_to_seq(buttonNr) < 0)
+        dblclick_cancel();
+    if (perf_heldVoiceMask != 0u &&
+        btn_to_voice(buttonNr) < 0 && btn_to_seq(buttonNr) < 0)
+        perf_voiceActionOccurred = 1u;
+
     /*
      * Held-COPY owns its complete button gesture before ordinary row routing.
      * Inputs: one foreground event. Output: nonzero consumption prevents a
@@ -1354,13 +2360,41 @@ static void processPress(uint8_t buttonNr)
          * The old parser command is gone because this is now a direct same-CPU
          * call with no serialization boundary.
          */
+        /*
+         * S080 G8: SHIFT+PLAY in PERF arms the chain-editor chord and is
+         * consumed - it never toggles the transport. Outside PERF, SHIFT+PLAY
+         * keeps its old meaning.
+         */
+        if (bh_state.selectButtonMode == SELECT_MODE_PERF &&
+            buttonHandler_getShift()) {
+            bh_chainPlayArmed = 1u;
+            break;
+        }
         buttonHandler_setRunStopState((uint8_t)(1u - bh_state.seqRunning));
         seq_setRunning((uint8_t)bh_state.seqRunning);
         break;
 
     case BUT_REC:
+        if (bh_shiftRecMenuActive) {
+            /* S080 E7: REC exits the SHIFT+REC settings menu. */
+            buttonHandler_shiftRecMenuExit();
+            break;
+        }
         if (buttonHandler_getShift()) {
-            menu_switchPage(RECORDING_PAGE);
+            /* S080 E7: SHIFT+REC opens the settings menu (overlay + quant). */
+            buttonHandler_shiftRecMenuEnter();
+        } else if (seq_loopActive) {
+            /*
+             * S080 C7: REC is consumed while the looper is engaged.
+             *
+             * What:      ignore the record toggle and leave the REC state
+             *            unchanged. Why: looping and recording are mutually
+             *            exclusive (S080 §3 resolved #2); engaging the looper
+             *            already forced recording off, so the user cannot
+             *            re-enable it mid-loop. Inputs: seq_loopActive.
+             * Outputs: none (early out). Affiliates: seq_loopEngage() (C2).
+             */
+            break;
         } else {
             /*
              * Recording mode is Sequencer playback/edit state. The REC LED is
@@ -1416,6 +2450,24 @@ static void processPress(uint8_t buttonNr)
             (void)menuEffects_hookBar(0u, buttonHandler_getShift(), 1u);
             break;
         }
+        if (bh_state.selectButtonMode == SELECT_MODE_PERF) {
+            /*
+             * S080 E9 / P2 Defect 8: BAR1 hold is tracked in event order (it
+             * can sustain the loop) and, while the loop is engaged, is the
+             * momentary triplet modifier (x2/3). Loop starts never move.
+             */
+            bh_loopBarHeld |= 0x01u;
+            if (seq_loopActive) {
+                bh_loopBarModifier = 2u;            /* triplet */
+                seq_loopUpdateDivision(bh_loopLastSelectButton,
+                                       bh_loopBarModifier);
+                break;
+            }
+            bh_overlayActive = (bh_overlayActive == 1u) ? 0u : 1u;
+            led_setValue((uint8_t)(bh_overlayActive == 1u), LED_BAR1);
+            led_setValue((uint8_t)(bh_overlayActive == 2u), LED_BAR2);
+            break;
+        }
         if (menu_currentBar > 0u)
             buttonHandler_selectBar((uint8_t)(menu_currentBar - 1u));
         else
@@ -1435,6 +2487,22 @@ static void processPress(uint8_t buttonNr)
             (void)menuEffects_hookBar(1u, buttonHandler_getShift(), 1u);
             break;
         }
+        if (bh_state.selectButtonMode == SELECT_MODE_PERF) {
+            /* S080 E9 / P2 Defect 8: BAR2 is tracked in event order and is the
+             * dot modifier during a loop, else the right trigger-overlay
+             * toggle (see BAR1 above). */
+            bh_loopBarHeld |= 0x02u;
+            if (seq_loopActive) {
+                bh_loopBarModifier = 1u;            /* dot */
+                seq_loopUpdateDivision(bh_loopLastSelectButton,
+                                       bh_loopBarModifier);
+                break;
+            }
+            bh_overlayActive = (bh_overlayActive == 2u) ? 0u : 2u;
+            led_setValue((uint8_t)(bh_overlayActive == 1u), LED_BAR1);
+            led_setValue((uint8_t)(bh_overlayActive == 2u), LED_BAR2);
+            break;
+        }
         if (menu_currentBar < (NUM_BARS - 1u))
             buttonHandler_selectBar((uint8_t)(menu_currentBar + 1u));
         else
@@ -1443,6 +2511,26 @@ static void processPress(uint8_t buttonNr)
         break;
 
     case BUT_SHIFT:
+        /*
+         * S080 P2 Defect 3 / Phase G: SHIFT closes a latched menu.
+         *
+         * What: if the SHIFT+REC settings menu or the chain editor is open,
+         * this press closes it (restoring the previous page) and is
+         * consumed; its paired release is swallowed through
+         * bh_shiftReleaseConsume. Why: both menus latch open on entry and
+         * close on the next SHIFT press (plan §2.6, §4.1). Inputs:
+         * bh_shiftRecMenuActive, menu_chainMenuIsOpen(). Outputs: menu closed,
+         * release-consume armed. Affiliates: buttonHandler_shiftRecMenuExit(),
+         * menu_chainMenuClose() (Step 11), processRelease() BUT_SHIFT.
+         */
+        if (bh_shiftRecMenuActive || menu_chainMenuIsOpen()) {
+            if (bh_shiftRecMenuActive)
+                buttonHandler_shiftRecMenuExit();
+            else
+                menu_chainMenuClose();
+            bh_shiftReleaseConsume = 1u;
+            return;
+        }
         /* _SEQUENCER_ADD_SPIKE_: restore SHIFT-press mode behavior parity with AVR. */
         led_setValue(1, LED_SHIFT);
         switch (bh_state.selectButtonMode) {
@@ -1500,6 +2588,12 @@ static void processPress(uint8_t buttonNr)
             break;
 
         case SELECT_MODE_STEP:
+            /*
+             * S078 §5.6: hold SHIFT on the STEP page to show and edit the
+             * per-track length/scale/shuffle Morph endpoints, mirroring the
+             * VOICE SHIFT Morph view. Release returns to Normal values.
+             */
+            menu_setPatternTrackMorphEndpoint(1u);
             buttonHandler_leaveSeqModeStepMode();
             break;
 
@@ -1547,6 +2641,24 @@ static void processRelease(uint8_t buttonNr)
                     menu_fxVoiceMixOverlayEnd();
                 return;
             }
+            /*
+             * PERF VOICE release: single-track mute toggle (S077 P2 §4.1, Q8,
+             * Q12). The toggle fires only when the hold had no per-track
+             * assignment and no unrelated button press; each VOICE's mute
+             * fires on its own release independently.
+             */
+            /* S080 E12: an overlay-trigger VOICE release stops the repeat and
+             * sends note-off instead of toggling mute. */
+            if (bh_state.selectButtonMode == SELECT_MODE_PERF &&
+                (bh_overlayVoiceMask & bit) != 0u) {
+                buttonHandler_overlayRelease((uint8_t)voice);
+                return;
+            }
+            if (bh_state.selectButtonMode == SELECT_MODE_PERF &&
+                (perf_heldVoiceMask & bit) != 0u) {
+                buttonHandler_perfVoiceReleased((uint8_t)voice);
+                return;
+            }
         }
     }
     if (copyClear_buttonReleased(buttonNr))
@@ -1585,6 +2697,11 @@ static void processRelease(uint8_t buttonNr)
     }
 
     switch (buttonNr) {
+    case BUT_START_STOP:
+        /* S080 G8: releasing PLAY ends the SHIFT+PLAY chord. */
+        bh_chainPlayArmed = 0u;
+        break;
+
     case BUT_MODE1:
         if (bh_state.selectButtonMode == SELECT_MODE_VOICE) {
             /*
@@ -1608,19 +2725,91 @@ static void processRelease(uint8_t buttonNr)
             led_setActiveVoice(menu_getActiveVoice());
             led_setActiveSelectButton(menu_getSubPage());
             if (buttonHandler_morphVoiceModeActive)
-                led_setBlinkLed(LED_MODE1, 1u);
+               led_setBlinkLed(LED_MODE1, 1u);
         }
         break;
 
+    case BUT_MODE2:
+        /*
+         * PERF release ends fill mode (S079 §3.3).
+         *
+         * Output: the fill hold is disarmed and seq_fillActive cleared, so
+         * fil/!fl conditions revert immediately. The PERF mode/page stays as
+         * the press-side handler already switched it.
+         */
+        bh_fillArmed = 0u;
+        bh_fillPressTick = 0u;
+        seq_fillActive = 0u;
+        break;
+
     case BUT_BAR1:
+        if (bh_state.selectButtonMode == SELECT_MODE_PERF) {
+            /*
+             * S080 E8/E9, P2 Defect 8: BAR1 release in PERF.
+             *
+             * What: clears the BAR1 hold. While looping, the modifier falls
+             * back to the other BAR (dot) or none, the BAR1 LED goes dark,
+             * and the loop ends if nothing sustains it any more. Otherwise
+             * the BAR LED shows the overlay toggle. Why: BAR holds sustain
+             * the loop (Defect 8); P1 left the BAR LED lit after a modifier
+             * release. Inputs: bh_loopBarHeld, seq_loopActive. Outputs:
+             * seq_loopUpdateDivision(), LED, possibly seq_loopDisengage().
+             * Affiliates: buttonHandler_loopCheckDisengage().
+             */
+            bh_loopBarHeld &= (uint8_t)~0x01u;
+            if (seq_loopActive) {
+                bh_loopBarModifier = (bh_loopBarHeld & 0x02u) ? 1u : 0u;
+                seq_loopUpdateDivision(bh_loopLastSelectButton,
+                                       bh_loopBarModifier);
+                led_setValue(0u, LED_BAR1);
+                buttonHandler_loopCheckDisengage();
+                break;
+            }
+            led_setValue((uint8_t)(bh_overlayActive == 1u), LED_BAR1);
+            break;
+        }
         led_setValue(0, LED_BAR1);
         break;
 
     case BUT_BAR2:
+        if (bh_state.selectButtonMode == SELECT_MODE_PERF) {
+            /* S080 P2 Defect 8: BAR2 release, mirror of BAR1 above. */
+            bh_loopBarHeld &= (uint8_t)~0x02u;
+            if (seq_loopActive) {
+                bh_loopBarModifier = (bh_loopBarHeld & 0x01u) ? 2u : 0u;
+                seq_loopUpdateDivision(bh_loopLastSelectButton,
+                                       bh_loopBarModifier);
+                led_setValue(0u, LED_BAR2);
+                buttonHandler_loopCheckDisengage();
+                break;
+            }
+            led_setValue((uint8_t)(bh_overlayActive == 2u), LED_BAR2);
+            break;
+        }
         led_setValue(0, LED_BAR2);
         break;
 
     case BUT_SHIFT:
+        /*
+         * S080 P2 Defect 3 / Phase G: latched-menu SHIFT release.
+         *
+         * What: (1) the release paired with a closing SHIFT press is consumed
+         * and only turns the SHIFT LED off; (2) while SHIFT+REC or the chain
+         * editor is open, every SHIFT release is ignored, so the menu stays
+         * open and the SHIFT LED stays lit. Why: the old code exited SHIFT+REC
+         * on the entry gesture's own release (Defect 3), and the PERF branch
+         * below re-enters PERFORMANCE_PAGE, which snapped the chain editor
+         * back to PERF. Inputs: bh_shiftReleaseConsume, bh_shiftRecMenuActive,
+         * menu_chainMenuIsOpen(). Outputs: SHIFT LED; no page change.
+         * Affiliates: processPress() BUT_SHIFT (5.2).
+         */
+        if (bh_shiftReleaseConsume) {
+            bh_shiftReleaseConsume = 0u;
+            led_setValue(0u, LED_SHIFT);
+            break;
+        }
+        if (bh_shiftRecMenuActive || menu_chainMenuIsOpen())
+            break;
         /* _SEQUENCER_ADD_SPIKE_: restore shift-release unwind flow from AVR. */
         if (bh_state.seqErasing) {
             bh_state.seqErasing = 0;
@@ -1644,10 +2833,36 @@ static void processRelease(uint8_t buttonNr)
             break;
 
         case SELECT_MODE_PERF:
+            /*
+             * Return to the PERF page after a SHIFT gesture.
+             *
+             * What: clears stale blinks and re-enters PERFORMANCE_PAGE; the
+             * page switch repaints the SEQ Scene row and the SELECT row from
+             * looper state. Why: the old led_clearSelectLeds() +
+             * led_initPerformanceLeds() pair wiped the looper's division LED
+             * whenever SHIFT was released during a loop (S080 P2 Defect 4).
+             * Affiliates: menu_switchPage() PERF LED block,
+             * menu_syncPerfSelectLed().
+             */
             led_clearAllBlinkLeds();
-            led_clearSelectLeds();
             menu_switchPage(PERFORMANCE_PAGE);
-            led_initPerformanceLeds();
+            /*
+             * S080 A2 (SHIFT release): keep the PERF cursor on cell 0.
+             *
+             * What:      after returning to PERFORMANCE_PAGE on SHIFT
+             *            release, re-zero the within-subpage cursor.
+             * Why:       the SHIFT Morph view leaves menuIndex wherever the
+             *            user was; the S080 layout expects entry at cell 0
+             *            (mrp) on subpage 0. menu_switchPage() runs its own
+             *            reset, but the subpage bits can still be stale from
+             *            the previous context, so this repeats the guarded
+             *            reset for the PERF case.
+             * Inputs:    none.
+             * Outputs:   menuIndex parameter bits zeroed for subpage 0.
+             * Accessors: processRelease() BUT_SHIFT / SELECT_MODE_PERF (here).
+             * Affiliates: menu_resetActiveParameter() (menu.c).
+             */
+            menu_resetActiveParameter();
             return;
 
         case SELECT_MODE_FX:
@@ -1663,6 +2878,8 @@ static void processRelease(uint8_t buttonNr)
             return;
 
         case SELECT_MODE_STEP:
+            /* S078 §5.6: leaving the STEP SHIFT view returns to Normal cells. */
+            menu_setPatternTrackMorphEndpoint(0u);
             buttonHandler_enterSeqModeStepMode();
             break;
 
@@ -1717,7 +2934,36 @@ void buttonHandler_processEvents(void)
         /* S075 F2-F: a lost TRACK release must not strand the overlay. */
         buttonHandler_fxVoiceMixTrackMask = 0u;
         menu_fxVoiceMixOverlayEnd();
+        /*
+         * S077 P2: a dropped VOICE release must not strand the PERF per-track
+         * hold or its action flag, and a lost SEQ edge must not leave a stale
+         * double-click window armed.
+         */
+        perf_heldVoiceMask = 0u;
+        perf_voiceActionOccurred = 0u;
+        dblclick_cancel();
         buttonHandler_buttonTimerStepNr = NO_STEP_SELECTED;
+        /*
+         * S080 C8 / P2: a lost release must not strand the looper or a latch.
+         *
+         * What: releases the looper (tracks resume where they would have
+         * been), clears every looper hold bit, drops the BAR overlay, and
+         * closes the SHIFT+REC menu and the chain editor, disarming the
+         * SHIFT+PLAY chord and the SHIFT release-consume. Why: a ring overflow
+         * can drop the release edge, which would otherwise leave the looper
+         * engaged with no held button or a menu latched with no exit edge.
+         * Inputs: event overflow detected. Outputs: looper/overlay/latch
+         * state cleared. Affiliates: buttonHandler_loopForceRelease(),
+         * menu_chainMenuClose(), buttonHandler_shiftRecMenuExit().
+         */
+        buttonHandler_loopForceRelease();
+        bh_overlayActive = 0u;
+        if (bh_shiftRecMenuActive)
+            buttonHandler_shiftRecMenuExit();
+        if (menu_chainMenuIsOpen())
+            menu_chainMenuClose();
+        bh_shiftReleaseConsume = 0u;
+        bh_chainPlayArmed = 0u;
 #if DEV_MODE_LOGGING
         {
             uint8_t depth = (uint8_t)(evt_producer - evt_consumer);

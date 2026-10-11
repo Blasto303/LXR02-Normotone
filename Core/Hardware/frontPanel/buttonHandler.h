@@ -113,6 +113,13 @@ int8_t  buttonHandler_getArmedAutomationStep(void);
 void    buttonHandler_setRunStopState(uint8_t running);
 void    buttonHandler_showMuteLEDs(void);
 void    buttonHandler_muteVoice(uint8_t voice, uint8_t isMuted);
+/* S080 P2 Defect 11: clear the VOICE mute mirror after a bulk unmute. */
+void    buttonHandler_clearAllMutes(void);
+/*
+ * S080 P2 Defect 4: SELECT index (0..7) of the PERF looper division while the
+ * looper is held or engaged, else 0xFF. Client: menu_syncPerfSelectLed().
+ */
+uint8_t buttonHandler_loopSelectLed(void);
 
 extern uint8_t  buttonHandler_selectedStep;
 extern uint16_t buttonHandler_originalParameter;

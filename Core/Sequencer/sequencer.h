@@ -39,6 +39,86 @@ extern uint8_t seq_recordActive;
 extern uint8_t seq_eraseActive;
 
 /*
+ * Fill-mode flag, written by buttonHandler PERF hold logic (S079 §3.3).
+ *
+ * What: nonzero while fill mode is active, i.e. while the PERF button has been
+ * held past DOUBLE_CLICK_TIMEOUT. Why: the condition evaluator reads this for
+ * the fil/!fl conditions. Written by the foreground button handler, read by
+ * the TIM3 ISR; a single-byte store/load is atomic on Cortex-M7. Affiliates:
+ * seq_evaluateStepCondition(), buttonHandler.c PERF hold.
+ */
+extern uint8_t seq_fillActive;
+
+/*
+ * Loop-active flag (S080 B2/C1, P2).
+ *
+ * What: single-byte ISR gate, 1 while the PERF looper is engaged: a looper
+ * SELECT, the VOICE of a looped track, or a BAR button is held (S080 P2
+ * Defect 8). It may be 1 with no looped tracks (all looped VOICEs released
+ * while SELECT is held). Written by the sequencer looper API under PRIMASK;
+ * read by the TIM3 ISR in seq_evaluateStepCondition() (lop/!lp), the scene
+ * chain conditions (lox/lob/!lx/!lb) and the loop wrap. Single-byte reads are
+ * atomic on Cortex-M7, like seq_fillActive. Inputs: seq_loopEngage()/
+ * seq_loopDisengage()/transport stop. Affiliates: buttonHandler looper,
+ * seq_fillActive.
+ */
+extern uint8_t seq_loopActive;
+
+/*
+ * Looper control API (S080 C1, rewritten S080 P2 Defects 7/8/14).
+ *
+ * What: seq_loopEngage() starts a loop on trackMask (filtered by the loopable
+ * flags), anchoring each track's loop start on the master clock, and returns
+ * the mask actually looping (0 and no engage while the transport is stopped).
+ * seq_loopUpdateMask() changes the looped set while engaged: added tracks get
+ * a fresh anchor, kept tracks keep theirs, dropped tracks resume where they
+ * would have been; it returns the new mask. seq_loopDisengage() ends the loop
+ * and resumes every looped track. seq_loopUpdateDivision() changes the loop
+ * length without moving any loop start. seq_loopableTrackMask() reports the
+ * tracks whose played Scene allows looping (Defect 8a). Why: the foreground
+ * owns gestures and the TIM3 ISR owns step timing; all shared state is
+ * published under PRIMASK. Inputs: 7-bit masks, division 0..7 (1 bar..1/128),
+ * modifier 0 none / 1 dot / 2 triplet. Callers: buttonHandler.c PERF
+ * SELECT/VOICE/BAR handlers.
+ */
+uint8_t seq_loopEngage(uint8_t trackMask, uint8_t division, uint8_t modifier);
+uint8_t seq_loopUpdateMask(uint8_t newMask);
+void    seq_loopDisengage(void);
+void    seq_loopUpdateDivision(uint8_t division, uint8_t modifier);
+uint8_t seq_loopableTrackMask(void);
+
+/*
+ * Deferred / queued scene change API (S080 F7/F8/F9).
+ *
+ * What: seq_requestSceneChange() arms a direct Scene change at a musical
+ * division (division 0 = instant, applied by the caller instead);
+ * seq_queueSceneChange() arms a queued (SHIFT+SEQ) change. The TIM3 ISR raises
+ * the fire flag at the boundary; the foreground polls seq_sceneChangeFirePending()
+ * and then reads seq_pendingSceneTarget()/seq_pendingSceneIsQueue() and calls
+ * seq_clearPendingSceneChange(). Why: scene changes can be quantised to the
+ * master clock without doing DSP/LED work in the ISR. Inputs: scene index and
+ * division (scd/qcd option value). Outputs: the pending state and fire flag.
+ * Affiliates: menu_serviceDeferredSceneChange(), buttonHandler SHIFT+SEQ.
+ */
+void seq_requestSceneChange(uint8_t scene_index, uint8_t division);
+void seq_queueSceneChange(uint8_t scene_index, uint8_t division);
+uint8_t seq_sceneChangeFirePending(void);
+uint8_t seq_pendingSceneIsQueue(void);
+uint8_t seq_pendingSceneTarget(void);
+void seq_clearPendingSceneChange(void);
+/* S080 P2: cancel a pending direct/chain change but keep a queued one. */
+void seq_cancelPendingDirectChange(void);
+/* S080 G7: 1 when the fired pending change came from a scene chain. */
+uint8_t seq_pendingSceneIsChain(void);
+/* S080 P2 Defect 10: queued target Scene (0..15) or 0xFF when none. */
+uint8_t seq_queuedSceneTarget(void);
+/*
+ * S080 G7: chain repeat of the playing Scene (counters reset, stp cleared,
+ * realign; restart when `restart` = pcr). Client: menu_serviceDeferredSceneChange().
+ */
+void seq_chainRepeatSelf(uint8_t restart);
+
+/*
  * Per-track Pattern assignment stub for the unified stack service.
  *
  * What: seven resident Scene indices, one per sequencer track. Why: S067
@@ -49,6 +129,68 @@ extern uint8_t seq_eraseActive;
  * RAM: +7 bytes SRAM1. Affiliate: future per-track Pattern assignment.
  */
 extern uint8_t seq_perTrackPattern[NUM_TRACKS];
+
+/*
+ * Nonzero when any track plays from a Scene other than seq_activePattern
+ * (S077 P2 §1.1).
+ *
+ * Inputs: derived from seq_perTrackPattern[] vs seq_activePattern. Output:
+ * foreground code reads this to gate per-track UI/record behaviour: the fast
+ * path when 0 leaves all seq_activePattern reads correct as-is. Affiliates:
+ * seq_setTrackPlayedScene(), seq_clearPerTrackOverrides().
+ */
+extern uint8_t seq_perTrackActive;
+
+/*
+ * Set one track's played Scene for per-track playback (S077 P2 §1.3).
+ *
+ * Inputs: track 0..6, valid Scene index. Output: seq_perTrackPattern[track]
+ * updated, seq_perTrackActive recomputed. Tracks 5+6 (HiHat pair) switch
+ * together. Client: the buttonHandler PERF hold-VOICE+press-SEQ gesture.
+ */
+void seq_setTrackPlayedScene(uint8_t track, uint8_t scene_index);
+
+/*
+ * Coalesce all tracks back to the active Scene (S077 P2 §1.5).
+ *
+ * Output: all seq_perTrackPattern[] == seq_activePattern; seq_perTrackActive
+ * = 0. Client: the scene-level SEQ press coalesce (PAR_FOLLOW on single-click,
+ * PAR_FOLLOW off double-click).
+ */
+void seq_clearPerTrackOverrides(void);
+
+/*
+ * Read one track's played Scene (S077 P2 §3.5).
+ *
+ * Inputs: track/slot 0..6. Output: the resident Scene playback reads for that
+ * track (seq_activePattern for an out-of-range track). Client:
+ * preset_getSlotPlayedScene() resolves per-voice FX-send, fader, and Morph
+ * lookups through this.
+ */
+uint8_t seq_getTrackPlayedScene(uint8_t track);
+
+/*
+ * Realign one track's step cursor from the master clock using its own played
+ * Scene's track length (S077 P2 §1.4).
+ *
+ * Input: track 0..6. Output: seq_stepIndex[track] repositioned. Client:
+ * per-track assignment gesture, double-click single-track realign.
+ */
+void seq_realignTrackToMasterClock(uint8_t track);
+/*
+ * Recompute the effective (morphed) per-track timing cache (S078 §5.4).
+ *
+ * What: refreshes the sequencer's ISR-static effective length/scale/shuffle
+ * arrays from each track's played Scene Normal values, Scene Morph endpoints,
+ * and associated voice Morph amount. Why: the sequencer reads these arrays
+ * instead of the Pattern region, so a Morph sweep changes playback without
+ * writing retained Normal data. Inputs: none. Output: seq_effectiveTrack*
+ * updated. Callers: presetMorph_tick() (every foreground worker tick),
+ * seq_selectActivePattern(), seq_alignActivePatternToScene(),
+ * seq_setTrackPlayedScene(), seq_clearPerTrackOverrides(), and
+ * seq_setStepIndexToStart().
+ */
+void seq_refreshTrackEffectiveParams(void);
 
 void seq_triggerVoice(uint8_t voiceNr, uint8_t vol, uint8_t note);
 /*
@@ -174,6 +316,18 @@ void seq_restoreAutomatedParameters(uint8_t trigger_track);
  * seq_restoreAllAutomation().
  */
 uint8_t seq_automationHoldsParameter(uint8_t slot, uint8_t local);
+/*
+ * Clear the Scene-target automation dirty bitmap (S076 Rule B).
+ *
+ * What: zeroes the bitmap that tracks which Scene mod targets were written
+ * by step automation during the current transport pass. After a Scene
+ * switch the previous Scene's dirty bits are stale and could alias into
+ * the new Scene's target table on transport restore.
+ * Input: none. Output: seq_scene_automation_dirty = 0.
+ * Callers: seq_selectActivePattern(), seq_alignActivePatternToScene().
+ * Affiliate: seq_applySceneAutomation().
+ */
+void seq_clearSceneAutomationDirty(void);
 /*
  * Start or stop the sequencer transport.
  *

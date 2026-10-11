@@ -33,9 +33,33 @@ static const char *const ccCopy_stepLabels[] = {
 static const char *const ccCopy_barLabels[] = {
     "bar -> repl", "bar -> merge", "auto -> repl", "auto -> merge"
 };
-static const char *const ccCopy_trackLabels[] = { "track", "instrument" };
+/*
+ * What:       track copy labels: "track", "instrument", and "inst -> morph".
+ *             The label names the source being copied onto the Morph
+ *             endpoints: the instrument's Normal image.
+ * Why:        the array is indexed by cc_copy_track_sel_t; the
+ *             CC_COPY_MORPH = 2 entry must be present at index 2. The
+ *             "[inst -> morph]" display label shows the user that Normal
+ *             instrument endpoints are being copied onto the Morph endpoints.
+ * Inputs:     ccCopy_label() maps CC_MENU_COPY_TRACK to this array.
+ * Outputs:    const label string for the copy/clear session menu renderer.
+ * Affiliates: ccCopy_selectionCount(), ccCopy_runMorphTrack().
+ */
+static const char *const ccCopy_trackLabels[] = {
+    "track", "instrument", "inst -> morph"
+};
+/*
+ * What:       Scene copy labels: "scene -> morph" at index 5 copies all
+ *             Normal endpoints of the source Scene onto the destination
+ *             Scene's Morph endpoints, fanning out through the edit mask.
+ * Why:        indexed by cc_copy_scene_sel_t; CC_COPY_SCENE_MORPH = 5 must be
+ *             present at index 5. The "[scene -> morph]" display label shows
+ *             the user that the whole Scene's Normal endpoints are being
+ *             copied onto the Morph endpoints.
+ * Affiliates: ccCopy_selectionCount(), ccCopy_runSceneMorph().
+ */
 static const char *const ccCopy_sceneLabels[] = {
-    "scene", "settings", "kit", "effect", "pattern"
+    "scene", "settings", "kit", "effect", "pattern", "scene -> morph"
 };
 static const char *const ccCopy_fxLabels[] = { "step" };
 
@@ -55,11 +79,21 @@ cc_menu_t ccCopy_menuForSource(const cc_source_t *src)
 
 uint8_t ccCopy_selectionCount(cc_menu_t menu)
 {
+    /*
+     * What:       updated counts: COPY_TRACK 2 -> 3 (+inst -> morph),
+     *             COPY_SCENE 5 -> 6 (+scene -> morph). The other menus are
+     *             unchanged.
+     * Why:        exposes the new selections at the end of each menu; the
+     *             encoder clamps to selectionCount - 1.
+     * Inputs:     cc_menu_t from ccCopy_menuForSource().
+     * Outputs:    total entry count for the menu.
+     * Affiliates: ccCopy_label(), ccCopy_runJob().
+     */
     switch (menu) {
     case CC_MENU_COPY_STEP:  return 4u;
     case CC_MENU_COPY_BAR:   return 4u;
-    case CC_MENU_COPY_TRACK: return 2u;
-    case CC_MENU_COPY_SCENE: return 5u;
+    case CC_MENU_COPY_TRACK: return 3u;  /* +inst -> morph */
+    case CC_MENU_COPY_SCENE: return 6u;  /* +scene -> morph */
     case CC_MENU_COPY_FX:    return 1u;
     default:                 return 0u;
     }
@@ -106,6 +140,19 @@ uint8_t ccCopy_requestPaste(const cc_source_t *src, uint8_t selection,
                               src->start <= src->end);
         break;
     case CC_KIND_TRACK:
+        /*
+         * What:       identical-paste test for track-level pastes. Only
+         *             `copy track` (same track) and `copy instrument` (same
+         *             slot) are true no-ops. `copy morph` is deliberately not
+         *             listed: it copies the slot's own Normal image onto its
+         *             own Morph image (even for the same Scene/slot the two
+         *             images differ in general), so it must run.
+         * Why:        the identical test gates the PASTE_NOOP trace and the
+         *             early return; morph copy is never a no-op.
+         * Inputs:     src Scene/track, dst Scene/track, selection.
+         * Outputs:    identical flag for the trace and early return.
+         * Affiliates: ccCopy_runMorphTrack().
+         */
         identical = (uint8_t)(dst_scene == src->scene &&
             ((selection == CC_COPY_TRACK && dst_track == src->track) ||
              (selection == CC_COPY_INSTRUMENT &&
@@ -132,6 +179,65 @@ uint8_t ccCopy_requestPaste(const cc_source_t *src, uint8_t selection,
         ccTrace(AUTOSAVE_TRACE_CC_EVT_PASTE_NOOP, ccTrace_job(&job));
         return 0u;
     }
+    slot = ccSvc_enqueue(&job);
+    if (slot == 0u)
+        return 0u;
+    /*
+     * What:       early trigger bits are written only for Pattern pastes.
+     *             `copy track` is a whole-Pattern replace (CC_COPY_TRACK ==
+     *             CC_COPY_ALL) and gets them; `copy instrument` and
+     *             `copy morph` change slot endpoints only and must not touch
+     *             Pattern triggers.
+     * Why:        ccSvc_pasteGeometry() normalizes every track-kind paste to
+     *             CC_COPY_ALL, so the selection cannot be recovered once the
+     *             geometry is built; `ccSvc_pasteTriggersNow()` therefore
+     *             re-checks the raw selection (spec §12.6 lists only the
+     *             step/bar/track -> repl/merge pastes). Affiliate:
+     *             ccSvc_pasteTriggersNow(), CC_COPY_MORPH.
+     */
+    if (src->kind != CC_KIND_TRACK || selection == CC_COPY_TRACK)
+        (void)ccSvc_pasteTriggersNow((uint8_t)(slot - 1u));
+    return 1u;
+}
+
+/*
+ * What:       bar-to-step paste request. Identical to ccCopy_requestPaste()
+ *             except the job kind is CC_KIND_BAR_TO_STEP instead of
+ *             src->kind (CC_KIND_BAR). This tells the geometry function to
+ *             use bar source coordinates (src->start * 16) but step
+ *             destination coordinates (job->start as an absolute step).
+ * Why:        ccCopy_requestPaste() always sets job.kind = src->kind. For
+ *             cross-kind pastes the job kind must differ from the source
+ *             kind so the geometry function knows the destination is in step
+ *             space, not bar space.
+ * Inputs:     src (CC_KIND_BAR source), selection (cc_copy_step_sel_t),
+ *             dst_scene, dst_track, dst_start (absolute step 0..127).
+ * Outputs:    1 if a job was queued, 0 if dropped (queue full).
+ * Accessors:  ccSvc_enqueue(), ccSvc_pasteTriggersNow().
+ * Affiliates: ccCopy_requestPaste(), cc_copySeq().
+ */
+uint8_t ccCopy_requestBarToStep(const cc_source_t *src, uint8_t selection,
+                                uint8_t dst_scene, uint8_t dst_track,
+                                uint8_t dst_start)
+{
+    cc_job_t job;
+    uint8_t slot;
+
+    if (!src || src->kind != CC_KIND_BAR)
+        return 0u;
+    /*
+     * Identical-paste check: a bar-to-step paste is never identical to its
+     * source because the destination is in step space and the source is in
+     * bar space. Even if the step happens to fall inside the source bar(s),
+     * the operation is meaningful (it copies the bar content to a potentially
+     * different alignment).
+     */
+    job.op = (uint8_t)(CC_JOB_PASTE | (selection & CC_JOB_SEL_MASK));
+    job.kind = CC_KIND_BAR_TO_STEP;
+    job.scene = dst_scene;
+    job.track = dst_track;
+    job.start = dst_start;
+    job.end = dst_start;
     slot = ccSvc_enqueue(&job);
     if (slot == 0u)
         return 0u;
@@ -466,28 +572,45 @@ uint8_t ccCopy_buildStep(uint8_t selection, const uint8_t *src_block,
             return 0u;
         }
         *trigger_mode = src_trigger ? PAT_RAW_TRIGGER_ON : PAT_RAW_TRIGGER_KEEP;
+        /*
+         * Merge all: union the flags and take the source value for every
+         * special it stored, falling back to the destination's value for
+         * specials the source left absent (S079 extends this to all seven).
+         */
         flags = (uint8_t)(ss.flags | ds.flags);
         if ((ss.flags & PAT_SPECIAL_NOTE_BIT) == 0u)
             ss.note = ds.note;
         if ((ss.flags & PAT_SPECIAL_VEL_BIT) == 0u)
             ss.velocity = ds.velocity;
-        if ((ss.flags & PAT_SPECIAL_PROB_BIT) == 0u)
-            ss.probability = ds.probability;
+        if ((ss.flags & PAT_SPECIAL_COND_BIT) == 0u)
+            ss.condition = ds.condition;
+        if ((ss.flags & PAT_SPECIAL_ROLL_BIT) == 0u)
+            ss.roll = ds.roll;
+        if ((ss.flags & PAT_SPECIAL_TIMING_BIT) == 0u)
+            ss.timing = ds.timing;
+        if ((ss.flags & PAT_SPECIAL_RHYTHM_BIT) == 0u)
+            ss.rhythm = ds.rhythm;
+        if ((ss.flags & PAT_SPECIAL_FILL_BIT) == 0u)
+            ss.fill = ds.fill;
+        ss.flags = flags;
         sc = ccCopy_union(sa, sc, da, dc);
-        return pat_rawEncode(out, flags, ss.note, ss.velocity, ss.probability,
-                             sa, sc);
+        return pat_rawEncode(out, flags, &ss, sa, sc);
     case CC_COPY_AUTO:
-        /* Source automation and probability replace the destination's. */
-        flags = (uint8_t)((ds.flags & (uint8_t)~PAT_SPECIAL_PROB_BIT) |
-                          (ss.flags & PAT_SPECIAL_PROB_BIT));
+        /*
+         * Source automation and trigger condition replace the destination's;
+         * every other destination special is retained (S079).
+         */
+        flags = (uint8_t)((ds.flags & (uint8_t)~PAT_SPECIAL_COND_BIT) |
+                          (ss.flags & PAT_SPECIAL_COND_BIT));
         if (sc == 0u && dc == 0u && flags == ds.flags &&
-            ((flags & PAT_SPECIAL_PROB_BIT) == 0u ||
-             ss.probability == ds.probability)) {
+            ((flags & PAT_SPECIAL_COND_BIT) == 0u ||
+             ss.condition == ds.condition)) {
             *skip = 1u;
             return 0u;
         }
-        return pat_rawEncode(out, flags, ds.note, ds.velocity,
-                             ss.probability, sa, sc);
+        ds.condition = ss.condition;
+        ds.flags = flags;
+        return pat_rawEncode(out, flags, &ds, sa, sc);
     case CC_COPY_MERGE_AUTO:
     default:
         if (sc == 0u) {
@@ -495,8 +618,7 @@ uint8_t ccCopy_buildStep(uint8_t selection, const uint8_t *src_block,
             return 0u;
         }
         sc = ccCopy_union(sa, sc, da, dc);
-        return pat_rawEncode(out, ds.flags, ds.note, ds.velocity,
-                             ds.probability, sa, sc);
+        return pat_rawEncode(out, ds.flags, &ds, sa, sc);
     }
 }
 
@@ -884,6 +1006,243 @@ static uint8_t ccCopy_runFxSteps(const cc_job_t *job)
     return CC_RUN_DONE;
 }
 
+/*
+ * `copy track morph` (S076 P3): copy the source track's Normal endpoints onto
+ * the destination track's Morph endpoints (instrument images plus the
+ * correlated Scene params), fanning out through the edit mask.
+ *
+ * What:       for each Scene in the fan-out mask:
+ *             (a) preset_copySlotNormalToMorph() copies the morphable
+ *                 instrument Normal bytes onto the Morph bytes; it returns 0
+ *                 and changes nothing when the slot types differ (silent skip,
+ *                 user-confirmed);
+ *             (b) preset_setVoiceFxSendMorph() sets the FX-send Morph endpoint
+ *                 to the source's FX-send Normal endpoint (always, no type
+ *                 dependency);
+ *             (c) when both slots are slot 6 the generated slot-6/track-7 Morph
+ *                 decay takes the source's Normal decay;
+ *             (d) the destination instrument row loses its refreshed flag.
+ *             When the active Scene is in the mask the Morph worker is
+ *             requeued once after all writes.
+ * Why:        per-track morph copy is a Scene-child edit, so it fans out like
+ *             `copy instrument` (user F3). No morph amount and no Pattern data
+ *             is touched, and no phase machine is needed because every write is
+ *             an immediate retained commit.
+ * Inputs:     job->scene/job->track (destination Scene/track); source from
+ *             copyClear_source().
+ * Outputs:    CC_RUN_WAIT while the active Scene's apply workers drain, then
+ *             CC_RUN_DONE. Side effects: Instrument Morph, FX-send Morph and
+ *             Kit Morph-decay AutoSave marks; Morph worker requeue.
+ * Accessors:  copyClear_source(), ccCopy_slotOf(), bank_sceneFanoutMask(),
+ *             preset_copySlotNormalToMorph(), preset_setVoiceFxSendMorph(),
+ *             scene_getVoiceFxSendAmount(),
+ *             scene_setSlot6Track7MorphAmpEnvelopeDecay(),
+ *             scene_getSlot6Track7AmpEnvelopeDecay(), preset_rebuildMorph().
+ * Affiliates: ccCopy_runInstrument() (fan-out copy model),
+ *             ccClear_runResetMorphTrack() (analogous reset).
+ */
+static uint8_t ccCopy_runMorphTrack(const cc_job_t *job)
+{
+    const cc_source_t *src = copyClear_source();
+    uint8_t s_slot;
+    uint8_t d_slot;
+    uint16_t mask;
+    uint8_t active = scene_getActiveIndex();
+    uint8_t m;
+
+    if (!src)
+        return CC_RUN_DROP;
+    s_slot = ccCopy_slotOf(src->track);
+    d_slot = ccCopy_slotOf(job->track);
+    mask = bank_sceneFanoutMask(job->scene);
+    if ((mask & ccCopy_bit(active)) != 0u && !preset_applyWorkersIdle())
+        return CC_RUN_WAIT;
+    for (m = 0u; m < SCENE_COUNT; m++) {
+        if ((mask & ccCopy_bit(m)) == 0u)
+            continue;
+        /*
+         * Silent type-mismatch skip: preset_copySlotNormalToMorph() returns 0
+         * and leaves the member unchanged when the slot instrument types
+         * differ (no cross-type descriptor remapping, user-confirmed).
+         */
+        (void)preset_copySlotNormalToMorph(src->scene, s_slot, m, d_slot);
+        (void)preset_setVoiceFxSendMorph(
+            m, d_slot, scene_getVoiceFxSendAmount(src->scene, s_slot));
+        /*
+         * S078 §5.8: copy the source track's Pattern Normal timing onto this
+         * member's per-track Morph endpoints. job->track is the destination
+         * track (0..6) and src->track is the source track, so this is the
+         * per-track counterpart of the Scene-wide track endpoint copy.
+         */
+        if (job->track < NUM_TRACKS && src->track < NUM_TRACKS) {
+            const pat_scene_region_t *src_region =
+                pat_sceneRegion(src->scene);
+
+            if (src_region) {
+                scene_setTrackMorphLength(m, job->track,
+                                          src_region->track_length[src->track]);
+                scene_setTrackMorphScale(m, job->track,
+                                         src_region->track_scale[src->track]);
+                scene_setTrackMorphShuffle(m, job->track,
+                                           src_region->track_shuffle[src->track]);
+            }
+        }
+        if (s_slot == INSTRUMENT_SLOT_COUNT - 1u &&
+            d_slot == INSTRUMENT_SLOT_COUNT - 1u)
+            scene_setSlot6Track7MorphAmpEnvelopeDecay(
+                m, scene_getSlot6Track7AmpEnvelopeDecay(src->scene));
+        ccSvc_nameContentChanged(
+            filesystem_identityRow(FS_ROW_INSTRUMENT, m, d_slot));
+    }
+    ccTrace(AUTOSAVE_TRACE_CC_EVT_FANOUT,
+            (uint32_t)mask | ((uint32_t)(job->scene & 0xFu) << 16u) |
+            (10u << 20u) | ((uint32_t)(d_slot & 0xFu) << 25u));
+    if ((mask & ccCopy_bit(active)) != 0u)
+        preset_rebuildMorph();
+    menu_repaint();
+    return CC_RUN_DONE;
+}
+
+/*
+ * `copy scene -> morph` (S076 P3, S077 P4 fan-out correction): copy all
+ * Normal endpoints of the source Scene onto the destination Scene's Morph
+ * endpoints for every matching-type component, fanning out through the edit
+ * mask (parallels `copy kit`).
+ *
+ * What:       for each Scene in bank_sceneFanoutMask(job->scene):
+ *             (a) for each of the six slots:
+ *                 preset_copySlotNormalToMorph() copies the source Scene's
+ *                 Normal morphable bytes onto the member's Morph bytes
+ *                 (silent skip per slot on a type mismatch — the member's
+ *                 Morph stays unchanged for that slot);
+ *             (b) preset_setVoiceFxSendMorph() sets the member's FX-send
+ *                 Morph endpoint to the source FX-send Normal endpoint;
+ *             (c) the generated slot-6/track-7 decay Morph takes the source
+ *                 Normal decay;
+ *             (d) when the source and member Effect types match, each
+ *                 morphable Effect Morph cell takes the source Normal cell,
+ *                 otherwise the member's Effect is silently skipped;
+ *             (e) the member's Instrument, Scene and Effect HCNAMES rows
+ *                 lose their refreshed flag.
+ *             When the active Scene is in the mask the Morph worker is
+ *             requeued and the Effect runtime is rebuilt once after all
+ *             writes.
+ * Why:        morph endpoints are scene-child data (instrument images, FX
+ *             send, Effect parameters). Scene-child edits fan out through
+ *             the edit mask: `copy kit`, `copy instrument` and `copy effect`
+ *             all fan out. The original single-destination version incorrectly
+ *             paralleled `copy scene` (which exchanges the mask, not a child).
+ * Inputs:     job->scene (destination, origin of the fan-out mask); source
+ *             from copyClear_source().
+ * Outputs:    CC_RUN_WAIT while the active Scene's apply workers drain, then
+ *             CC_RUN_DONE. Side effects: Instrument Morph, FX-send Morph, Kit
+ *             Morph-decay and Effect AutoSave marks; runtime rebuild.
+ * Accessors:  copyClear_source(), bank_sceneFanoutMask(),
+ *             preset_copySlotNormalToMorph(), preset_setVoiceFxSendMorph(),
+ *             scene_getVoiceFxSendAmount(),
+ *             scene_setSlot6Track7MorphAmpEnvelopeDecay(),
+ *             scene_getSlot6Track7AmpEnvelopeDecay(), scene_effectConst(),
+ *             effects_paramMorphable(), scene_effectRecordForWholeCommit(),
+ *             scene_finishEffectWholeCommit(), effects_activateScene(),
+ *             preset_rebuildMorph().
+ * Affiliates: ccCopy_runKit() (fan-out copy model),
+ *             ccCopy_runMorphTrack() (per-slot fan-out morph copy),
+ *             ccClear_runResetSceneMorph() (analogous reset).
+ */
+static uint8_t ccCopy_runSceneMorph(const cc_job_t *job)
+{
+    const cc_source_t *src = copyClear_source();
+    uint16_t mask;
+    uint8_t active = scene_getActiveIndex();
+    const effect_record_t *src_fx;
+    uint8_t m;
+
+    if (!src)
+        return CC_RUN_DROP;
+    mask = bank_sceneFanoutMask(job->scene);
+    if ((mask & ccCopy_bit(active)) != 0u && !preset_applyWorkersIdle())
+        return CC_RUN_WAIT;
+    src_fx = scene_effectConst(src->scene);
+    for (m = 0u; m < SCENE_COUNT; m++) {
+        uint8_t slot;
+
+        if ((mask & ccCopy_bit(m)) == 0u)
+            continue;
+        for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++) {
+            (void)preset_copySlotNormalToMorph(src->scene, slot, m, slot);
+            (void)preset_setVoiceFxSendMorph(
+                m, slot, scene_getVoiceFxSendAmount(src->scene, slot));
+            ccSvc_nameContentChanged(
+                filesystem_identityRow(FS_ROW_INSTRUMENT, m, slot));
+        }
+        scene_setSlot6Track7MorphAmpEnvelopeDecay(
+            m, scene_getSlot6Track7AmpEnvelopeDecay(src->scene));
+        /*
+         * Effect: copy the source Normal cells onto this member's Morph
+         * cells only when the two Effect types match; a different type
+         * shares no descriptor layout, so the Effect is silently skipped.
+         */
+        {
+            const effect_record_t *dst_fx = scene_effectConst(m);
+
+            if (src_fx && dst_fx && src_fx->type == dst_fx->type) {
+                effect_record_t *record =
+                    scene_effectRecordForWholeCommit(m);
+
+                if (record) {
+                    uint8_t changed = 0u;
+                    uint8_t i;
+
+                    for (i = 0u; i < EFFECT_PARAM_COUNT; i++) {
+                        if (!effects_paramMorphable(src_fx->type, i))
+                            continue;
+                        if (record->morph[i] != src_fx->normal[i]) {
+                            record->morph[i] = src_fx->normal[i];
+                            changed = 1u;
+                        }
+                    }
+                    if (changed)
+                        scene_finishEffectWholeCommit(m);
+                }
+            }
+        }
+        /*
+         * S078 §5.4: copy the source Scene's Pattern Normal track timing onto
+         * this member's track Morph endpoints for all seven tracks. This is the
+         * Scene-wide counterpart of copy track morph for the morphable track
+         * parameters, and keeps the track endpoints coupled to the Normal values
+         * the user is duplicating.
+         */
+        {
+            const pat_scene_region_t *src_region = pat_sceneRegion(src->scene);
+            uint8_t t;
+
+            if (src_region) {
+                for (t = 0u; t < NUM_TRACKS; t++) {
+                    scene_setTrackMorphLength(m, t,
+                                              src_region->track_length[t]);
+                    scene_setTrackMorphScale(m, t, src_region->track_scale[t]);
+                    scene_setTrackMorphShuffle(m, t,
+                                               src_region->track_shuffle[t]);
+                }
+            }
+        }
+        ccSvc_nameContentChanged(
+            filesystem_identityRow(FS_ROW_SCENE, m, 0u));
+        ccSvc_nameContentChanged(
+            filesystem_identityRow(FS_ROW_EFFECT, m, 0u));
+    }
+    ccTrace(AUTOSAVE_TRACE_CC_EVT_FANOUT,
+            (uint32_t)mask |
+            ((uint32_t)(job->scene & 0xFu) << 16u) | (11u << 20u));
+    if ((mask & ccCopy_bit(active)) != 0u) {
+        preset_rebuildMorph();
+        effects_activateScene(active);
+        menu_repaintAll();
+    }
+    return CC_RUN_DONE;
+}
+
 uint8_t ccCopy_runJob(const cc_job_t *job)
 {
     uint8_t sel;
@@ -893,13 +1252,37 @@ uint8_t ccCopy_runJob(const cc_job_t *job)
         return CC_RUN_DROP;
     }
     sel = (uint8_t)(job->op & CC_JOB_SEL_MASK);
+    /*
+     * What:       CC_KIND_BAR_TO_STEP is a Pattern paste (bar source, step
+     *             destination) and uses the same engine as CC_KIND_STEP and
+     *             CC_KIND_BAR.
+     * Why:        ccSvc_runPatternPaste() dispatches entirely on the resolved
+     *             geometry; the new kind produces correct geometry through
+     *             ccSvc_pasteGeometry(). No per-kind logic inside the engine
+     *             depends on the value.
+     * Affiliates: ccSvc_pasteGeometry(), CC_KIND_BAR_TO_STEP.
+     */
     switch (job->kind) {
     case CC_KIND_STEP:
     case CC_KIND_BAR:
+    case CC_KIND_BAR_TO_STEP:
         return ccSvc_runPatternPaste(job);
     case CC_KIND_TRACK:
-        return (sel == CC_COPY_INSTRUMENT) ? ccCopy_runInstrument(job)
-                                           : ccSvc_runPatternPaste(job);
+        /*
+         * What:       three-way track copy dispatch. CC_COPY_MORPH is the new
+         *             "inst -> morph" selection; CC_COPY_INSTRUMENT keeps its slot
+         *             paste; every other selection is a Pattern paste.
+         * Why:        morph copy must reach its own endpoint executor rather
+         *             than the Pattern engine (its job selection shares the
+         *             low nibble space with the step selections).
+         * Affiliates: ccCopy_runInstrument(), ccCopy_runMorphTrack(),
+         *             ccSvc_runPatternPaste().
+         */
+        if (sel == CC_COPY_MORPH)
+            return ccCopy_runMorphTrack(job);
+        if (sel == CC_COPY_INSTRUMENT)
+            return ccCopy_runInstrument(job);
+        return ccSvc_runPatternPaste(job);
     case CC_KIND_SCENE:
         switch (sel) {
         case CC_COPY_SCENE:          return ccCopy_runScene(job);
@@ -907,6 +1290,7 @@ uint8_t ccCopy_runJob(const cc_job_t *job)
         case CC_COPY_KIT:            return ccCopy_runKit(job);
         case CC_COPY_EFFECT:         return ccCopy_runEffect(job);
         case CC_COPY_PATTERN:        return ccCopy_runPatternOnly(job);
+        case CC_COPY_SCENE_MORPH:    return ccCopy_runSceneMorph(job);
         default:
             ccSvc_traceDropReason(AUTOSAVE_TRACE_CC_DROP_BAD_SELECTION, sel);
             return CC_RUN_DROP;

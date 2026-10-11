@@ -43,8 +43,8 @@ _Static_assert(PAT_STACK_SIZE > 0u && PAT_STACK_SIZE <= 512u,
                "PAT_STACK_SIZE must fit the 14-bit pool bitmap");
 _Static_assert(sizeof(pat_scene_region_t) ==
                (PAT_STEPS_PER_SCENE * 2u) + (PAT_STACK_SIZE * 32u) +
-               512u + 23u,
-               "pat_scene_region_t size must match the Pattern budget");
+               512u + 31u,
+               "pat_scene_region_t size must match the Pattern budget (S080 P2: +1 B loop exclude)");
 
 /*
  * Static lifetime owner for all resident Scene Pattern storage.
@@ -57,16 +57,33 @@ _Static_assert(sizeof(pat_scene_region_t) ==
 static pat_scene_region_t pat_regions[SCENE_COUNT];
 
 /*
- * Pattern AutoSave snapshot staging buffer.
+ * Background Scene region (S077).
  *
- * What: one standalone pat_scene_region_t separate from pat_regions[]. Why:
- * the background writer snapshots one Scene in the main loop, then streams
- * it over many filesystem ticks without reading data that recording/erasing
- * may later change. SRAM cost: 10,519 bytes in SRAM1 .bss. Lifetime: static;
- * written by pat_snapshotScene() and read by pat_autosaveSnapshot(). Owner:
- * PatternData.c exclusively. Affiliate: filesystem.c Pattern drain writer.
+ * What: one additional pat_scene_region_t outside pat_regions[SCENE_COUNT].
+ * Not a playable Scene: scene_indexValid(), pat_patternValid(), the sequencer,
+ * the UI, PERF and Bank all continue to bound at SCENE_COUNT (16). It is
+ * reached only through its named accessors. Why: serves three purposes that
+ * must never overlap with live Scenes - (1) AutoSave snapshot staging for the
+ * Pattern drain writer, (2) copy/clear scratch pool for overlapping pastes
+ * that would otherwise borrow the 9 kB name buffer for block data, and
+ * (3) future Bank Load staging. SRAM cost: 10,519 bytes in SRAM1 .bss (the
+ * same footprint as the removed pat_autosave_snapshot; net zero). Lifetime:
+ * static. Owner: PatternData.c exclusively. Accessors: pat_snapshotScene(),
+ * pat_autosaveSnapshot(), pat_backgroundPoolMut(). Affiliates: filesystem.c
+ * Pattern drain writer, copyClearService.c overlapping paste engine.
+ *
+ * Ownership contract (these users must never run concurrently):
+ *   - AutoSave Pattern drain vs copy/clear snapshot: a new drain is blocked
+ *     by copyClear_backgroundSuspended(); an in-flight drain by the
+ *     filesystem_patternSnapshotInUse() gate at paste path selection.
+ *   - AutoSave Pattern drain vs Bank Load staging: future; Bank Load
+ *     suspends AutoSave by the same mechanism.
+ *   - Copy/clear snapshot vs Bank Load staging: future; copy/clear is
+ *     refused while Load/Save owns the UI (menu_storageBusy).
+ *   - Boot reader rollback copy vs any: boot only; it runs before copy/clear
+ *     or AutoSave can start.
  */
-static pat_scene_region_t pat_autosave_snapshot;
+static pat_scene_region_t pat_background_region;
 
 /*
  * Mark one Pattern mutation at the existing card-clean boundary.
@@ -88,29 +105,51 @@ static void pat_markSceneDirty(uint8_t scene_index)
  * Capture one coherent Pattern region for the background writer.
  *
  * Inputs: validated resident Scene index and an idle RECORD/ERASE boundary.
- * Output: the dedicated 10,519-byte snapshot becomes a plain copy of the
- * selected live region. No interrupt masking is performed; filesystem.c owns
- * the scheduler guard that makes the copy safe. Affiliate:
- * pat_autosaveSnapshot().
+ * Output: the background region becomes a plain copy of the selected live
+ * region. No interrupt masking is performed; the caller owns the scheduler
+ * guard that makes the copy safe. The copy/clear paste engine must check
+ * filesystem_patternSnapshotInUse() before overwriting the same region's
+ * pool during an overlapping paste (S077). Affiliate: pat_autosaveSnapshot().
  */
 void pat_snapshotScene(uint8_t scene_index)
 {
     if (!scene_indexValid(scene_index))
         return;
-    memcpy(&pat_autosave_snapshot, &pat_regions[scene_index],
+    memcpy(&pat_background_region, &pat_regions[scene_index],
            sizeof(pat_scene_region_t));
 }
 
 /*
  * Borrow the latest Pattern AutoSave snapshot for bounded file streaming.
  *
- * Input: none. Output: const pointer to PatternData's dedicated snapshot,
- * valid until the next pat_snapshotScene() call. No allocation or I/O occurs;
+ * Input: none. Output: const pointer into the background region, valid until
+ * the next pat_snapshotScene() call. No allocation or I/O occurs;
  * filesystem.c is the sole consumer. Affiliate: Pattern drain state machine.
  */
 const pat_scene_region_t *pat_autosaveSnapshot(void)
 {
-    return &pat_autosave_snapshot;
+    return &pat_background_region;
+}
+
+/*
+ * Mutable pointer to the background region's pool bytes.
+ *
+ * What: returns the raw pool array of pat_background_region for use as
+ * copy/clear scratch storage during an overlapping paste. The pool is exactly
+ * PAT_STACK_SIZE * 32 bytes (8,192 B today), the same size as every live
+ * Scene pool. Why: the overlapping paste formerly borrowed the 9 kB name
+ * buffer for block data; this accessor removes that dependency and scales
+ * automatically with PAT_STACK_SIZE. The caller writes retargeted source
+ * blocks contiguously from byte 0. The swap reservation and bitmap within the
+ * background region are irrelevant for raw scratch; only the pool bytes are
+ * used. Inputs: none. Outputs: a non-NULL mutable pointer valid for the
+ * static lifetime. The caller must ensure no concurrent reader (see the
+ * filesystem_patternSnapshotInUse() gate). Affiliates: copyClearService.c
+ * overlapping paste engine, pat_snapshotScene(), pat_autosaveSnapshot().
+ */
+uint8_t *pat_backgroundPoolMut(void)
+{
+    return pat_background_region.pool;
 }
 
 /*
@@ -305,14 +344,17 @@ static void pat_poolFree(pat_scene_region_t *r, uint16_t byte_offset,
 }
 
 /*
- * Calculate the four-byte allocation size for one dynamic block.
+ * Calculate the four-byte allocation size for one dynamic block (S079).
  *
- * What: include the two-byte header, flags byte, one byte per supported
- * special, and two bytes per automation entry, then round up to a chunk. Why:
- * allocator/free/reallocation paths must agree on complete block ownership.
- * Inputs: supported special flags and a bounded automation count. Output: the
- * required four-byte chunk count. Affiliates: all dynamic block readers and
- * writers below.
+ * What: counts set bits in special_flags to determine how many value bytes
+ * precede the automation tail: note (bit 0), velocity (bit 1), condition
+ * (bit 2), roll (bit 3), timing (bit 4), rhythm (bit 5), fill (bit 6), then
+ * include the two-byte header, flags byte, and two bytes per automation
+ * entry, rounded up to a chunk. Why: allocator, free, reallocation, in-place
+ * append, and integrity check must agree on exact block ownership. Inputs:
+ * masked special flags and a bounded automation count. Output: the required
+ * four-byte chunk count. Affiliates: pat_blockWrite(), pat_blockRead(),
+ * pat_blockReadAutomations(), pat_tryAppendAutomation(), pat_writeDynamic().
  */
 static uint8_t pat_blockChunks(uint8_t special_flags, uint8_t auto_count)
 {
@@ -320,12 +362,13 @@ static uint8_t pat_blockChunks(uint8_t special_flags, uint8_t auto_count)
     uint8_t total;
 
     special_flags &= (uint8_t)PAT_SPECIAL_FLAGS_MASK;
-    if (special_flags & PAT_SPECIAL_NOTE_BIT)
-        value_count++;
-    if (special_flags & PAT_SPECIAL_VEL_BIT)
-        value_count++;
-    if (special_flags & PAT_SPECIAL_PROB_BIT)
-        value_count++;
+    if (special_flags & PAT_SPECIAL_NOTE_BIT)   value_count++;
+    if (special_flags & PAT_SPECIAL_VEL_BIT)    value_count++;
+    if (special_flags & PAT_SPECIAL_COND_BIT)   value_count++;
+    if (special_flags & PAT_SPECIAL_ROLL_BIT)   value_count++;
+    if (special_flags & PAT_SPECIAL_TIMING_BIT) value_count++;
+    if (special_flags & PAT_SPECIAL_RHYTHM_BIT) value_count++;
+    if (special_flags & PAT_SPECIAL_FILL_BIT)   value_count++;
     if (auto_count > PAT_BLOCK_AUTO_COUNT_MASK)
         auto_count = PAT_BLOCK_AUTO_COUNT_MASK;
     total = (uint8_t)(PAT_BLOCK_HEADER_BYTES + 1u + value_count +
@@ -334,20 +377,23 @@ static uint8_t pat_blockChunks(uint8_t special_flags, uint8_t auto_count)
 }
 
 /*
- * Write one complete dynamic block at an allocated pool offset.
+ * Write one complete dynamic block at an allocated pool offset (S079).
  *
  * What: encode the step back-reference, special flags/values, and packed
- * automation entries in the fixed block order. Why: every menu mutation and
- * future integrity reader needs one stable byte layout. Inputs: region/offset,
- * bounded track/step, supported flags, special values, and up to 63 decoded
- * automation entries. Output: the allocated block is written with a
- * big-endian header and little-endian automation words. Affiliates:
- * pat_blockRead(), pat_blockReadAutomations(), and pat_writeSpecials().
+ * automation entries in the fixed block order. The 7-special byte order is:
+ * note, velocity, condition, roll, timing, rhythm, fill - matching the
+ * ascending bit order in the flags byte. Why: every menu mutation and future
+ * integrity reader needs one stable byte layout. Inputs: region/offset,
+ * bounded track/step, the specials struct (only fields gated by flags are
+ * written), and up to 63 decoded automation entries. Output: the allocated
+ * block is written with a big-endian header and little-endian automation
+ * words. Affiliates: pat_blockRead(), pat_blockReadAutomations(),
+ * pat_writeDynamic(), pat_rawEncode().
  */
 static void pat_blockWrite(pat_scene_region_t *r, uint16_t byte_offset,
                            uint8_t track, uint8_t step,
-                           uint8_t special_flags, uint8_t note,
-                           uint8_t velocity, uint8_t probability,
+                           uint8_t special_flags,
+                           const pat_step_specials_t *sp,
                            const pat_automation_entry_t *autos,
                            uint8_t auto_count)
 {
@@ -374,12 +420,13 @@ static void pat_blockWrite(pat_scene_region_t *r, uint16_t byte_offset,
     p[2] = special_flags;
 
     idx = 3u;
-    if (special_flags & PAT_SPECIAL_NOTE_BIT)
-        p[idx++] = note;
-    if (special_flags & PAT_SPECIAL_VEL_BIT)
-        p[idx++] = velocity;
-    if (special_flags & PAT_SPECIAL_PROB_BIT)
-        p[idx++] = probability;
+    if (special_flags & PAT_SPECIAL_NOTE_BIT)   p[idx++] = sp->note;
+    if (special_flags & PAT_SPECIAL_VEL_BIT)    p[idx++] = sp->velocity;
+    if (special_flags & PAT_SPECIAL_COND_BIT)   p[idx++] = sp->condition;
+    if (special_flags & PAT_SPECIAL_ROLL_BIT)   p[idx++] = sp->roll;
+    if (special_flags & PAT_SPECIAL_TIMING_BIT) p[idx++] = sp->timing;
+    if (special_flags & PAT_SPECIAL_RHYTHM_BIT) p[idx++] = sp->rhythm;
+    if (special_flags & PAT_SPECIAL_FILL_BIT)   p[idx++] = sp->fill;
     for (auto_idx = 0u; auto_idx < auto_count; auto_idx++) {
         uint16_t packed = (uint16_t)(((uint16_t)(autos[auto_idx].value & 0x7Fu)
                                       << 9u) |
@@ -390,14 +437,15 @@ static void pat_blockWrite(pat_scene_region_t *r, uint16_t byte_offset,
 }
 
 /*
- * Read resolved values from one dynamic block.
+ * Read resolved values from one dynamic block (S079).
  *
- * What: parse the flags byte and value bytes in ascending flag order. Why: the
- * Sequencer and STEP menu must resolve the same defaults and overrides. Inputs:
- * a valid allocated Scene region offset. Output: a specials struct with
- * PAT_DEFAULT_NOTE, PAT_DEFAULT_VELOCITY, and probability 127 where flags are
- * absent. The header is retained for future integrity scans but skipped here.
- * Affiliates: pat_readStepSpecials().
+ * What: parse the flags byte and value bytes in ascending flag order for all
+ * 7 specials. Why: the Sequencer and STEP menu must resolve the same defaults
+ * and overrides. Inputs: a valid allocated Scene region offset. Output: a
+ * specials struct with defaults for absent fields: note PAT_DEFAULT_NOTE,
+ * velocity PAT_DEFAULT_VELOCITY, condition 0, roll 0, timing 0, rhythm 0,
+ * fill 100. The header is retained for future integrity scans but skipped
+ * here. Affiliates: pat_readStepSpecials().
  */
 static pat_step_specials_t pat_blockRead(const pat_scene_region_t *r,
                                          uint16_t byte_offset)
@@ -410,7 +458,11 @@ static pat_step_specials_t pat_blockRead(const pat_scene_region_t *r,
 
     out.note = PAT_DEFAULT_NOTE;
     out.velocity = PAT_DEFAULT_VELOCITY;
-    out.probability = 127u;
+    out.condition = 0u;
+    out.roll = 0u;
+    out.timing = 0u;
+    out.rhythm = 0u;
+    out.fill = 100u;
     out.flags = 0u;
     if (!r || !pat_poolOffsetValid(byte_offset))
         return out;
@@ -424,12 +476,13 @@ static pat_step_specials_t pat_blockRead(const pat_scene_region_t *r,
         return out;
     out.flags = flags;
     idx = 3u;
-    if (flags & PAT_SPECIAL_NOTE_BIT)
-        out.note = p[idx++];
-    if (flags & PAT_SPECIAL_VEL_BIT)
-        out.velocity = p[idx++];
-    if (flags & PAT_SPECIAL_PROB_BIT)
-        out.probability = p[idx++];
+    if (flags & PAT_SPECIAL_NOTE_BIT)   out.note = p[idx++];
+    if (flags & PAT_SPECIAL_VEL_BIT)    out.velocity = p[idx++];
+    if (flags & PAT_SPECIAL_COND_BIT)   out.condition = p[idx++];
+    if (flags & PAT_SPECIAL_ROLL_BIT)   out.roll = p[idx++];
+    if (flags & PAT_SPECIAL_TIMING_BIT) out.timing = p[idx++];
+    if (flags & PAT_SPECIAL_RHYTHM_BIT) out.rhythm = p[idx++];
+    if (flags & PAT_SPECIAL_FILL_BIT)   out.fill = p[idx++];
 
     return out;
 }
@@ -461,12 +514,13 @@ static uint8_t pat_blockReadAutomations(const pat_scene_region_t *r,
         return 0u;
     p = &r->pool[byte_offset];
     flags = (uint8_t)(p[2] & PAT_SPECIAL_FLAGS_MASK);
-    if (flags & PAT_SPECIAL_NOTE_BIT)
-        value_count++;
-    if (flags & PAT_SPECIAL_VEL_BIT)
-        value_count++;
-    if (flags & PAT_SPECIAL_PROB_BIT)
-        value_count++;
+    if (flags & PAT_SPECIAL_NOTE_BIT)   value_count++;
+    if (flags & PAT_SPECIAL_VEL_BIT)    value_count++;
+    if (flags & PAT_SPECIAL_COND_BIT)   value_count++;
+    if (flags & PAT_SPECIAL_ROLL_BIT)   value_count++;
+    if (flags & PAT_SPECIAL_TIMING_BIT) value_count++;
+    if (flags & PAT_SPECIAL_RHYTHM_BIT) value_count++;
+    if (flags & PAT_SPECIAL_FILL_BIT)   value_count++;
     auto_count = (uint8_t)(p[1] & PAT_BLOCK_AUTO_COUNT_MASK);
     if ((uint32_t)byte_offset +
             ((uint32_t)pat_blockChunks(flags, auto_count) * 4u) >
@@ -515,12 +569,13 @@ static uint8_t pat_tryAppendAutomation(pat_scene_region_t *r,
         pat_blockChunks(old_flags, old_count) != old_chunks ||
         pat_blockChunks(old_flags, auto_count) != new_chunks)
         return 0u;
-    if (old_flags & PAT_SPECIAL_NOTE_BIT)
-        value_count++;
-    if (old_flags & PAT_SPECIAL_VEL_BIT)
-        value_count++;
-    if (old_flags & PAT_SPECIAL_PROB_BIT)
-        value_count++;
+    if (old_flags & PAT_SPECIAL_NOTE_BIT)   value_count++;
+    if (old_flags & PAT_SPECIAL_VEL_BIT)    value_count++;
+    if (old_flags & PAT_SPECIAL_COND_BIT)   value_count++;
+    if (old_flags & PAT_SPECIAL_ROLL_BIT)   value_count++;
+    if (old_flags & PAT_SPECIAL_TIMING_BIT) value_count++;
+    if (old_flags & PAT_SPECIAL_RHYTHM_BIT) value_count++;
+    if (old_flags & PAT_SPECIAL_FILL_BIT)   value_count++;
     /*
      * S075: in-place growth must stay below the permanent swap-block reserve.
      * A failed bound falls back to the disjoint write-new path.
@@ -568,22 +623,23 @@ static uint8_t pat_tryAppendAutomation(pat_scene_region_t *r,
 }
 
 /*
- * Replace one step's complete dynamic block while preserving its trigger bit.
+ * Replace one step's complete dynamic block while preserving its trigger bit
+ * (S079).
  *
  * What: free, reuse, or allocate the block selected by the special flags and
- * automation list, then swap the address entry to its resulting offset. Why:
- * special and automation edits must share one ownership transaction, including
- * automation-only blocks whose special-flags byte is zero. Inputs: Scene/
- * track/step, supported flags, special values, at most 63 entries, and a
- * shrink-in-place policy used only by removal. Output: nonzero when the
- * block/address state was committed; allocation failure otherwise leaves the
- * old block and address untouched. Affiliates: pat_writeSpecials() and the
- * public automation CRUD functions below.
+ * automation list, then swap the address entry to its resulting offset. The
+ * specials struct supplies all 7 value fields; only those gated by new_flags
+ * are written. Why: special and automation edits must share one ownership
+ * transaction, including automation-only blocks whose special-flags byte is
+ * zero. Inputs: Scene/track/step, new flags, specials struct, at most 63
+ * entries, and a shrink-in-place policy used only by removal. Output: nonzero
+ * when the block/address state was committed; allocation failure otherwise
+ * leaves the old block and address untouched. Affiliates: pat_writeSpecials()
+ * and the public automation CRUD functions below.
  */
 static uint8_t pat_writeDynamic(uint8_t scene_index, uint8_t track,
                                 uint8_t step, uint8_t new_flags,
-                                uint8_t note, uint8_t velocity,
-                                uint8_t probability,
+                                const pat_step_specials_t *sp,
                                 const pat_automation_entry_t *autos,
                                 uint8_t auto_count,
                                 uint8_t allow_shrink_in_place)
@@ -694,8 +750,8 @@ static uint8_t pat_writeDynamic(uint8_t scene_index, uint8_t track,
      * new_offset/new block and old_offset/old block. Output: one committed
      * address swap and one reclaimed old run. Affiliate: pat_poolAlloc().
      */
-    pat_blockWrite(r, new_offset, track, step, new_flags, note, velocity,
-                   probability, autos, auto_count);
+    pat_blockWrite(r, new_offset, track, step, new_flags, sp, autos,
+                   auto_count);
     {
         uint16_t published;
 
@@ -714,18 +770,22 @@ static uint8_t pat_writeDynamic(uint8_t scene_index, uint8_t track,
 }
 
 /*
- * Replace one step's special values while retaining every automation entry.
+ * Replace one step's special values while retaining every automation entry
+ * (S079).
  *
- * Inputs: Scene/track/step, desired special flags, and candidate values.
- * Output: the shared dynamic-block transaction preserves automation entries
- * and commits the special edit or leaves the old state on allocation failure.
- * Affiliate: pat_setStepNote(), pat_setStepVolume(), and
- * pat_setStepProbability().
+ * What: reads the existing automations, then calls pat_writeDynamic() with
+ * the new specials struct and the full automation list. Why: individual
+ * setters only change one field; this helper preserves all others. Inputs:
+ * Scene/track/step, desired flags, and the complete specials struct with the
+ * new value already set. Output: the shared dynamic-block transaction
+ * preserves automation entries and commits the special edit or leaves the old
+ * state on allocation failure. Affiliates: pat_setStepNote(),
+ * pat_setStepVolume(), pat_setStepCondition(), pat_setStepRoll(),
+ * pat_setStepTiming(), pat_setStepRhythm(), pat_setStepFill().
  */
 static uint8_t pat_writeSpecials(uint8_t scene_index, uint8_t track,
                                  uint8_t step, uint8_t new_flags,
-                                 uint8_t note, uint8_t velocity,
-                                 uint8_t probability)
+                                 const pat_step_specials_t *sp)
 {
     pat_automation_entry_t autos[PAT_BLOCK_AUTO_COUNT_MASK];
     const pat_scene_region_t *r = pat_sceneRegion(scene_index);
@@ -740,8 +800,8 @@ static uint8_t pat_writeSpecials(uint8_t scene_index, uint8_t track,
         pat_poolOffsetValid(offset))
         auto_count = pat_blockReadAutomations(r, offset, autos,
                                               PAT_BLOCK_AUTO_COUNT_MASK);
-    return pat_writeDynamic(scene_index, track, step, new_flags, note, velocity,
-                            probability, autos, auto_count, 0u);
+    return pat_writeDynamic(scene_index, track, step, new_flags, sp, autos,
+                            auto_count, 0u);
 }
 
 uint8_t pat_trackValid(uint8_t track)
@@ -794,17 +854,25 @@ void pat_initScene(uint8_t scene_index)
      * fixed behavior. seq_advanceTrackStep() reads this at each step boundary
      * and wraps independently per track; valid range is 1–NUM_STEPS (128).
      *
-     * track_scale and track_shuffle: stored and persisted but not yet consumed
-     * by playback. The scale index uses StepScale's shared table; the default
-     * is 1/16 and 0 remains the no-shuffle offset.
+     * track_scale: consumed by the per-track DDA accumulators (S078). The
+     * value is a 128-position CC on StepScale's shared log curve; the default
+     * is 76 (1/16).
+     *
+     * track_shuffle: consumed by the per-track shuffle deferral (S078). 0 is
+     * the no-shuffle offset.
+     *
+     * track_play_mode: 0 fwd is the default; see pat_scene_region_t.
      */
     for (track = 0u; track < NUM_TRACKS; track++) {
         region->track_length[track] = NUM_STEPS_PER_BAR;
         region->track_scale[track] = TRACK_SCALE_DEFAULT;
         region->track_shuffle[track] = 0u;
+        region->track_play_mode[track] = 0u;
     }
     region->pattern_change_bar = 0u;
     region->pattern_next = 0u;
+    /* S080 P2 Defect 8a: every track starts loopable. */
+    region->track_loop_exclude = 0u;
 }
 
 /*
@@ -957,14 +1025,15 @@ void pat_releaseStepDynamic(uint8_t scene_index, uint8_t track,
 }
 
 /*
- * Resolve one address entry into menu/playback-ready step specials.
+ * Resolve one address entry into menu/playback-ready step specials (S079).
  *
  * What: validate the entry's specials bit and pool offset, then parse its
  * dynamic block. Why: Sequencer and Menu need one owner for defaults and pool
  * bounds. Inputs: resident Scene/track/step coordinates. Output: note,
- * velocity, probability, and explicit-special flags; invalid or trigger-only
- * entries return PAT_DEFAULT_NOTE, PAT_DEFAULT_VELOCITY, probability 127, and
- * zero flags. Affiliate: pat_blockRead().
+ * velocity, condition, roll, timing, rhythm, fill, and explicit-special
+ * flags; invalid or trigger-only entries return PAT_DEFAULT_NOTE,
+ * PAT_DEFAULT_VELOCITY, condition 0, roll 0, timing 0, rhythm 0, fill 100,
+ * and zero flags. Affiliate: pat_blockRead().
  */
 pat_step_specials_t pat_readStepSpecials(uint8_t scene_index,
                                          uint8_t track, uint8_t step)
@@ -976,7 +1045,11 @@ pat_step_specials_t pat_readStepSpecials(uint8_t scene_index,
 
     out.note = PAT_DEFAULT_NOTE;
     out.velocity = PAT_DEFAULT_VELOCITY;
-    out.probability = 127u;
+    out.condition = 0u;
+    out.roll = 0u;
+    out.timing = 0u;
+    out.rhythm = 0u;
+    out.fill = 100u;
     out.flags = 0u;
 
     entry = pat_addrPtr(scene_index, track, step);
@@ -1100,6 +1173,10 @@ void pat_applyTrackSettingsToMenu(uint8_t scene_index, uint8_t track)
     parameter_values[PAR_TRACK_LENGTH] = region->track_length[track];
     parameter_values[PAR_TRACK_SCALE] = region->track_scale[track];
     parameter_values[PAR_SHUFFLE] = region->track_shuffle[track];
+    parameter_values[PAR_TRACK_PLAY_MODE] = region->track_play_mode[track];
+    /* S080 P2 Defect 8a: lop mirror (1 = loopable). */
+    parameter_values[PAR_TRACK_LOOPABLE] =
+        (uint8_t)((region->track_loop_exclude & (uint8_t)(1u << track)) == 0u);
 }
 
 /* Persist one track-length menu edit in the resident Scene region. */
@@ -1133,6 +1210,62 @@ void pat_setTrackShuffle(uint8_t scene_index, uint8_t track, uint8_t value)
         return;
     region->track_shuffle[track] = value;
     pat_markSceneDirty(scene_index);
+}
+
+/*
+ * Per-track play mode setter (S078 §4.1).
+ *
+ * What: writes the play mode byte for one track in the Pattern region.
+ * Input: scene_index, track 0..6, value 0..5. Output: region updated, Pattern
+ * AutoSave marked dirty. Affiliates: menu.c PAR_TRACK_PLAY_MODE edit handler,
+ * pat_applyTrackSettingsToMenu().
+ */
+void pat_setTrackPlayMode(uint8_t scene_index, uint8_t track, uint8_t value)
+{
+    pat_scene_region_t *region = pat_sceneRegionMut(scene_index);
+
+    if (!region || !pat_trackValid(track))
+        return;
+    region->track_play_mode[track] = value;
+    pat_markSceneDirty(scene_index);
+}
+
+/*
+ * Per-track loopable setter/getter (S080 P2 Defect 8a).
+ *
+ * What: pat_setTrackLoopable() sets or clears the track's exclude bit in the
+ * resident region (loopable = 0 sets it) and marks the Scene's Pattern dirty
+ * only on change; pat_trackLoopable() reports 1 when the bit is clear. Why:
+ * the flag is Pattern data persisted in the PAT4 track header and travels
+ * with Pattern copy/clear. Inputs: Scene, track, flag. Outputs: region byte,
+ * Pattern AutoSave dirty. Accessors: menu_cellCommitValue() (lop cell),
+ * copyClearService.c, seq_loopableTrackMask() reads the region directly.
+ * Affiliates: pat_scene_region_t.track_loop_exclude.
+ */
+void pat_setTrackLoopable(uint8_t scene_index, uint8_t track, uint8_t loopable)
+{
+    pat_scene_region_t *region = pat_sceneRegionMut(scene_index);
+    uint8_t bit;
+    uint8_t next;
+
+    if (!region || !pat_trackValid(track))
+        return;
+    bit = (uint8_t)(1u << track);
+    next = loopable ? (uint8_t)(region->track_loop_exclude & (uint8_t)~bit)
+                    : (uint8_t)(region->track_loop_exclude | bit);
+    if (next == region->track_loop_exclude)
+        return;
+    region->track_loop_exclude = next;
+    pat_markSceneDirty(scene_index);
+}
+
+uint8_t pat_trackLoopable(uint8_t scene_index, uint8_t track)
+{
+    const pat_scene_region_t *region = pat_sceneRegion(scene_index);
+
+    if (!region || !pat_trackValid(track))
+        return 1u;
+    return (uint8_t)((region->track_loop_exclude & (uint8_t)(1u << track)) == 0u);
 }
 
 /*
@@ -1223,9 +1356,8 @@ uint8_t pat_writeStepAutomation(uint8_t scene_index, uint8_t track,
         if (autos[i].target == target) {
             autos[i].value = (uint8_t)(value & 0x7Fu);
             sp = pat_readStepSpecials(scene_index, track, step);
-            return pat_writeDynamic(scene_index, track, step, sp.flags, sp.note,
-                                    sp.velocity, sp.probability, autos, count,
-                                    0u);
+            return pat_writeDynamic(scene_index, track, step, sp.flags, &sp,
+                                    autos, count, 0u);
         }
     }
     if (count >= PAT_BLOCK_AUTO_COUNT_MASK)
@@ -1234,8 +1366,8 @@ uint8_t pat_writeStepAutomation(uint8_t scene_index, uint8_t track,
     autos[count].value = (uint8_t)(value & 0x7Fu);
     count++;
     sp = pat_readStepSpecials(scene_index, track, step);
-    return pat_writeDynamic(scene_index, track, step, sp.flags, sp.note,
-                            sp.velocity, sp.probability, autos, count, 0u);
+    return pat_writeDynamic(scene_index, track, step, sp.flags, &sp, autos,
+                            count, 0u);
 }
 
 /*
@@ -1273,8 +1405,8 @@ uint8_t pat_removeStepAutomation(uint8_t scene_index, uint8_t track,
         autos[i] = autos[i + 1u];
     count--;
     sp = pat_readStepSpecials(scene_index, track, step);
-    return pat_writeDynamic(scene_index, track, step, sp.flags, sp.note,
-                            sp.velocity, sp.probability, autos, count, 1u);
+    return pat_writeDynamic(scene_index, track, step, sp.flags, &sp, autos,
+                            count, 1u);
 }
 
 /*
@@ -1323,13 +1455,15 @@ void pat_setPatternNext(uint8_t scene_index, uint8_t value)
 }
 
 /*
- * Load one selected step's resolved specials into the STEP menu buffer.
+ * Apply all 7 step specials to the menu parameter buffer (S079).
  *
- * What: copy the pool reader's note, velocity, and probability into
- * parameter_values[]. Why: selecting a step must repaint its stored values and
- * show the agreed defaults when no block exists. Inputs: viewed Scene, active
- * track, and selected step. Output: the three PAR_STEP_* cells are refreshed.
- * Affiliates: menu_parseParameter() and pat_readStepSpecials().
+ * What: copy the pool reader's resolved special values into
+ * parameter_values[] so the STEP page can display and edit them. Why:
+ * selecting a step must repaint its stored values and show the agreed
+ * defaults when no block exists. Inputs: viewed Scene, active track, and
+ * selected step. Output: the seven PAR_STEP_* cells are refreshed.
+ * Affiliates: menu_showStepEditPage(), PAR_ACTIVE_STEP handler,
+ * pat_readStepSpecials().
  */
 void pat_applyStepToMenu(uint8_t scene_index, uint8_t track, uint8_t step)
 {
@@ -1337,15 +1471,19 @@ void pat_applyStepToMenu(uint8_t scene_index, uint8_t track, uint8_t step)
 
     parameter_values[PAR_STEP_NOTE] = sp.note;
     parameter_values[PAR_STEP_VOLUME] = sp.velocity;
-    parameter_values[PAR_STEP_PROB] = sp.probability;
+    parameter_values[PAR_STEP_CONDITION] = sp.condition;
+    parameter_values[PAR_STEP_TIMING] = sp.timing;
+    parameter_values[PAR_STEP_ROLL] = sp.roll;
+    parameter_values[PAR_STEP_RHYTHM] = sp.rhythm;
+    parameter_values[PAR_STEP_FILL] = sp.fill;
 }
 
 /*
- * Set or clear one step's note override through a read-modify-write.
+ * Set or clear one step's note override through a read-modify-write (S079).
  *
- * What: retain velocity/probability specials while changing note. Why: the
- * endless encoder edits one field at a time, and PAT_DEFAULT_NOTE needs no
- * pool byte. Inputs: Scene/track/step and a MIDI note value 0..127. Output:
+ * What: retain the other specials while changing note. Why: the endless
+ * encoder edits one field at a time, and PAT_DEFAULT_NOTE needs no pool byte.
+ * Inputs: Scene/track/step and a MIDI note value 0..127. Output:
  * pat_writeSpecials() reallocates, updates, or frees the block as required and
  * returns nonzero only after the address/pool transaction commits.
  * Affiliates: menu PAR_STEP_NOTE dispatch and pat_readStepSpecials().
@@ -1356,19 +1494,20 @@ uint8_t pat_setStepNote(uint8_t scene_index, uint8_t track, uint8_t step,
     pat_step_specials_t sp = pat_readStepSpecials(scene_index, track, step);
     uint8_t new_flags;
 
+    sp.note = value;
     if (value == PAT_DEFAULT_NOTE)
         new_flags = (uint8_t)(sp.flags & (uint8_t)~PAT_SPECIAL_NOTE_BIT);
     else
         new_flags = (uint8_t)(sp.flags | PAT_SPECIAL_NOTE_BIT);
-    return pat_writeSpecials(scene_index, track, step, new_flags,
-                             value, sp.velocity, sp.probability);
+    return pat_writeSpecials(scene_index, track, step, new_flags, &sp);
 }
 
 /*
- * Set or clear one step's velocity override through a read-modify-write.
+ * Set or clear one step's velocity override through a read-modify-write
+ * (S079).
  *
- * What: retain note/probability specials while changing velocity. Why: the
- * Step volume encoder must not disturb another stored value, and
+ * What: retain the other specials while changing velocity. Why: the Step
+ * volume encoder must not disturb another stored value, and
  * PAT_DEFAULT_VELOCITY needs no pool byte. Inputs: Scene/track/step and a
  * 0..127 velocity. Output: pat_writeSpecials() updates or releases storage
  * and returns nonzero only after the address/pool transaction commits.
@@ -1380,36 +1519,118 @@ uint8_t pat_setStepVolume(uint8_t scene_index, uint8_t track, uint8_t step,
     pat_step_specials_t sp = pat_readStepSpecials(scene_index, track, step);
     uint8_t new_flags;
 
+    sp.velocity = value;
     if (value == PAT_DEFAULT_VELOCITY)
         new_flags = (uint8_t)(sp.flags & (uint8_t)~PAT_SPECIAL_VEL_BIT);
     else
         new_flags = (uint8_t)(sp.flags | PAT_SPECIAL_VEL_BIT);
-    return pat_writeSpecials(scene_index, track, step, new_flags,
-                             sp.note, value, sp.probability);
+    return pat_writeSpecials(scene_index, track, step, new_flags, &sp);
 }
 
 /*
- * Set or clear one step's probability override through a read-modify-write.
+ * Set or clear one step's trigger condition (S079 §3).
  *
- * What: retain note/velocity specials while changing probability. Why: 127 is
- * the always-fire default and therefore needs no pool byte. Inputs:
- * Scene/track/step and a 0..127 probability. Output: pat_writeSpecials()
- * updates or releases storage and returns nonzero only after commit; lower
- * values gate playback probabilistically.
- * Affiliates: menu PAR_STEP_PROB dispatch and pat_readStepSpecials().
+ * What: condition value 0 is the always-fire default and clears the condition
+ * flag; nonzero values store the condition index. Inputs: Scene/track/step
+ * and condition 0..36. Output: pat_writeSpecials() commit. Affiliates: menu
+ * PAR_STEP_CONDITION dispatch.
  */
-uint8_t pat_setStepProbability(uint8_t scene_index, uint8_t track,
-                               uint8_t step, uint8_t value)
+uint8_t pat_setStepCondition(uint8_t scene_index, uint8_t track,
+                             uint8_t step, uint8_t value)
 {
     pat_step_specials_t sp = pat_readStepSpecials(scene_index, track, step);
     uint8_t new_flags;
 
-    if (value == 127u)
-        new_flags = (uint8_t)(sp.flags & (uint8_t)~PAT_SPECIAL_PROB_BIT);
+    sp.condition = value;
+    if (value == 0u)
+        new_flags = (uint8_t)(sp.flags & (uint8_t)~PAT_SPECIAL_COND_BIT);
     else
-        new_flags = (uint8_t)(sp.flags | PAT_SPECIAL_PROB_BIT);
-    return pat_writeSpecials(scene_index, track, step, new_flags,
-                             sp.note, sp.velocity, value);
+        new_flags = (uint8_t)(sp.flags | PAT_SPECIAL_COND_BIT);
+    return pat_writeSpecials(scene_index, track, step, new_flags, &sp);
+}
+
+/*
+ * Set or clear one step's roll rate (S079 §4).
+ *
+ * What: value 0 is off (no roll) and clears the flag. Inputs:
+ * Scene/track/step and roll index 0..8. Output: pat_writeSpecials() commit.
+ * Affiliates: menu PAR_STEP_ROLL dispatch.
+ */
+uint8_t pat_setStepRoll(uint8_t scene_index, uint8_t track,
+                        uint8_t step, uint8_t value)
+{
+    pat_step_specials_t sp = pat_readStepSpecials(scene_index, track, step);
+    uint8_t new_flags;
+
+    sp.roll = value;
+    if (value == 0u)
+        new_flags = (uint8_t)(sp.flags & (uint8_t)~PAT_SPECIAL_ROLL_BIT);
+    else
+        new_flags = (uint8_t)(sp.flags | PAT_SPECIAL_ROLL_BIT);
+    return pat_writeSpecials(scene_index, track, step, new_flags, &sp);
+}
+
+/*
+ * Set or clear one step's micro-timing delay (S079 §7).
+ *
+ * What: value 0 is no delay and clears the flag. Inputs: Scene/track/step and
+ * delay 0..99. Output: pat_writeSpecials() commit. Affiliates: menu
+ * PAR_STEP_TIMING dispatch.
+ */
+uint8_t pat_setStepTiming(uint8_t scene_index, uint8_t track,
+                          uint8_t step, uint8_t value)
+{
+    pat_step_specials_t sp = pat_readStepSpecials(scene_index, track, step);
+    uint8_t new_flags;
+
+    sp.timing = value;
+    if (value == 0u)
+        new_flags = (uint8_t)(sp.flags & (uint8_t)~PAT_SPECIAL_TIMING_BIT);
+    else
+        new_flags = (uint8_t)(sp.flags | PAT_SPECIAL_TIMING_BIT);
+    return pat_writeSpecials(scene_index, track, step, new_flags, &sp);
+}
+
+/*
+ * Set or clear one step's roll rhythm pattern (S079 §5).
+ *
+ * What: value 0 is the default 1-1 pattern and clears the flag. Inputs:
+ * Scene/track/step and a packed rhythm byte. Output: pat_writeSpecials()
+ * commit. Affiliates: menu PAR_STEP_RHYTHM dispatch.
+ */
+uint8_t pat_setStepRhythm(uint8_t scene_index, uint8_t track,
+                          uint8_t step, uint8_t value)
+{
+    pat_step_specials_t sp = pat_readStepSpecials(scene_index, track, step);
+    uint8_t new_flags;
+
+    sp.rhythm = value;
+    if (value == 0u)
+        new_flags = (uint8_t)(sp.flags & (uint8_t)~PAT_SPECIAL_RHYTHM_BIT);
+    else
+        new_flags = (uint8_t)(sp.flags | PAT_SPECIAL_RHYTHM_BIT);
+    return pat_writeSpecials(scene_index, track, step, new_flags, &sp);
+}
+
+/*
+ * Set or clear one step's roll fill percentage (S079 §6).
+ *
+ * What: value 100 is the default (full step) and clears the flag. Inputs:
+ * Scene/track/step and fill 0..100. Output: pat_writeSpecials() commit.
+ * Affiliates: menu PAR_STEP_FILL dispatch.
+ */
+uint8_t pat_setStepFill(uint8_t scene_index, uint8_t track,
+                        uint8_t step, uint8_t value)
+{
+    pat_step_specials_t sp = pat_readStepSpecials(scene_index, track, step);
+    uint8_t new_flags;
+
+    sp.fill = value;
+    if (value == 100u)
+        new_flags = (uint8_t)(sp.flags & (uint8_t)~PAT_SPECIAL_FILL_BIT);
+    else
+        new_flags = (uint8_t)(sp.flags | PAT_SPECIAL_FILL_BIT);
+    return pat_writeSpecials(scene_index, track, step, new_flags, &sp);
 }
 
 /* =======================================================================
@@ -1564,7 +1785,11 @@ uint8_t pat_rawDecode(const uint8_t *block, pat_step_specials_t *specials,
     if (specials) {
         specials->note = PAT_DEFAULT_NOTE;
         specials->velocity = PAT_DEFAULT_VELOCITY;
-        specials->probability = 127u;
+        specials->condition = 0u;
+        specials->roll = 0u;
+        specials->timing = 0u;
+        specials->rhythm = 0u;
+        specials->fill = 100u;
         specials->flags = 0u;
     }
     if (!block || pat_rawBlockBytes(block) == 0u)
@@ -1579,8 +1804,24 @@ uint8_t pat_rawDecode(const uint8_t *block, pat_step_specials_t *specials,
         if (specials) specials->velocity = block[index];
         index++;
     }
-    if (flags & PAT_SPECIAL_PROB_BIT) {
-        if (specials) specials->probability = block[index];
+    if (flags & PAT_SPECIAL_COND_BIT) {
+        if (specials) specials->condition = block[index];
+        index++;
+    }
+    if (flags & PAT_SPECIAL_ROLL_BIT) {
+        if (specials) specials->roll = block[index];
+        index++;
+    }
+    if (flags & PAT_SPECIAL_TIMING_BIT) {
+        if (specials) specials->timing = block[index];
+        index++;
+    }
+    if (flags & PAT_SPECIAL_RHYTHM_BIT) {
+        if (specials) specials->rhythm = block[index];
+        index++;
+    }
+    if (flags & PAT_SPECIAL_FILL_BIT) {
+        if (specials) specials->fill = block[index];
         index++;
     }
     if (specials)
@@ -1606,7 +1847,7 @@ uint8_t pat_rawDecode(const uint8_t *block, pat_step_specials_t *specials,
  * stamps it.
  */
 uint8_t pat_rawEncode(uint8_t out[PAT_RAW_BLOCK_MAX], uint8_t flags,
-                      uint8_t note, uint8_t velocity, uint8_t probability,
+                      const pat_step_specials_t *specials,
                       const pat_automation_entry_t *autos, uint8_t count)
 {
     uint8_t index = 3u;
@@ -1615,7 +1856,8 @@ uint8_t pat_rawEncode(uint8_t out[PAT_RAW_BLOCK_MAX], uint8_t flags,
 
     flags &= (uint8_t)PAT_SPECIAL_FLAGS_MASK;
     if (!out || count > PAT_BLOCK_AUTO_COUNT_MASK ||
-        (count != 0u && !autos) || (flags == 0u && count == 0u))
+        (count != 0u && !autos) || (flags == 0u && count == 0u) ||
+        (flags != 0u && !specials))
         return 0u;
     bytes = (uint8_t)(pat_blockChunks(flags, count) * 4u);
     if (bytes == 0u || bytes > PAT_RAW_BLOCK_MAX)
@@ -1623,9 +1865,13 @@ uint8_t pat_rawEncode(uint8_t out[PAT_RAW_BLOCK_MAX], uint8_t flags,
     memset(out, 0, bytes);
     out[1] = (uint8_t)(count & PAT_BLOCK_AUTO_COUNT_MASK);
     out[2] = flags;
-    if (flags & PAT_SPECIAL_NOTE_BIT) out[index++] = note;
-    if (flags & PAT_SPECIAL_VEL_BIT) out[index++] = velocity;
-    if (flags & PAT_SPECIAL_PROB_BIT) out[index++] = probability;
+    if (flags & PAT_SPECIAL_NOTE_BIT)   out[index++] = specials->note;
+    if (flags & PAT_SPECIAL_VEL_BIT)    out[index++] = specials->velocity;
+    if (flags & PAT_SPECIAL_COND_BIT)   out[index++] = specials->condition;
+    if (flags & PAT_SPECIAL_ROLL_BIT)   out[index++] = specials->roll;
+    if (flags & PAT_SPECIAL_TIMING_BIT) out[index++] = specials->timing;
+    if (flags & PAT_SPECIAL_RHYTHM_BIT) out[index++] = specials->rhythm;
+    if (flags & PAT_SPECIAL_FILL_BIT)   out[index++] = specials->fill;
     for (i = 0u; i < count; i++) {
         uint16_t packed = (uint16_t)(((uint16_t)(autos[i].value & 0x7Fu) << 9u) |
                                      (autos[i].target & 0x01FFu));
@@ -1806,6 +2052,10 @@ void pat_rawRegionCopyBody(uint8_t src_scene, uint8_t dst_scene)
     memcpy(dst->track_length, src->track_length, sizeof(dst->track_length));
     memcpy(dst->track_scale, src->track_scale, sizeof(dst->track_scale));
     memcpy(dst->track_shuffle, src->track_shuffle, sizeof(dst->track_shuffle));
+    memcpy(dst->track_play_mode, src->track_play_mode,
+           sizeof(dst->track_play_mode));
+    /* S080 P2 Defect 8a: the loop exclusion travels with a Scene copy. */
+    dst->track_loop_exclude = src->track_loop_exclude;
     dst->pattern_change_bar = src->pattern_change_bar;
     dst->pattern_next = src->pattern_next;
 }

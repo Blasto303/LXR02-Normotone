@@ -301,17 +301,18 @@
  */
 #define PAT_STACK_SIZE           256u
 /*
- * Permanent Pattern pool swap block (S075).
+ * Permanent Pattern pool swap block (S075, updated S079).
  *
- * What: the top 33 chunks (132 B, one maximum dynamic block) of every Scene
- * pool are kept out of ordinary allocation. Why: a copy/clear paste can
- * always place one maximum block even into a full pool (place via swap, free
- * the old run, compact, return), and the block is reserved for future uses.
- * Inputs: PAT_STACK_SIZE. Outputs: allocator bound (PAT_POOL_ALLOC_CHUNKS),
- * swap byte offset, and the usage-percent denominator. Affiliates:
- * PatternData.c pat_poolAlloc()/pat_raw*, PatternStackService.c bounds.
+ * What: the top 34 chunks (136 B, one maximum dynamic block with 7 specials
+ * and 63 automation entries) of every Scene pool are kept out of ordinary
+ * allocation. Why: a copy/clear paste can always place one maximum block
+ * even into a full pool (place via swap, free the old run, compact, return),
+ * and the block is reserved for future uses. Inputs: PAT_RAW_BLOCK_MAX / 4
+ * rounded up (S079). Outputs: allocator bound (PAT_POOL_ALLOC_CHUNKS), swap
+ * byte offset, and the usage-percent denominator. Affiliates: PatternData.c
+ * pat_poolAlloc()/pat_raw*, PatternStackService.c bounds.
  */
-#define PAT_POOL_SWAP_CHUNKS      33u
+#define PAT_POOL_SWAP_CHUNKS      34u
 #define PAT_POOL_SWAP_BYTES      (PAT_POOL_SWAP_CHUNKS * 4u)
 #define PAT_POOL_ALLOC_CHUNKS    ((uint16_t)(PAT_STACK_SIZE * 8u - PAT_POOL_SWAP_CHUNKS))
 #define PAT_POOL_SWAP_OFFSET     ((uint16_t)(PAT_POOL_ALLOC_CHUNKS * 4u))
@@ -434,6 +435,32 @@
 ** va_scanService(), and menu_serviceRuntimeWidgets().
 ** ----------------------------------------------------------------------- */
 #define BUTTON_HOLD_DELAY_MS                 200u
+/*
+ * Double-click detection window (S077 P2 §4.2, Q7).
+ *
+ * What: the maximum milliseconds between the first and second press of the same
+ * button for the second press to count as a double-click. Why: PERF SEQ
+ * double-click triggers realignment. The timeout is short enough to avoid false
+ * positives during rapid Scene switching but long enough for a deliberate
+ * double-tap. Inputs: time_sysTick. Output: the double-click detector's
+ * wrap-safe comparison in buttonHandler.c. Domain: must stay below 32,768 for
+ * unsigned 16-bit comparison. Affiliate: buttonHandler.c dblclick_onPress().
+ */
+#define DOUBLE_CLICK_TIMEOUT                 300u
+/*
+ * Per-step roll fill gate fade time (S079 P2).
+ *
+ * What: duration in milliseconds of the fast output-gain fade that ducks a
+ * voice when a per-step roll's fill window ends before the step does
+ * (roll fill < 100). Why: the roll fill must cut the sounding voice with a
+ * short fade instead of altering the voice's decay parameter; keeping the
+ * duration in config.h makes the feel easy to tune. Inputs: none. Outputs:
+ * InstrumentManager's per-block fade step
+ * (OUTPUT_DMA_SIZE / (ROLL_FILL_FADE_MS / 1000 * REAL_FS)). Affiliates:
+ * instrumentManager_calcSlotAsync(), instrumentManager_requestGateDuck(),
+ * InstrumentManager.c. RAM: none (compile-time).
+ */
+#define ROLL_FILL_FADE_MS       5u
 #define VOICE_AUTOMATION_UNDERLINE_QUIET_MS  100u
 #define VOICE_AUTOMATION_SCAN_STEPS_PER_PASS 4u
 

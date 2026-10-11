@@ -79,8 +79,22 @@ enum ParamEnums
 
 	PAR_ACTIVE_STEP,
 	PAR_STEP_VOLUME,
-	PAR_STEP_PROB,
+	/*
+	 * Step-special flat parameter mirrors (S079).
+	 *
+	 * What: one id per editable step special. PAR_STEP_CONDITION replaces the
+	 * former PAR_STEP_PROB probability gate; PAR_STEP_TIMING, PAR_STEP_ROLL,
+	 * PAR_STEP_RHYTHM, and PAR_STEP_FILL are new. Why: the STEP page displays
+	 * and edits each special in its own cell through parameter_values[].
+	 * Inputs: pat_applyStepToMenu(), menu_parseGlobalParam(). Affiliates:
+	 * menuPages.h SEQ_PAGE, menu.c DTYPE/static-param dispatch.
+	 */
+	PAR_STEP_CONDITION,
 	PAR_STEP_NOTE,
+	PAR_STEP_TIMING,
+	PAR_STEP_ROLL,
+	PAR_STEP_RHYTHM,
+	PAR_STEP_FILL,
 
 	PAR_EUKLID_LENGTH,
 	PAR_EUKLID_STEPS,
@@ -108,6 +122,15 @@ enum ParamEnums
 	PAR_TRACK_SCALE,
 	PAR_TRACK_MIDI_CHAN,
 	PAR_TRACK_MIDI_NOTE,
+	/*
+	 * Per-track play mode flat parameter (S078 §4.1).
+	 *
+	 * What: menu display/edit mirror for the track's play mode byte. Input:
+	 * Menu track settings page. Output: parameter_values[PAR_TRACK_PLAY_MODE]
+	 * holds 0..5. Affiliates: pat_applyTrackSettingsToMenu(),
+	 * pat_setTrackPlayMode(), menuPages.h SEQ_PAGE layout.
+	 */
+	PAR_TRACK_PLAY_MODE,
 
 	PAR_BEGINNING_OF_GLOBALS,
 	PAR_BPM = PAR_BEGINNING_OF_GLOBALS,
@@ -187,6 +210,80 @@ enum ParamEnums
 	PAR_BUS_COMP_TIME,
 	PAR_BUS_COMP_SIDECHAIN,
 
+	/*
+	 * S080 BAR overlay settings (perf_btn_lt/rt, perf_note_lt/rt).
+	 *
+	 * What: four persisted global parameters for the SHIFT+REC overlay page.
+	 * The *_BTN ids select a trigger type (vmx, v10, v64, v32, flm, fls, r/8,
+	 * r16, r32, r64, r6t, 128); the *_NOTE ids select a MIDI note (0 = def, else
+	 * 0..127). Why: the overlay behaviour must survive power cycles, so it is
+	 * written to settings.cfg alongside the existing globals. Inputs: SHIFT+REC
+	 * edits and settings load/default. Outputs: parameter_values[] reads by
+	 * buttonHandler's VOICE trigger dispatch. Affiliates: filesystem settings
+	 * writer/parser (S080 E10/E11), RECORDING_PAGE (S080 E3).
+	 */
+	PAR_PERF_BTN_LT,
+	PAR_PERF_NOTE_LT,
+	PAR_PERF_BTN_RT,
+	PAR_PERF_NOTE_RT,
+
+	/*
+	 * S080 scene queue / change division globals (scd, qcd, qac).
+	 *
+	 * What: PAR_SCENE_CHANGE_DIV (scd) is the musical division at which direct
+	 * (SEQ) scene changes take effect (0..9); PAR_SCENE_QUEUE_DIV (qcd) is the
+	 * division for queued (SHIFT+SEQ) changes, with its own longer list
+	 * (0..17, adding 5b..9b, 12b, 15b, 16b, S080 P2);
+	 * PAR_SCENE_QUEUE_ACTION (qac) selects what a
+	 * queued change does when it fires: nrm, mut, mrp, res, u+r, o+r, mmr, rld,
+	 * r+r (values 0..8, S080 P2 Defect 15). Why: musical timing and console
+	 * normalisation for scene changes. The PC reset for direct and chain-fired
+	 * changes is the pre-existing PAR_BAR_RESET_MODE (pcr); queued changes carry
+	 * their own reset inside qac and ignore pcr. Inputs: global settings page
+	 * edits and settings load/default. Outputs: sequencer scene-change deferral
+	 * and the foreground executor (menu_serviceDeferredSceneChange()).
+	 * Affiliates: filesystem settings writer/parser (keys scd/qcd/qac),
+	 * MENU_MIDI_PAGE sub-page 2, sceneQueueActionNames (MenuText.h).
+	 */
+	PAR_SCENE_CHANGE_DIV,
+	PAR_SCENE_QUEUE_DIV,
+	PAR_SCENE_QUEUE_ACTION,
+
+	/*
+	 * S080 Phase G chain editor mirrors (cn1, nx1, cn2, nx2).
+	 *
+	 * What: display/edit mirrors of the four chain bytes of the Scene shown in
+	 * the SHIFT+PLAY+SEQ chain editor: condition 1 (0..78), next scene 1
+	 * (0..43), condition 2, next scene 2. Why: the generic static-cell renderer
+	 * reads parameter_values[]; the retained values live per Scene in
+	 * scene_settings_t.chain_condition[]/chain_next[]. Inputs: loaded from the
+	 * viewed Scene by menu_chainMenuOpen()/menu_chainMenuView(). Outputs:
+	 * edits commit through menu_commitChainParam() to that Scene only (no edit
+	 * mask fan-out). Never serialized as Globals; menu_parseGlobalParam()
+	 * treats them as no-ops so a settings load cannot write SceneData.
+	 * Affiliates: PATTERN_SETTINGS_PAGE (menuPages.h), chainConditionNames/
+	 * chainNextNames (MenuText.h), scene_setChainCondition()/Next().
+	 */
+	PAR_CHAIN_COND1,
+	PAR_CHAIN_NEXT1,
+	PAR_CHAIN_COND2,
+	PAR_CHAIN_NEXT2,
+
+	/*
+	 * S080 P2 Defect 8a: per-track loopable mirror (lop).
+	 *
+	 * What: on/off display/edit mirror of the active track's loopable flag in
+	 * the viewed Scene's Pattern region (1 = the looper may capture the track,
+	 * 0 = always excluded). Why: lets the performer keep utility tracks
+	 * running free while looping. Appended here, not beside
+	 * PAR_TRACK_PLAY_MODE, so no established Global id is renumbered. Inputs:
+	 * pat_applyTrackSettingsToMenu(). Outputs: edits commit through
+	 * menu_cellCommitValue() to pat_setTrackLoopable(); bulk Global apply is a
+	 * no-op for this id. Affiliates: pat_scene_region_t.track_loop_exclude,
+	 * seq_loopableTrackMask(), SEQ_PAGE sub-page 0 cell 6.
+	 */
+	PAR_TRACK_LOOPABLE,
+
 	NUM_PARAMS = 384,
 };
 
@@ -194,6 +291,13 @@ _Static_assert(PAR_AUTOSAVE_ENABLED < NUM_PARAMS,
 	"AutoSave parameter must fit the fixed flat parameter allocation");
 _Static_assert(PAR_BUS_COMP_SIDECHAIN < NUM_PARAMS,
 	"S074 bus compressor mirrors must fit the fixed flat parameter allocation");
+
+/*
+ * S080 P2: the chain mirrors and the loopable mirror consume existing
+ * parameter_values[] capacity; this keeps the fixed flat allocation honest.
+ */
+_Static_assert(PAR_TRACK_LOOPABLE < NUM_PARAMS,
+	"S080 chain/loopable mirrors must fit the fixed flat parameter allocation");
 
 #include "stm32f4xx.h"
 

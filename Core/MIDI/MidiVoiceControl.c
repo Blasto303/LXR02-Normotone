@@ -211,6 +211,7 @@ void voiceControl_noteOn(uint8_t voice, uint8_t note, uint8_t vel)
 
 }
 //----------------------------------------------------------------
+//----------------------------------------------------------------
 void voiceControl_noteOff(uint8_t voice)
 {
 	uint32_t primask;

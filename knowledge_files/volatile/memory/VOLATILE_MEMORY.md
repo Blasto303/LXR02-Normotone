@@ -31,36 +31,71 @@ Do not recommend bumping `AUTOSAVE_PARAMETER_GETS_PER_WRITE` or adjusting
 capture timing unless the user explicitly asks. The section-based CRC
 format redesign is the chosen path for write performance.
 
-## Current carryover after Session 075
+## Current carryover after Session 080
 
-Session 075 (2026-10-01/03, `dev-ph6-copyclear`) started Phase 6: copy and
-clear of Pattern data, Scenes and Scene children (`Core/Menu/CopyClear/`),
-global `srt` retired (PERF `fxm`), the DEV trace stage `c`, two hardware
-follow-up rounds (F1, F2: defaults, pan rule, morphable FX send, VOICE
-hold-SHIFT Morph, Effect-page SHIFT+TRACK overlay) and the automation
-priority fix (F3).
+Session 080 (2026-10-10/11, `dev-ph6-cleanup`) built the PERF performance
+surface: PERF page split, `lop`/`!lp` conditions, the master-clock-anchored
+looper with per-track Loopable flag, the BAR VOICE-trigger overlay, the
+latched SHIFT+REC settings menu, scene change / queued change divisions and
+queue actions (one PC reset `pcr`; queued reset in `qac`), scene chaining
+with the SHIFT+PLAY+SEQ editor, and the queued-Scene fast blink.
 
-- **Commits:** HEAD `76aef20` holds every S075 code change. The closeout docs
-  and three comment-only pointer edits are uncommitted. The user manages
-  commits.
-- **Final link (DEV):** `text=532,408`, `data=416`, `bss=426,712`; payload
-  532,824 B of 753,664 (220,840 B free); ITCM 4,168 B; DTCM statics 4,472 B;
-  FX arena 126,592 B; `scenes` `0x65E0`. `LXRV2_lxr02.img` SHA-256
-  `d1c0aac2…9ceb`. Production build last measured at F1.
-- **Durable authorities:** `075_SESSION_HANDOFF_LOG.md`;
-  `COPYCLEAR_UTILITIES.md` (new); `PATTERN_DYNAMIC_STACK.md` §6.2a and §12.17;
-  `MODULE_INTERCHANGE_SPEC.md`; `BANK_PRESET_ARCHITECTURE.md`.
-- **Disposable:** the ten root `S075_*.md` documents.
-- **Next session (076):** user hardware checks (overlay follow-up, the
-  `COPYCLEAR_UTILITIES.md` §16 list, an F2-card validator run after deleting
-  old AutoSave records), production build measurement, then the next Phase 6
-  item chosen with the user.
-- **Open (details in `knowledge_files/volatile/S070_WORKING_NOTES.md` and the
-  log §13):** Pattern Load fan-out tear; O1 per-voice Morph equalisation;
-  MIDI-entered values reach the LCD only at the next repaint; Effects saved at
-  pan 64 show `1`; the S074 items (boot timeout, `cpu` with `cmp`, BC11, F4
-  trace priorities, stale comments).
-- **Hardware still pending from S072:** the Phase 5 Step 6–10 matrices.
+- **Commits:** code at `4869a98`; close-out docs uncommitted. The user
+  manages commits.
+- **Final link (DEV):** `text=556,008`, `data=412`, `bss=427,976`; payload
+  556,420 B of 753,664 (197,244 B free).
+- **Durable authorities:** `080_SESSION_HANDOFF_LOG.md`;
+  `PATTERN_DYNAMIC_STACK.md` §6.5/§6.6; `MODULE_INTERCHANGE_SPEC.md` "PERF
+  performance surface".
+- **Next session (081):** carry-over list in
+  `knowledge_files/volatile/S078_WORKING_NOTES.md` (S080 matrix row by row,
+  S079 P2 checklist, reload/live-record decisions, STEP marker retry,
+  production build).
+
+### Working preferences confirmed in Session 080
+
+- **Hardware failure → trace before planning.** When an implementation
+  fails on hardware the user asks for the important implementation
+  decisions piece by piece, then a full schedule from a code deep-dive. Trace
+  each reported symptom to concrete code causes (several causes can stack;
+  list them all), and say when the written plan itself is wrong (the
+  Defect 7 realign rule, the chain menu's "SHIFT release exits").
+- **Plan text is not always the user's intent.** The user corrects
+  misstated requirements in the plan (S080 Defect 14 loop start on scene
+  change) and adds options late (Defect 15 queue actions). Fold such
+  changes into both the plan and the reference, mark them as corrections,
+  and keep follow-up questions explicit.
+- **Decisions from the written plan win over a recommendation the user has
+  not answered.** When applying recommendations the user has not answered,
+  list them as "decisions applied" so the user can veto them.
+- **No new files without a named filename** (still binding): S080 put the
+  PERF reference into existing specs rather than a new document.
+- **Close-out includes `SCOPING_TARGETS.md`** (accomplished/open) and
+  marking hardware results in the schedule when the user reports them.
+
+### Working preferences confirmed in Session 078
+
+- **Root cause first, then a narrow fix document.** For a reported defect the
+  user asks for the "precise, targeted reason" and a narrowly scoped fix
+  written to a named root document, before any code. Read the code, rule out
+  alternatives explicitly, and do not pad with speculative diagnostic plans
+  when the code already proves the cause.
+- **Plan → schedule → implement → review → test.** The user asks for a
+  per-change implementation schedule (file, line, add/remove/modify, full
+  comment blocks), then implements (or asks the assistant to), then asks for
+  an assessment appended to the schedule, then tests on hardware and asks for
+  results to be marked in the documents.
+- **Deviations found in a deep dive are listed explicitly** and the plan
+  document is updated to match the schedule when asked.
+- **"Doesn't work" without detail:** ask which part, what was seen, and which
+  image was flashed before changing code (S078: it was a wrong image).
+- **Labels follow existing vocabulary.** The user rejects poor abbreviations
+  (`mod`) and wants a concept to read the same everywhere (track `run` /
+  `Track` / `RunMode`, matching the FX sequencer's `run` / `RunMode`).
+- **SHIFT Morph-view rule (binding):** a non-morphable parameter shows and
+  edits its Normal value in every Morph view; never `---`, never locked.
+- **Session closeout also updates `SCOPING_TARGETS.md`** for what was
+  accomplished (this or earlier sessions).
 
 ### Working preferences confirmed in Session 075
 

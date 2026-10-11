@@ -141,6 +141,12 @@ typedef enum {
     IM_SPECIAL_TRANSIENT_FREQ,
     IM_SPECIAL_INSTRUMENT_DRIVE,
     IM_SPECIAL_LFO_RATE,
+    /*
+     * S076 P2: lfo_offset writer. Scales the 0..127 descriptor byte onto the
+     * full 32-bit phase accumulator range before writing lfo.phaseOffset,
+     * instead of the raw TYPE_UINT32 store that made 127 effectively zero.
+     */
+    IM_SPECIAL_LFO_OFFSET,
     IM_SPECIAL_WRITER_COUNT
 } instrument_special_writer_t;
 
@@ -500,6 +506,43 @@ void instrumentManager_updateLfoAdapters(uint8_t source_slot,
 void instrumentManager_setSlot6Track7StepDecayOverride(uint8_t value);
 void instrumentManager_clearSlot6Track7StepDecayOverride(void);
 /*
+ * LFO phase Scene-change handoff (S076 P2).
+ *
+ * What:       captureLfoPhases() snapshots the running phase of every slot's
+ *             LFO before the deferred Scene worker starts.
+ *             restoreLfoPhaseIfNeeded(slot) checks the incoming LFO's
+ *             retrigger field after descriptor values are applied and decides:
+ *             scn retrigger -> phase = phaseOffset (reset to start);
+ *             otherwise -> phase = captured snapshot (continue cycle).
+ * Why:        instrumentManager_resetRuntimeSlot() unconditionally zeroes the
+ *             LFO phase via memset + lfo_init. Without capture/restore, the
+ *             running phase is always lost on Scene change.
+ * Inputs:     captureLfoPhases() reads from the current runtime LFOs.
+ *             restoreLfoPhaseIfNeeded(slot) reads the handoff struct and the
+ *             incoming LFO's retrigger field (already written by descriptor
+ *             apply).
+ * Outputs:    captureLfoPhases() fills the static handoff struct
+ *             (28 bytes: 6 x uint32_t phase + 1 uint8_t valid, padded).
+ *             restoreLfoPhaseIfNeeded(slot) writes lfo->phase.
+ * Callers:    preset_startDrumsetApply() (capture),
+ *             preset_resetAndApplyKitVoiceImage() (restore).
+ * Affiliates: instrumentManager_resetRuntimeSlot() (the reset that destroys
+ *             the phase), presetMorph_applyVoiceNow() (descriptor apply that
+ *             writes retrigger before restore is called).
+ */
+void instrumentManager_captureLfoPhases(void);
+void instrumentManager_restoreLfoPhaseIfNeeded(uint8_t slot);
+/*
+ * Capture one slot's LFO phase before a single-voice apply (S077 P2 §2.3).
+ *
+ * Inputs: slot 0..5. Output: the slot's running phase is snapshotted into the
+ * shared handoff struct and marked valid, so
+ * instrumentManager_restoreLfoPhaseIfNeeded() can continue the cycle after the
+ * slot reset. Client: preset_startSingleVoiceApply(). Affiliate:
+ * instrumentManager_captureLfoPhases() (the all-slot variant).
+ */
+void instrumentManager_captureLfoPhaseForSlot(uint8_t slot);
+/*
  * Dynamic instrument runtime dispatcher.
  *
  * Inputs: logical slot/track numbers from SceneData, MIDI, mixer, and LFO
@@ -528,6 +571,15 @@ void instrumentManager_runtimeInit(void);
  */
 void instrumentManager_clearAllRuntimeModulationTargets(void);
 /*
+ * Clear runtime modulation targets for one slot only (S077 P2 §2.2).
+ *
+ * Inputs: slot 0..5. Output: this source slot's two LFO pair destinations and
+ * velocity source are detached, leaving every other slot's modulation graph
+ * live. Client: preset_startSingleVoiceApply(). Affiliate:
+ * instrumentManager_clearAllRuntimeModulationTargets() (the all-slot variant).
+ */
+void instrumentManager_clearRuntimeModulationTargetsForSlot(uint8_t slot);
+/*
  * Quiet test for deferred Scene-slot replacement.
  *
  * Inputs: zero-based instrument slot. Output: nonzero when the slot has no
@@ -555,6 +607,17 @@ uint8_t instrumentManager_ampEnvelopeQuiet(uint8_t slot);
  * voices during one Instrument load.
  */
 void instrumentManager_resetRuntimeSlot(uint8_t slot);
+/*
+ * Reinitialize one slot's runtime from a caller-selected Scene (S077 P2 §2.1).
+ *
+ * Inputs: slot 0..5 and a resident Scene index. Output: that slot's tagged
+ * runtime member is reset to the Scene's type and engine defaults. Why: the
+ * single-voice per-track apply commits a slot whose played Scene may differ
+ * from the active Scene. Affiliate: instrumentManager_resetRuntimeSlot()
+ * (the active-Scene wrapper).
+ */
+void instrumentManager_resetRuntimeSlotFromScene(uint8_t slot,
+                                                 uint8_t scene_index);
 void instrumentManager_dispatchRuntimeLfos(void);
 void instrumentManager_recalcRuntimeLfoSync(void);
 void instrumentManager_retriggerRuntimeLfos(uint8_t trigger_track);
@@ -584,6 +647,30 @@ uint8_t instrumentManager_runtimePan(uint8_t slot);
 float instrumentManager_runtimeVolume(uint8_t slot);
 void instrumentManager_triggerTrack(uint8_t trigger_track, uint8_t note,
                                     uint8_t velocity);
+
+/*
+ * Arm a fast gain fade-out on a track's voice (S079 P2 fix 4).
+ *
+ * What: maps a visible trigger track to its storage slot and sets that slot's
+ * duck request. Why: a per-step roll's fill boundary must duck the sounding
+ * voice with a short output fade instead of altering the voice's decay
+ * parameter (which was the P1 bug). Inputs: visible trigger track 0..6.
+ * Output: the slot's duck request is set; the audio path arms the fade at the
+ * next rendered block. Context: called from the TIM3 sequencer ISR; a single
+ * byte store is atomic on Cortex-M7. Affiliates: seq_processRollTicks(),
+ * instrumentManager_calcSlotAsync().
+ */
+void instrumentManager_requestGateDuck(uint8_t trigger_track);
+
+/*
+ * Current per-slot roll fill gate gain, 1.0 = open, 0.0 = fully ducked
+ * (S079 P2 fix 4).
+ *
+ * What: returns the live fade multiplier for one slot. Why: the mixer folds it
+ * into the slot's dry and send gains. Inputs: zero-based slot. Output:
+ * 0.0..1.0. Affiliates: mixer_faderGains().
+ */
+float instrumentManager_gateGain(uint8_t slot);
 /*
  * Return the type that currently owns a slot's live tagged runtime member.
  *

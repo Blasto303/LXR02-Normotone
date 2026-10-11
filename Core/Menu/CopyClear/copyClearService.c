@@ -36,11 +36,8 @@
 #define CC_REMAP_NONE         0xFFu
 
 _Static_assert(CC_SCRATCH_REMAP_OFFSET + FS_HCNAMES_ROW_COUNT <=
-                   CC_SCRATCH_TABLE_OFFSET,
-               "remap must end before the paste table");
-_Static_assert(CC_SCRATCH_BLOCK_OFFSET + PAT_POOL_ALLOC_CHUNKS * 4u <=
                    FS_NAME_SCRATCH_BYTES,
-               "copy/clear scratch must fit the name buffer");
+               "HCNAMES remap must fit the borrowed name buffer");
 
 /* FIFO of pending pastes/clears: 4 x 6 B plus head and count (26 B). */
 static cc_job_t ccSvc_queue[CC_QUEUE_SIZE];
@@ -93,6 +90,23 @@ static uint8_t ccSvc_claimScene = CC_NO_SCENE;
 static uint16_t ccSvc_nameRetry;
 /* Borrowed 9 kB name buffer, NULL while not borrowed (4 B). */
 static uint8_t *ccSvc_buf;
+
+/*
+ * Paste source table for overlapping pastes (S077).
+ *
+ * What: a 128-entry uint16_t array that replaces the cast into the borrowed
+ * name buffer at the former CC_SCRATCH_TABLE_OFFSET. Each entry encodes one
+ * source step: bit 15 is the source trigger (CC_SNAP_TRIGGER), bit 14
+ * announces stored block data (CC_SNAP_BLOCK), and bits 11..0 are a
+ * four-byte-chunk offset into the background region's pool (CC_SNAP_OFFSET).
+ * Why: the table must outlive the name-buffer borrow (which is now shorter)
+ * and must accommodate a future PAT_STACK_SIZE of 512 (4,063 allocatable
+ * chunks). SRAM cost: 256 bytes in SRAM1 .bss (approved). Lifetime: static;
+ * valid from the SNAPSHOT phase of an overlapping paste until the PLACE phase
+ * completes. Owner: copyClearService.c exclusively. Affiliates: ccSvc_table(),
+ * ccSvc_snapBlock(), ccSvc_runPatternPaste().
+ */
+static uint16_t ccSvc_snapTable[NUM_STEPS];
 
 #if DEV_MODE_LOGGING
 /*
@@ -292,7 +306,7 @@ static uint8_t ccSvc_claimAndEvacuate(uint8_t scene)
 
 /* ---- Pattern paste engine (spec §9.5) ---------------------------------- */
 
-/* Geometry of a step/range/bar/track paste. */
+/* Geometry of a step/range/bar/bar-to-step/track paste. */
 typedef struct {
     uint8_t src_first;   /* first source step                         */
     int8_t dir;          /* +1 or -1                                  */
@@ -328,6 +342,34 @@ static void ccSvc_pasteGeometry(const cc_job_t *job, cc_paste_geo_t *g)
         g->count = (uint8_t)((hi - lo + 1u) * NUM_STEPS_PER_BAR);
         g->dst_first = (uint8_t)(job->start * NUM_STEPS_PER_BAR);
         break;
+    /*
+     * What:       bar-to-step cross-kind paste geometry. The source uses bar
+     *             coordinates (identical to CC_KIND_BAR: src->start * 16,
+     *             direction and count scaled by 16). The destination uses
+     *             step coordinates (job->start is an absolute step, used
+     *             directly — NOT multiplied by 16).
+     * Why:        the user copied a bar source and pasted to a step
+     *             destination. The source data is the same bar(s); only the
+     *             destination alignment changes.
+     * Inputs:     job->start (absolute step 0..127), src->start/end (bar
+     *             indices 0..7).
+     * Outputs:    g->dst_first = job->start (absolute step); source fields
+     *             identical to CC_KIND_BAR.
+     * Affiliates: CC_KIND_BAR (source geometry), CC_KIND_STEP (destination
+     *             geometry model).
+     */
+    case CC_KIND_BAR_TO_STEP:
+        if (src->start <= src->end) {
+            g->src_first = (uint8_t)(src->start * NUM_STEPS_PER_BAR);
+            g->dir = 1;
+        } else {
+            g->src_first = (uint8_t)(src->start * NUM_STEPS_PER_BAR +
+                                     NUM_STEPS_PER_BAR - 1u);
+            g->dir = -1;
+        }
+        g->count = (uint8_t)((hi - lo + 1u) * NUM_STEPS_PER_BAR);
+        g->dst_first = job->start;
+        break;
     default:            /* `copy track` */
         g->src_first = 0u;
         g->dir = 1;
@@ -348,23 +390,60 @@ static uint8_t ccSvc_dstStep(const cc_paste_geo_t *g, uint8_t i)
     return (uint8_t)((g->dst_first + i) & (NUM_STEPS - 1u));
 }
 
-/* Snapshot table entry layout (u16 at offset 256 + 2*i). */
+/*
+ * Snapshot table entry layout (one uint16_t in ccSvc_snapTable[NUM_STEPS]).
+ *
+ * Bits 15 and 14 mark a source trigger (CC_SNAP_TRIGGER) and stored block
+ * data (CC_SNAP_BLOCK); bits 11..0 are a four-byte-chunk offset
+ * (CC_SNAP_OFFSET) into the background region's pool.
+ */
 #define CC_SNAP_TRIGGER  0x8000u
 #define CC_SNAP_BLOCK    0x4000u
-#define CC_SNAP_OFFSET   0x07FFu
+#define CC_SNAP_OFFSET   0x0FFFu
+/*
+ * Offset field width guard (S077).
+ *
+ * What: CC_SNAP_OFFSET must represent every allocatable chunk index. Why: at
+ * PAT_STACK_SIZE 256 the maximum is 2,015 chunks (fits in 11 bits), but at
+ * PAT_STACK_SIZE 512 it is 4,063 chunks and would wrap in the old 11-bit mask.
+ * The 12-bit field (0x0FFF, max 4,095) covers both. Bits 12-13 remain free
+ * between CC_SNAP_BLOCK (bit 14) and CC_SNAP_OFFSET (bits 11..0). Inputs:
+ * PAT_POOL_ALLOC_CHUNKS. Affiliate: config.h pool geometry.
+ */
+_Static_assert(PAT_POOL_ALLOC_CHUNKS <= CC_SNAP_OFFSET + 1u,
+               "CC_SNAP_OFFSET must cover every allocatable chunk");
 
+/*
+ * Paste source table accessor (S077).
+ *
+ * What: returns the static 128-entry table that replaced the cast into the
+ * name buffer. Why: the table is now independent of the name-buffer borrow;
+ * the overlapping paste engine writes it during SNAPSHOT and reads it during
+ * PLACE. Inputs: none. Outputs: pointer to ccSvc_snapTable[]. Affiliates:
+ * ccSvc_runPatternPaste(), ccSvc_sourceBlock().
+ */
 static uint16_t *ccSvc_table(void)
 {
-    return (uint16_t *)(void *)&ccSvc_buf[CC_SCRATCH_TABLE_OFFSET];
+    return ccSvc_snapTable;
 }
 
-/* Snapshot block of entry i, or NULL. */
+/*
+ * Snapshot block accessor (S077).
+ *
+ * What: returns a pointer into the background region's pool where the
+ * overlapping-paste SNAPSHOT phase stored one retargeted source block. Why:
+ * the pool is the same type and size as every live Scene pool, so it can hold
+ * any set of source blocks without the name-buffer size constraint. The
+ * offset field (CC_SNAP_OFFSET) is a four-byte-chunk index from pool byte 0.
+ * Inputs: one uint16_t table entry. Outputs: const pointer to the block
+ * bytes, or NULL when CC_SNAP_BLOCK is not set. Affiliates:
+ * ccSvc_sourceBlock(), pat_backgroundPoolMut().
+ */
 static const uint8_t *ccSvc_snapBlock(uint16_t entry)
 {
     if ((entry & CC_SNAP_BLOCK) == 0u)
         return 0;
-    return &ccSvc_buf[CC_SCRATCH_BLOCK_OFFSET +
-                      (uint16_t)(entry & CC_SNAP_OFFSET) * 4u];
+    return &pat_backgroundPoolMut()[(uint16_t)(entry & CC_SNAP_OFFSET) * 4u];
 }
 
 /* Bit helpers for the 128-bit early-trigger masks. */
@@ -416,9 +495,17 @@ uint8_t ccSvc_pasteTriggersNow(uint8_t slot)
     if (slot >= CC_QUEUE_SIZE)
         return 0u;
     job = &ccSvc_queue[slot];
+    /*
+     * What:       early trigger gate. Accepts step, bar, bar-to-step and
+     *             track paste jobs; other kinds (Scene, FX step) have no
+     *             Pattern triggers to preview.
+     * Why:        CC_KIND_BAR_TO_STEP is a Pattern paste and needs the same
+     *             immediate trigger-bit write as CC_KIND_BAR and CC_KIND_STEP.
+     * Affiliates: ccSvc_pasteGeometry(), ccCopy_requestBarToStep().
+     */
     if ((job->op & CC_JOB_CLASS_MASK) != CC_JOB_PASTE ||
         (job->kind != CC_KIND_STEP && job->kind != CC_KIND_BAR &&
-         job->kind != CC_KIND_TRACK))
+         job->kind != CC_KIND_BAR_TO_STEP && job->kind != CC_KIND_TRACK))
         return 0u;
     ccSvc_pasteGeometry(job, &g);
     if (g.count == 0u ||
@@ -528,8 +615,7 @@ static uint8_t ccSvc_sourceBlock(const cc_job_t *job, const cc_paste_geo_t *g,
             count = ccCopy_retargetEntries(&ctx, autos, count);
             if (count_drops)
                 ccSvc_traceRetargetDropped((uint8_t)(before - count));
-            bytes = pat_rawEncode(out, sp.flags, sp.note, sp.velocity,
-                                  sp.probability, autos, count);
+            bytes = pat_rawEncode(out, sp.flags, &sp, autos, count);
         }
         *block_out = bytes ? out : 0;
         return bytes;
@@ -587,8 +673,17 @@ uint8_t ccSvc_runPatternPaste(const cc_job_t *job)
 
         if (ccSvc_pasteOverlaps(job, &g)) {
             run->phase = 1u;
-            if (!ccSvc_ensureScratch())
+            if (filesystem_patternSnapshotInUse()) {
+                CC_TRACE_SAT16(ccSvc_traceState.scratch_wait);
                 return CC_RUN_WAIT;
+            }
+#if DEV_MODE_LOGGING
+            if (ccSvc_traceState.scratch_wait != 0u) {
+                ccTrace(AUTOSAVE_TRACE_CC_EVT_SNAPSHOT_GATE,
+                        (uint32_t)ccSvc_traceState.scratch_wait);
+                ccSvc_traceState.scratch_wait = 0u;
+            }
+#endif
         }
         r = ccSvc_claimAndEvacuate(job->scene);
         if (r != CC_RUN_DONE)
@@ -634,12 +729,11 @@ uint8_t ccSvc_runPatternPaste(const cc_job_t *job)
                     count = ccCopy_retargetEntries(&ctx, autos, count);
                     ccSvc_traceRetargetDropped((uint8_t)(before - count));
                 }
-                bytes = pat_rawEncode(block, sp.flags, sp.note, sp.velocity,
-                                      sp.probability, autos, count);
+                bytes = pat_rawEncode(block, sp.flags, &sp, autos, count);
             }
             if (bytes != 0u) {
-                memcpy(&ccSvc_buf[CC_SCRATCH_BLOCK_OFFSET +
-                                  (uint16_t)run->aux * 4u], block, bytes);
+                memcpy(&pat_backgroundPoolMut()[(uint16_t)run->aux * 4u],
+                       block, bytes);
                 entry = (uint16_t)(entry | CC_SNAP_BLOCK |
                                    (run->aux & CC_SNAP_OFFSET));
                 run->aux = (uint16_t)(run->aux + bytes / 4u);
@@ -754,6 +848,12 @@ uint8_t ccSvc_runPatternPaste(const cc_job_t *job)
                                   s->track_scale[src->track]);
                 pat_setTrackShuffle(job->scene, job->track,
                                     s->track_shuffle[src->track]);
+                /* S078 §4.1: play mode is part of a track copy. */
+                pat_setTrackPlayMode(job->scene, job->track,
+                                     s->track_play_mode[src->track]);
+                /* S080 P2 Defect 8a: loopable is part of a track copy. */
+                pat_setTrackLoopable(job->scene, job->track,
+                                     pat_trackLoopable(src->scene, src->track));
             }
         } else if (dst) {
             uint16_t last = (uint16_t)g.dst_first + g.count - 1u;
@@ -820,7 +920,8 @@ static uint8_t ccSvc_clearSelection(const cc_job_t *job)
 /*
  * Clear one step: `all` empties it (trigger off), `automation` strips the
  * automation and keeps trigger and specials, `notes` turns the trigger off,
- * removes note/velocity specials, and keeps probability plus automation.
+ * removes note/velocity specials, and keeps the trigger condition plus
+ * automation.
  * Rewrites never grow, so they use the swap path. Returns CC_RUN_DONE or
  * CC_RUN_WAIT (swap-return pending).
  */
@@ -852,14 +953,16 @@ static uint8_t ccSvc_clearStep(uint8_t scene, uint8_t track, uint8_t step,
     if (sel == CC_CLEAR_AUTO) {
         if (count == 0u)
             return CC_RUN_DONE;
-        bytes = pat_rawEncode(block, sp.flags, sp.note, sp.velocity,
-                              sp.probability, 0, 0u);
+        bytes = pat_rawEncode(block, sp.flags, &sp, 0, 0u);
         return ccSvc_rewriteShrink(scene, track, step, block, bytes,
                                    PAT_RAW_TRIGGER_KEEP);
     }
-    /* notes: probability gates the retained automation and must stay. */
-    bytes = pat_rawEncode(block, (uint8_t)(sp.flags & PAT_SPECIAL_PROB_BIT),
-                          0u, 0u, sp.probability, autos, count);
+    /*
+     * notes: the trigger condition gates the retained automation and must
+     * stay; the note and velocity specials are dropped (S079).
+     */
+    sp.flags &= (uint8_t)PAT_SPECIAL_COND_BIT;
+    bytes = pat_rawEncode(block, sp.flags, &sp, autos, count);
     return ccSvc_rewriteShrink(scene, track, step, block, bytes,
                                PAT_RAW_TRIGGER_OFF);
 }
@@ -868,7 +971,7 @@ static uint8_t ccSvc_clearStep(uint8_t scene, uint8_t track, uint8_t step,
  * Run one Pattern clear in bounded steps (spec §5, §9.6).
  *
  * What: empties steps (all), strips automation (automation), or turns
- * triggers off and removes note/velocity specials while keeping probability
+ * triggers off and removes note/velocity specials while keeping the condition
  * and automation (notes), over a step range, a track, or the whole Pattern;
  * and
  * resets track settings for `clear track`. Every rewrite is
@@ -924,6 +1027,10 @@ uint8_t ccSvc_runPatternClear(const cc_job_t *job)
             pat_setTrackLength(job->scene, job->track, NUM_STEPS_PER_BAR);
             pat_setTrackScale(job->scene, job->track, TRACK_SCALE_DEFAULT);
             pat_setTrackShuffle(job->scene, job->track, 0u);
+            /* S078 §4.1: clearing a track returns play mode to fwd. */
+            pat_setTrackPlayMode(job->scene, job->track, 0u);
+            /* S080 P2 Defect 8a: a cleared track is loopable again. */
+            pat_setTrackLoopable(job->scene, job->track, 1u);
         }
         ccSvc_release();
         ccSvc_patternChangedUi(job->scene,
@@ -999,8 +1106,7 @@ uint8_t ccSvc_runRegionCopy(uint8_t src_scene, uint8_t dst_scene)
                 count = ccCopy_retargetEntries(&ctx, autos, count);
                 ccSvc_traceRetargetDropped((uint8_t)(before - count));
             }
-            bytes = pat_rawEncode(block, sp.flags, sp.note, sp.velocity,
-                                  sp.probability, autos, count);
+            bytes = pat_rawEncode(block, sp.flags, &sp, autos, count);
             if (!pat_rawRegionPublishRewritten(src_scene, dst_scene, index,
                                                bytes ? block : 0))
                 ccTrace_anomaly(AUTOSAVE_TRACE_CC_ANOM_REGION_REWRITE_GREW,
@@ -1085,9 +1191,8 @@ static uint8_t ccSvc_runRegister(void)
                 if (autos[i].target != target)
                     autos[kept++] = autos[i];
             if (kept != count) {
-                uint8_t bytes = pat_rawEncode(block, sp.flags, sp.note,
-                                              sp.velocity, sp.probability,
-                                              autos, kept);
+                uint8_t bytes = pat_rawEncode(block, sp.flags, &sp, autos,
+                                              kept);
 
                 if (ccSvc_rewriteShrink(scene, t, s, block, bytes,
                                         PAT_RAW_TRIGGER_KEEP) == CC_RUN_WAIT)

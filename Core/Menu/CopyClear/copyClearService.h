@@ -33,8 +33,9 @@
  * One queued paste or clear (6 B). op: class | selection. kind: source kind
  * (paste) or object kind (clear). scene/track: destination (paste) or object
  * Scene/track (clear). start: destination start (paste: absolute step, bar,
- * track, Scene or FX step) or object start. end: object end (clear); unused
- * for pastes (the length comes from the operation's source).
+ * bar-to-step absolute step, track, Scene or FX step) or object start.
+ * end: object end (clear); unused for pastes (the length comes from the
+ * operation's source).
  */
 typedef struct {
     uint8_t op;
@@ -88,28 +89,26 @@ void ccSvc_interactionStarted(void);
 /* Run state of the job at the queue head (valid only inside an executor). */
 cc_run_t *ccSvc_run(void);
 /*
- * Borrowed 9 kB name buffer (S075, F1-I).
+ * Borrowed 9 kB name buffer (S075 F1-I; S077 reduced scope).
  *
- * What: the filesystem's name cache, lent to copy/clear only when it is used:
- * by a step/bar paste that overlaps its own source (snapshot), and by the
- * name remap and its end-of-operation HCNAMES write. Clears, pot clears,
- * whole-Pattern copy/reset, non-overlapping pastes and Scene-level data
- * commits never wait for it. ccSvc_scratch() returns NULL while not borrowed.
- * Layout (spec §9.3): [0..160] HCNAMES row remap (0xFF = unchanged);
- * [256..511] paste source table; [512..] source blocks. Accessors:
+ * What: the filesystem's name cache, lent to copy/clear only for the HCNAMES
+ * row remap and the end-of-operation name write. Source block data and the
+ * paste source table are no longer stored here (S077: blocks use the
+ * background region's pool; the table is a static uint16_t[128]). Clears, pot
+ * clears, whole-Pattern copy/reset, non-overlapping pastes and Scene-level
+ * data commits never wait for it. ccSvc_scratch() returns NULL while not
+ * borrowed. Layout: [0..160] HCNAMES row remap (0xFF = unchanged). Accessors:
  * copyClearService.c, copyOps.c.
  */
 uint8_t *ccSvc_scratch(void);
 /* Borrow scratch for the final name phase; zero while filesystem is busy. */
 uint8_t ccSvc_namesReady(void);
 #define CC_SCRATCH_REMAP_OFFSET   0u
-#define CC_SCRATCH_TABLE_OFFSET   256u
-#define CC_SCRATCH_BLOCK_OFFSET   512u
 
 /*
  * Bounded engines shared by the executors (each returns CC_RUN_*):
- * ccSvc_runPatternPaste(): step, range, bar and `copy track` pastes (spec
- * §9.5). ccSvc_runPatternClear(): step/bar/track and PERF Pattern clears
+ * ccSvc_runPatternPaste(): step, range, bar, bar-to-step and `copy track`
+ * pastes (spec §9.5). ccSvc_runPatternClear(): step/bar/track and PERF Pattern clears
  * (spec §5). ccSvc_runRegionCopy(): whole-Pattern copy src -> dst with
  * retargeting when types differ (spec §9.8). ccSvc_runRegionReset(): empty
  * one whole Pattern. They take and release the exclusive boundary themselves

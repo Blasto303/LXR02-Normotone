@@ -32,14 +32,34 @@ typedef enum {
     CC_OP_CLEAR
 } cc_op_t;
 
-/* What a copy object button selected (also the kind of a held clear object). */
+/* What a copy object button selected, the kind of a held clear object, or a
+ * cross-kind paste (CC_KIND_BAR_TO_STEP: bar source, step destination). */
+/*
+ * What:       CC_KIND_BAR_TO_STEP (6) is a cross-kind paste: the source is a
+ *             bar or bar range (CC_KIND_BAR coordinates: bar index 0..7) but
+ *             the destination is an absolute step (0..127). The paste engine
+ *             resolves this through ccSvc_pasteGeometry() which uses bar-scale
+ *             source geometry (src->start * 16, count * 16) and step-scale
+ *             destination geometry (job->start as absolute step).
+ * Why:        allows the user to paste a copied bar starting at any step, not
+ *             only at a bar boundary. The source kind remains CC_KIND_BAR (the
+ *             source was selected with a SELECT button); only the job kind
+ *             changes to CC_KIND_BAR_TO_STEP to signal the cross-kind
+ *             interpretation. Value 6 fits in the 3-bit trace field
+ *             (ccTrace_job: job->kind & 0x07u).
+ * Inputs:     set by cc_copySeq() when a bar source accepts a SEQ destination.
+ * Outputs:    consumed by ccSvc_pasteGeometry(), ccSvc_pasteTriggersNow(),
+ *             ccCopy_runJob(), and the trace encoder.
+ * Affiliates: CC_KIND_BAR, CC_KIND_STEP, ccSvc_pasteGeometry().
+ */
 typedef enum {
     CC_KIND_NONE = 0u,
     CC_KIND_STEP,
     CC_KIND_BAR,
     CC_KIND_TRACK,
     CC_KIND_SCENE,
-    CC_KIND_FX_STEP
+    CC_KIND_FX_STEP,
+    CC_KIND_BAR_TO_STEP
 } cc_kind_t;
 
 /*
@@ -170,6 +190,19 @@ uint8_t copyClear_ownsEncoder(void);
 void copyClear_encoderTurned(int8_t inc);
 uint8_t copyClear_ownsPots(void);
 uint8_t copyClear_potTurned(const cc_pot_target_t *target);
+
+/*
+ * Report whether the held copy/clear gesture is a clear (not a copy).
+ *
+ * What: nonzero only while CC_OP_CLEAR is the active phase, i.e. SHIFT was
+ * held when the copy/clear button went down. Why: copyClear_ownsPots() is
+ * true for both copy and clear, but the STEP held-step track automation
+ * overlay (S078 P2 §8) must intercept a pot turn only to remove automation
+ * from the held steps; in copy mode the same pot turn must stay inert.
+ * Inputs: cc_state.phase. Output: 1 for clear, 0 for armed-copy/copy/none.
+ * Callers: menu_parseKnobDelta().
+ */
+uint8_t copyClear_isClearMode(void);
 
 /*
  * AutoSave and Pattern maintenance suspension (spec §9.2).

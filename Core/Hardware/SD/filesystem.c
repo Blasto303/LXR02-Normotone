@@ -2589,6 +2589,21 @@ static void filesystem_resetGlobalsToDefaults(void)
     memset(parameter_values + PAR_BEGINNING_OF_GLOBALS, 0, globals_len);
     parameter_values[PAR_BPM] = 120u;
     parameter_values[PAR_OSC_WAVE_INTERP] = 0u;
+    /*
+     * S080 E11/F6: defaults for the new persistent globals. Overlay defaults
+     * are vmx trigger / def note (0). Scene globals default to instant change
+     * (scd/qcd = 0) and normal queue action (qac = 0, nrm), which preserves the
+     * pre-S080 instant-switch behaviour when a settings.cfg from older firmware
+     * omits these keys. The one PC reset (bar_reset_mode) keeps its pre-S080
+     * default below.
+     */
+    parameter_values[PAR_PERF_BTN_LT] = 0u;
+    parameter_values[PAR_PERF_NOTE_LT] = 0u;
+    parameter_values[PAR_PERF_BTN_RT] = 0u;
+    parameter_values[PAR_PERF_NOTE_RT] = 0u;
+    parameter_values[PAR_SCENE_CHANGE_DIV] = 0u;
+    parameter_values[PAR_SCENE_QUEUE_DIV] = 0u;
+    parameter_values[PAR_SCENE_QUEUE_ACTION] = 0u;
 }
 
 static void filesystem_sanitizeLoadedGlobals(void)
@@ -2596,6 +2611,28 @@ static void filesystem_sanitizeLoadedGlobals(void)
     uint8_t ch = parameter_values[PAR_MIDI_CHAN_GLOBAL];
     if (ch == 0u || ch > 16u)
         parameter_values[PAR_MIDI_CHAN_GLOBAL] = 1u;
+    /*
+     * S080 P2 Defect 15: qac has nine values (0..8). A hand-edited or corrupt
+     * settings.cfg must not leave an out-of-range action that the menu cannot
+     * display; out-of-range values fall back to nrm (0). P1 files storing 3
+     * (old m+m) or 4 (old rld) now read as res / u+r (backward compatibility
+     * not required, user).
+     */
+    if (parameter_values[PAR_SCENE_QUEUE_ACTION] > 8u)
+        parameter_values[PAR_SCENE_QUEUE_ACTION] = 0u;
+    /*
+     * S080 P2: qcd has its own 18-value list (0..17: ins, 1/8, 1/4, 1/2,
+     * 1b..9b, 12b, 15b, 16b, ens, enl) and scd keeps 0..9. Out-of-range values
+     * from a hand-edited or corrupt settings.cfg fall back to instant (0). A
+     * P1 file that stored qcd 8 (ens) or 9 (enl) now reads as 5b / 6b
+     * (backward compatibility not required, user). Affiliates:
+     * sceneQueueDivNames/sceneChangeDivNames (MenuText.h),
+     * seq_queueChangeDivUnits().
+     */
+    if (parameter_values[PAR_SCENE_QUEUE_DIV] > 17u)
+        parameter_values[PAR_SCENE_QUEUE_DIV] = 0u;
+    if (parameter_values[PAR_SCENE_CHANGE_DIV] > 9u)
+        parameter_values[PAR_SCENE_CHANGE_DIV] = 0u;
     /*
      * Normalize the persistent AutoSave preference at the common Global-load
      * boundary. Input is any flat/global compatibility image. Output is one
@@ -2768,6 +2805,15 @@ static uint8_t filesystem_settingsParamForKey(const char *key,
     else if (strcmp(key, "follow") == 0) *param = PAR_FOLLOW;
     else if (strcmp(key, "osc_wave_interp") == 0) *param = PAR_OSC_WAVE_INTERP;
     else if (strcmp(key, "autosave") == 0) *param = PAR_AUTOSAVE_ENABLED;
+    /* S080 E11: PERF BAR overlay settings. */
+    else if (strcmp(key, "perf_btn_lt") == 0) *param = PAR_PERF_BTN_LT;
+    else if (strcmp(key, "perf_note_lt") == 0) *param = PAR_PERF_NOTE_LT;
+    else if (strcmp(key, "perf_btn_rt") == 0) *param = PAR_PERF_BTN_RT;
+    else if (strcmp(key, "perf_note_rt") == 0) *param = PAR_PERF_NOTE_RT;
+    /* S080 F6: scene queue / change division globals. */
+    else if (strcmp(key, "scd") == 0) *param = PAR_SCENE_CHANGE_DIV;
+    else if (strcmp(key, "qcd") == 0) *param = PAR_SCENE_QUEUE_DIV;
+    else if (strcmp(key, "qac") == 0) *param = PAR_SCENE_QUEUE_ACTION;
     else return 0u;
     return 1u;
 }
@@ -3039,6 +3085,15 @@ static void filesystem_patternBuildHeader(uint8_t *header,
         header[base] = region->track_length[track];
         header[base + 1u] = region->track_scale[track];
         header[base + 2u] = region->track_shuffle[track];
+        /* S078 §4.5: byte 3 of the 16-byte track header stores play mode. */
+        header[base + 3u] = region->track_play_mode[track];
+        /*
+         * S080 P2 Defect 8a: byte 4 stores the looper exclusion (1 = track
+         * not loopable). The byte was reserved and written as zero, so older
+         * files read as loopable and the PAT4 version stays 2.
+         */
+        header[base + 4u] =
+            (uint8_t)((region->track_loop_exclude >> track) & 1u);
     }
 }
 
@@ -6602,9 +6657,10 @@ static void filesystem_residentNames_tick(void)
      * Read `/.hcnames`, optionally replace affected Instrument or Kit rows,
      * and write the variable-length register through the normal flush gate.
      *
-     * Load mode is used on Instrument or Kit menu entry: it fills the existing
-     * generalized cache and lets Menu copy one selected row before requesting
-     * the appropriate `.hcindex`. Update mode first performs that same read,
+     * Load mode is used on Instrument or Kit menu entry: it fills the
+     * dedicated `hcnames_name_mirror` and lets Menu copy one selected row
+     * before requesting the appropriate `.hcindex`. Update mode first
+     * performs that same read,
      * changes only rows identified by the completed action, then truncates and
      * streams all cached rows. A full Kit update replaces one Kit row and its
      * six Instrument rows per selected Scene; a nested Instrument update still
@@ -13158,12 +13214,18 @@ static void filesystem_loadSceneDirectory_tick(void)
             uint8_t track;
             region->pattern_change_bar = staging_buf[32];
             region->pattern_next = staging_buf[33];
+            region->track_loop_exclude = 0u;
             for (track = 0u; track < NUM_TRACKS; track++) {
                 uint16_t base = (uint16_t)(48u +
                     track * PATTERN_FILE_TRACK_HEADER_BYTES);
                 region->track_length[track] = staging_buf[base];
                 region->track_scale[track] = staging_buf[base + 1u];
                 region->track_shuffle[track] = staging_buf[base + 2u];
+                /* S078 §4.5: old files are zero-filled here -> fwd. */
+                region->track_play_mode[track] = staging_buf[base + 3u];
+                /* S080 P2 Defect 8a: byte 4 = looper exclusion (old files 0). */
+                if (staging_buf[base + 4u] != 0u)
+                    region->track_loop_exclude |= (uint8_t)(1u << track);
             }
             op_stream_index = 0u;
             op_phase = 48u;
@@ -15188,12 +15250,18 @@ static void filesystem_loadPattern_tick(void)
             if (!region) { op_close_status = FS_STATUS_ERROR; op_phase = 13u; return; }
             region->pattern_change_bar = staging_buf[32u];
             region->pattern_next = staging_buf[33u];
+            region->track_loop_exclude = 0u;
             for (track = 0u; track < NUM_TRACKS; track++) {
                 uint16_t base = (uint16_t)(48u +
                     track * PATTERN_FILE_TRACK_HEADER_BYTES);
                 region->track_length[track] = staging_buf[base];
                 region->track_scale[track] = staging_buf[base + 1u];
                 region->track_shuffle[track] = staging_buf[base + 2u];
+                /* S078 §4.5: root Pattern Load play mode. */
+                region->track_play_mode[track] = staging_buf[base + 3u];
+                /* S080 P2 Defect 8a: byte 4 = looper exclusion (old files 0). */
+                if (staging_buf[base + 4u] != 0u)
+                    region->track_loop_exclude |= (uint8_t)(1u << track);
             }
             op_stream_index = 0u; op_phase = 9u; return;
         }
@@ -16667,6 +16735,16 @@ static void filesystem_initSceneStage(filesystem_scene_stage_t *stage)
      * resident Scene.
      */
     scene_busCompDefaults(&stage->settings);
+    /*
+     * S078 §5.4: stage the track Morph endpoint defaults (16/76/0) so a
+     * sceneset.scg without the new keys behaves like a fresh resident Scene,
+     * and Morph amount 0..255 is a no-op until the endpoints differ.
+     */
+    for (track = 0u; track < NUM_TRACKS; track++) {
+        stage->settings.track_morph_length[track] = NUM_STEPS_PER_BAR;
+        stage->settings.track_morph_scale[track] = STEP_SCALE_DEFAULT;
+        stage->settings.track_morph_shuffle[track] = 0u;
+    }
 }
 
 static uint8_t filesystem_commitSceneStage(void)
@@ -17288,6 +17366,37 @@ static uint8_t filesystem_nextScenesetLine(char *dst, uint16_t cap,
         return filesystem_formatAssignmentCsvU8Line(
             dst, cap, "fx_send_morph", scene->settings.fx_send_morph,
             INSTRUMENT_SLOT_COUNT);
+    case 15u:
+        /*
+         * S078 §5.4: append the three per-track Morph endpoint lines after
+         * fx_send_morph so no earlier writer line moves. Parser keys:
+         * storageTypes.c track_morph_length/scale/shuffle.
+         */
+        return filesystem_formatAssignmentCsvU8Line(
+            dst, cap, "track_morph_length", scene->settings.track_morph_length,
+            NUM_TRACKS);
+    case 16u:
+        return filesystem_formatAssignmentCsvU8Line(
+            dst, cap, "track_morph_scale", scene->settings.track_morph_scale,
+            NUM_TRACKS);
+    case 17u:
+        return filesystem_formatAssignmentCsvU8Line(
+            dst, cap, "track_morph_shuffle",
+            scene->settings.track_morph_shuffle, NUM_TRACKS);
+    case 18u:
+        /*
+         * S080 G5: Scene chain lines, appended after the track Morph lines so
+         * no earlier writer line moves. chain_condition = cn1,cn2 (0..78);
+         * chain_next = nx1,nx2 (0..43). Parser keys: storageTypes.c
+         * storage_scenesetParseLine(). Affiliates: scene_settings_t.chain_*.
+         */
+        return filesystem_formatAssignmentCsvU8Line(
+            dst, cap, "chain_condition", scene->settings.chain_condition,
+            SCENE_CHAIN_SLOT_COUNT);
+    case 19u:
+        return filesystem_formatAssignmentCsvU8Line(
+            dst, cap, "chain_next", scene->settings.chain_next,
+            SCENE_CHAIN_SLOT_COUNT);
     default:
         return 0u;
     }
@@ -17395,19 +17504,55 @@ static uint8_t filesystem_nextSettingsLine(char *dst, uint16_t cap,
         return filesystem_formatAssignmentU16Line(
             dst, cap, "autosave", parameter_values[PAR_AUTOSAVE_ENABLED]);
     case 17u:
+        /* S080 E10: PERF BAR overlay trigger type/note (left overlay). */
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "perf_btn_lt", parameter_values[PAR_PERF_BTN_LT]);
+    case 18u:
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "perf_note_lt", parameter_values[PAR_PERF_NOTE_LT]);
+    case 19u:
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "perf_btn_rt", parameter_values[PAR_PERF_BTN_RT]);
+    case 20u:
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "perf_note_rt", parameter_values[PAR_PERF_NOTE_RT]);
+    /*
+     * S080 F5: scene queue / change division globals.
+     *
+     * What: scd (direct scene-change division), qcd (queued change division),
+     * qac (queued change action, 0..8 incl. the queued PC reset, S080 P2
+     * Defect 15). Why: these controls add musical timing and reset options to
+     * scene changes and must persist across power cycles. The one PC reset for
+     * direct/chain changes is bar_reset_mode above (S080 P2 Defect 5 removed
+     * the duplicate pcr key). Together with the four overlay keys above the
+     * settings data lines grow from 17 to 24; the terminator count moves with
+     * them. Affiliates: filesystem_settingsParamForKey(), the global settings
+     * page.
+     */
+    case 21u:
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "scd", parameter_values[PAR_SCENE_CHANGE_DIV]);
+    case 22u:
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "qcd", parameter_values[PAR_SCENE_QUEUE_DIV]);
+    case 23u:
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "qac", parameter_values[PAR_SCENE_QUEUE_ACTION]);
+    case 24u:
         /*
-         * Self-checking terminator for future format expansion.
+         * Self-checking terminator for format expansion.
          *
-         * What: emits "lines=17\n" as the final line, where 17 is the count
-         * of preceding data lines (cases 0u..16u). Why: gives any future
-         * consumer a cheap completeness signal that distinguishes a genuine
-         * end-of-file from a clean-but-early EOF after a crash. Adding a new
-         * settings key in the future requires incrementing both the key's own
-         * case and this declared count. The boot recovery prelude validates
-         * this count; the normal load path ignores it as an unknown key.
-         * Affiliates: §6 of S057_SETTINGS_WRITE_SAFE.md.
+         * What: emits "lines=24\n" as the final line, where 24 is the count
+         * of preceding data lines (cases 0u..23u: 17 original + 4 overlay
+         * (S080 E10) + 3 scene globals (S080 F5, P2 Defect 5)). Why: gives
+         * consumers a cheap completeness signal that distinguishes a genuine
+         * end-of-file from a clean-but-early EOF after a crash. Adding a
+         * settings key requires incrementing both its own case and this
+         * declared count. The boot recovery prelude validates this count; the
+         * normal load path ignores it as an unknown key. Affiliates: §6 of
+         * S057_SETTINGS_WRITE_SAFE.md.
          */
-        return filesystem_formatAssignmentU16Line(dst, cap, "lines", 17u);
+        return filesystem_formatAssignmentU16Line(dst, cap, "lines", 24u);
     default:
         return 0u;
     }
@@ -25818,6 +25963,31 @@ fs_status_t filesystem_status(void)
     return status;
 }
 
+/*
+ * Pattern drain snapshot-reading gate (S077).
+ *
+ * What: returns nonzero while the Pattern drain state machine is actively
+ * reading the background region snapshot. The drain reads the snapshot in
+ * phases 2-6 (header build, address array, bitmap, pool) and does not read it
+ * in phases 0-1 (chdir, fopen) or 7+ (CRC, close, HCNAMES update). Why: the
+ * overlapping paste copies source blocks into the same background region's
+ * pool; it must not overwrite pool bytes while the drain is streaming them to
+ * disk. The copyClear_backgroundSuspended() gate prevents NEW drains from
+ * starting, but an in-flight drain that began before the copy/clear session
+ * started may still be reading. This function fills that gap. Both ccSvc_tick()
+ * and filesystem_tick() are cooperative main-loop code (called from
+ * timebase_serviceFrontPanel()), so there is no interrupt race on the 10.5 kB
+ * snapshot. Inputs: current_op, op_phase (module-static). Outputs: nonzero
+ * while the snapshot is being read. Affiliates: copyClearService.c
+ * overlapping-paste path-selection gate, pat_snapshotScene(),
+ * pat_autosaveSnapshot().
+ */
+uint8_t filesystem_patternSnapshotInUse(void)
+{
+    return (uint8_t)(current_op == FS_INTERNAL_OP_AUTOSAVE_PATTERN_DRAIN &&
+                     op_phase >= 2u && op_phase <= 6u);
+}
+
 void filesystem_getBootDiagnostic(uint8_t *op, uint8_t *phase)
 {
     uint8_t public_op = FS_BOOT_DIAG_OTHER;
@@ -28383,12 +28553,18 @@ static uint8_t filesystem_bootReaderReadPatternFile(const char *file_name,
     }
     region->pattern_change_bar = staging_buf[32u];
     region->pattern_next = staging_buf[33u];
+    region->track_loop_exclude = 0u;
     for (track = 0u; track < NUM_TRACKS; track++) {
         uint16_t base = (uint16_t)(48u +
             track * PATTERN_FILE_TRACK_HEADER_BYTES);
         region->track_length[track] = staging_buf[base];
         region->track_scale[track] = staging_buf[base + 1u];
         region->track_shuffle[track] = staging_buf[base + 2u];
+        /* S078 §4.5: AutoSave Pattern boot play mode. */
+        region->track_play_mode[track] = staging_buf[base + 3u];
+        /* S080 P2 Defect 8a: byte 4 = looper exclusion (old files 0). */
+        if (staging_buf[base + 4u] != 0u)
+            region->track_loop_exclude |= (uint8_t)(1u << track);
     }
     if (filesystem_blockRead(file, (uint8_t *)region->address,
                              PATTERN_FILE_ADDRESS_BYTES) !=
@@ -30462,14 +30638,14 @@ bool filesystem_requestUpdateResidentKitNames(uint16_t scene_mask,
      * Kit/Instrument family exit, plus an optional callback. Individual
      * scroll, load, and save operations only update committed SceneData and
      * Menu scratch; they do not call this updater.
-     * Output: `/.hcnames` is read into the existing generalized cache, exactly
-     * one Kit row and six Instrument rows per selected Scene are replaced from
-     * committed resident state, and the variable-length file is rewritten
-     * through the normal close/flush gate. Every unrelated logical row is
-     * preserved from the file. One exit request can therefore commit several
-     * actions and several Scenes without retaining a 16-by-7 name array. The
-     * request reuses the existing operation mask, line buffer, and general
-     * cache, so it adds no persistent SRAM storage.
+     * Output: `/.hcnames` is read into the dedicated `hcnames_name_mirror`,
+     * exactly one Kit row and six Instrument rows per selected Scene are
+     * replaced from committed resident state, and the variable-length file is
+     * rewritten through the normal close/flush gate. Every unrelated logical
+     * row is preserved from the file. One exit request can therefore commit
+     * several actions and several Scenes without retaining a 16-by-7 name
+     * array. The request reuses the existing operation mask, line buffer, and
+     * the dedicated mirror, so it adds no persistent SRAM storage.
      */
     if (status == FS_STATUS_BUSY)
         return false;

@@ -90,6 +90,10 @@ it belongs in the summary or the log, not here.
 | 073 | 2026-09-28/29 | `dev-ph5-effects`, HEAD `692abf8` + uncommitted closeout edits | Program flash 480 → 736 KiB, Load:[Samples] restored, DSP CPU refactor (about 10 % worst case), `tools/dsp_test` bench |
 | 074 | 2026-09-29/30 | `dev-ph5-effects`, HEAD `50610dd` | Effect-page underlines, CrumpBit (first arena Effect), master bus compressor, `xfd` fader mode, AutoSave torn-record fix |
 | 075 | 2026-10-01/03 | `dev-ph6-copyclear`, HEAD `76aef20` | Phase 6 copy/clear (`Core/Menu/CopyClear/`), `srt` retired, F1/F2 hardware follow-ups, morphable FX send, automation-priority fix |
+| 076 | 2026-10-06 | `dev-ph6-cleanup`, HEAD uncommitted | Scene parameter automation override clear rules; LFO Scene-reset retrigger and phase-offset scaling fix; copy/clear morph additions; reload scene, bar chaselight, SHIFT+SELECT pattern length |
+| 077 | 2026-10-08 | `dev-ph6-cleanup`, HEAD uncommitted | Background Scene region (17th `pat_background_region`), copy snapshot migration, per-track Scene playback, blank menu after load fix, Scene morph fan-out correction, bar-to-step copy, PERF mode morph automation underline |
+| 078 | 2026-10-08/10 | `dev-ph6-cleanup`, P1 `0c23def`, P2+P3 `b537e6f`, P4 uncommitted | Continuous per-track step scale (Q8.8 DDA), shuffle, run modes, track Morph/automation, STEP multi-step editing, held-step overlay, underline/clear fix, run-mode remediation |
+| 079 | 2026-10-10 | `dev-ph6-cleanup`, HEAD uncommitted | Step trigger conditions (37 → 39 entries), per-step roll/rhythm/fill, micro-timing; P2 remediation: step-button toggle, scroll marker, rhythm presentation, roll fill duck; SD_CARD v1 → v2 conversion |
 
 
 ---
@@ -528,6 +532,18 @@ Session 065 delivered the first working end-to-end step automation path: the exi
 | **Automation always wins** until the voice's next trigger: every Morph-base runtime write is guarded by `seq_automationHoldsParameter()`; a menu edit applies only that parameter's interpolation; external MIDI CC is lowest priority (stores the clamped Normal endpoint; the Morph sweep applies it) | 075 |
 | One pan rule: stored 0..127, **63 = centre = display `0`** (`DTYPE_PM63`); Effect stereo balance laws are centred on 63; mono laws unchanged | 075 |
 | FX send has Normal/Morph endpoints (`fx_send_morph[6]`, AutoSave Scene cells 45..50, `sceneset.scg` `fx_send_morph`); Scene parameter count is **51** | 075 |
+| `pat_background_region` (10,519 B, 17th region) replaces `pat_autosave_snapshot`: used by Pattern AutoSave snapshot, copy/clear overlap paste pool, and future Bank Load staging; never a playable Scene | 077 |
+| `ccSvc_snapTable[128]` (256 B static) holds the paste source table; removed from the 9 kB name buffer. `CC_SNAP_OFFSET` widened to `0x0FFFu` | 077 |
+| `filesystem_patternSnapshotInUse()` returns nonzero during autosave drain phases 2–6; copy/clear overlap waits on this gate, not the retired `ccSvc_ensureScratch()` | 077 |
+| Per-track Scene playback: `seq_perTrackPattern[7]` maps each track to its played Scene; `seq_perTrackActive` flag; ISR reads played Scene per track for region/specials/automation | 077 |
+| `preset_startSingleVoiceApply()` / `preset_tickSingleVoiceApply()` factor single-voice instrument apply from the drumset worker with supersede coordination | 077 |
+| `preset_getSlotPlayedScene(slot)` returns the played Scene for a voice slot, used by the mixer for live fader/send reads | 077 |
+| PERF hold-VOICE+press-SEQ gesture assigns tracks to Scenes; double-click on SEQ toggles per-track override; PERF VOICE release without action toggles mute. `DOUBLE_CLICK_TIMEOUT 300u` | 077 |
+| Background `.hcnames` rewrite must NOT raise `menu_storageBusy` — it locks mode switches/encoder/pots/widgets/copy-clear for ~3 s. Use a lightweight callback (`menu_residentNameDeferredFlushComplete()`) instead | 077 |
+| `menu_endResidentNameScratchSession()` must guard `filesystem_status() == FS_STATUS_BUSY` — without this guard, re-entering Load/Save during a write triggers a spurious FsErr overlay | 077 |
+| Scene morph copy/reset fans out through `bank_sceneFanoutMask()` like `copy kit`/`clear fx`, NOT like `copy scene`/`clear scene` (which exchange/reset the edit mask) | 077 |
+| `CC_KIND_BAR_TO_STEP` (6): cross-kind paste uses bar source geometry (src×16) with step destination geometry (job->start directly); no identical-paste check | 077 |
+| PERF morph automation underline: `va_searchPerfMorphMask` (7-bit), `menu_applyPerfMarkers()` walks 4 visible compact-view cells; the scan/classify/render pipeline was extended to PERF page | 077 |
 
 ---
 
@@ -1759,3 +1775,74 @@ fed back each round; F3 "seems ok". **Phase 6 has started.**
   `AUTOSAVE.md`, `FILESYSTEM_SPEC.md`, `DEV_MODES.md`,
   `STORAGE_SRAM_MANIFEST.md`, `dsp_instruments_effects/EFFECTS_BUS_REFERENCE.md`,
   `dsp_instruments_effects/INSTRUMENTS_DSP_REFERENCE.md`.
+
+### 076 — Override Clear Rules, LFO Scene Retrigger, Morph Copy/Reset, Reload Scene, Bar Chaselight, Pattern Length (2026-10-06)
+
+Session 076 ran on `dev-ph6-cleanup` from the S075 close (`76aef20`; text 532,408, bss 426,712) to uncommitted (text 535,976, data 416, bss 426,744; payload 536,392 B of 753,664, headroom 217,272 B). Four parts implemented:
+
+- **P1 override clear rules:** Rule A (a non-automation write to a parameter clears its step override) and Rule B (Scene activation clears all five override families — instrument, Scene target, voice audio-out, slot-6 track-7 decay, and Effect). 7 files, 16 inline additions.
+- **P2 LFO retrigger `scn` + phase offset fix:** LFO retrigger value 7 (`scn`) performs Scene-change phase handoff via a per-slot `lfo_scene_handoff` struct (+32 B BSS); the LFO phase offset scaling fix converts the raw byte through `IM_SPECIAL_LFO_OFFSET` to full 32-bit phase. 9+1 files.
+- **P3 morph reset/copy:** `reset morph` (track and Scene), `reset fx morph`, `copy morph` (track and Scene). `CC_CLEAR_SEND` moved from value 4 to 5. 8 files, +2,848 B flash.
+- **P4 reload scene / bar chaselight / pattern length:** `reload scene` in the PERF clear menu (fire-and-forget Scene reload from HCNAMES source); bar chaselight on SELECT LEDs in STEP mode; SHIFT+SELECT sets per-track pattern length. 5 files, +792 B flash.
+
+- **Find here**: [076_SESSION_HANDOFF_LOG.md](076_SESSION_HANDOFF_LOG.md),
+  `COPYCLEAR_UTILITIES.md`, `BANK_PRESET_ARCHITECTURE.md`.
+
+### 077 — Background Scene Region, Per-Track Scene Playback, Blank Menu Fix, Scene Morph Fan-Out, Bar-to-Step Copy, PERF Morph Underline (2026-10-08)
+
+Session 077 ran on `dev-ph6-cleanup` from the S076 close (text 535,976, bss 426,744) through six parts to final build text=538,416, data=416, bss=427,008 (payload 538,832 B of 753,664, headroom 214,832 B). BSS +264 B from S076 (256 B static paste table + 8 B alignment).
+
+- **P1 background Scene region (17th `pat_background_region`):** replaced `pat_autosave_snapshot` with an identical-type `pat_background_region` (10,519 B, same as one Scene). `pat_snapshotScene()` / `pat_autosaveSnapshot()` now operate on it; new `pat_backgroundPoolMut()` returns the background pool for copy/clear overlap pastes. `copyClearService.c` gained a static `ccSvc_snapTable[128]` (256 B BSS) for the paste source table, no longer stored in the 9 kB name buffer. `CC_SNAP_OFFSET` widened from `0x07FFu` to `0x0FFFu`. New `filesystem_patternSnapshotInUse()` returns nonzero during autosave drain phases 2–6. Overlap path waits on the filesystem gate instead of the retired `ccSvc_ensureScratch()`.
+- **P2 per-track Scene playback (50 changes across 16 files):** `seq_perTrackPattern[7]` for independent track-to-Scene mapping; `seq_perTrackActive` flag; `seq_setTrackPlayedScene()` / `seq_clearPerTrackOverrides()` / `seq_getTrackPlayedScene()` APIs. Sequencer ISR reads played Scene per track for region/specials/automation/erase. `preset_startSingleVoiceApply()` / `preset_tickSingleVoiceApply()` factor single-voice instrument apply from the drumset worker. PERF hold-VOICE+press-SEQ gesture assigns tracks to Scenes; double-click detector (`dblclick_onPress()`, `DOUBLE_CLICK_TIMEOUT 300u`). Live mixer reads from played Scene via `preset_getSlotPlayedScene()`. PERF LED refresh with tempo pulse and viewed-scene blink. Bug found and fixed: `dblclick_onPress()` timing comparison inverted (fast double-clicks treated as two singles).
+- **P3 blank menu after Scene Load fix:** root cause was background `.hcnames` rewrite raising `menu_storageBusy` for ~3 s, locking mode switches/encoder/pots/widgets/copy-clear. Fixed with new lightweight `menu_residentNameDeferredFlushComplete()` callback that never touches `menu_storageBusy`. A1 fix: `menu_endResidentNameScratchSession()` guard — if `filesystem_status() == FS_STATUS_BUSY`, return 0 with no overlay (prevents spurious FsErr). Hardware verified: primary symptom confirmed fixed.
+- **P4 Scene morph fan-out correction:** `ccCopy_runSceneMorph()` and `ccClear_runResetSceneMorph()` rewritten with `bank_sceneFanoutMask()` loop and per-member Effect type check, matching the fan-out model of `copy kit`/`clear fx`. Labels corrected: `"morph"` → `"inst -> morph"`, `"scene morph"` → `"scene -> morph"`. Pre-existing §13 error in `clear reset fx morph` row corrected.
+- **P5 bar-to-step copy:** new `CC_KIND_BAR_TO_STEP` (6); `cc_copySeq()` routes bar source to step destination via `ccCopy_requestBarToStep()`; `ccSvc_pasteGeometry()` new case uses bar source coords (src×16) with step destination coords (job->start directly). No identical-paste check (cross-kind is never identical).
+- **P6 PERF mode morph automation underline:** new `va_searchPerfMorphMask` (7-bit mask: bits 0–5 per-voice morph, bit 6 effect morph). `va_scanService()` PERF branch classifies morph automation. New `menu_applyPerfMarkers()` walks 4 visible compact-view cells and applies underline markers. Extensions to `menu_repaintGeneric()`, `menu_serviceRuntimeWidgets()`, CGRAM retry guard, `menu_patternContentChanged()`, `menu_switchPage()` PERF entry, and `menu_automationTargetCleared()`.
+
+- **Find here**: [077_SESSION_HANDOFF_LOG.md](077_SESSION_HANDOFF_LOG.md),
+  `COPYCLEAR_UTILITIES.md`, `PATTERN_DYNAMIC_STACK.md`, `STORAGE_SRAM_MANIFEST.md`,
+  `BANK_PRESET_ARCHITECTURE.md`, `AUTOSAVE.md`.
+
+### 078 — Continuous Per-Track Step Scale, Shuffle, Run Modes, Track Morph/Automation, STEP Held-Step Editing, Run-Mode Remediation (2026-10-08/10)
+
+Session 078 ran on `dev-ph6-cleanup` from the S077 close (`8c123fb`; text 538,416, bss 427,008) through `0c23def` (P1) and `b537e6f` (P2+P3) to uncommitted P4 (text 539,856, data 416, bss 427,616; payload 540,272 B of 753,664, headroom 213,392 B). Four parts:
+
+- **P1 track settings expansion:** 128-position continuous log step scale (0.25×..8×, 14 nudged musical stops, default CC 76 = 1/16) with a Q8.8 LUT and per-track DDA accumulators (drift-free fractional timing; seed `interval − 256`); FX sequencer on the same curve (DDA + step counter; `.fx` tokens map to CCs); per-track shuffle on the 1/16 grid (`shuffle × 24 / 256` ticks, odd steps); per-track run modes fwd/rev/pip/rnd/onc/1fr (`track_play_mode[7]`, PAT4 track byte 3, once-mode retrigger rules); morphable length/scale/shuffle (Scene endpoints `track_morph_*[7]`, AutoSave cells 51..71, `sceneset.scg` lines, effective cache `seq_effectiveTrack*[]` per played Scene, voice Morph amount drives its tracks); Scene automation targets 405..425; STEP SHIFT Morph view; `tools/convert_scene_scale.py`. RAM +608 B bss (76 B ISR-static, 24 B overrides, 336 B Scene endpoints, 112 B region).
+- **P2 STEP multi-step editing:** held steps broadcast velocity/note/probability; held steps + TRACK opens a held-step track-automation overlay (`len`/`scl`/`shf` written to held steps; SHIFT+COPY + pot clears held steps only; `copyClear_isClearMode()`).
+- **P3 underline/clear fix:** STEP-page Pattern search (`VA_SEARCH_SCENE_TRACK_BIT`, `va_seqTrackSearchBit()`), name underline with or without held steps, editor/Scene/copy-clear restarts, `menu_knobClearTarget()` STEP arm for pot clears; dead presence byte removed. Hardware 14/14 PASS.
+- **P4 run-mode remediation:** STEP Morph view gated on physical SHIFT (fixes stuck view after SHIFT+mode button, busy page refusal, dropped release); **rule: any SHIFT Morph view shows/edits Normal for non-morphable parameters**; label `run`/`Track`/`RunMode`. Hardware PASS.
+- **Hardware:** P1, P2, P3 and P4 all PASS (user, 2026-10-10).
+- **Retest:** S076 P4, S077 P1 and S077 P2 checklist sections all PASS; 3.10/3.14/3.15 and C1–C6 open. Open finding: STEP marker retry gap (`menu.c` ~13329).
+
+- **Find here**: [078_SESSION_HANDOFF_LOG.md](078_SESSION_HANDOFF_LOG.md),
+  `PATTERN_DYNAMIC_STACK.md` (§6.4), `BANK_PRESET_ARCHITECTURE.md`,
+  `MODULE_INTERCHANGE_SPEC.md`, `FILESYSTEM_SPEC.md`, `AUTOSAVE.md`,
+  `COPYCLEAR_UTILITIES.md`, `STORAGE_SRAM_MANIFEST.md`,
+  `dsp_instruments_effects/EFFECTS_BUS_REFERENCE.md`.
+
+### 079 — Step Trigger Conditions, Per-Step Roll/Rhythm/Fill, Micro-Timing, P2 Remediation (2026-10-10)
+
+Session 079 ran on `dev-ph6-cleanup` from the S078 close (text 539,856, bss 427,616) through two parts to final build text=544,072, data=408, bss=427,776 (payload 544,480 B of 753,664, headroom 209,184 B). BSS +160 B from S078 (P1 +80 B: ~67 B sequencer condition/roll ISR state + 13 B alignment; P2 +80 B: InstrumentManager gate arrays 54 B padded to 56 B + sequencer duck arrays 21 B padded to 24 B). Two implementation parts plus SD_CARD conversion and a P1 addendum:
+
+- **P1 step trigger conditions, roll, and micro-timing (design + implementation):** expanded the dynamic pool block from 3 specials (note/velocity/probability) to 7 specials (note/velocity/condition/roll/timing/rhythm/fill) using flag bits 0–6. `PAT_SPECIAL_PROB_BIT` → `PAT_SPECIAL_COND_BIT`; four new bit definitions (`ROLL`, `TIMING`, `RHYTHM`, `FILL`). `PAT_SPECIAL_FLAGS_MASK` = `0x7Fu`. `pat_step_specials_t` widened to 8 fields; `PAT_RAW_BLOCK_MAX` 132 → 136, `PAT_POOL_SWAP_CHUNKS` 33 → 34. `pat_rawEncode()` signature widened from 3 positional values to `const pat_step_specials_t *`. Four new setters (`pat_setStepRoll/Timing/Rhythm/Fill`); `pat_setStepProbability` → `pat_setStepCondition`. PatternStackService: 5 new ops, service setters. Sequencer: `seq_evaluateStepCondition()` — full 39-entry dispatch (10 probability, 10 repeat-count X:Y, fill/!fill, last/!last, 14 mute/!mute across 7 tracks); self-mute bypass on muted tracks (reads address bit 14, pool condition byte, evaluates if self-mute); `seq_trackRepeatCount[7]`, `seq_trackLastConditionFired[7]`, `seq_fillActive`; per-step roll retrigger engine with rhythm-modified velocity, fill gate, and carry-over across matching steps; micro-timing merged with shuffle deferral. STEP page: 2 step-special subpages (sub 1 = vel/not/cdn/tim, sub 2 = rol/rtm/rfl), with scroll chain sub 1 → sub 2 → automations. PERF fill mode: `seq_fillActive` arm/disarm on hold past `DOUBLE_CLICK_TIMEOUT`. PAT4 version 1 → 2; `tools/convert_pattern_specials.py` (offline probability → condition converter, new). 16 files changed.
+- **P1 addendum (3 post-testing fixes):** (a) subpage 2 unreachable — chained sub 1 → sub 2 → automations in `menu_moveToMenuItem()`, changed `menu_stepAutomationPageActive()` predicate to `== 2u`; (b) display text corrections — `con` → `cdn`, `dly` → `tim`, `Conditn` → `Conditin`, `MicTimng` → `% Delay`; (c) 7th-track mute condition — extended condition table from 37 to 39 entries (added `7mu`/`!7m` at indices 37/38), modulus 6 → 7, boundary 30 → 31, clamp 36 → 38.
+- **P2 remediation (4 hardware-testing fixes, design + implementation + assessment):** (1) step-button re-press toggle — `menu_toggleStepEditSubpage()` flips SEQ sub 1 ↔ sub 2; routed in `buttonHandler_seqButtonPressed()` SELECT_MODE_STEP arm. (2) `>` scroll marker on roll subpage — `checkScrollSign()` subpage-2 arm, positions 0–2. (3) rhythm label/category/order — `rrt` → `rtm`, `RlRhythm` → `Rhythm`, `CAT_STEP` → `CAT_VELOCITY`; decoder `off` for byte 0/cycle<2/full≥cycle; `stepRollRhythmBytes[21]` ordered list (off + 10 halve + 10 double, cycles 2–5, equal pairs excluded); `menu_rollRhythmStep()` stepper called from encoder and endless-pot hooks; clamp snaps to list. (4) roll fill duck — removed `instrumentManager_applyTriggerGateDecay()`, `voiceControl_noteOnGated()`, `seq_triggerVoiceGated()`; added per-slot `gateFade[6]`/`gateFadeStep[6]`/`gateDuck[6]` in InstrumentManager, `ROLL_FILL_FADE_MS 5u` in config.h, `instrumentManager_requestGateDuck()`/`instrumentManager_gateGain()` APIs; mixer folds gate gain into dry + send; sequencer `seq_rollDuckDelta/Delay/Active[7]` with `seq_rollArmDuck()`. Roll + duck resets at all four sequencer reset sites. DSP classification: S0 bit-identical when no duck active, S4 audible by design when active, constant cost. Post-implementation assessment: all 5 schedule steps PASS, 0 issues.
+- **SD_CARD conversion:** `tools/convert_pattern_specials.py` converted 194 PAT4 v1 files → v2 across 3 banks (Bank 000, 002, 003).
+
+- **Find here**: [079_SESSION_HANDOFF_LOG.md](079_SESSION_HANDOFF_LOG.md),
+  `PATTERN_DYNAMIC_STACK.md`, `MODULE_INTERCHANGE_SPEC.md`,
+  `STORAGE_SRAM_MANIFEST.md`.
+
+### 080 — PERF Performance Surface: Looper, BAR Overlay, SHIFT+REC Menu, Scene Queue/Change Division, Scene Chaining, Loopable Tracks (2026-10-10/11)
+
+Session 080 ran on `dev-ph6-cleanup` from the S079 close (`efcdbe1`; text 544,072, data 408, bss 427,776) through `8c5946d` (P1 code + plan), `e621884` (P2 plan) and `4869a98` (P2 implementation, hardware OK) to final DEV link text=556,008, data=412, bss=427,976 (payload 556,420 B of 753,664, headroom 197,244 B). BSS +200 B. Two parts:
+
+- **P1 plan + implementation (phases A–F of 8):** PERF page split to two sub-pages (`mrp fxm 1VM 2VM` / `3VM..6VM`) with the cursor reset on entry; trigger conditions `lop`/`!lp` inserted at 23–24 (41 entries; mute groups now 27–33 / 34–40; pre-existing S079 mute-label order bug fixed); SELECT1..8 performance looper (1 bar .. 1/128; BAR1 triplet, BAR2 dot); BAR `<`/`>` VOICE-trigger overlay (12 types: vmx v10 v64 v32 flm fls r/8 r16 r32 r64 r6t 128; note `def`/0..127; 1 ms foreground repeat timer); SHIFT+REC settings menu (RECORDING_PAGE: overlay sub-page 0, `qnt` sub-page 1; cross-sub-page encoder step); scene change division `scd`, queued change `qcd`, queue action `qac` with ISR boundary detection → foreground executor. Phases G (chaining) / H (AutoSave) deferred, D partly done.
+- **P2 defect remediation + Phase G (16 items):** first P2 attempt rolled back after hardware test (looper out of sync on individual tracks, queued-scene blink not continuous, chain menu snapping back, scene restarts from bar 0). Root causes traced; redesign: **master-clock-anchored looper** (per-track anchor tick + pre-advance snapshot; wrap before the DDA advance when `(elapsed−anchor) % L == 0`; loop start = start of the fastest looped track's current step or last `qnt` boundary, found by rewinding; resume by projecting the snapshot forward; scene change keeps anchors and re-snapshots the incoming Scene at the same master tick — **spec correction**, user; resetting change rebases to tick 0; all publishes under PRIMASK); loop sustained by any SELECT / looped VOICE / BAR; VOICE release drops its track; SEQ always a full change while looping; per-track `lop` (Loopable) flag (region `track_loop_exclude`, PAT4 track header byte 4, no version bump); queued-scene double-rate flash on a new `LED_LAYER_FAST`; latched SHIFT+REC and chain-editor menus (SHIFT release ignored, SHIFT press closes, its release consumed); duplicate `pcr` removed (one PC reset = `PAR_BAR_RESET_MODE`, direct + chain changes); queue actions `nrm mut mrp res u+r o+r mmr rld r+r` with the queued change's own reset (reload deferred); instant/stopped queue fires at once; mute LED mirror sync; no SELECT LED in PERF unless looping; **Phase G scene chaining** (per-Scene `cn1 nx1 cn2 nx2`, 79 conditions / 44 next values, TIM3 evaluation at bar/repetition ends, `stp` freeze, `slf` repeat, SHIFT+PLAY+SEQ editor on PATTERN_SETTINGS_PAGE, sceneset keys, AutoSave Scene cells 72–75 in reserved space); AutoSave restore `return`→`continue` fix. Follow-up: compressor alone on global sub-page 3 (`^` after `qac`, `+` on cmp page), `qcd` gains 5b..9b 12b 15b 16b.
+- **Hardware:** P1 tested (defects → P2 plan); final P2 "seems ok so far" (user); Step 14 follow-up PASS (2026-10-11). Full T-row matrix not run row-by-row.
+
+- **Find here**: [080_SESSION_HANDOFF_LOG.md](080_SESSION_HANDOFF_LOG.md),
+  `MODULE_INTERCHANGE_SPEC.md` (PERF performance surface),
+  `PATTERN_DYNAMIC_STACK.md` (§6.5 looper, §6.6 scene change/queue/chain,
+  §1/§7 loop exclude), `BANK_PRESET_ARCHITECTURE.md`, `AUTOSAVE.md`,
+  `FILESYSTEM_SPEC.md`, `STORAGE_SRAM_MANIFEST.md`, `COPYCLEAR_UTILITIES.md`.

@@ -3,6 +3,7 @@
 #include "InstrumentManager.h"
 #include "SceneData.h"
 #include "sequencer.h"
+#include "PatternData.h"
 #include <stdint.h>
 
 typedef struct {
@@ -57,6 +58,25 @@ static struct {
     uint8_t active;
     uint8_t amount;
 } morph_step_override[INSTRUMENT_SLOT_COUNT];
+
+/*
+ * Per-track step-automation overlays for the morphable timing parameters
+ * (S078 §5.5).
+ *
+ * What: one absolute value per track and one active-bit byte per parameter.
+ * A set bit T in track_param_override_mask[param] means track T is driven by
+ * step automation and its Normal/Morph interpolation is bypassed. Why: step
+ * automation reaches playback as a runtime overlay without writing the
+ * retained Pattern region or Scene endpoints. Tracks 6 and 7 share voice 6's
+ * automation only in the sense that the target rows carry the track index;
+ * each track's overlay is independent. Lifetime: static runtime state, cleared
+ * at boot and at transport/Pattern restore. Owner: Preset Morph engine.
+ * Affiliates: presetMorph_getTrackEffective*(), seq_applySceneAutomation(),
+ * seq_restoreAllSceneAutomation(). RAM: 21 + 3 bytes SRAM1.
+ */
+static uint8_t track_param_override_value[PRESETMORPH_TRACK_PARAM_COUNT]
+                                         [NUM_TRACKS];
+static uint8_t track_param_override_mask[PRESETMORPH_TRACK_PARAM_COUNT];
 
 #define PRESET_MORPH_ALL_SLOTS_MASK \
     ((uint8_t)((1u << INSTRUMENT_SLOT_COUNT) - 1u))
@@ -457,21 +477,51 @@ void presetMorph_prioritizeVoice(uint8_t scene_index, uint8_t slot)
  * presetMorph_applyParameterNow(). Affiliates: seq_restoreAutomatedParameters(),
  * seq_restoreAllAutomation(), preset_applyInstrumentRuntimeValue().
  */
+/*
+ * Write one interpolated Morph value to the live runtime (S077 P2 §3.4).
+ *
+ * What: the force flag selects whether a non-active resident Scene may write
+ * the live runtime slot. Why: the normal Morph worker and synchronous Scene
+ * switch only ever write the active Scene (force = 0 preserves that guard),
+ * while the per-track single-voice apply commits a slot whose played Scene may
+ * differ from the active Scene and must write the runtime for that Scene
+ * (force = 1). Inputs: Scene index, slot, descriptor-local index, value, force.
+ * Output: unless step automation holds the parameter, the descriptor runtime
+ * value is written. Affiliates: seq_automationHoldsParameter(),
+ * preset_applyInstrumentRuntimeValueForced().
+ */
+static void presetMorph_writeRuntimeBaseEx(uint8_t scene_index, uint8_t slot,
+                                           uint8_t local,
+                                           instrument_param_value_t value,
+                                           uint8_t force)
+{
+    if (!force && scene_index != scene_getActiveIndex())
+        return;
+    if (seq_automationHoldsParameter(slot, local))
+        return;
+    (void)preset_applyInstrumentRuntimeValueForced(
+        scene_index, instrumentParam_make(slot, local), value);
+}
+
 static void presetMorph_writeRuntimeBase(uint8_t scene_index, uint8_t slot,
                                          uint8_t local,
                                          instrument_param_value_t value)
 {
-    if (scene_index != scene_getActiveIndex())
-        return;
-    if (seq_automationHoldsParameter(slot, local))
-        return;
-    (void)preset_applyInstrumentRuntimeValue(
-        scene_index, instrumentParam_make(slot, local), value);
+    presetMorph_writeRuntimeBaseEx(scene_index, slot, local, value, 0u);
 }
 
 uint8_t presetMorph_tick(void)
 {
     scene_t *scene;
+
+    /*
+     * S078 §5.4: refresh the sequencer's effective track-timing cache on every
+     * worker tick, before the early-out below, so a Morph sweep, a Morph
+     * endpoint edit, or a Pattern Normal edit all reach playback within one
+     * main-loop pass. The array math is 7 tracks x 3 parameters, so it stays
+     * inside the bounded worker budget.
+     */
+    seq_refreshTrackEffectiveParams();
 
     if (!morph_worker.active)
         return 0u;
@@ -583,25 +633,27 @@ void presetMorph_rebuildScene(uint8_t scene_index)
     presetMorph_requestAll(scene_index);
 }
 
-void presetMorph_applyVoiceNow(uint8_t scene_index, uint8_t slot)
+/*
+ * Commit one slot's Morph-derived runtime image (S077 P2 §3.4).
+ *
+ * What: walks every morphable descriptor cell, updates morph_interpolation[],
+ * and (when force_runtime or the Scene is active) writes the live runtime.
+ * Inputs: Scene index, slot, and a force flag selecting whether a non-active
+ * Scene may write the runtime. Output: the slot image is current. This is the
+ * shared body of presetMorph_applyVoiceNow() (active Scene, force = 0) and
+ * presetMorph_applyVoiceNowFromScene() (per-track played Scene, force = 1).
+ * Parameters held by step automation keep their runtime value; only
+ * morph_interpolation[] is updated for them (S075 F3).
+ */
+static void presetMorph_applyVoiceNowInternal(uint8_t scene_index,
+                                              uint8_t slot,
+                                              uint8_t force_runtime)
 {
     scene_t *scene = scene_get(scene_index);
     kit_instrument_slot_t *instrument;
     uint8_t local;
     uint8_t amount;
 
-    /*
-     * Commit one slot's Morph-derived runtime image immediately.
-     *
-     * Inputs: Scene/slot selected by the deferred Scene-switch worker. Outputs:
-     * all morphable descriptor cells in morph_interpolation[] are updated, and
-     * active-Scene runtime writes are complete before the caller returns. This
-     * mirrors presetMorph_tick() but intentionally walks the whole slot so a
-     * trigger-time Scene swap cannot fire with half-old instrument parameters.
-     * Parameters held by step automation keep their runtime value; only
-     * morph_interpolation[] is updated for them (S075 F3,
-     * presetMorph_writeRuntimeBase()).
-     */
     if (!scene || slot >= INSTRUMENT_SLOT_COUNT)
         return;
     instrument = &scene->kit.instruments[slot];
@@ -609,10 +661,13 @@ void presetMorph_applyVoiceNow(uint8_t scene_index, uint8_t slot)
      * Synchronous Scene-switch application also honors a live step overlay.
      * The overlay is normally restored before a transport/Pattern boundary,
      * but this guard keeps trigger-time priority behavior consistent if a
-     * caller applies a slot while the overlay is still active.
+     * caller applies a slot while the overlay is still active. The hidden LFO
+     * Morph layer is live state of the active Scene only, so an inactive
+     * resident Scene resolves to its retained base amount (S077 P2 §6.7).
      */
     amount = presetMorph_effectiveVoiceBase(scene, slot);
-    if (presetMorph_voiceHasLfoLayer(slot))
+    if (scene_index == scene_getActiveIndex() &&
+        presetMorph_voiceHasLfoLayer(slot))
         amount = presetMorph_resolveLfoAmount(scene, slot);
 
     for (local = 0u; local < INSTRUMENT_PARAM_COUNT; local++) {
@@ -637,7 +692,8 @@ void presetMorph_applyVoiceNow(uint8_t scene_index, uint8_t slot)
             amount);
         instrument->parameter_images.morph_interpolation[local] = value;
         /* Held automation keeps its runtime value until the trigger. */
-        presetMorph_writeRuntimeBase(scene_index, slot, local, value);
+        presetMorph_writeRuntimeBaseEx(scene_index, slot, local, value,
+                                       force_runtime);
     }
 
     if (morph_worker.scene_index == scene_index) {
@@ -672,6 +728,33 @@ void presetMorph_applyVoiceNow(uint8_t scene_index, uint8_t slot)
             morph_worker.priority_resume_valid = 0u;
         }
     }
+}
+
+/*
+ * Commit one active-Scene slot's Morph-derived runtime image (S076/S077).
+ *
+ * Inputs: active Scene/slot selected by the deferred Scene-switch worker.
+ * Output: morph_interpolation[] and the live runtime image are current for that
+ * slot. Callers: preset_sendDrumsetParameters(), preset_resetAndApplyKitVoiceImage().
+ */
+void presetMorph_applyVoiceNow(uint8_t scene_index, uint8_t slot)
+{
+    presetMorph_applyVoiceNowInternal(scene_index, slot, 0u);
+}
+
+/*
+ * Commit one per-track slot's runtime image from its played Scene
+ * (S077 P2 §3.4).
+ *
+ * Inputs: the track's played Scene and slot. Output: morph_interpolation[] is
+ * refreshed and the live runtime is written even though the Scene is not the
+ * global active Scene. Client: preset_resetAndApplyKitVoiceImage() when the
+ * single-voice apply commits a slot whose played Scene differs from the active
+ * one. Affiliate: presetMorph_applyVoiceNow() (the active-Scene wrapper).
+ */
+void presetMorph_applyVoiceNowFromScene(uint8_t scene_index, uint8_t slot)
+{
+    presetMorph_applyVoiceNowInternal(scene_index, slot, 1u);
 }
 
 void presetMorph_setVoiceLfoModulation(uint8_t scene_index,
@@ -861,4 +944,216 @@ void presetMorph_clearAllStepAutomationOverrides(uint8_t scene_index)
     }
     if (any && scene_getConst(scene_index))
         presetMorph_rebuildScene(scene_index);
+}
+
+/*
+ * Clear the step-automation Morph base for one voice (S076 Rule A).
+ *
+ * What: deactivates morph_step_override[slot] so the effective Morph base
+ * falls back to the retained Scene amount. Unlike the clearAll helper this
+ * does NOT queue a rebuild; the caller is a retained-value setter that will
+ * queue its own rebuild or retained-base commit immediately after.
+ * Why: a non-automation write (menu edit, MIDI CC1, copy/clear, type change)
+ * must supersede any active step override for that slot so the user's edit
+ * is audible and visible. The full transport-boundary clear
+ * (presetMorph_clearAllStepAutomationOverrides) continues to own bulk
+ * restore with rebuild.
+ * Inputs: zero-based instrument slot 0..INSTRUMENT_SLOT_COUNT-1.
+ * Output: the slot's morph_step_override.active is set to 0. Out-of-range
+ * slot is a no-op.
+ * Callers: preset_morphVoiceScene(), preset_morphScene().
+ * Affiliates: presetMorph_setStepAutomationOverride() (the setter),
+ * presetMorph_clearAllStepAutomationOverrides() (the transport clear),
+ * presetMorph_effectiveVoiceBase() (the consumer that checks .active),
+ * presetMorph_getEffectiveVoiceAmount() (the display bridge).
+ */
+void presetMorph_clearStepAutomationOverride(uint8_t slot)
+{
+    if (slot >= INSTRUMENT_SLOT_COUNT)
+        return;
+    morph_step_override[slot].active = 0u;
+}
+
+/*
+ * Resolve the voice slot whose Morph amount drives one track (S078 §5.3).
+ *
+ * Inputs: track 0..6. Output: the track index for tracks 0..5, and 5 for tracks
+ * 6 and 7 (the HiHat/Choke pair shares voice 6). Affiliates:
+ * presetMorph_trackAmount(), the effective track getters below.
+ */
+static uint8_t presetMorph_trackSlot(uint8_t track)
+{
+    return (track <= 5u) ? track : 5u;
+}
+
+/*
+ * Retained voice Morph amount that drives one track's timing endpoints (S078
+ * §5.3, §5-4).
+ *
+ * Inputs: the track's played Scene and track index. Output: the retained
+ * voice_morph_amount[] of the associated voice (track 6/7 use voice 6), or 0
+ * for an invalid Scene. Why: the effective track values follow the user's Morph
+ * setting (PERF knob / MIDI CC1), matching the plan's effective-array design;
+ * the resolved amount (step override + LFO) is intentionally not used here.
+ */
+static uint8_t presetMorph_trackAmount(uint8_t scene_index, uint8_t track)
+{
+    const scene_t *scene = scene_getConst(scene_index);
+
+    if (!scene)
+        return 0u;
+    return scene->settings.voice_morph_amount[presetMorph_trackSlot(track)];
+}
+
+/*
+ * Interpolate one track timing value between its endpoints (S078 §5.1).
+ *
+ * Inputs: Normal value, Morph endpoint, and a 0..255 amount. Output: the
+ * rounded interpolation, exactly Normal at amount 0 and Morph at 255. Why: same
+ * contract as the instrument and FX-send Morph paths, so a Morph sweep is
+ * continuous across every endpoint kind.
+ */
+static uint8_t presetMorph_interpTrack(uint8_t normal, uint8_t morph,
+                                       uint8_t amount)
+{
+    if (amount == 0u)
+        return normal;
+    if (amount == 255u)
+        return morph;
+    return (uint8_t)(((uint16_t)normal * (uint16_t)(255u - amount) +
+                      (uint16_t)morph * amount + 127u) / 255u);
+}
+
+uint8_t presetMorph_getTrackEffectiveLength(uint8_t scene_index,
+                                            uint8_t track)
+{
+    const pat_scene_region_t *region;
+    uint8_t normal;
+    uint8_t result;
+
+    /*
+     * Effective track length (S078 §5.1).
+     *
+     * Inputs: the track's played Scene and track index. Output: the value the
+     * sequencer loops on: any active step-automation overlay, otherwise the
+     * Pattern Normal interpolated against the Scene Morph endpoint at the
+     * voice Morph amount, clamped to 1..NUM_STEPS. Never writes retained data.
+     */
+    if (track >= NUM_TRACKS)
+        return NUM_STEPS_PER_BAR;
+    if (track_param_override_mask[PRESETMORPH_TRACK_LENGTH] &
+        (uint8_t)(1u << track))
+        return track_param_override_value[PRESETMORPH_TRACK_LENGTH][track];
+    region = pat_sceneRegion(scene_index);
+    if (!region)
+        return NUM_STEPS_PER_BAR;
+    normal = region->track_length[track];
+    if (normal < 1u)
+        normal = NUM_STEPS_PER_BAR;
+    result = presetMorph_interpTrack(
+        normal, scene_getTrackMorphLength(scene_index, track),
+        presetMorph_trackAmount(scene_index, track));
+    if (result < 1u)
+        result = 1u;
+    else if (result > NUM_STEPS)
+        result = NUM_STEPS;
+    return result;
+}
+
+uint8_t presetMorph_getTrackEffectiveScale(uint8_t scene_index,
+                                           uint8_t track)
+{
+    const pat_scene_region_t *region;
+    uint8_t normal;
+    uint8_t result;
+
+    /*
+     * Effective track step-scale CC (S078 §5.1).
+     *
+     * Inputs: the track's played Scene and track index. Output: a CC 0..127 the
+     * DDA accumulator turns into a Q8.8 tick interval: any active step-automation
+     * overlay, otherwise the Pattern Normal CC interpolated against the Scene
+     * Morph endpoint CC. A stale byte falls back to the 1/16 default.
+     */
+    if (track >= NUM_TRACKS)
+        return STEP_SCALE_DEFAULT;
+    if (track_param_override_mask[PRESETMORPH_TRACK_SCALE] &
+        (uint8_t)(1u << track))
+        return track_param_override_value[PRESETMORPH_TRACK_SCALE][track];
+    region = pat_sceneRegion(scene_index);
+    if (!region)
+        return STEP_SCALE_DEFAULT;
+    normal = region->track_scale[track];
+    if (normal >= STEP_SCALE_COUNT)
+        normal = STEP_SCALE_DEFAULT;
+    result = presetMorph_interpTrack(
+        normal, scene_getTrackMorphScale(scene_index, track),
+        presetMorph_trackAmount(scene_index, track));
+    if (result >= STEP_SCALE_COUNT)
+        result = STEP_SCALE_DEFAULT;
+    return result;
+}
+
+uint8_t presetMorph_getTrackEffectiveShuffle(uint8_t scene_index,
+                                             uint8_t track)
+{
+    const pat_scene_region_t *region;
+    uint8_t normal;
+    uint8_t result;
+
+    /*
+     * Effective track shuffle amount (S078 §5.1).
+     *
+     * Inputs: the track's played Scene and track index. Output: a 0..127
+     * shuffle amount: any active step-automation overlay, otherwise the Pattern
+     * Normal amount interpolated against the Scene Morph endpoint.
+     */
+    if (track >= NUM_TRACKS)
+        return 0u;
+    if (track_param_override_mask[PRESETMORPH_TRACK_SHUFFLE] &
+        (uint8_t)(1u << track))
+        return track_param_override_value[PRESETMORPH_TRACK_SHUFFLE][track];
+    region = pat_sceneRegion(scene_index);
+    if (!region)
+        return 0u;
+    normal = region->track_shuffle[track];
+    if (normal > 127u)
+        normal = 0u;
+    result = presetMorph_interpTrack(
+        normal, scene_getTrackMorphShuffle(scene_index, track),
+        presetMorph_trackAmount(scene_index, track));
+    return (result > 127u) ? 0u : result;
+}
+
+void presetMorph_setTrackParamStepOverride(uint8_t track,
+                                           presetMorph_trackParam_t param,
+                                           uint8_t value)
+{
+    /*
+     * Activate one track's step-automation timing overlay (S078 §5.5).
+     *
+     * Inputs: track 0..6, parameter lane, and the 7-bit automation value.
+     * Output: the overlay value is stored and its active bit set, so the
+     * effective getters return it until the next transport/Pattern restore.
+     * Invalid coordinates are a no-op.
+     */
+    if (track >= NUM_TRACKS || param >= PRESETMORPH_TRACK_PARAM_COUNT)
+        return;
+    track_param_override_value[param][track] = value;
+    track_param_override_mask[param] |= (uint8_t)(1u << track);
+}
+
+void presetMorph_clearAllTrackParamStepOverrides(void)
+{
+    /*
+     * Drop every track timing overlay (S078 §5.5).
+     *
+     * Inputs: none. Output: all three active-bit bytes are zero, so the
+     * effective getters fall back to the Normal/Morph interpolation. Common
+     * caller: seq_restoreAllSceneAutomation() at transport/Pattern boundaries.
+     */
+    uint8_t param;
+
+    for (param = 0u; param < PRESETMORPH_TRACK_PARAM_COUNT; param++)
+        track_param_override_mask[param] = 0u;
 }

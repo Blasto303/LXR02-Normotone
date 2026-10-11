@@ -20,57 +20,55 @@ make all && make img   →   build/LXRV2_lxr02.img   (use `make all`: bare `make
 
 **Commits belong to the user.** Do not suggest or prompt when to commit.
 
-**Current working source**: **Session 075 is closed** on `dev-ph6-copyclear`
-(2026-10-03). **Phase 6 has started:** copy and clear are implemented, plus
-two rounds of hardware follow-ups (F1, F2) and an automation-priority fix
-(F3). Phase 5 (the Effects bus, initial pass) was largely completed in S074.
+**Current working source**: **Session 080 is closed** on `dev-ph6-cleanup`
+(2026-10-11). S080 built the PERF performance surface in two parts: P1 plan +
+implementation (PERF page split, `lop`/`!lp` conditions, looper, BAR
+VOICE-trigger overlay, SHIFT+REC settings menu, scene change/queue
+divisions); P2 defect remediation (a first P2 attempt failed on hardware and
+was rolled back; root causes traced, looper redesigned) plus Phase G scene
+chaining, then a follow-up (compressor page, `qcd` list).
 
-- **Commits:** HEAD `76aef20` holds every S075 code change. The S075
-  closeout documentation (log, index, `COPYCLEAR_UTILITIES.md`, spec
-  updates, this file, volatile notes, `SCOPING_TARGETS.md`) and three
-  comment-only code edits (`AutosaveTrace.h` ×2, `copyClearSession.h`, now
-  pointing at `COPYCLEAR_UTILITIES.md`) are uncommitted. The user manages
+- **Commits:** code at `4869a98` ("perf mode updates phase 2 implementation,
+  tests ok"); the S080 close-out documents are uncommitted. The user manages
   commits.
-- **Build at S075 close (DEV config):** `text=532,408`, `data=416`,
-  `bss=426,712`; flash payload 532,824 B of 753,664 (**220,840 B free**);
-  ITCM 4,168 / 16,384 B; DTCM statics 4,472 B; FX arena 126,592 B at
-  `0x20001180` (margin 3,712 B); `scenes` `0x65E0`. `LXRV2_lxr02.img`
-  532,840 B, SHA-256 `d1c0aac2…9ceb` (record the `.img` hash; the `.bin` is
-  unstamped). The production build (`DEV_MODE_LOGGING 0`) was last measured
-  at F1 and needs a rebuild.
-- **Hardware (user):** the base pass, F1 and F2 were tested and each fed the
-  next round; F3 "seems ok". Not yet reported: the SHIFT+TRACK overlay
-  follow-up re-test and the remaining case list (`COPYCLEAR_UTILITIES.md`
-  §16).
+- **Build at S080 close (DEV config):** `text=556,008`, `data=412`,
+  `bss=427,976`; flash payload 556,420 B of 753,664 (**197,244 B free**).
+  BSS +200 B from S079 (looper 67 B, scene change/chain state 12 B, PERF UI
+  state 25 B, `scenes` +64 B chain settings, Pattern regions +17 B loop
+  exclude, alignment). Production build (`DEV_MODE_LOGGING 0`) last measured
+  at S075 F1; needs a rebuild.
+- **Hardware (user):** final S080 P2 "seems ok so far"; Step 14 follow-up
+  PASS (2026-10-11). The S080 matrix (`080_SESSION_HANDOFF_LOG.md` §12) has
+  not been run row by row. S079 P2 checklist still pending.
 
-Session 075 in one paragraph:
+Session 080 in one paragraph:
 
-- **Copy/clear** (`Core/Menu/CopyClear/`, reference
-  `COPYCLEAR_UTILITIES.md`). COPY held + object copies; SHIFT + COPY clears.
-  Sources: step/range, bar/range, track, Scene, FX step/range; Scene-level
-  pastes `scene/settings/kit/effect/pattern`, `instrument`; clears per
-  object, PERF Scene clears, EFFECTS SEQ clear, pot clears of automation.
-  Background service (queue 4, register 8), exclusive per-Scene Pattern
-  boundary, permanent 132 B **swap block** per pool (8,060 B usable), raw
-  block API, sliding compaction, retargeting, early trigger bits with drop
-  restore, 0.1 % trickle governor, lazy 9 kB name-buffer loan, one HCNAMES
-  rewrite (`HNcU`). AutoSave/trace/settings/repair suspended per operation.
-  Pattern never fans out; Scene children fan out through the edit mask.
-- **Global `srt` retired;** PERF `fxm` (Effect Morph) in its cell.
-- **F2:** St1 and compressor off/0/0/off defaults, `Copy`/`Clear` header,
-  long-name-only Effect full views, one pan rule (stored 63 = centre = `0`),
-  CrumpBit defaults/`snc`, morphable FX send (`fx_send_morph[6]`, AutoSave
-  cells 45..50), VOICE hold-SHIFT Morph view, Effect-page SHIFT+TRACK
-  voice-mix overlay (last TRACK pressed; no mutes while held).
-- **F3:** automation always wins until the voice's next trigger; menu edits
-  apply one parameter's interpolation; external MIDI is lowest priority.
-- **RAM (approved):** F2 +101 B, F1 net +124 B, base pass +92 B net; DEV
-  trace +24 B.
+- **Looper:** SELECT1..8 hold = 1 bar..1/128 (384..3 master ticks), BAR2
+  dot / BAR1 triplet; all tracks or the held VOICE tracks, filtered by the
+  per-track `lop` (Loopable) flag (`track_loop_exclude`, PAT4 track byte 4).
+  **Master-clock anchored** (`PATTERN_DYNAMIC_STACK.md` §6.5): per-track
+  anchor tick + pre-advance snapshot, wrap before the DDA when
+  `(elapsed−anchor) % L == 0`, loop start = fastest track's current step
+  start or last `qnt` boundary (rewind), resume by projection, scene change
+  keeps anchors and re-snapshots the incoming Scene, resetting change → anchor
+  0. Sustained by any SELECT / looped VOICE / BAR; VOICE release drops its
+  track; SEQ is always a full change while looping.
+- **Scenes:** `scd` (direct, 0..9), `qcd` (queued, 0..17 incl. 5b..9b 12b 15b
+  16b), `qac` (`nrm mut mrp res u+r o+r mmr rld r+r`; reload deferred); one
+  PC reset `pcr` = `PAR_BAR_RESET_MODE` for direct + chain changes, queued
+  changes use the qac reset; queued Scene flashes on `LED_LAYER_FAST`. Scene
+  chaining: per-Scene `cn1 nx1 cn2 nx2` (79 conditions, 44 next values),
+  TIM3 evaluation at bar/repetition ends, `stp` freeze, SHIFT+PLAY+SEQ
+  editor on PATTERN_SETTINGS_PAGE, AutoSave Scene cells 72..75.
+- **UI:** BAR `<`/`>` VOICE-trigger overlay (12 types, 1 ms repeat slot);
+  SHIFT+REC latched menu (RECORDING_PAGE); latched-menu SHIFT rules; no
+  SELECT LED in PERF unless looping; global sub-page 2 `scd qcd qac` (`^`),
+  sub-page 3 compressor (`+`, `MENU_GLOBAL_SCENE_SUBPAGE` = 3).
 
 **Permanent authority:**
 
-- `knowledge_files/log_archive/075_SESSION_HANDOFF_LOG.md` (and 074, 073,
-  072);
+- `knowledge_files/log_archive/080_SESSION_HANDOFF_LOG.md` (and 079, 078,
+  077, 076, 075, 074, 073, 072);
 - `knowledge_files/specification_reference/COPYCLEAR_UTILITIES.md` (new in
   S075);
 - `knowledge_files/specification_reference/dsp_instruments_effects/`:
@@ -87,9 +85,25 @@ Session 075 in one paragraph:
 - The ten root `S075_*.md` documents are superseded (the user deletes them);
   their pre-implementation versions are in `00bd078`, `b1216db`, `822bbc9`,
   `b8f08db`.
+- The eight root `S076_*.md` task documents are superseded by
+  `076_SESSION_HANDOFF_LOG.md` (the user deletes them).
+- The eleven root `S077_*.md` task documents are superseded by
+  `077_SESSION_HANDOFF_LOG.md` (the user deletes them after hardware test
+  results are recorded).
+- The root `S078_*.md` task documents (P1–P4 plans/schedules and
+  `S078_RETEST_CHECKLIST.md`) are superseded by `078_SESSION_HANDOFF_LOG.md`
+  and the updated specifications (the user deletes them).
+- The four root `S080_*.md` task documents (`S080_P1_PERF_MODE_UPDATES.md`,
+  `S080_P1_IMPLEMENTATION.md`, `S080_P2_PERF_EXPANSION_DEFECTS.md`,
+  `S080_P2_IMPLEMENTATION.md`) are superseded by `080_SESSION_HANDOFF_LOG.md`
+  and the updated specifications (the user deletes them).
+- The four root `S079_*.md` task documents (`S079_P1_STEP_CONDITIONS_SPECIALS.md`,
+  `S079_P1_IMPLEMENTATION.md`, `S079_P2_ROLL_FOLLOWUP_REMEDIATION.md`,
+  `S079_P2_IMPLEMENTATION.md`) are superseded by `079_SESSION_HANDOFF_LOG.md`
+  and the updated specifications (the user deletes them).
 
-Still deferred: per-track step scale/shuffle playback (`PATTERN_DYNAMIC_STACK.md`
-§6.4).
+Per-track step scale/shuffle playback, deferred since S068, was implemented in
+S078 (`PATTERN_DYNAMIC_STACK.md` §6.4).
 
 ## RAM Allocation Approval Policy
 
@@ -136,6 +150,37 @@ This section is for short carryover points only. Flush or rewrite it at session
 end; durable facts belong in `knowledge_files/log_archive/` or
 `knowledge_files/specification_reference/`.
 
+- **Session 080 is closed.** Durable record: `080_SESSION_HANDOFF_LOG.md`;
+  looper and scene change/chain engine: `PATTERN_DYNAMIC_STACK.md` §6.5/§6.6;
+  PERF gestures, LEDs, pages, executor: `MODULE_INTERCHANGE_SPEC.md` "PERF
+  performance surface". Carry-over: `knowledge_files/volatile/S078_WORKING_NOTES.md`
+  (rewritten as the S080 → S081 notes).
+- **Looper invariants (S080) — binding:** the looper is master-clock
+  anchored (per-track anchor tick + pre-advance snapshot); never reintroduce a
+  shared loop tick counter, an un-anchored snapshot at the press, or resume
+  via `seq_realignTrackToMasterClock()` (all caused the S080 P2 sync
+  failures). Every looper publish holds PRIMASK; the wrap runs before the DDA
+  advance; `seq_setStepIndexToStart()` rebases (does not end) an engaged loop;
+  transport stop ends it. FX/Effects are never looped.
+- **One PC reset (S080, user):** `pcr` = `PAR_BAR_RESET_MODE` (key
+  `bar_reset_mode`); with it on, **direct and chain-fired** scene changes
+  restart tracks and the master clock. **Queued** changes ignore pcr and use
+  the qac reset bit (`res u+r o+r mmr r+r`). Do not add another PC reset
+  parameter (the S080 P1 duplicate caused the "restart from bar 0" report).
+- **PERF SEQ LEDs (S080):** the queued Scene uses `LED_LAYER_FAST`
+  (owner `menu_syncQueuedSceneLed()`); `menu_refreshPerfSceneLeds()` never
+  restarts a running blink (`led_isBlinkLed()`); never start/stop SEQ blinks
+  from a per-beat path. SELECT row in PERF = looper division only.
+- **Latched menus (S080):** SHIFT+REC and the chain editor stay open after
+  release; SHIFT release is ignored while open; SHIFT press closes and its
+  release is consumed (`bh_shiftReleaseConsume`); MODE closes first. The PERF
+  SHIFT-release path re-enters PERFORMANCE_PAGE — any new latched PERF menu
+  must bypass it.
+- **Parameter mirrors after the Globals (S080):** `PAR_CHAIN_*` and
+  `PAR_TRACK_LOOPABLE` sit after `PAR_BEGINNING_OF_GLOBALS`, so
+  `menu_sendAllGlobals()` replays them on every settings load; they are
+  no-ops in `menu_parseGlobalParam()` and commit in `menu_cellCommitValue()`
+  (bus-compressor precedent). Follow the same pattern for any new mirror.
 - **Active Scene (user definition, S075):** active means the Scene being
   viewed and written to, not playback. Any Scene and track may be read; only
   one Scene's Pattern is modified at a time. Today a PERF Scene press selects
@@ -146,10 +191,63 @@ end; durable facts belong in `knowledge_files/log_archive/` or
   to match in parameters and FX settings, so edits, pastes and clears of
   Scene children (Instrument, Kit, Effect, FX sequence, `send`) fan out;
   Pattern data never does. `copy scene`/`settings` exchange the mask entry;
-  `clear scene`/`settings` reset it to self.
-- **Session 075 is closed.** Durable record: `075_SESSION_HANDOFF_LOG.md`;
-  copy/clear reference: `COPYCLEAR_UTILITIES.md`. The ten root `S075_*.md`
-  documents are superseded (the user deletes them).
+  `clear scene`/`settings` reset it to self. **Scene morph** copy/reset fans
+  out through `bank_sceneFanoutMask()` like kit/fx, NOT like scene/settings
+  (S077 P4 correction).
+- **Session 078 is closed.** Durable record: `078_SESSION_HANDOFF_LOG.md`;
+  per-track timing authority: `PATTERN_DYNAMIC_STACK.md` §6.4/§6.3a; Morph
+  rules: `BANK_PRESET_ARCHITECTURE.md` §5. The root `S078_*.md` task
+  documents are superseded (the user deletes them). Inter-session notes:
+  `knowledge_files/volatile/S078_WORKING_NOTES.md` (rewritten at the S078
+  close as the carry-over for Session 079).
+- **SHIFT Morph-view rule (user, S078 P4) — binding, project-wide:** in ANY
+  SHIFT Morph view only morphable parameters are redirected to their Morph
+  endpoint; a non-morphable parameter shows and edits its **Normal** value
+  and is never blanked (`---`) or locked. VOICE is the reference behaviour.
+- **STEP Morph view is momentary (S078 P4):**
+  `menu_patternTrackMorphViewActive()` = flag && SEQ_PAGE &&
+  `buttonHandler_getShift()`. SHIFT-derived view state must not rely on the
+  SHIFT release alone: `handleModeButtons()` changes mode while SHIFT is held
+  (`(mode + 4) & 7`), so the release runs in the new mode. No STEP Morph
+  latch: SHIFT+MODE STEP is the only SOM entry.
+- **Per-track timing (S078):** the sequencer reads timing only from
+  `seq_effectiveTrackLength/Scale/Shuffle[]` (Normal + Scene endpoint +
+  retained voice Morph amount, or a step override), refreshed by
+  `seq_refreshTrackEffectiveParams()`; Morph/automation never write the
+  Pattern region. DDA accumulators are seeded `interval − 256`; shuffle delay
+  is stored `delay − 1`. `track_scale` is a CC 0..127 (76 = 1/16); pre-S078
+  PAT4 bytes are not migrated on device (`tools/convert_scene_scale.py`).
+- **Menu dtype space is full (S078):** all 16 `DTYPE_MENU` table ids and all
+  16 `DTYPE_*` nibbles are used. New enumerated cells use an existing dtype
+  plus static-param special cases (the run-mode precedent:
+  `MENU_CELL_STATIC + PAR_TRACK_PLAY_MODE`).
+- **STEP underline search (S078 P3):** bits `VA_SEARCH_SCENE_TRACK_BIT(0..2)`
+  = 0x10/0x20/0x40 in `va_searchSceneMask`, set/cleared only via
+  `va_seqTrackSearchBit()`; `va_scanService()` never re-validates a completed
+  result, so every context/content change needs an explicit
+  `va_searchRestart()`. `menu_automationTargetCleared()` is for whole-Scene
+  removals only. Open finding: the deferred CGRAM marker retry in
+  `menu_serviceRuntimeWidgets()` excludes SEQ_PAGE (one-line fix not applied).
+- **Session 077 is closed.** Durable record: `077_SESSION_HANDOFF_LOG.md`;
+  copy/clear reference: `COPYCLEAR_UTILITIES.md`. The eleven root `S077_*.md`
+  task documents are superseded (the user deletes them after hardware test
+  results are recorded). The eight root `S076_*.md` and ten root `S075_*.md`
+  documents were also superseded at their respective session closes.
+- **Per-track Scene playback (S077 P2):** `seq_perTrackPattern[7]` maps each
+  track to its played Scene. ISR reads are single-byte SRAM1 (atomic on
+  Cortex-M7). Recording is gated on `!seq_perTrackActive`. The mixer reads
+  the played Scene per voice via `preset_getSlotPlayedScene()`. Known
+  limitation: LFO/velocity Scene-namespace target tokens still resolve
+  through the active Scene in InstrumentManager.
+- **Background .hcnames (S077 P3):** the background rewrite must NOT raise
+  `menu_storageBusy`. The correct path is
+  `menu_residentNameDeferredFlushComplete()`.
+  `menu_endResidentNameScratchSession()` must guard `filesystem_status() ==
+  BUSY`.
+- **pat_background_region (S077 P1):** 10,526 B since S078 (17th region), replaces
+  `pat_autosave_snapshot`. Three non-concurrent uses: AutoSave snapshot,
+  overlap paste pool, Bank Load staging. `filesystem_patternSnapshotInUse()`
+  gates overlap availability.
 - **Automation priority (user, S075 F3) — binding:** step automation, then
   menu edits, then MIDI. A held voice-parameter automation value is never
   overwritten before the voice's next trigger: every Morph-base runtime write
@@ -173,7 +271,16 @@ end; durable facts belong in `knowledge_files/log_archive/` or
   132 B of every pool is the swap block; Pattern writes publish before free;
   while `copyClear_backgroundSuspended()` is set no AutoSave, Pattern
   AutoSave, trace, settings write or repair epoch starts; the 9 kB name cache
-  may be lent (other filesystem ops are refused while lent).
+  may be lent (other filesystem ops are refused while lent). Since S077 the
+  paste source table is a static `uint16_t[128]` and source blocks use
+  `pat_backgroundPoolMut()`; the name buffer loan now carries only the 161 B
+  HCNAMES remap.
+- **S078 open items:** decide the STEP marker retry one-liner; track length
+  128 cannot be step-automated (7-bit, accepted). P1–P4 hardware PASS.
+- **S077 open items:** S077 P4 re-test rows 3.10/3.14/3.15; S077 P5
+  (bar-to-step) and P6 (PERF morph underline) never had checklist rows;
+  carry-over C1–C6. (S076 P4, S077 P1 and S077 P2 checklist sections all
+  PASS at the S078 close.)
 - **S075 open items** (details in the log §13 and `SCOPING_TARGETS.md`
   "Session 075 carry-forward"): overlay follow-up re-test; the case list
   (`COPYCLEAR_UTILITIES.md` §16); an F2-card validator PASS; production
@@ -193,8 +300,9 @@ end; durable facts belong in `knowledge_files/log_archive/` or
   Self-recovering failures get trace records, not user screens (user
   policy).
 - **Bus compressor rules (S074):** St1 = `output2`, St2 = `output`; the
-  settings page stays last (`MENU_GLOBAL_SCENE_SUBPAGE`; new global pages go
-  before it); the four `PAR_BUS_COMP_*` ids never commit through
+  settings page stays last and holds only the four Scene cells
+  (`MENU_GLOBAL_SCENE_SUBPAGE` = 3 since S080, cue `+`; the scd/qcd/qac
+  sub-page before it shows `^`; new global pages go before it); the four `PAR_BUS_COMP_*` ids never commit through
   `menu_parseGlobalParam()` (refresh-only there).
 - **Effect page (S074):** type UI lives in the registry (layout +
   `effect_ui_hooks_t`), never in `menu.c` branches; every SELECT LED write
@@ -913,7 +1021,7 @@ are superseded by `knowledge_files/log_archive/052_SESSION_HANDOFF_LOG.md`.
 │   │   ├── EFFECTS_BUS_REFERENCE.md   ← as-built Effect system: registry, resolution, page, FX sequencer, storage, add-a-type tutorial
 │   │   ├── EFFECTS_MIXER_DSP_REFERENCE.md ← mixer, FX bus and Effect DSP, output pipeline, DTCM arena contract, costs (S073)
 │   │   ├── INSTRUMENTS_DSP_REFERENCE.md ← instrument DSP, parameters, modulation/LFO, costs, how to extend (S073)
-│   │   ├── MODULE_INTERCHANGE_SPEC.md ← current direct-call API ownership/boundary map through Session 073
+│   │   ├── MODULE_INTERCHANGE_SPEC.md ← current direct-call API ownership/boundary map through Session 078
 │   │   ├── OSC_INTERP_AUDIT.md        ← oscillator waveform interpolation implementation, persistence, runtime behavior, risks, and validation
 │   │   ├── PATTERN_DYNAMIC_STACK.md   ← dynamic Pattern storage, PAT4, Pattern Stack Service, step automation encoding and drain
 │   │   └── STORAGE_SRAM_MANIFEST.md   ← flash, sample flash and RAM map, linker guards, image check, reservation/approval policy (S073)
@@ -1040,6 +1148,9 @@ are superseded by `knowledge_files/log_archive/052_SESSION_HANDOFF_LOG.md`.
 | Master bus compressor, `xfd` fader mode, CrumpBit DSP? | `knowledge_files/specification_reference/dsp_instruments_effects/EFFECTS_MIXER_DSP_REFERENCE.md` (§3.2, §4.4, §5A) |
 | Phase 6 copy/clear behaviour, architecture, trace? | `knowledge_files/specification_reference/COPYCLEAR_UTILITIES.md`; history and decisions: `075_SESSION_HANDOFF_LOG.md` |
 | Who may write a voice parameter's runtime value (automation vs menu vs MIDI)? | `PATTERN_DYNAMIC_STACK.md` §6.2a, `BANK_PRESET_ARCHITECTURE.md` §3 |
+| Per-track step scale, shuffle, run modes, track Morph/automation (S078)? | `PATTERN_DYNAMIC_STACK.md` §6.4; Morph architecture and the Morph-view rule: `BANK_PRESET_ARCHITECTURE.md` §5, §8; history: `078_SESSION_HANDOFF_LOG.md` |
+| STEP-page held-step editing, track automation overlay, STEP underlines? | `PATTERN_DYNAMIC_STACK.md` §6.3a; APIs: `MODULE_INTERCHANGE_SPEC.md` (menu, buttonHandler) |
+| PERF looper, scene change/queue divisions, queue actions, PC reset, scene chaining (S080)? | Engine: `PATTERN_DYNAMIC_STACK.md` §6.5 (looper), §6.6 (scene change, queue, chain); gestures/LEDs/pages/executor: `MODULE_INTERCHANGE_SPEC.md` "PERF performance surface"; history: `080_SESSION_HANDOFF_LOG.md` |
 | Effect system (types, FX bus, FX sequencer, Effect automation/LFO, adding a type)? | `knowledge_files/specification_reference/dsp_instruments_effects/EFFECTS_BUS_REFERENCE.md` |
 | Instrument DSP, modulation/LFO, their costs, adding parameters or types? | `knowledge_files/specification_reference/dsp_instruments_effects/INSTRUMENTS_DSP_REFERENCE.md` |
 | Mixer, FX bus and Effect DSP, output pipeline, buffer-using Effects? | `knowledge_files/specification_reference/dsp_instruments_effects/EFFECTS_MIXER_DSP_REFERENCE.md` |
@@ -1066,17 +1177,17 @@ and may contain historical snapshots as noted below.
 | File | What it contains | Use it when |
 |------|------------------|------------|
 | `ASYNCFATFS_REFERENCE.md` | Foreground-pumped async FAT32/VFAT contracts: component paths, LFN/SFN identity, object iteration, removal, terminator-aware directory-entry publication, lazy directory-cluster initialization, flush boundaries, and (S074) the cluster-rounded size of a file open for writing and the one-byte length-probe rule. | Changing `Core/Hardware/SD/asyncfatfs/` or adding filesystem operations. |
-| `AUTOSAVE.md` | Implemented scalar HCPR and per-Scene PAT4 hidden A/B formats, boot readers, ownership, dirty masks, writer lifecycle, power-loss behavior (including torn records), and validation status, including the S072 v3 Effect region, the S074 bus compressor cells 41..44, the S074 torn-record fix and the `V` flag layout, and (S075) reserved cell 7, FX-send Morph cells 45..50 (no migration) and the copy/clear suspension gates. Updated through Session 075. | Changing AutoSave format, boot restore, dirty hooks, capture, scheduling, or recovery. |
-| `COPYCLEAR_UTILITIES.md` | Phase 6 copy/clear (S075): mental model, terms, gestures by mode, operation lifecycle, sources/ranges, every copy and clear selection, pot clears, screens/LEDs, fan-out and the present rule, architecture and entry points, the service tick and suspension, the name-buffer loan, Pattern engines (exclusive boundary, swap block, raw block API, sliding compaction, paste/clear/region engines, early triggers), Scene-level executors, HCNAMES names, trace stage `c` layouts, verification list, resources, limits, how to modify, and a map of the `spec §N`/decision tags used in code comments. | Changing copy/clear, the Pattern pool rewrite rules, or reading a stage-`c` trace. |
-| `BANK_PRESET_ARCHITECTURE.md` | Hierarchy overview (Bank → Scene → Kit → Instrument), BankData voice-edit mask, SceneData parameter images, morph engine, runtime overlay architecture, Scene mod targets, `parameter_values[]` legacy bridge, dirty marking, boot restore order, the Scene target table (incl. `fxm`), Effect overlays, the S072 edit-mask layout gate, the S074 bus compressor settings and the Settings-Load bulk-apply hazard (O1), and (S075) the copy/clear edit-mask rules, St1/compressor defaults, FX-send Normal/Morph endpoints, VOICE Morph views and the automation-priority rules. Updated through Session 075. | Understanding parameter storage, morph interpolation, runtime overlays, Scene activation, or dirty marking. |
+| `AUTOSAVE.md` | Implemented scalar HCPR and per-Scene PAT4 hidden A/B formats, boot readers, ownership, dirty masks, writer lifecycle, power-loss behavior (including torn records), and validation status, including the S072 v3 Effect region, the S074 bus compressor cells 41..44, the S074 torn-record fix and the `V` flag layout, (S075) reserved cell 7, FX-send Morph cells 45..50 (no migration) and the copy/clear suspension gates, (S077) the snapshot gate, (S078) the track Morph endpoint cells 51..71, and (S080) the Scene chain cells 72..75 and the restore-loop `continue` fix. Updated through Session 080. | Changing AutoSave format, boot restore, dirty hooks, capture, scheduling, or recovery. |
+| `COPYCLEAR_UTILITIES.md` | Phase 6 copy/clear (S075; S076 morph copy/reset and reload scene; S077 background-region snapshot, Scene morph fan-out, bar-to-step; S078 track run mode and track Morph endpoints in track/morph copy/clear, STEP pot clears; S080 Loopable flag in track copy/clear, Scene chain in Scene settings copy/clear): mental model, terms, gestures by mode, operation lifecycle, sources/ranges, every copy and clear selection, pot clears, screens/LEDs, fan-out and the present rule, architecture and entry points, the service tick and suspension, the name-buffer loan, Pattern engines (exclusive boundary, swap block, raw block API, sliding compaction, paste/clear/region engines, early triggers), Scene-level executors, HCNAMES names, trace stage `c` layouts, verification list, resources, limits, how to modify, and a map of the `spec §N`/decision tags used in code comments. | Changing copy/clear, the Pattern pool rewrite rules, or reading a stage-`c` trace. |
+| `BANK_PRESET_ARCHITECTURE.md` | Hierarchy overview (Bank → Scene → Kit → Instrument), BankData voice-edit mask, SceneData parameter images, morph engine, runtime overlay architecture, Scene mod targets, `parameter_values[]` legacy bridge, dirty marking, boot restore order, the Scene target table (incl. `fxm` and the S078 track targets 405..425), Effect overlays, the S072 edit-mask layout gate, the S074 bus compressor settings and the Settings-Load bulk-apply hazard (O1), (S075) the copy/clear edit-mask rules, St1/compressor defaults, FX-send Normal/Morph endpoints, VOICE Morph views and the automation-priority rules, (S076/S077) override clear rules and per-track Scene playback, (S078) track Morph endpoints, the track effective-value architecture, the STEP Morph view and the project-wide Morph-view rule, and (S080) the Scene chain settings, the S080 `parameter_values[]` Globals/mirrors and their dirty marking. Updated through Session 080. | Understanding parameter storage, morph interpolation, runtime overlays, Scene activation, or dirty marking. |
 | `dsp_instruments_effects/CPU_USE_DSP_AUDIT.md` | DSP performance audit (S074 cost additions items 27–31, S075 items 32–35): the Session 073 cost audit (findings F1–F10, sound classes S0–S4, checked-and-rejected ideas) above the 2026-05 historical audit (render scheduling, IRQ priorities, caches/MPU, ITCM/DTCM, SIMD/FPU, DMA), and the ordered optimization record (items 1–26, including the S073 results). | Investigating audio underruns or planning an optimization. For how the DSP works now, use the two DSP references. |
 | `DEV_MODES.md` | Screen-only diagnostic versus file-only logging contract, current `bootlog.bin`/`asavetrc.bin` formats (including the S074 `V` flag layout and the S075 copy/clear stage `c`), the stall-detection sites (the drain is progress-aware since S074), the BC18 settings-page check, duplicate limitation, and failed unified-log warning. | Adding or interpreting diagnostics, trace, or logging output. |
-| `dsp_instruments_effects/EFFECTS_BUS_REFERENCE.md` | As-built Phase 5 Effect system through S075 (registry `off/flt/cbt`, the page hook/layout contract, the automation-underline rule, CrumpBit's page; S075 Effect copy/clear and fan-out, the pan rule, full views, the SHIFT+TRACK overlay): module map, signal flow and fader modes, type contract and registry self-check codes, retained data and type change, resolution order, DTCM arena and handoff, Effect page, fan-out and layout gate, FX sequencer, IDs/automation/LFO, `.fx`/HCNAMES/AutoSave, lifecycle, design rationale, debugging, and the add-a-type tutorial. | Adding an Effect type or changing anything in the Effect/bus/FX-sequencer path. |
-| `FILESYSTEM_SPEC.md` | Current product storage specification through Session 075 (the `sceneset.scg` line table with the `bus_comp_*` keys, `fader_setting` 0..3, retired `voice_decimation_all` and `fx_send_morph`; the `cbt` `.fx` keys; the copy/clear name-buffer loan and `HNcU`; retained MIDI endpoint entries): root layout, typed 161-row HCNAMES, PAT4, `.fx` v2 Effect children, name indexes and typed-index recovery, Kit/Instrument schemas, Scene/Bank storage, boot restore, load/save reachability, overwrite safety, and verification anchors. | Changing product storage, serialization, load/save, or instrument propagation. |
-| `MODULE_INTERCHANGE_SPEC.md` | Live direct-call ownership map through Session 075 (including EffectsManager, FxBuffer, menuEffects and its S074 page extensions, BusCompressor, StepScale, the S075 CopyClear module, the FX-send Morph/overlay APIs and the automation-priority guard) for Pattern, UI, sequencer, Preset, instruments, modulation, MIDI, filesystem, AsyncFATFS, storageTypes, and boot. | Connecting modules or deciding which layer owns a new API/state transition. |
+| `dsp_instruments_effects/EFFECTS_BUS_REFERENCE.md` | (S078: FX sequencer Q8.8 DDA on the 128-position step-scale curve, `.fx` token→CC map.) As-built Phase 5 Effect system through S075 (registry `off/flt/cbt`, the page hook/layout contract, the automation-underline rule, CrumpBit's page; S075 Effect copy/clear and fan-out, the pan rule, full views, the SHIFT+TRACK overlay): module map, signal flow and fader modes, type contract and registry self-check codes, retained data and type change, resolution order, DTCM arena and handoff, Effect page, fan-out and layout gate, FX sequencer, IDs/automation/LFO, `.fx`/HCNAMES/AutoSave, lifecycle, design rationale, debugging, and the add-a-type tutorial. | Adding an Effect type or changing anything in the Effect/bus/FX-sequencer path. |
+| `FILESYSTEM_SPEC.md` | Current product storage specification through Session 080 (S080: settings.cfg `perf_*`/`scd`/`qcd`/`qac` keys and `lines=24`, `sceneset.scg` chain lines 18/19, PAT4 track byte 4 loop exclusion; S078: PAT4 `track_scale` as a step-scale CC and run-mode byte 3, `sceneset.scg` `track_morph_*` lines 15..17, `.fx` `step_scale` token→CC map, the offline converter; earlier: the `sceneset.scg` line table with the `bus_comp_*` keys, `fader_setting` 0..3, retired `voice_decimation_all` and `fx_send_morph`; the `cbt` `.fx` keys; the copy/clear name-buffer loan and `HNcU`; retained MIDI endpoint entries): root layout, typed 161-row HCNAMES, PAT4, `.fx` v2 Effect children, name indexes and typed-index recovery, Kit/Instrument schemas, Scene/Bank storage, boot restore, load/save reachability, overwrite safety, and verification anchors. | Changing product storage, serialization, load/save, or instrument propagation. |
+| `MODULE_INTERCHANGE_SPEC.md` | Live direct-call ownership map through Session 080 (S080: the "PERF performance surface" section — button map, latched menus, pages, LED rules, scene change execution, how to add a PERF gesture — plus looper/scene/chain sequencer APIs, `LED_LAYER_FAST`, chain editor and Loopable APIs; S078: the 128-position StepScale contract, sequencer DDA/shuffle/run-mode/effective-cache helpers, track Morph/override APIs, the STEP Morph view, STEP held-step overlay, multi-step broadcast, `copyClear_isClearMode()`; earlier: including EffectsManager, FxBuffer, menuEffects and its S074 page extensions, BusCompressor, StepScale, the S075 CopyClear module, the FX-send Morph/overlay APIs and the automation-priority guard) for Pattern, UI, sequencer, Preset, instruments, modulation, MIDI, filesystem, AsyncFATFS, storageTypes, and boot. | Connecting modules or deciding which layer owns a new API/state transition. |
 | `OSC_INTERP_AUDIT.md` | Implemented oscillator waveform interpolation feature: global parameter/UI/runtime state, render behavior, settings persistence, file-level changes, risks, and hardware validation checklist. | Changing oscillator interpolation or its global save/load behavior. |
-| `PATTERN_DYNAMIC_STACK.md` | Dynamic Pattern storage (address array, pool, bitmap), PAT4, Pattern Stack Service, step automation encoding and drain, including S072 Effect targets and Effect step markers, and (S075) the swap block, exclusive boundary, raw block API, sliding compaction and the automation-priority rule (§6.2a). | Changing Pattern storage, step automation, or the automation drain. |
-| `STORAGE_SRAM_MANIFEST.md` | On-chip storage map (renamed from `SRAM_MANIFEST.md` in S073; S074 and S075 ledgers, sector 6 contents, the swap block and name-buffer loan): program flash window, image layout, linker guards, boot image check, bootloader facts and growth paths; sample flash layout and guards; the static RAM ledger (SRAM1, DTCM and the FX arena, ITCM contents, DMA region); SRAM1 owners; the reservation and approval policy. SD card storage is only referenced. | Changing retained state, flash layout or sample storage, adding caches/names, or evaluating memory cost. Update it in the same change. |
+| `PATTERN_DYNAMIC_STACK.md` | Dynamic Pattern storage (address array, pool, bitmap), PAT4, Pattern Stack Service, step automation encoding and drain, including S072 Effect targets and Effect step markers, (S075) the swap block, exclusive boundary, raw block API, sliding compaction and the automation-priority rule (§6.2a), (S077) the background region, (S078) per-track timing as played — continuous step scale, DDA, shuffle, run modes, effective cache, track automation (§6.4) — and STEP-page multi-step editing/track automation overlay/underlines (§6.3a), (S079) the 7-special block, trigger conditions and roll engine, and (S080) the 41-entry conditions, the master-clock-anchored PERF looper (§6.5), scene change/queue timing and scene chaining (§6.6) and the `track_loop_exclude` byte. Updated through Session 080. | Changing Pattern storage, step automation, or the automation drain. |
+| `STORAGE_SRAM_MANIFEST.md` | (Ledger current through S080.) On-chip storage map (renamed from `SRAM_MANIFEST.md` in S073; S074 and S075 ledgers, sector 6 contents, the swap block and name-buffer loan): program flash window, image layout, linker guards, boot image check, bootloader facts and growth paths; sample flash layout and guards; the static RAM ledger (SRAM1, DTCM and the FX arena, ITCM contents, DMA region); SRAM1 owners; the reservation and approval policy. SD card storage is only referenced. | Changing retained state, flash layout or sample storage, adding caches/names, or evaluating memory cost. Update it in the same change. |
 | `dsp_instruments_effects/INSTRUMENTS_DSP_REFERENCE.md` | Instrument DSP (S073; S074 sidechain tap in the trigger funnel; S075 runtime-write priority: automation, menu, MIDI): timing model and constant-CPU rule, per-block sequence, tagged runtime slots, descriptors and the write path (special-writer tags), the four voice engines, oscillator/filter/envelope/transient/distortion building blocks, LFO/velocity/Morph/automation modulation, measured costs, and how to add parameters, writers, modes and instrument types. | Changing or extending voices, parameters, modulation or their cost. |
 | `dsp_instruments_effects/EFFECTS_MIXER_DSP_REFERENCE.md` | Mixer and Effect DSP (S073, S074: CrumpBit DSP, the master bus compressor, `xfd`; S075: pan laws centred on 63, global decimation removed, FX-send Morph): number formats and headroom, jack routing, fader modes, dry/send arithmetic, the FX bus and return, output buffers, DMA pack and MPU, the StereoFilter DSP, the DTCM arena contract for buffer-using Effects, measured costs, and how to add Effect DSP or change the mixer and output pipeline. | Changing the mixer, the FX bus, an Effect's DSP, or the output path. |
 
@@ -1526,7 +1637,8 @@ sequencerTimer_init(); // TIM3 4kHz sequencer owner — AFTER audioCodec_init()
 - `led_processSeqLedState()` drains sequencer LED events in the main loop. Do not move it to an ISR without auditing PatternData and LED RMW races.
 - `Core/MIDI/frontPanelParser.c/h` is deleted. Do not replace it with a generic bridge; call owner APIs directly.
 - New pattern/track/step/automation work should enter through `pat_*` APIs in `Core/Bank/Scene/Pattern/PatternData.c/h`.
-- Sequencer no longer exposes `seq_patternSet`, `seq_tmpPattern`, or `seq_selectedStep` compatibility names in live code. Playback and recording must use PatternData helpers such as `pat_readStep()`, `pat_getEffectiveTrackLength()`, `pat_recordNote()`, and `pat_eraseMainStepSubSteps()`.
+- Sequencer no longer exposes `seq_patternSet`, `seq_tmpPattern`, or `seq_selectedStep` compatibility names in live code. Playback and recording must use PatternData helpers such as `pat_readStep()`, `pat_recordNote()`, and `pat_eraseMainStepSubSteps()` (`pat_getEffectiveTrackLength()` no longer exists; track timing uses the sequencer's effective cache, next bullet).
+- **Per-track timing (S078):** sequencer track timing (length wrap, DDA scale interval, shuffle delay, realignment) reads only `seq_effectiveTrackLength/Scale/Shuffle[]`, refreshed by `seq_refreshTrackEffectiveParams()` from each track's played Scene; the run mode is read from `region->track_play_mode[]`. Do not read `track_length/scale/shuffle` from the region in ISR timing code, and never write the region from Morph or automation (`PATTERN_DYNAMIC_STACK.md` §6.4).
 - `pat_tmpPattern` is the remaining active-pattern load buffer. Leave it until the 17th Scene/background-bank-load design replaces it; it should be the only temporary pattern storage needed.
 - `seq_offsetTrackStepIndexForRotation()` is a narrow runtime hook used by PatternData; UI code should call `pat_setTrackRotation()`.
 - `Core/Bank/Scene/Preset/` owns Preset code location. Public names intentionally remain `preset_*`, `parameterArray_*`, and `paramArray_*`; do not rename only part of this API.
@@ -1539,6 +1651,11 @@ sequencerTimer_init(); // TIM3 4kHz sequencer owner — AFTER audioCodec_init()
 - `BUTTON_TIMEOUT` is milliseconds on this port (`500u`), not original AVR ticks (`38 * 13.107ms`).
 - `EuklidGenerator.c` matches original LXR. PATGEN distribution depends on `__CLZ(0) == 32`; do not replace the shim with `__builtin_clz()`.
 - `seq_tick()` is owned by `TIM3_IRQHandler`. **Do NOT add seq_tick() back to the main loop.**
+- **S080 TIM3 order in `seq_processSchedulerTick()`:** master boundary (scene
+  change fire detection) → `seq_chainServiceTick()` → deferred triggers →
+  (unless chain `stp`) `seq_loopProcessTick()` → per-track DDA → rolls → FX
+  clock. Scene changes themselves run in the foreground
+  (`menu_serviceDeferredSceneChange()` from `buttonHandler_tick()`).
 - `midiParser_processRealtimeEvents()` and `triggerJacks_tick()` are also owned by TIM3. Do NOT call them from the main loop.
 - `voiceControl_processPending()` is called only inside `audio_check_and_render()` before `mixer_calcNextSampleBlock()`. Do NOT call from ISR context.
 - DIN TX FIFO inserts and USB MIDI writes from foreground code must use short critical-section wrappers to avoid corruption from TIM3 clock/note output.

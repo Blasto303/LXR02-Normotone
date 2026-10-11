@@ -29,13 +29,16 @@
 #define PAGE_SHIFT      3
 
 /*
- * S074 Scene-owned bus compressor page.
+ * S074 Scene-owned bus compressor page (sub-page 3 since S080 P2).
  *
- * It is deliberately the last populated settings sub-page. New global pages
- * go before it and move this constant; menu cues and the diagnostic check use
- * the named boundary rather than a duplicated literal.
+ * It is deliberately the last populated settings sub-page and holds only the
+ * four Scene-owned compressor cells (cmp, cam, ctm, csc). The Global screen
+ * before it (scd, qcd, qac) shows the '^' cue and this page shows '+'. New
+ * global pages go before it and move this constant; menu cues, the
+ * cross-sub-page encoder step and the diagnostic check use the named boundary
+ * rather than a duplicated literal.
  */
-#define MENU_GLOBAL_SCENE_SUBPAGE 2u
+#define MENU_GLOBAL_SCENE_SUBPAGE 3u
 _Static_assert(MENU_GLOBAL_SCENE_SUBPAGE < NUM_SUB_PAGES,
                "Scene-owned settings page must be a real sub-page");
 
@@ -147,6 +150,24 @@ enum NamesEnum {
     /* S074 Scene-owned bus compressor page: cmp, cam, ctm, csc. */
     TEXT_BUS_COMP_MODE, TEXT_BUS_COMP_AMOUNT,
     TEXT_BUS_COMP_TIME, TEXT_BUS_COMP_SIDECHAIN,
+    /* S078 per-track play mode label for the STEP track-settings page. */
+    TEXT_TRACK_PLAY_MODE,
+    /* S079 STEP step-special labels: condition, micro-timing, roll family. */
+    TEXT_CONDITION, TEXT_MICROTIMING, TEXT_ROLL_RATE, TEXT_ROLL_RHYTHM,
+    TEXT_ROLL_FILL,
+    /*
+     * S080 E2: BAR overlay settings on the SHIFT+REC page (BtnStat</-
+     * BtnNote</BtnStat>/BtnNote>).
+     */
+    TEXT_PERF_BTN_LT, TEXT_PERF_NOTE_LT, TEXT_PERF_BTN_RT, TEXT_PERF_NOTE_RT,
+    /* S080 F2: scene change/queue division and queue action globals. The
+     * S080 F2 duplicate pcr label was removed in S080 P2 (Defect 5); the one
+     * PC reset is TEXT_BAR_RESET_MODE. */
+    TEXT_SCENE_CHANGE_DIV, TEXT_SCENE_QUEUE_DIV, TEXT_SCENE_QUEUE_ACTION,
+    /* S080 G10: per-Scene chain parameter labels (cn1/nx1/cn2/nx2). */
+    TEXT_CHAIN_COND1, TEXT_CHAIN_NEXT1, TEXT_CHAIN_COND2, TEXT_CHAIN_NEXT2,
+    /* S080 P2 Defect 8a: per-track loopable label (lop) on the STEP page. */
+    TEXT_TRACK_LOOPABLE,
     NUM_NAMES
 };
 
@@ -158,7 +179,14 @@ enum catNamesEnum {
     CAT_GLOBAL, CAT_VELOCITY, CAT_PARAMETER, CAT_SEQUENCER,
     CAT_GENERATOR, CAT_MIDI, CAT_TRIGGER,
     /* S074: Scene-owned static cells on the bus compressor page. */
-    CAT_SCENE
+    CAT_SCENE,
+    /* S078 P4: per-track Pattern settings category ("Track"); parallel to
+     * catNames[] in MenuText.h, which must stay index-aligned. */
+    CAT_TRACK,
+    /* S080 E4: "Prfrmnc" category for the BAR overlay settings. */
+    CAT_PERFORMANCE,
+    /* S080 G10: "Chain" category for the scene chain parameters. */
+    CAT_CHAIN
 };
 
 enum longNamesEnum {
@@ -192,6 +220,17 @@ enum longNamesEnum {
     /* S074 bus compressor long names. */
     LONG_BUS_COMP_MODE, LONG_BUS_COMP_AMOUNT,
     LONG_BUS_COMP_TIME, LONG_BUS_COMP_SIDECHAIN,
+    /* S078 per-track run mode long name: RunMode (S078 P4). */
+    LONG_PLAY_MODE,
+    /* S079 step-special long names (condition, micro-timing, roll family). */
+    LONG_CONDITION, LONG_MICROTIMING, LONG_ROLL_RATE, LONG_ROLL_RHYTHM,
+    LONG_ROLL_FILL,
+    /* S080 overlay/scene/chain long names (parallel to TEXT_ additions). */
+    LONG_PERF_BTN_LT, LONG_PERF_NOTE_LT, LONG_PERF_BTN_RT, LONG_PERF_NOTE_RT,
+    LONG_SCENE_CHANGE_DIV, LONG_SCENE_QUEUE_DIV, LONG_SCENE_QUEUE_ACTION,
+    LONG_CHAIN_COND1, LONG_CHAIN_NEXT1, LONG_CHAIN_COND2, LONG_CHAIN_NEXT2,
+    /* S080 P2 Defect 8a: "Loopable". */
+    LONG_TRACK_LOOPABLE,
 };
 
 enum shortNamesEnum {
@@ -222,7 +261,18 @@ enum shortNamesEnum {
     SHORT_AUTOSAVE,
     /* S074 bus compressor compact labels: cmp, cam, ctm, csc. */
     SHORT_BUS_COMP_MODE, SHORT_BUS_COMP_AMOUNT,
-    SHORT_BUS_COMP_TIME, SHORT_BUS_COMP_SIDECHAIN
+    SHORT_BUS_COMP_TIME, SHORT_BUS_COMP_SIDECHAIN,
+    /* S078 per-track run mode compact label: run (S078 P4). */
+    SHORT_PLAY_MODE,
+    /* S079 step-special compact labels. */
+    SHORT_CONDITION, SHORT_MICROTIMING, SHORT_ROLL_RATE, SHORT_ROLL_RHYTHM,
+    SHORT_ROLL_FILL,
+    /* S080 overlay/scene/chain compact labels (parallel to TEXT_ additions). */
+    SHORT_PERF_BTN_LT, SHORT_PERF_NOTE_LT, SHORT_PERF_BTN_RT, SHORT_PERF_NOTE_RT,
+    SHORT_SCENE_CHANGE_DIV, SHORT_SCENE_QUEUE_DIV, SHORT_SCENE_QUEUE_ACTION,
+    SHORT_CHAIN_COND1, SHORT_CHAIN_NEXT1, SHORT_CHAIN_COND2, SHORT_CHAIN_NEXT2,
+    /* S080 P2 Defect 8a: "lop". */
+    SHORT_TRACK_LOOPABLE
 };
 
 #define PAR_RUNTIME_CPU_USE 0xFFFEu
@@ -407,7 +457,28 @@ void menu_loadInstrumentExit(void);
  */
 uint8_t menu_loadSceneButtonPressed(uint8_t scene_index);
 void    menu_perfModeSceneButtonPressed(uint8_t scene_index);
+/*
+ * Run a deferred/queued scene change when the sequencer raises its fire flag
+ * (S080 F8/F9). Input: none. Output: the pending change is executed (queue
+ * action applied first). Client: buttonHandler_tick() on the main-loop
+ * cadence, so a queued change fires regardless of the current menu.
+ * Affiliates: seq_sceneChangeFirePending().
+ */
+void    menu_serviceDeferredSceneChange(void);
 void    menu_refreshPerfSceneLeds(void);
+/*
+ * S080 G8 scene chain editor (SHIFT+PLAY+SEQ in PERF).
+ *
+ * menu_chainMenuOpen() shows a present Scene's chain (returns 1 when opened),
+ * menu_chainMenuView() switches the viewed Scene while open,
+ * menu_chainMenuClose() returns to PERF, menu_chainMenuIsOpen() reports the
+ * latch. Clients: buttonHandler.c. Affiliates: PATTERN_SETTINGS_PAGE,
+ * scene_getChain*()/scene_setChain*().
+ */
+uint8_t menu_chainMenuOpen(uint8_t scene_index);
+void    menu_chainMenuView(uint8_t scene_index);
+void    menu_chainMenuClose(void);
+uint8_t menu_chainMenuIsOpen(void);
 /*
  * Repaint the temporary MODE VOICE held Scene edit-mask view.
  *
@@ -427,6 +498,20 @@ uint8_t menu_voiceHeldSceneButtonPressed(uint8_t scene_index);
  * encoder, and endless-pot code uses the matching parameter buffer.
  */
 void menu_setVoiceModeShowMorph(uint8_t onOff);
+
+/*
+ * STEP-page track Morph endpoint view (S078 §5.4).
+ *
+ * Why: the per-track length/scale/shuffle Morph endpoints are Scene settings
+ * and need an edit surface. Holding SHIFT in STEP mode shows and edits the
+ * endpoints on the STEP front-page cells, mirroring the VOICE SHIFT Morph view.
+ * Input onOff is a boolean owned by buttonHandler's SHIFT press/release in
+ * SELECT_MODE_STEP. Output: the STEP page's len/scl/shf cells read and write
+ * the active Scene's track Morph endpoints instead of the Pattern Normal
+ * values, and the page repaints. Separate from voiceModeShowMorph so the VOICE
+ * morph latch is never affected.
+ */
+void menu_setPatternTrackMorphEndpoint(uint8_t onOff);
 
 /*
  * Effect-page SHIFT Morph view (Session 072 step 7; plan §13.5).
@@ -500,15 +585,17 @@ void menu_voiceAutoOverlayBarChanged(void);
  * Restart the automation-presence search after Pattern content changed (S075;
  * formerly menu_voiceAutoOverlayPatternDeleted()).
  *
- * What: restarts the bounded search shared by the VOICE pages (active track)
- * and the Effect page (all seven tracks, S074), then repaints, so underlines
- * follow the new content once the rescan completes. Why: a paste or clear can
- * add or remove automation anywhere in the viewed Pattern, and a removed
- * target cannot be proven absent without a full rescan. Inputs: none; call
- * after Pattern content has been changed. Outputs: a cleared search and a
- * repaint on VOICE and Effect pages; nothing on other pages, whose next
- * VOICE/Effect entry restarts the search anyway. Callers: copyClearService.c
- * after every Pattern paste/clear on the viewed Scene. Affiliates:
+ * What: restarts the bounded search shared by the VOICE pages (active track),
+ * the STEP track-settings page (SEQ_PAGE, active track, `len`/`scl`/`shf`,
+ * S078 P3), the Effect page (all seven tracks, S074), and the PERF page (all
+ * seven tracks, S077 P6), then repaints, so underlines follow the new content
+ * once the rescan completes. Why: a paste or clear can add or remove
+ * automation anywhere in the viewed Pattern, and a removed target cannot be
+ * proven absent without a full rescan. Inputs: none; call after Pattern
+ * content has been changed. Outputs: a cleared search and a repaint on those
+ * pages; nothing on other pages, whose next entry restarts the search anyway.
+ * Callers: copyClearService.c (ccSvc_patternChangedUi()) after every Pattern
+ * paste/clear and pot-clear register pass on the viewed Scene. Affiliates:
  * va_searchRestart() and va_scanService() in menu.c.
  */
 void menu_patternContentChanged(void);
@@ -516,12 +603,15 @@ void menu_patternContentChanged(void);
  * Drop one target's underline now, without restarting the search (S075).
  *
  * What: clears the presence bit for one target in the current search result
- * and repaints. Why: a pot clear removes the underline at the turn (spec §6)
- * while the background removal runs; restarting the whole search would make
- * every other underline vanish until the rescan completes. The search loop
- * filters targets waiting in the register (ccSvc_targetPending()), so the
- * bit cannot come back before the removal finishes. Inputs: Pattern target
- * ID. Output: repaint. Caller: ccClear_potTurned().
+ * and repaints; VOICE, Effect, PERF, and (S078 P3) the STEP track-settings
+ * `len`/`scl`/`shf` bits of the active track are covered. Why: a pot clear
+ * removes the underline at the turn (spec §8) while the background removal
+ * runs; restarting the whole search would make every other underline vanish
+ * until the rescan completes. The search loop filters targets waiting in the
+ * register (ccSvc_targetPending()), so the bit cannot come back before the
+ * removal finishes. Only for whole-Scene removals: a held-step-only removal
+ * restarts the search instead. Inputs: Pattern target ID. Output: repaint.
+ * Caller: ccClear_potTurned().
  */
 void menu_automationTargetCleared(uint16_t target);
 /*
@@ -548,8 +638,49 @@ uint8_t menu_isStorageBusy(void);
 void menu_toggleStepTrackSettingsHalf(void);
 void menu_showStepTrackSettingsFirstHalf(void);
 void menu_showStepEditPage(void);
+/*
+ * Toggle the STEP edit page between the two step-special subpages (S079 P2).
+ *
+ * What: switches SEQ_PAGE between subpage 1 (vel/note/condition/timing) and
+ * subpage 2 (roll/rhythm/fill), selects parameter 0, resets the automation
+ * editor cursor, refreshes endless-pot snapshots, and repaints. Why:
+ * re-pressing the already-selected step button must reach the roll settings
+ * without the scroll gesture. Inputs: current SEQ subpage. Output: menuIndex
+ * moves to the other step-special subpage. Affiliates:
+ * buttonHandler_seqButtonPressed().
+ */
+void menu_toggleStepEditSubpage(void);
+/*
+ * STEP held-step track automation overlay (S078 P2 §B).
+ *
+ * What: enters the STEP-mode overlay that writes an automatable track timing
+ * parameter (length, scale, shuffle) as step automation to every physically
+ * held step. Why: STEP mode has no track-level parameter editor, so holding
+ * steps and pressing a TRACK button opens the SEQ track-settings page with
+ * automation-editing semantics instead of the normal retained-value editor.
+ * Inputs: voiceNr is the pressed TRACK button (0..6). Outputs: the SEQ_PAGE
+ * front page is shown for that track, the shared VOICE-overlay state is armed
+ * for the STEP context, step LEDs are refreshed, and the frame is repainted;
+ * held-step values are underlined on the value row, and automated
+ * `len`/`scl`/`shf` names are underlined from the SEQ_PAGE Pattern search
+ * (S078 P3), which also runs without the overlay. Lifetime: until all steps
+ * are released, the page changes, or the mode changes. Caller:
+ * handleVoiceButton() in buttonHandler.c when buttonHandler_seqHeldMask() is
+ * nonzero. Affiliates: menu_seqCellToTrackTarget(),
+ * sa_refreshAutomationLeds(), sa_applyTrackMarkers().
+ */
+void menu_enterStepTrackAutomationOverlay(uint8_t voiceNr);
 void menu_resetActiveParameter(void);
 uint8_t menu_getSubPage(void);
+/*
+ * Repaint the PERF SELECT row from looper state (S080 A5, P2 Defect 4).
+ *
+ * Input: none. Output: the looper division's SELECT LED while the looper is
+ * held or engaged, otherwise a dark SELECT row. Clients: menu_switchPage()
+ * PERF block, the PERF sub-page step, buttonHandler looper release.
+ * Affiliates: buttonHandler_loopSelectLed().
+ */
+void menu_syncPerfSelectLed(void);
 /*
  * Parameter buffer resolution for voice morph mode.
  *
@@ -586,11 +717,15 @@ uint8_t menu_isLoadSaveCommandActive(void);
  * What: exposes Menu's existing dirty-mask state to filesystem_tick() and
  * lets that scheduler start the existing atomic HCNAMES writer after page
  * exit. Why: page repaint/exit must not wait for HCNAMES persistence, while
- * the dirty mask must remain owned by Menu until a successful completion.
- * Inputs: no new storage; the implementation reads Menu's resident-name
- * session state. Outputs: a read-only dirty query and one deferred flush
- * request. Affiliates: filesystem_tick(), menu.c's resident-name helpers, and
- * menu_residentNameScratchFlushComplete().
+ * the dirty mask must remain owned by Menu until a successful completion. The
+ * deferred write is a background operation: it holds the filesystem (as
+ * AutoSave does) but must not raise menu_storageBusy, so mode buttons,
+ * encoder, pots, runtime widgets, and copy/clear stay responsive for the ~3 s
+ * write (S077_P3_BLANK_MENU_AFTER_SCN_LOAD.md §3). Inputs: no new storage; the
+ * implementation reads Menu's resident-name session state. Outputs: a
+ * read-only dirty query and one deferred flush request. Affiliates:
+ * filesystem_tick(), menu.c's resident-name helpers, and
+ * menu_residentNameDeferredFlushComplete().
  */
 uint8_t menu_hasResidentNameDirtyMask(void);
 void menu_triggerDeferredHcnamesFlush(void);
