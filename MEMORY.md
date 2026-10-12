@@ -263,6 +263,13 @@ end; durable facts belong in `knowledge_files/log_archive/` or
   and mono maths may differ (stereo balance laws are centred on 63; mono
   laws use `squareRootLut`), but display and default must match. Do not
   change instrument defaults casually (user).
+- **No backward compatibility, ever (user, standing; restated S081):** stored
+  formats and stored values (PAT4, settings, AutoSave, specials indices) may
+  change meaning freely. Do not offer migration, aliasing or converter
+  options in plans, and do not raise compatibility as a follow-up question.
+- **Wording (user, S081):** stored data are *files* (PAT4 files, settings
+  files, AutoSave records), not "cards". "Card" means only the physical SD
+  card.
 - **No backward compatibility for S075 F2 storage (user):** before testing
   this firmware on an older card, delete `.hcprms1`/`.hcprms2` and other
   temporary records (AutoSave Scene cells 45..50 are not migrated).
