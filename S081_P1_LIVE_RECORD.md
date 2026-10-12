@@ -30,7 +30,7 @@ Session 081 plan, branch `dev-ph6-cleanup`, base `02553df`.
   - the step reset rule (§5.8);
   - slow rolls and flams are recorded as individual steps (§8.8);
   - two more pre-existing roll defects (§3.3-15/16);
-  - the voice-queue reset flag (§19.15);
+  - the voice-queue reset (§19.15);
   - new follow-ups F-R and F-S.
 - **Revision 8 (2026-10-12):** F-R and F-S accepted as recommended. No
   follow-ups remain open.
@@ -491,16 +491,16 @@ eff(i) = menuHold(i) ? menu(i)
 
 **Mechanism (replaces "every trigger restores"):**
 
-- **Voice queue reset flag.**
+- **Voice queue reset.**
   - `seq_restoreAutomatedParameters()` stays in the trigger funnel, but runs
-    only for entries flagged RESET (§19.15).
-  - The Sequencer flags only first triggers.
-  - A roll renewal enqueues a reset-only entry: no voice trigger, just the
-    restore and override clear.
-  - Live triggers are always flagged.
+    only for a voice with a pending reset (per-voice mask, §19.15).
+  - The Sequencer requests a reset only for first triggers.
+  - A roll renewal requests a reset with no voice trigger: the restore and
+    override clear only.
+  - Live triggers always request one.
 - **Deferred automation.** A step whose first trigger is deferred (shuffle
   or micro-timing) queues its automation entries at the deferred fire time,
-  in TIM3, together with the flagged trigger, not at the step start.
+  in TIM3, together with the resetting trigger, not at the step start.
   - The foreground order `voiceControl_processPending()` →
     `seq_drainPendingAutomation()` (`main.c:212-213`) then gives
     reset → trigger → that step's automation, as for on-time steps.
@@ -910,11 +910,12 @@ Normal SRAM1, static. The schedule fixes exact bytes.
 | Live-hold mask, erase masks (specials, full), published `rtk`/writing | 5 | Sequencer |
 | PPQ µs stamp + period | 8 | Sequencer |
 | Deferred trigger: step index + roll flag per track (§5.8) | 7 | Sequencer |
+| Per-voice pending-reset mask (§19.15) | 1 | MidiVoiceControl |
 | Playback epoch counter | 1 | Sequencer |
 | Instrument menu-override bitmap, 6 × `u64` (§5.1) | 48 | Sequencer |
 | Effect `menuHold` (64-bit + Morph bit) | ~9 | EffectsManager |
 | FX-erase pending mask (16 × 16 bits) + erase lane mask | ~34 | EffectsManager |
-| **Added** | **~409** | |
+| **Added** | **~410** | |
 
 Released (not reused, per policy):
 
@@ -933,7 +934,7 @@ Each phase lists its §19 subsections.
 
 | Phase | Content | §19 | Verify (hardware unless noted) |
 |---|---|---|---|
-| A1 | §5.8 step reset rule (reset flag, deferred automation, delayed rolls, spill rule); R12 Instrument menu override; per-target Scene clears | 19.1 (1–3, 5–7), 19.5, 19.6 (R12), 19.15 | Plain / delayed / rolled / carried / spilled steps reset exactly once at the right point; menu vs automation per class |
+| A1 | §5.8 step reset rule (per-voice reset mask, deferred automation, delayed rolls, spill rule); R12 Instrument menu override; per-target Scene clears | 19.1 (1–3, 5–7), 19.5, 19.6 (R12), 19.15 | Plain / delayed / rolled / carried / spilled steps reset exactly once at the right point; menu vs automation per class |
 | A2 | R13 Effect rules: marker removal, lock-start clear, `menuHold`, one-step Morph lane, realign reset | 19.1 (4,8), 19.4 | FX lock/overlay/menu sequences incl. `sel`; Scene change/realign clears |
 | A3 | Roll table + 64T/128; `qnt trk` (recording quantiser + looper); R19 overlay fixes; `PAR_ROLL` retirement | 19.1 (9,10), 19.6 (lists), 19.7 (overlay) | Roll rates by count; looper `trk`; overlay LED across modes; overlay switch while held |
 | B | LiveRecord skeleton; REC press/hold/blink; arm while stopped; `rtk` cell and follow; gate moves (filesystem, copy/clear); looper record-off move; removals | 19.2, 19.7 (REC), 19.10, 19.11, 19.12 | REC gestures/LEDs; `rtk`; AutoSave runs while armed and stopped |
@@ -976,8 +977,9 @@ Each phase lists its §19 subsections.
     (restore, override clear) before the drain applies that step's entries.
   - Delayed triggers and roll retriggers break this today (§3.3-1/2). §5.8
     fixes it in Phase A1, before R12 and recording rely on it.
-  - The reset flag must survive the voice-queue path unchanged. A dropped
-    or merged queue entry would skip a reset.
+  - The reset must survive the voice queue's drop path (`noteOff` deletes
+    queued entries for the voice). Hence the per-voice pending-reset mask,
+    not a flag inside the entry (§19.15).
 - **R-5a Roll playback changes (§5.8).** Existing patterns change in three
   ways (intended):
   - roll steps now honour micro-timing and shuffle;
@@ -1081,8 +1083,8 @@ PRIMASK-published):
      TIM3 queues them when the deferred trigger fires, so no foreground
      parking is needed.
 3. **`seq_restoreAutomatedParameters()`** (`:2563`): also clears
-   `seq_menuOverride[slot]`. It runs only for RESET-flagged voice-queue
-   entries (§5.8, §19.15).
+   `seq_menuOverride[slot]`. It runs only for voices with a pending reset
+   (per-voice mask, §5.8, §19.15).
    - `seq_triggerVoice()` gains a `reset` argument (or a
      `seq_triggerVoiceFirst()` twin):
      - `seq_advanceTrackStep()` on-time triggers, deferred fires and
@@ -1544,16 +1546,56 @@ None: no converter change (F-H; §3.3-5).
 Owned by the trigger funnel, not by the MIDI parser. It survives the MIDI
 rework.
 
-- The pending voice-trigger entry carries a RESET flag. Note and velocity
-  are 7-bit, so the flag fits in a spare bit; no RAM change if the entry
-  has one, otherwise one byte per entry, counted at schedule time.
-- `voiceControl_triggerNow()` (`:153`) calls
-  `seq_restoreAutomatedParameters()` only when RESET is set.
-- New `voiceControl_resetOnly(track)` enqueues a RESET entry with no
-  trigger, for roll renewals.
-- `voiceControl_noteOn()` keeps its signature for existing callers (always
-  RESET).
-- A flagged variant serves the Sequencer.
+**Current queue** (`MidiVoiceControl.c:72-150`):
+
+- `VoiceTriggerEvent` is `{uint8_t voice, note, vel}`: 3 B with no padding,
+  in a 32-entry ring (96 B). `voice` is always 0..6.
+- `voiceControl_noteOff(voice)` calls `voiceControl_dropPendingLocked()`.
+  That **removes every queued entry for that voice**.
+- `seq_triggerVoice()` calls `voiceControl_noteOff()` before every
+  `voiceControl_noteOn()` (`sequencer.c:1294-1297`). So a later trigger
+  queued for the same voice, before the foreground drains, deletes the
+  earlier one.
+
+**Decision: the RESET intent is not stored in the entry.** It is a per-voice
+pending-reset mask, `voiceControl_pendingReset` (`u8`, bits 0..6), set and
+cleared under the queue's existing PRIMASK.
+
+| Option | Problem |
+|---|---|
+| Flag in bit 7 of `note` or `vel` | Lost when the entry is dropped (for example: first roll hit queued, then retrigger 2 queued before the foreground runs; or a reset-only renewal followed by any trigger). A reset would be skipped (R-5). A stored step note or velocity byte is also not range-checked on PAT4 load, so a stray value ≥ 128 would read as RESET. |
+| Flag in the spare bits of `voice` | Same drop problem. Also forces masking in `dropPendingLocked()` and the pop path. |
+| Separate per-voice mask (chosen) | Survives drops: a reset is pending until some trigger or the end of the pass consumes it. |
+
+**Behaviour:**
+
+- **Enqueue:** a resetting trigger or `voiceControl_resetOnly()` sets the
+  voice's bit. A trigger without reset (roll retriggers 2+) does not touch
+  it.
+- **`voiceControl_processPending()`:**
+  - For each popped event: if its voice's bit is set, run
+    `seq_restoreAutomatedParameters()`, clear the bit, then
+    `instrumentManager_triggerTrack()`.
+  - After the ring is empty, run the restore for any bits still set
+    (reset-only renewals, or resets whose trigger entry was dropped), then
+    clear them.
+  - All of this precedes `seq_drainPendingAutomation()` (`main.c:212-213`),
+    so a step's own automation still lands after its reset.
+- **`voiceControl_triggerNow()`** no longer calls the restore
+  unconditionally.
+- **Edge (accepted):** if the foreground falls behind, a reset bit set by
+  step N+1 can be consumed by a still-queued roll retrigger of step N within
+  the same pass. Both run before the drain, so the only effect is that that
+  retrigger sounds with the base values.
+- **RAM:** +1 B. The entry struct and ring are unchanged.
+- **API:**
+  - `voiceControl_noteOn()` keeps its signature for MIDI, preview and
+    overlay callers. Those are live triggers, which always reset (F12), so
+    it sets the bit.
+  - A no-reset variant (`voiceControl_noteOnNoReset()`) serves roll
+    retriggers 2+.
+  - The Sequencer reaches them, and `voiceControl_resetOnly()`, through
+    `seq_triggerVoice(…, reset)`.
 
 ### 19.14 Documentation at close
 
