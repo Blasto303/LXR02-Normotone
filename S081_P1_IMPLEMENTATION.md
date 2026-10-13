@@ -24,6 +24,266 @@ decision.
 
 ---
 
+## Implementation log
+
+Executed against `dev-ph6-cleanup`, base `02553df` (code unchanged through
+`a6c96a0`). Each entry records what landed; every change carries the adjacent
+comment block from its schedule step. Full firmware build (`make all`) is the
+per-phase gate.
+
+### Phase A1 — done (2026-10-13)
+
+- **A1-1** `Core/MIDI/MidiVoiceControl.c/.h`: added `voiceControl_pendingReset`
+  mask, `voiceControl_noteOnNoReset()`, `voiceControl_resetOnly()`;
+  `voiceControl_popPending()` now returns the per-voice reset under PRIMASK;
+  `voiceControl_triggerNow()` gained `reset` and only restores when set;
+  `voiceControl_processPending()` drains leftover reset bits under PRIMASK.
+- **A1-2** `Core/Sequencer/sequencer.c/.h`: `seq_triggerVoice()` gained `reset`;
+  all callers updated (roll first hit / step hits / overlay / SOM / preview = 1,
+  `seq_processRollTicks` retriggers = 0, overlay timer = `count != 0xFF`).
+- **A1-3** `sequencer.c`: `seq_trackShuffleStep/Roll` deferral state,
+  `seq_fireDeferred()` (queues automation then fires roll/plain), deferral path
+  now covers roll steps, step-allowed block skips automation when the step's
+  trigger was deferred, roll end rule (F-R) only cuts on a firing trigger,
+  roll carry path calls `voiceControl_resetOnly()`.
+- **A1-4** `sequencer.c/.h`: `seq_menuOverride[6]`, `seq_menuOverrideSet()`,
+  drain skip filter, per-trigger clear in `seq_restoreAutomatedParameters()`,
+  clears at all A1-4e transport/Scene/per-track/realign sites.
+- **A1-5** `presetManager.c/.h`, `presetMorphEngine.c/.h`:
+  `preset_clearFxSendStepOverride()`, `preset_clearAudioOutStepOverride()`,
+  `presetMorph_clearTrackParamStepOverride()`.
+- **A1-6** `sequencer.c/.h`: `seq_clearSceneAutomationBit()`.
+- **A1-7** `Core/Menu/menu.c`: INSTRUMENT commit sets the override before the
+  edit-mask loop; AUDIO_OUT/FX_SEND/7dc commits do the per-target clear;
+  `menu_clearTrackTimingOverride()` helper applied to the STEP length/scale/
+  shuffle Normal and Morph-endpoint commits.
+
+Gate: `make all` clean (pre-existing filesystem unused-function warnings and
+linker libc notes only). Flash headroom 195,476 B.
+
+### Phase A2 — done (2026-10-13)
+
+- **A2-1** `EffectsManager.c/.h`: removed `owner[]`, `pending_end`,
+  `pending_track`, `owner_tracks`; removed `effects_automationPublishOwners()`,
+  `effects_automationStepBegin()`, `effects_automationStepFlush()` and their
+  header declarations; removed the `held_morph`/`held_morph_valid` latch and
+  `effects_seqLatchMorph()`. `effects_state_t` 84→80 B,
+  `effects_automation_t` 184→120 B.
+- **A2-2** added `menuHold` (u64) + `menuHoldMorph` (u8); `effects_setParameter`
+  / `effects_setMorphAmount` clear the overlay + set menuHold; `effects_apply
+  Automation` / `effects_setMorphAutomation` clear menuHold; new
+  `effects_lockClearLayers()` at FX lock step start (in `effects_seqConsume`
+  STEP and `effects_seqSelect` sel); `effects_automationClear` clears
+  menuHold; `effects_service()` resolution is now menuHold > lock > overlay >
+  menu, and the Morph base resolution is menuHoldMorph > lockMorph (current
+  step) > fxm > menu.
+- **A2-3** `sequencer.c/.h`: removed `seq_queueEffectStepMarker()`,
+  `seq_effectAutomationTracks`, `seq_setEffectAutomationTracks()`,
+  `SEQ_PENDING_TYPE_FX_STEP_BIT`, the marker call, the drain marker branch and
+  the final `effects_automationStepFlush()`.
+- **A2-4** `sequencer.c`: new `seq_fxRealignToMasterClock()` and
+  `seq_requestEffectOverlayReset()`, called at the end of both realign
+  functions (a STEP keeps the FX position valid; the latch clears overlays).
+
+Gate: `make all` clean. Flash headroom 195,580 B; bss 428040→427968 (72 B
+released).
+
+### Phase A3 — done (2026-10-13)
+
+- **A3-1** `sequencer.c`: `seq_rollPpq()` retimed to the 96-PPQ table
+  `{0,48,32,24,16,12,8,6,4,3}`, guard `rate > 9`.
+- **A3-2** `MenuText.h`: `stepRollRateNames` → 10 entries (drop 48, add 64t /
+  128); `quantisationNames` → 6 entries (add trk). `menu.c`: STEP roll clamp
+  8→9; `menu_getRollRateName` guard 8→9.
+- **A3-3** `sequencer.h`: `QUANT_TRACK`. `sequencer.c`: `seq_setQuantisation()`
+  clamps 0..5; `seq_loopSnapshotTracks()` computes per-track anchors for
+  `trk` (each track's own last step start); `seq_loopEventAnchor()` unchanged.
+- **A3-4** `buttonHandler.c`: new `bh_overlayHeldType`; BAR LEDs are (re)set
+  per mode in `handleModeButtons()`; new `buttonHandler_overlaySwitchHeld()`
+  re-configures the held overlay on a BAR switch/toggle-off (F-B/F-O), called
+  from both PERF BAR presses. The two `liveRec_rollRelease/RateChange`
+  notifications are deferred to Phase E with the module (the A3 phase must
+  build without LiveRecord; noted as a schedule adjustment).
+- **A3-5** `sequencer.c/.h`: removed `seq_rollRate`/`seq_rollState`, the legacy
+  roll block in `seq_advanceTrackStep`, `seq_setRoll()`, `seq_setRollRate()`
+  and their declarations. `menu.c`/`menuPages.h`/`MenuText.h`: retired
+  `PAR_ROLL` (dtype, parse, default, name-value cases, Euklid cell) and removed
+  `MENU_ROLL_RATES`/`rollRateNames`.
+
+Gate: `make all` clean. Flash headroom 195,188 B.
+
+### Phase B — done (2026-10-13)
+
+- **B-1** new `Core/Sequencer/LiveRecord.c/.h`; added to `Makefile` SRCS. Mode,
+  `rtk` and gate functions complete; `liveRec_service()` and the trigger/
+  automation/erase entry points are stubs (filled in E/F/G).
+- **B-2** `buttonHandler.c`: removed `bh_state.seqRecording`; added
+  `bh_recPressTick`/`bh_recArmed`; REC press starts the hold timer; REC hold
+  auto-enters overdub in `buttonHandler_tick`; REC release toggles latch or ends
+  overdub; SHIFT+REC menu enter flashes the REC LED, exit restores it; COPY
+  erase gate uses `liveRec_armed()`.
+- **B-4** `sequencer.c`: removed the record-off inside `seq_loopEngage()`;
+  `buttonHandler.c` calls `liveRec_forceOff()` + REC LED off before engage.
+- **B-5** `menu.c`: `menu_setActiveVoice()` follows `rtk`; `PAR_AUTOM_TRACK`
+  dtype `DTYPE_0B127`, clamp 0..6, rtk display special case, commit via
+  `menu_parseGlobalParam`, excluded from the settings-dirty test;
+  `menuPages.h` sub-page 2 cell 0 = rtk; `MenuText.h` names `rtk`/`RecTrk`.
+- **B-6** `copyClearSession.c` and `filesystem.c` gates use
+  `liveRec_armed()`/`liveRec_patternWriting()` (seq_eraseActive term kept until
+  G-5).
+- **B-7** `sequencer.c/.h`: removed `seq_quantize()`, `seq_recordTrigger()`,
+  `seq_setRecordingMode()` and their declarations; MidiParser.c note hook now
+  builds a `liveRec_trigger_t` (SINGLE/MIDI) and calls `liveRec_triggerIn()`.
+- **B-8** `ledHandler.c/.h`: removed `SEQ_LED_DIRTY_REC_SUB`, `recordSubStep`
+  and `led_updateRecordedSubStep()`; `led_updateRecordedMainStep()` now draws by
+  absolute step; new `seq_markRecordedStep()` in `sequencer.c/.h`.
+- **B-9** `timebase.c` calls `liveRec_service()` before `patSvc_tick()`; `main.c`
+  calls `liveRec_init(menu_getActiveVoice())` after `copyClear_init()`.
+
+Gate: `make all` clean. Flash headroom 194,780 B; bss +192 B (LiveRecord).
+
+Schedule adjustment: the A3-4b `liveRec_rollRelease()`/`liveRec_rollRateChange()`
+notifications land with the overlay hooks in Phase E-2 (the A3 phase had to build
+before LiveRecord existed).
+
+### Phase C — done (2026-10-13)
+
+- **C-1..C-7** `sequencer.c/.h`: added the service state (`seq_recRing` +
+  cursors, `seq_recTrack/Writing`, `seq_echoStep[7]`, `seq_liveHoldMask`,
+  `seq_eraseSpecialsMask/FullMask`, `seq_ppqStampUs/PeriodUs`, `seq_playbackEpoch`,
+  filter pointers) and the APIs `seq_takeRecBoundary`, `seq_setRecordTarget`,
+  `seq_suppressStepOnce`, `seq_setLiveHold`, `seq_cancelPendingTrigger`,
+  `seq_setEraseMasks`, `seq_getPlaybackEpoch`, `seq_setAutomationFilter`;
+  PPQ us stamp written at the head of `seq_processSchedulerTick`; drain filter
+  skips latched/erased entries; `seq_playbackEpoch` bumped and echo marks expired
+  at the transport/Scene/realign/per-track sites; `seq_liveRecResetMarks()` at
+  `seq_init`.
+- **C-8** `seq_captureTrackTime()`, `seq_projectStep()`, `seq_quantiseTick()`
+  (+ the header types `seq_track_time_t`, `seq_rec_boundary_t`).
+- **C-9** `seq_advanceTrackStep()`: fired bit + boundary-ring push; side-effect-
+  free `seq_conditionPassesPure()` for a muted `rtk`; echo/live-hold trigger
+  suppression with echo consumption. `seq_evaluateStepCondition()` refactored to
+  share `seq_conditionEval()`.
+- **C-10** echo marks expire on effective length/scale change
+  (`seq_refreshTrackEffectiveParams`), and at the reset/epoch sites.
+
+Gate: `make all` clean. Flash headroom 193,844 B.
+
+Minor deviation: the play-mode-change echo expiry (C-10) is not wired (it would
+need a Sequencer entry point from the PatternData commit); the length/scale and
+reset/epoch expiries cover the realistic cases. Noted for review.
+
+### Phase D — done (2026-10-13)
+
+- **D-1** `pat_writeDynamic()` gained a `trigger_policy` argument applied inside
+  the two PRIMASK publications (`pat_rawTriggerBits`); all existing callers pass
+  `PAT_RAW_TRIGGER_KEEP`.
+- **D-2/D-3** `PatternData.c/.h`: new `pat_record_spec_t`, `pat_recordStep()`
+  (trigger ON, clears rhythm, keeps the condition or sets fil) and
+  `pat_eraseSpecials()` (keeps condition + automation, else releases the block).
+- **D-4** `PatternStackService.c/.h`: 4-slot record staging table;
+  `PATSVC_OP_RECORD_STEP` / `PATSVC_OP_ERASE_SPECIALS`; `patSvc_recordStep()`
+  submit, `patSvc_enqueueEraseSpecials()` (TIM3-safe), `patSvc_requiredChunks()`
+  cases, `patSvc_executeEvent()` cases, and staged-slot release on count-drops.
+- **D-5** `service_target_request` + `patSvc_desiredScene()`; all eight
+  `seq_activePattern` comparisons now use `patSvc_desiredScene()`;
+  `patSvc_requestTarget`/`releaseTarget`/`targetOpen`/`replacePending`;
+  `patSvc_idle()` is false while a target override is held.
+
+Gate: `make all` clean. Flash headroom 192,916 B.
+
+### Phase E — done (2026-10-13)
+
+- **E-1** `LiveRecord.c`: `liveRec_triggerIn()` gating (LATCH/OVERDUB, running,
+  P1 looper lockout, ownership), capture, `liveRec_place()` (step + delay),
+  slow/fast roll classification (a duplicated 96-PPQ table),
+  `liveRec_commitHit()` (write + echo/cancel), flam pairing, `fil`.
+- **E-2** `buttonHandler.c`: `buttonHandler_overlayReport()` helper; overlay
+  single/grace/roll-start report in `overlayTrigger`, flam-main/roll-hit report
+  in `overlayTick`, `liveRec_rollRelease()` in `overlayRelease`; the deferred
+  A3-4b `liveRec_rollRelease/RateChange` notifications in
+  `overlaySwitchHeld`.
+- **E-4** `liveRec_service()` ring drain writes carry-over span steps (fill 100)
+  for the live-hold track; `liveRec_stepEnd()` is a stub filled in F/G.
+
+Gate: `make all` clean. Flash headroom 190,532 B.
+
+Simplifications to verify on hardware: micro-timing/shuffle are not folded into
+placement (nominal step only); the roll release fill is left at 100 rather than
+the elapsed fraction; MIDI/overlay sub-tick µs is not applied.
+
+### Phase F — done (2026-10-13)
+
+- **F-1** `menu.c`: `menu_liveRecRecordKnob()` (recordable test: mode, page,
+  Morph view, track-length exclusion) called after the ordinary pot commit.
+- **F-2** `LiveRecord.c`: `liveRec_paramIn()` marks dirty (and latch in LATCH);
+  `liveRec_targetValue7()` resolves Instrument (Normal endpoint) and Scene
+  targets (morph/audio-out/fx-send/7dc/fxm/scl/shf) and Effect (Normal).
+- **F-3** drain filter already done in C-7.
+- **F-4** `MidiParser.c`: CC stub hook calls `liveRec_paramIn()` with an invalid
+  target (no mapping yet).
+- **F-5** `LiveRecord.c`: `liveRec_stepEnd()` implements the LATCH/OVERDUB tables
+  with one `pat_readStepAutomations()` read and L3 "only real changes" writes/
+  clears, plus `fil` on written steps.
+
+Gate: `make all` clean.
+
+Simplification: F-1b (encoder path) is not hooked; only the endless-pot path
+records. Noted for review.
+
+### Phase G — done (2026-10-13)
+
+- **G-3** `EffectsManager.c/.h`: `effects_eraseLanes`, `effects_erasedSteps`,
+  `effects_erasedLanesAcc`; `effects_setLiveEraseLanes()`,
+  `effects_takeErasedLocks()`; `effects_lockClearLayers()` excludes erased lanes
+  (queues them) and `effects_seqOverride()` / the Morph lock skip them.
+- **G-1/G-5** `buttonHandler.c`: removed `bh_state.seqErasing`; added
+  `bh_shiftHeld`/`bh_clearHeld`; SHIFT+COPY enters/exits live erase; the erase
+  button router handles SEQ (track or FX), VOICE (track) and PLAY (plain toggle).
+- **G-2** `menu.c`: the knob-erase branch runs before the copy/clear pot
+  branch and calls `liveRec_eraseParam()`.
+- **G-5** `sequencer.c/.h`: the TIM3 erase branch uses `seq_eraseFullMask` /
+  `seq_eraseSpecialsMask` (full queues `patSvc_enqueueErase`, specials queues
+  `patSvc_enqueueEraseSpecials`, automation queues only for non-full); removed
+  `seq_eraseActive`, `seq_setErasingMode()` and their terms in filesystem /
+  copyClear.
+- **G-6** `LiveRecord.c`: erase masks + `liveRec_pushEraseMasks()`;
+  `liveRec_eraseParam/SeqHeld/FxSeqHeld/TrackHeld` implemented;
+  `liveRec_stepEnd()` removes erased targets on the passed step; `liveRec_service`
+  drains `effects_takeErasedLocks()` → `effects_clearSeqLanes()`.
+
+Gate: `make all` clean.
+
+### Phase H — done (2026-10-13)
+
+- **H-1** target negotiation is in `liveRec_service()` (take boundary / epoch,
+  `patSvc_replacePending()` suspend, `patSvc_requestTarget()` for T != A,
+  `seq_setRecordTarget()` + `seq_setAutomationFilter()`).
+- **H-2a** `menu.c`: `menu_parseKnobDelta()` / `menu_parseEncoder()` silently
+  refuse STEP-page edits while `liveRec_activePatternLocked()` (Q13).
+- **H-2b** `buttonHandler.c`: `buttonHandler_setRemoveStep()` refuses while
+  locked (Q13).
+- **H-3** DEV-only drop counters/trace codes are not added (no new trace stages).
+
+Gate: `make all` clean. Flash headroom 188,236 B.
+
+### Phase I — documentation
+
+Deferred. The plan `§19.14` documentation list (PATTERN_DYNAMIC_STACK.md,
+EFFECTS_BUS_REFERENCE.md, MODULE_INTERCHANGE_SPEC.md, STORAGE_SRAM_MANIFEST.md,
+FILESYSTEM_SPEC.md, MEMORY.md) is not yet updated; it is prose work to be done at
+session close and does not affect the firmware build. This implementation log
+records the landed code change set in its place.
+
+## Implementation status summary
+
+All code phases (A1, A2, A3, B, C, D, E, F, G, H) are implemented and the full
+firmware builds clean (`make all`) at every phase. The documentation phase (I)
+is deferred. Known simplifications/verification items are called out per phase
+above.
+
+---
+
 ## Phase A1 — Step Reset Rule, Instrument Menu Override, Per-Target Clears
 
 §5.8, §5.1, §5.2. Prerequisite for all recording: fixes the
@@ -3164,3 +3424,118 @@ E, F and G fill. Erase changes all land in G (G-5) and the MIDI call site in
 B (B-7a), so every phase builds. I is documentation only.
 
 Each phase is verified on hardware before the next begins (§15 verify column).
+
+---
+
+## Code review — P1 implementation (2026-10-13)
+
+**Scope.** The working tree against `a6c96a0`: 28 files, about 2,900 lines,
+including the new `Core/Sequencer/LiveRecord.c/.h`. Checked against this
+schedule (revision 4) and `S081_P1_LIVE_RECORD.md` (revision 11).
+
+**Build** (re-run for this review):
+
+- `make all` is clean. The only warnings predate this work:
+  `PatternData.c:200` packed-member address, and the libc stub notes.
+- text 565,016, data 412, bss 428,316: +340 B bss since the S080 close, which
+  is within the approved budget.
+- Flash headroom 188,236 B.
+
+**Verdict.**
+
+- Phases A1–A3 (step reset rule, R12/R13, roll table, overlay fixes, `trk`
+  loop anchors) are sound and can go to hardware now.
+- The recording paths (E/F/G/H) have defects that would record wrong data or
+  lock out normal editing. Fix the **must-fix** items before hardware
+  recording tests.
+
+### Must fix
+
+| # | Where | Problem | Fix |
+|---|---|---|---|
+| 1 | `LiveRecord.c:573` `liveRec_activePatternLocked()`; callers `menu.c` `menu_parseKnobDelta()`/`menu_parseEncoder()`, `buttonHandler.c` `buttonHandler_setRemoveStep()` | Returns true whenever P(rtk) ≠ A, **including with REC off**. With per-track playback (S077), selecting a track that plays another Scene silently locks STEP editing and step toggles. Regression. | Locked only while armed **and** the target override is held (`liveRec_armed() && T ≠ A`). |
+| 2 | `LiveRecord.c:236` | `seq_setAutomationFilter(liveRec_latch, liveRec_dirty, liveRec_rtk)` passes the **dirty** bitmap as the erase filter. Knob-erased automation still plays until removed (spec: removed before it plays). In LATCH/OVERDUB the drain wrongly skips rtk entries of dirty targets (OVERDUB should play automation). | Pass `liveRec_erase`. |
+| 3 | `LiveRecord.c:256`, `:712`, `:215` | Fast-roll span writing, live-hold release and the take-boundary clear all use `liveRec_rtk`, but the live hold is set on the **rolled** track (`:655`). An overlay roll on a track other than rtk: no span steps are written, and that track's live hold is never cleared, so its stored triggers stay silent. | Keep `liveRec_rollTrack`; use it for spans, release and the take-boundary clear. |
+| 4 | `sequencer.c` `seq_advanceTrackStep()` muted-rtk branch (`rec_fired = seq_conditionPassesPure(&rsp, track)`) | Ignores bit 15. Every step of a muted rtk, including empty ones, counts as fired, so LATCH re-stamps own-Instrument values onto **every** step (pool growth, wrong data). | `rec_fired = pat_isStepActive(…) && seq_conditionPassesPure(…)`. |
+| 5 | `sequencer.c:3765` `seq_projectStep()`, `seq_quantiseTick()` (`trk` branch); `LiveRecord.c:118` `liveRec_place()` | Placement maps the tick through the track's **canonical master-clock** position (`tick·256 / current interval`), not its actual position. After any scale or length change during playback (menu edit, Morph, scale/length automation) they differ, and hits land on the wrong step with the wrong delay. Also: the delay ignores shuffle, so odd shuffled steps play late by the shuffle amount (implementer-noted); and "delay rounds to 100 → step + 1" is wrong for rev/pip. | Place relative to the captured live state: current step start = now − (accumulator >> 8); walk forward/back with the live interval (`seq_loopShiftPosition()`-style). Subtract the shuffle deferral on odd steps. Take the next step from the run mode. |
+| 6 | `LiveRecord.c:596-599` `liveRec_commitHit()`; `sequencer.c` C-10 | Every placement not on the current step gets an echo mark, including steps **behind** the playhead (backward quantize, a flam grace on the previous step). With no pass-wrap expiry (C-10 not implemented for wraps), the newly recorded hit is silenced on its next pass. | Mark only steps ahead of the playhead in the current pass. Add the pass-wrap expiry. |
+| 7 | `sequencer.c:924` `seq_cancelPendingTrigger()` | Clears the pending deferral only. Since A1-3 moved a deferred step's automation to fire time, this also drops that step's automation for the pass. It also cancels a deferral that belongs to an earlier step. | Cancel only if the pending deferral is for the recorded step, and queue that step's automation (without the trigger). |
+| 8 | `buttonHandler.c` `processPress()`/`processRelease()` erase router | The §10.2 per-mode table is not applied. SEQ in PERF, Load/Save, MENU and SOM_GEN starts a SEQ erase (PERF Scene buttons would erase triggers). VOICE in Load/Save, MENU and SOM_GEN erases tracks. | SEQ: VOICE/STEP → track erase, FX → FX-sequence erase, otherwise consumed. VOICE: VOICE/STEP/PERF/FX → track erase, otherwise consumed. |
+| 9 | `LiveRecord.c:755` `liveRec_eraseSeqHeld()` | SEQ-hold erase uses rtk, not the **active** track (F7). These differ after an rtk override. | Pass the active track from buttonHandler. |
+| 10 | `LiveRecord.c:209-218`; epoch bump in `seq_setRunning()` | Every transport start/stop is a take boundary. It zeroes the Sequencer erase masks but keeps LiveRecord's own copies. Pressing PLAY while holding SHIFT+CLEAR+TRACK drops the held erase, so "playback starts with live erase enabled" fails, and the stale local masks come back on the next gesture. | On a take boundary, re-push LiveRecord's current erase state (held gestures persist), or clear both copies together. Transport start must not end a held erase. |
+| 11 | `LiveRecord.c:717` `liveRec_paramIn()` / `liveRec_stepEnd()`; `:629` trigger gate | Ownership (plan §7) is missing in the automation path: with T ≠ A, Effect/Scene edits are recorded into T, and an Instrument target is not checked for "slot plays T" or a type match. The trigger path checks P(track) == T but not the slot type. | Apply the §7 table in `liveRec_paramIn()`/step end and the type check for triggers. |
+| 12 | `buttonHandler.c` BUT_SHIFT release and press | `bh_shiftHeld = 0` comes after the early `break`s (consumed release, latched menus), so the flag can stick and erase cannot end; on press, the set can be skipped the same way. On SHIFT release the SHIFT LED goes off while CLEAR is still held. The CLEAR LED is never lit. Spec: SHIFT and CLEAR lit while either is held. | Update `bh_shiftHeld` first in both handlers. While ERASE, keep both LEDs lit until both keys are released. |
+| 13 | `buttonHandler.c` `handleSelectButton()` before `seq_loopEngage()` | `liveRec_forceOff()` runs even when the engage does nothing (stopped transport), so a SELECT press in PERF while stopped disarms record. S080 cleared record only if `seq_loopActive` after engage. | Call `liveRec_forceOff()` only if the loop actually engaged (P1 interim; P2 removes the lockout). |
+
+### Should fix / spec gaps
+
+The implementer's noted simplifications are included here.
+
+| # | Where | Problem |
+|---|---|---|
+| 14 | `menu.c` `menu_parseEncoder()` | F-1b not hooked: encoder edits are not recorded. |
+| 15 | `buttonHandler.c` `buttonHandler_overlayReport()`; `LiveRecord.c:157` | `note_is_default` is never set by the overlay and is forced to 0 in `liveRec_writeStep()`, so Q12 (no note special for `def`) is not met. Velocity 100 and fill 100 are always stored explicitly (no "absent" form): harmless but costs bytes. |
+| 16 | `LiveRecord.c` roll paths | Release fill fixed at 100. "Released before the second hit → plain trigger" missing. single → roll switch sends no ROLL_START, so a fast roll is recorded as many single hits (last wins per step). No slow/fast re-check after a rate switch. Span steps don't get `fil`. |
+| 17 | `LiveRecord.c` `liveRec_place()` | µs sub-tick (Q3) not used; tick resolution only. |
+| 18 | `LiveRecord.c:346` | Effect values are not compressed to 7 bits for WIDE8 rows. A value above 127 wraps when packed (`& 0x7F`). Latent unless an AUTOMATABLE Effect row is WIDE8; verify. `fxm` stores m/2 while playback expands with `effect_expand7Linear()` (rounding mismatch). |
+| 19 | `menu.c` `menu_liveRecRecordKnob()` | F-1c (`scl`/`shf` only while the viewed Pattern is A) not implemented. Effect-page Morph view is not excluded (only `voiceModeShowMorph` and the STEP view are checked); verify the Effect view flag. |
+| 20 | `menu.c` rtk cell | The display reads `liveRec_recordTrack()`, but the edit seed is `parameter_values[PAR_AUTOM_TRACK]`, which never follows rtk. The first detent jumps from a stale value. |
+| 21 | `LiveRecord.c` erase masks; `sequencer.c` TIM3 erase branch | Track/SEQ erase masks are not gated by P(track) == T. TIM3 clears bit 15 in non-target Scenes (pool reclaim is then rejected). Gate the masks in LiveRecord. |
+| 22 | `LiveRecord.c:230-232` | The target override is requested whenever armed, including while stopped. `patSvc_idle()` is then false and Pattern AutoSave is blocked while armed and stopped with T ≠ A, against F-M. Request only while writing. |
+| 23 | `sequencer.c` step-allowed block | A pending deferral is fired at every allowed step start, not only when that step queues automation (A1-3c). Delays longer than one step are cut at the boundary even when the next step is empty. |
+| 24 | `sequencer.c:828-837` | TIM3-shared ring cursors and entries (`seq_recRing`, head/tail) and the echo/mask bytes are not `volatile` and have no barrier. Under LTO the foreground drain may cache `seq_recRingHead` or read an entry before its publication. Follow the `seq_pending_automation` precedent. |
+| 25 | C-10 | Play-mode-change echo expiry not wired (implementer-noted). |
+| 26 | H-3 | DEV-only drop counters not added; staging-full, ring-full and service rejections are silent. |
+| 27 | `menu.c` knob erase | Calls `menu_automationTargetCleared()`, which is for whole-Scene removals only (`MEMORY.md`). Live erase is progressive and rtk-only, so the underline can vanish while automation remains. Restart the search at erase end instead. |
+| 28 | `EffectsManager.c` `effects_erasedSteps`/`effects_erasedLanesAcc` | One step mask and one lane mask accumulate between drains, so two FX steps with different lane sets in one 2 ms window clear the union on both. Low probability; a per-step lane mask would make it exact. |
+| 29 | A2-4 realign | Open from the schedule review: non-resetting Scene changes now realign and publish the FX step immediately, changing the documented "menu values until the next FX boundary" rule (`EFFECTS_BUS_REFERENCE.md` §10). Needs the user's decision. |
+
+### Verified correct
+
+- **Voice queue reset:** per-voice mask; test-and-clear inside the
+  `voiceControl_popPending()` PRIMASK section; apply → restore (if reset) →
+  trigger order kept; leftover resets restored under PRIMASK before the drain.
+- **Trigger callers:** every `seq_triggerVoice()` caller passes the A1-2b
+  reset value (overlay timer `count != 0xFF`, roll retriggers 0, SOM 1).
+- **Deferred steps:** `seq_fireDeferred()` on expiry and flush; automation-only
+  steps still queue at the step start; roll steps honour shuffle and
+  micro-timing; F-R roll end on a firing trigger only; carry path
+  `voiceControl_resetOnly()`.
+- **R12:** `seq_menuOverride` cleared **before** the restore's early return;
+  drain skip; transport/Scene/realign clears; Instrument override set once per
+  cell slot; per-target clears for audio out, FX send, `7dc`, and track
+  length/scale/shuffle (Normal and Morph).
+- **R13 (EffectsManager):** markers and owner state removed (`effects_automation_t`
+  184 → 120 B); `menuHold` > lock > overlay > menu; one-step Morph lane;
+  lock-start clearing in clock and `sel` modes.
+- **FX realign:** `seq_fxRealignToMasterClock()` plus the overlay-only reset
+  latch at both realign sites.
+- **Roll table and names:** 96-PPQ table, 10 names, clamps 0..9; `PAR_ROLL`
+  retired; `qnt trk` list and clamp.
+- **`trk` loop anchors:** per-track anchor and back offset inside
+  `seq_loopSnapshotTracks()`; `off` and the grid keep their anchors (L1).
+- **Pattern Stack Service:** all eight `seq_activePattern` sites use
+  `patSvc_desiredScene()`; `patSvc_requestTarget()` refuses during claim,
+  replacement or busy queue; `patSvc_idle()` false under override;
+  record/erase ops, staging and chunk sizing in place.
+- **PatternData:** `pat_recordStep()` (trigger ON in the same publish,
+  automation and condition kept, `fil`); `pat_eraseSpecials()`.
+- **Condition evaluation:** refactor into `seq_conditionEval()` with a
+  side-effect-free variant.
+- **Boundary ring:** packing and decode consistent; step-start semantics and
+  the previous-entry step end implemented as specified (M-9).
+- **Smaller pieces:** LED recorded step by absolute step; rtk commit via
+  `menu_parseGlobalParam()`; rtk excluded from settings-dirty; AutoSave and
+  copy/clear gates; MIDI note and CC call sites; `liveRec_service()` before
+  `patSvc_tick()`; `liveRec_init()` at boot.
+- **REC gestures:** short press toggles on release; hold enters overdub with a
+  pulse; overdub and erase exclusivity per §10.3.
+
+### Suggested order
+
+1. Must-fix 1, 2, 3, 4 and 8: small, local changes with the largest impact.
+2. Must-fix 5, 6 and 7: placement and echo, the core of trigger recording.
+3. Must-fix 9–13.
+4. Then hardware-test A1–A3 and the recording matrix.
+5. Should-fix items next; 14, 15, 16, 21, 22 and 24 before release.
+

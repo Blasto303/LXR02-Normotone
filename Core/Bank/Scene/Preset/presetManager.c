@@ -1210,6 +1210,30 @@ uint8_t preset_getEffectiveAudioOut(uint8_t scene_index, uint8_t slot)
     return scene_getVoiceAudioOut(scene_index, slot);
 }
 
+/*
+ * Clear a single voice slot's audio-out step-automation override and
+ * re-apply the Scene-stored route (S081 §5.2).
+ *
+ * What: clears the per-slot audio-out override and calls
+ * preset_applyVoiceAudioOutRuntime(slot, scene_getVoiceAudioOut(A, slot)) to
+ * restore the Scene base route. Why: unlike FX send, clearing the audio-out
+ * override alone would leave the runtime on the last automation value until
+ * the next trigger. The explicit re-apply makes the menu edit audible
+ * immediately. Inputs: slot 0..5. Outputs: audio-out override cleared,
+ * runtime route restored. Affiliates: menu_cellCommitValue SCENE_SETTING
+ * AUDIO_OUT branch, preset_setAudioOutStepOverride,
+ * preset_applyVoiceAudioOutRuntime, scene_getVoiceAudioOut.
+ */
+void preset_clearAudioOutStepOverride(uint8_t slot)
+{
+    if (slot >= INSTRUMENT_SLOT_COUNT)
+        return;
+    audio_out_step_override[slot].active = 0u;
+    audio_out_step_override[slot].route = 0u;
+    preset_applyVoiceAudioOutRuntime(slot,
+        scene_getVoiceAudioOut(scene_getActiveIndex(), slot));
+}
+
 void preset_setFxSendStepOverride(uint8_t slot, uint8_t amount)
 {
 	/*
@@ -1275,6 +1299,26 @@ uint8_t preset_getEffectiveFxSendAmount(uint8_t scene_index, uint8_t slot)
     /* 127 * 255 + 127 fits uint16_t. */
     return (uint8_t)(((uint16_t)normal * (uint16_t)(255u - amount) +
                       (uint16_t)morph * amount + 127u) / 255u);
+}
+
+/*
+ * Clear a single voice slot's FX-send step-automation override (S081 §5.2).
+ *
+ * What: clears the per-slot FX-send override so the value returns to the
+ * Scene-stored amount. Why: R12/§5.2 says a menu edit of FX send clears that
+ * slot's override. Only bulk-clear versions existed before; live record and
+ * live erase need per-slot granularity. Inputs: slot 0..5. Outputs: the
+ * slot's FX-send override is removed; the runtime reverts to the Scene base.
+ * Affiliates: menu_cellCommitValue SCENE_SETTING FX_SEND branch,
+ * preset_setFxSendStepOverride (set site), seq_applySceneAutomation FX_SEND
+ * branch.
+ */
+void preset_clearFxSendStepOverride(uint8_t slot)
+{
+    if (slot >= INSTRUMENT_SLOT_COUNT)
+        return;
+    fx_send_step_override[slot].active = 0u;
+    fx_send_step_override[slot].amount = 0u;
 }
 
 uint8_t preset_getFxSendDisplayAmount(uint8_t scene_index, uint8_t slot)

@@ -637,12 +637,15 @@ static uint8_t pat_tryAppendAutomation(pat_scene_region_t *r,
  * leaves the old block and address untouched. Affiliates: pat_writeSpecials()
  * and the public automation CRUD functions below.
  */
+/* Trigger policy resolution helper (defined with the raw API below). */
+static uint16_t pat_rawTriggerBits(uint16_t live, uint8_t trigger_mode);
 static uint8_t pat_writeDynamic(uint8_t scene_index, uint8_t track,
                                 uint8_t step, uint8_t new_flags,
                                 const pat_step_specials_t *sp,
                                 const pat_automation_entry_t *autos,
                                 uint8_t auto_count,
-                                uint8_t allow_shrink_in_place)
+                                uint8_t allow_shrink_in_place,
+                                uint8_t trigger_policy)
 {
     pat_scene_region_t *r;
     uint16_t *entry;
@@ -689,7 +692,8 @@ static uint8_t pat_writeDynamic(uint8_t scene_index, uint8_t track,
             uint16_t published;
 
             __asm volatile("cpsid i" ::: "memory");
-            trigger_bits = (uint16_t)(*entry & PAT_ADDR_TRIGGER_BIT);
+            /* D-1a: the publication applies the caller's trigger policy. */
+            trigger_bits = pat_rawTriggerBits(*entry, trigger_policy);
             published = (uint16_t)(trigger_bits | PAT_ADDR_SENTINEL);
             *entry = published;
             __asm volatile("cpsie i" ::: "memory");
@@ -756,7 +760,8 @@ static uint8_t pat_writeDynamic(uint8_t scene_index, uint8_t track,
         uint16_t published;
 
         __asm volatile("cpsid i" ::: "memory");
-        trigger_bits = (uint16_t)(*entry & PAT_ADDR_TRIGGER_BIT);
+        /* D-1a: the publication applies the caller's trigger policy. */
+        trigger_bits = pat_rawTriggerBits(*entry, trigger_policy);
         published = (uint16_t)(trigger_bits | PAT_ADDR_SPECIALS_BIT |
                                new_offset);
         *entry = published;
@@ -801,7 +806,129 @@ static uint8_t pat_writeSpecials(uint8_t scene_index, uint8_t track,
         auto_count = pat_blockReadAutomations(r, offset, autos,
                                               PAT_BLOCK_AUTO_COUNT_MASK);
     return pat_writeDynamic(scene_index, track, step, new_flags, sp, autos,
-                            auto_count, 0u);
+                            auto_count, 0u, PAT_RAW_TRIGGER_KEEP);
+}
+
+/*
+ * Write a recorded step's specials and trigger (S081 D-2a, §8.4, §19.3).
+ *
+ * What: reads the existing specials and automation, applies the record spec
+ * (note, velocity, timing, roll, fill; clears rhythm; keeps the condition or sets
+ * fil), then writes the result with trigger ON. If the result has no specials and
+ * no automation it only sets bit 15 (pat_setStepActive). Why: the old
+ * seq_recordTrigger only set the trigger bit; live recording writes the full step
+ * in one block replacement. Inputs: scene, track, step, spec. Outputs: nonzero on
+ * commit, 0 when allocation fails (old state untouched). Which hit wins when two
+ * land on one step is decided by LiveRecord before submitting (E-1).
+ * Affiliates: pat_writeDynamic (trigger ON), pat_readStepSpecials,
+ * pat_readStepAutomations.
+ */
+uint8_t pat_recordStep(uint8_t scene_index, uint8_t track, uint8_t step,
+                       const pat_record_spec_t *spec)
+{
+    pat_step_specials_t sp;
+    pat_automation_entry_t autos[PAT_BLOCK_AUTO_COUNT_MASK];
+    const pat_scene_region_t *r;
+    const uint16_t *entry;
+    uint16_t offset;
+    uint8_t count = 0u;
+    uint8_t flags;
+
+    if (!spec || !pat_patternValid(scene_index) || !pat_trackValid(track) ||
+        !pat_stepValid(step))
+        return 0u;
+    r = pat_sceneRegion(scene_index);
+    entry = pat_addrPtr(scene_index, track, step);
+    if (!r || !entry)
+        return 0u;
+    sp = pat_readStepSpecials(scene_index, track, step);
+    offset = (uint16_t)(*entry & PAT_ADDR_OFFSET_MASK);
+    if (((*entry & PAT_ADDR_SPECIALS_BIT) != 0u) && pat_poolOffsetValid(offset))
+        count = pat_blockReadAutomations(r, offset, autos,
+                                         PAT_BLOCK_AUTO_COUNT_MASK);
+
+    flags = sp.flags;
+    /* Rhythm is never recorded. */
+    flags &= (uint8_t)~PAT_SPECIAL_RHYTHM_BIT;
+    /* Note: a default note records no note special. */
+    if (spec->noteIsDefault) {
+        flags &= (uint8_t)~PAT_SPECIAL_NOTE_BIT;
+    } else {
+        sp.note = spec->note;
+        flags |= PAT_SPECIAL_NOTE_BIT;
+    }
+    /* Velocity is always recorded. */
+    sp.velocity = spec->velocity;
+    flags |= PAT_SPECIAL_VEL_BIT;
+    /* Micro-timing. */
+    if (spec->timing == 0u) {
+        flags &= (uint8_t)~PAT_SPECIAL_TIMING_BIT;
+    } else {
+        sp.timing = spec->timing;
+        flags |= PAT_SPECIAL_TIMING_BIT;
+    }
+    /* Roll rate + fill. */
+    if (spec->roll == 0u) {
+        flags &= (uint8_t)~(PAT_SPECIAL_ROLL_BIT | PAT_SPECIAL_FILL_BIT);
+    } else {
+        sp.roll = spec->roll;
+        sp.fill = spec->fill;
+        flags |= PAT_SPECIAL_ROLL_BIT | PAT_SPECIAL_FILL_BIT;
+    }
+    /* Condition kept; fil overrides it (R10). */
+    if (spec->setFil) {
+        sp.condition = 21u;
+        flags |= PAT_SPECIAL_COND_BIT;
+    }
+    if (flags == 0u && count == 0u) {
+        /* Trigger-only: just set bit 15. */
+        pat_setStepActive(scene_index, track, step, 1u);
+        return 1u;
+    }
+    sp.flags = flags;
+    return pat_writeDynamic(scene_index, track, step, flags, &sp, autos,
+                            count, 0u, PAT_RAW_TRIGGER_ON);
+}
+
+/*
+ * Erase a step's specials while keeping automation (S081 D-3a, §10.2, §19.3).
+ *
+ * What: if automation is present, keeps the condition and removes all other
+ * specials (note, velocity, timing, roll, rhythm, fill). If no automation,
+ * releases the block entirely (trigger KEEP; TIM3 already cleared bit 15). Why:
+ * SEQ-hold erase removes triggers and specials but automation still plays.
+ * Keeping the condition on steps with automation preserves the automation gate.
+ */
+void pat_eraseSpecials(uint8_t scene_index, uint8_t track, uint8_t step)
+{
+    pat_step_specials_t sp;
+    pat_automation_entry_t autos[PAT_BLOCK_AUTO_COUNT_MASK];
+    const pat_scene_region_t *r;
+    const uint16_t *entry;
+    uint16_t offset;
+    uint8_t count = 0u;
+    uint8_t flags;
+
+    if (!pat_patternValid(scene_index) || !pat_trackValid(track) ||
+        !pat_stepValid(step))
+        return;
+    r = pat_sceneRegion(scene_index);
+    entry = pat_addrPtr(scene_index, track, step);
+    if (!r || !entry)
+        return;
+    offset = (uint16_t)(*entry & PAT_ADDR_OFFSET_MASK);
+    if (((*entry & PAT_ADDR_SPECIALS_BIT) != 0u) && pat_poolOffsetValid(offset))
+        count = pat_blockReadAutomations(r, offset, autos,
+                                         PAT_BLOCK_AUTO_COUNT_MASK);
+    if (count == 0u) {
+        pat_rawPublishEmpty(scene_index, track, step, PAT_RAW_TRIGGER_KEEP);
+        return;
+    }
+    sp = pat_readStepSpecials(scene_index, track, step);
+    flags = (uint8_t)(sp.flags & PAT_SPECIAL_COND_BIT);
+    sp.flags = flags;
+    (void)pat_writeDynamic(scene_index, track, step, flags, &sp, autos,
+                           count, 0u, PAT_RAW_TRIGGER_KEEP);
 }
 
 uint8_t pat_trackValid(uint8_t track)
@@ -1357,7 +1484,7 @@ uint8_t pat_writeStepAutomation(uint8_t scene_index, uint8_t track,
             autos[i].value = (uint8_t)(value & 0x7Fu);
             sp = pat_readStepSpecials(scene_index, track, step);
             return pat_writeDynamic(scene_index, track, step, sp.flags, &sp,
-                                    autos, count, 0u);
+                                    autos, count, 0u, PAT_RAW_TRIGGER_KEEP);
         }
     }
     if (count >= PAT_BLOCK_AUTO_COUNT_MASK)
@@ -1367,7 +1494,7 @@ uint8_t pat_writeStepAutomation(uint8_t scene_index, uint8_t track,
     count++;
     sp = pat_readStepSpecials(scene_index, track, step);
     return pat_writeDynamic(scene_index, track, step, sp.flags, &sp, autos,
-                            count, 0u);
+                            count, 0u, PAT_RAW_TRIGGER_KEEP);
 }
 
 /*
@@ -1406,7 +1533,7 @@ uint8_t pat_removeStepAutomation(uint8_t scene_index, uint8_t track,
     count--;
     sp = pat_readStepSpecials(scene_index, track, step);
     return pat_writeDynamic(scene_index, track, step, sp.flags, &sp, autos,
-                            count, 1u);
+                            count, 1u, PAT_RAW_TRIGGER_KEEP);
 }
 
 /*

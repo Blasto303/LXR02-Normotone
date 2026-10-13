@@ -77,6 +77,7 @@
 #include "copyClearSession.h"
 #include "SampleMemory.h"
 #include "sequencer.h"
+#include "LiveRecord.h"
 #include "PatternData.h"
 #include "PatternStackService.h"
 #include "PatternTrace.h"
@@ -24701,7 +24702,8 @@ static void filesystem_autosaveNonSemanticPatternDrainSchedule_tick(void)
         return;
     if (afatfs_getFilesystemState() != AFATFS_FILESYSTEM_STATE_READY)
         return;
-    if (seq_recordActive || seq_eraseActive)
+    /* AutoSave gate uses liveRec_patternWriting (S081 §19.11, F-M, B-6b). */
+    if (liveRec_patternWriting())
         return;
     if (!patSvc_idle())
         return;
@@ -25063,7 +25065,8 @@ static void filesystem_autosavePatternDrainSchedule_tick(void)
         return;
     if (afatfs_getFilesystemState() != AFATFS_FILESYSTEM_STATE_READY)
         return;
-    if (seq_recordActive || seq_eraseActive)
+    /* AutoSave gate uses liveRec_patternWriting (S081 §19.11, F-M, B-6b). */
+    if (liveRec_patternWriting())
         return;
 
     /* Defer until queued edits, barriers, recovery, and handover are quiescent. */

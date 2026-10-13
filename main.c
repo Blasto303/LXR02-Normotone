@@ -57,6 +57,7 @@
 #include "random.h"
 #include "triggerJacks.h"
 #include "sequencer.h"
+#include "LiveRecord.h"
 #include "sequencerTimer.h"
 #include "PatternStackService.h"
 #include "copyClearSession.h"
@@ -1297,6 +1298,17 @@ boot_filesystem_done:
      * queue and session ledger are ready before front-panel service begins.
      */
     copyClear_init();
+
+    /*
+     * LiveRecord init at boot (S081 §19.12, B-9b).
+     *
+     * What: calls liveRec_init(menu_getActiveVoice()) after copyClear_init().
+     * Why: initialises rtk to the boot-time active track and clears all bitmaps
+     * and state. Must run after the menu and Pattern systems are initialised.
+     * Inputs: initial active track. Outputs: LiveRecord ready. Affiliates:
+     * liveRec_init, menu_getActiveVoice, copyClear_init.
+     */
+    liveRec_init(menu_getActiveVoice());
 
     /* Initialise audio path: PLLI2S, GPIO, DMA circular streams, I2S.
     ** AFTER all blocking SD operations. From this point forward, SD

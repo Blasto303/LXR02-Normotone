@@ -212,7 +212,7 @@ void led_updateAutomationStepView(uint8_t track, uint8_t pattern,
  */
 #define SEQ_LED_DIRTY_CHASE    0x01
 #define SEQ_LED_DIRTY_BEAT     0x02
-#define SEQ_LED_DIRTY_REC_SUB  0x04
+/* 0x04 retired in S081 B-8 (the recordSubStep endpoint is removed). */
 #define SEQ_LED_DIRTY_REC_MAIN 0x08
 
 typedef struct {
@@ -223,10 +223,8 @@ typedef struct {
     volatile uint8_t chaseStep;
     /* 0/1 value for the temporary beat pulse on LED_START_STOP. */
     volatile uint8_t beatPulse;
-    /* Sub-step index 0..127 that was just recorded and may need SELECT LED
-     * refresh if the current UI page is showing that bridge step. */
-    volatile uint8_t recordSubStep;
-    /* Bridge step index 0..127 whose STEP-row LED may need refresh. */
+    /* Absolute step index 0..127 whose STEP-row LED may need refresh (S081
+     * B-8c: the field now carries the absolute step, not step % 16). */
     volatile uint8_t recordMainStep;
 } SeqLedState;
 
@@ -250,17 +248,10 @@ extern SeqLedState seq_ledState;
  */
 /* Move/clear chase feedback for playback step `step` after page/pattern checks. */
 void led_updateCurrentStep(uint8_t step);
-/* Refresh STEP-row record feedback for one recorded bridge step. */
+/* Refresh STEP-row record feedback for one recorded absolute step (S081 B-8c). */
 void led_updateRecordedMainStep(uint8_t activeTrack,
                                 uint8_t shownPattern,
-                                uint8_t subStep);
-/* Compatibility no-op for old SELECT-row record feedback. */
-void led_updateRecordedSubStep(uint8_t activeTrack,
-                               uint8_t shownPattern,
-                               uint8_t step,
-                               uint8_t selectedStepBase,
-                               uint8_t shiftHeld,
-                               uint8_t selectMode);
+                                uint8_t step);
 /* Repaint STEP and SELECT rows from PatternData for one track/pattern view. */
 void led_updatePatternTrack(uint8_t track, uint8_t pattern,
                             uint8_t selectedStepBase);

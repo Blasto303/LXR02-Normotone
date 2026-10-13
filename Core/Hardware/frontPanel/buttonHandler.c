@@ -31,6 +31,7 @@
 #include "EuklidGenerator.h"
 #endif
 #include "sequencer.h"
+#include "LiveRecord.h"
 #include "presetManager.h"
 #include "MidiVoiceControl.h"
 #include "MidiNoteNumbers.h"
@@ -155,9 +156,18 @@ void buttonHandler_buttonReleased(uint8_t buttonNr)
 static volatile struct {
     unsigned selectButtonMode :3;
     unsigned seqRunning       :1;
-    unsigned seqRecording     :1;
-    unsigned seqErasing       :1; /* _SEQUENCER_ADD_SPIKE_: keep erase state while COPY is held */
 } bh_state;
+/*
+ * Removed: bh_state.seqRecording (S081 §19.7, B-2e).
+ *
+ * What: the button handler's private copy of the record state. Readers now query
+ * LiveRecord. Affiliates: liveRec_mode(), liveRec_armed(). seqErasing stays
+ * until Phase G (G-5) removes the old erase path.
+ */
+
+/* S081 G-5: SHIFT/CLEAR hold state for the live-erase chord. */
+static uint8_t bh_shiftHeld;
+static uint8_t bh_clearHeld;
 
 static uint8_t lastActiveSubPage = 0;
 uint8_t buttonHandler_selectedStep = 0;
@@ -354,6 +364,17 @@ static uint8_t  bh_overlayVel       = 0u;
 static uint8_t  bh_overlayCount     = 0u;
 static uint16_t bh_overlayInterval  = 0u;
 static uint16_t bh_overlayNext      = 0u;
+
+/*
+ * Held overlay trigger type (S081 §5.7, R19, F-B/F-O).
+ *
+ * What: the trigger type (0..11) of the overlay whose VOICE is currently held,
+ * or 0xFF when none. Why: pressing the other BAR while a VOICE is held switches
+ * the overlay; the held trigger must adopt the new type/rate, and a roll needs
+ * to know whether the previous type was a roll. RAM: +1 byte SRAM1. Affiliates:
+ * buttonHandler_overlayTrigger(), buttonHandler_overlaySwitchHeld().
+ */
+static uint8_t bh_overlayHeldType = 0xFFu;
 
 
 #define DBLCLICK_FIRST  0u
@@ -828,6 +849,20 @@ static uint16_t bh_fillPressTick;
 static uint8_t bh_fillArmed;
 
 /*
+ * REC hold timer state (S081 §6, B-2b).
+ *
+ * What: bh_recPressTick records time_sysTick at the REC press; bh_recArmed is 1
+ * while waiting for the hold threshold. The elapsed time is computed as
+ * (uint16_t)(time_sysTick - bh_recPressTick), exactly like the fill hold. Why:
+ * time_sysTick is a volatile uint16_t, so a 16-bit store and a wrap-safe 16-bit
+ * subtraction are required. Inputs: set on REC press, cleared on release or
+ * threshold. Outputs: read by buttonHandler_tick. RAM: +3 B. Affiliates:
+ * bh_fillArmed/bh_fillPressTick.
+ */
+static uint16_t bh_recPressTick;
+static uint8_t  bh_recArmed;
+
+/*
  * S080 E12: BAR overlay trigger helpers.
  *
  * buttonHandler_overlayDivisionMs() converts a SELECT-style division index
@@ -868,6 +903,29 @@ static uint16_t buttonHandler_overlayDivisionMs(uint8_t idx)
     }
 }
 
+/*
+ * Report one overlay hit to LiveRecord (S081 §19.7, E-2a).
+ *
+ * What: builds a liveRec_trigger_t for the hit (track, note, velocity, kind,
+ * roll, OVERLAY source) and calls liveRec_triggerIn(). Why: LiveRecord captures
+ * each hit when it sounds. Affiliates: liveRec_triggerIn().
+ */
+static void buttonHandler_overlayReport(uint8_t voiceNr, uint8_t note,
+                                        uint8_t velocity, uint8_t kind,
+                                        uint8_t roll)
+{
+    liveRec_trigger_t t;
+
+    t.track = voiceNr;
+    t.note = note;
+    t.velocity = velocity;
+    t.kind = kind;
+    t.roll = roll;
+    t.source = LIVEREC_SRC_OVERLAY;
+    t.note_is_default = 0u;
+    liveRec_triggerIn(&t);
+}
+
 static void buttonHandler_overlayTrigger(uint8_t voiceNr)
 {
     uint8_t type;
@@ -875,7 +933,6 @@ static void buttonHandler_overlayTrigger(uint8_t voiceNr)
     uint8_t vel;
     uint8_t count;
     uint16_t interval;
-
     if (bh_overlayActive == 1u) {
         type = parameter_values[PAR_PERF_BTN_LT];
         note = parameter_values[PAR_PERF_NOTE_LT];
@@ -891,17 +948,22 @@ static void buttonHandler_overlayTrigger(uint8_t voiceNr)
         note = MIDI_DEFAULT_TRIGGER_NOTE;
 
     bh_overlayVoiceMask |= (uint8_t)(1u << voiceNr);
+    /* Remember the held overlay's type for a BAR switch while held (A3-4b). */
+    bh_overlayHeldType = type;
 
     if (type <= 3u) {
         /* Single trigger at vmx/v10/v64/v32. */
         static const uint8_t singleVel[4] = {127u, 100u, 64u, 32u};
 
-        seq_triggerVoice(voiceNr, singleVel[type], note);
+        seq_triggerVoice(voiceNr, singleVel[type], note, 1);
+        buttonHandler_overlayReport(voiceNr, note, singleVel[type],
+                                    LIVEREC_HIT_SINGLE, 0u);
         return;
     }
     if (type == 4u || type == 5u) {
         /* Flam: soft leading hit now, main hit one 1/32 later. */
-        seq_triggerVoice(voiceNr, 64u, note);
+        seq_triggerVoice(voiceNr, 64u, note, 1);
+        buttonHandler_overlayReport(voiceNr, note, 64u, LIVEREC_HIT_FLAM_GRACE, 0u);
         interval = buttonHandler_overlayDivisionMs(5u);
         vel = 100u;
         count = 1u;
@@ -913,7 +975,14 @@ static void buttonHandler_overlayTrigger(uint8_t voiceNr)
         interval = buttonHandler_overlayDivisionMs(rollDiv[idx]);
         if (idx == 4u)                                  /* r6t triplet */
             interval = (uint16_t)((interval * 2u) / 3u);
-        seq_triggerVoice(voiceNr, 100u, note);          /* first repeat now */
+        seq_triggerVoice(voiceNr, 100u, note, 1);       /* first repeat now */
+        /* S081 §8.8: type r/8..128 maps to step roll indices 1,3,5,7,8,9. */
+        {
+            static const uint8_t rollIdx[6] = {1u, 3u, 5u, 7u, 8u, 9u};
+
+            buttonHandler_overlayReport(voiceNr, note, 100u,
+                                        LIVEREC_HIT_ROLL_START, rollIdx[idx]);
+        }
         vel = 100u;
         count = 0xFFu;                                  /* repeat while held */
     }
@@ -937,8 +1006,109 @@ static void buttonHandler_overlayRelease(uint8_t voiceNr)
         bh_overlayTrack = 0u;
         bh_overlayCount = 0u;
     }
+    if (bh_overlayVoiceMask == 0u)
+        bh_overlayHeldType = 0xFFu;
     /* Drum voices are one-shots, but a note-off keeps MIDI-out correct. */
     voiceControl_noteOff(voiceNr);
+    /* S081 E-2c: an overlay release ends any recorded roll. */
+    liveRec_rollRelease(voiceNr);
+}
+
+/*
+ * Re-configure a held overlay after a BAR switch or toggle-off
+ * (S081 §5.7, R19, F-B, F-O).
+ *
+ * What: when a BAR press changes bh_overlayActive while a VOICE overlay is held
+ * (bh_overlayVoiceMask != 0):
+ *  - overlay toggled off (F-O): bh_overlayCount = 0 (repeats stop, no extra
+ *    hit); the recorded roll ends at that step (liveRec_rollRelease, added with
+ *    the module in Phase E).
+ *  - roll -> roll: bh_overlayInterval = the new division (same rollDiv[] and
+ *    r6t triplet rule as buttonHandler_overlayTrigger()); bh_overlayNext =
+ *    previous hit time + new interval, so the next hit follows the new rate;
+ *    liveRec_rollRateChange().
+ *  - single/flam -> roll: bh_overlayCount = 0xFF and bh_overlayNext = now + new
+ *    interval (no hit at the switch itself; the first new hit is one interval
+ *    later); liveRec_rollRateChange().
+ *  - roll -> single/flam: bh_overlayCount = 0 (no extra hit);
+ *    liveRec_rollRateChange(track, 0) ends the recorded roll.
+ *  - single -> single: nothing.
+ * Why: previously the type switched but the held trigger kept the old timing.
+ * Inputs: bh_overlayVoiceMask, bh_overlayTrack, bh_overlayHeldType, the new
+ * overlay parameters. Outputs: bh_overlay* repeat state. Affiliates:
+ * buttonHandler_overlayTrigger(), buttonHandler_overlayTick(),
+ * buttonHandler_overlayRelease().
+ */
+static void buttonHandler_overlaySwitchHeld(void)
+{
+    uint8_t type;
+    uint8_t note;
+    uint16_t interval;
+    uint8_t oldRoll;
+    uint8_t newRoll;
+
+    if (bh_overlayVoiceMask == 0u)
+        return;
+    if (bh_overlayActive == 0u) {
+        /* Toggled off (F-O): repeats stop, no extra hit. */
+        bh_overlayCount = 0u;
+        bh_overlayHeldType = 0xFFu;
+        /* S081 E: the recorded roll ends at this step (F-O). */
+        liveRec_rollRelease(bh_overlayTrack);
+        return;
+    }
+    type = (bh_overlayActive == 1u) ? parameter_values[PAR_PERF_BTN_LT]
+                                    : parameter_values[PAR_PERF_BTN_RT];
+    note = (bh_overlayActive == 1u) ? parameter_values[PAR_PERF_NOTE_LT]
+                                    : parameter_values[PAR_PERF_NOTE_RT];
+    if (type > 11u)
+        type = 0u;
+    if (note == 0u)
+        note = scene_getTrackMidiNote(
+            seq_getTrackPlayedScene(bh_overlayTrack), bh_overlayTrack);
+    if (note == 0u)
+        note = MIDI_DEFAULT_TRIGGER_NOTE;
+    oldRoll = (uint8_t)(bh_overlayHeldType != 0xFFu && bh_overlayHeldType >= 6u);
+    newRoll = (uint8_t)(type >= 6u);
+    bh_overlayNote = note;
+    bh_overlayHeldType = type;
+    if (!newRoll) {
+        /* roll -> single/flam (or single -> single): stop repeating. */
+        bh_overlayCount = 0u;
+        /* S081 E: roll -> single ends the recorded roll. */
+        liveRec_rollRateChange(bh_overlayTrack, 0u);
+        return;
+    }
+    {
+        static const uint8_t rollDiv[6] = {3u, 4u, 5u, 6u, 6u, 7u};
+        uint8_t idx = (uint8_t)(type - 6u);
+
+        interval = buttonHandler_overlayDivisionMs(rollDiv[idx]);
+        if (idx == 4u)                                  /* r6t triplet */
+            interval = (uint16_t)((interval * 2u) / 3u);
+        if (interval == 0u)
+            interval = 1u;
+        if (oldRoll) {
+            /* roll -> roll: keep the last hit time, apply the new interval. */
+            uint16_t lastHit =
+                (uint16_t)(bh_overlayNext - bh_overlayInterval);
+
+            bh_overlayInterval = interval;
+            bh_overlayNext = (uint16_t)(lastHit + interval);
+        } else {
+            /* single/flam -> roll: no hit at the switch; one interval later. */
+            bh_overlayVel = 100u;
+            bh_overlayInterval = interval;
+            bh_overlayNext = (uint16_t)(time_sysTick + interval);
+            bh_overlayCount = 0xFFu;
+        }
+        /* S081 E: roll -> roll / single -> roll take the new rate. */
+        {
+            static const uint8_t rollIdx[6] = {1u, 3u, 5u, 7u, 8u, 9u};
+
+            liveRec_rollRateChange(bh_overlayTrack, rollIdx[idx]);
+        }
+    }
 }
 
 static void buttonHandler_overlayTick(void)
@@ -947,7 +1117,16 @@ static void buttonHandler_overlayTick(void)
         return;
     if ((uint16_t)(time_sysTick - bh_overlayNext) >= 32768u)
         return;
-    seq_triggerVoice(bh_overlayTrack, bh_overlayVel, bh_overlayNote);
+    /* reset = 1 for the flam main (count 1); 0 for roll repeats (0xFF). */
+    seq_triggerVoice(bh_overlayTrack, bh_overlayVel, bh_overlayNote,
+                     (uint8_t)(bh_overlayCount != 0xFFu));
+    /* S081 E-2b: the flam main / a roll repeat, reported when it sounds. */
+    if (bh_overlayCount == 0xFFu)
+        buttonHandler_overlayReport(bh_overlayTrack, bh_overlayNote,
+                                    bh_overlayVel, LIVEREC_HIT_ROLL_HIT, 0u);
+    else
+        buttonHandler_overlayReport(bh_overlayTrack, bh_overlayNote,
+                                    bh_overlayVel, LIVEREC_HIT_FLAM_MAIN, 0u);
     if (bh_overlayCount != 0xFFu) {
         bh_overlayCount--;
         if (bh_overlayCount == 0u)
@@ -973,6 +1152,21 @@ void buttonHandler_tick(void)
         (uint16_t)(time_sysTick - bh_fillPressTick) >= DOUBLE_CLICK_TIMEOUT &&
         !seq_fillActive)
         seq_fillActive = 1u;
+
+    /*
+     * REC hold past DOUBLE_CLICK_TIMEOUT enters overdub (S081 §6, B-2c).
+     *
+     * What: if bh_recArmed and the hold reaches the threshold, enter overdub and
+     * pulse the REC LED; clear bh_recArmed. Why: overdub is a held gesture, not a
+     * toggle. Inputs: bh_recPressTick, current tick. Outputs: overdub mode,
+     * REC LED pulse. Affiliates: liveRec_overdubBegin, led_pulseLed.
+     */
+    if (bh_recArmed &&
+        (uint16_t)(time_sysTick - bh_recPressTick) >= DOUBLE_CLICK_TIMEOUT) {
+        bh_recArmed = 0u;
+        liveRec_overdubBegin();
+        led_pulseLed(LED_REC);
+    }
 
     /*
      * Foreground long-press poll using the wrapping 16-bit millisecond clock.
@@ -1069,6 +1263,9 @@ static void buttonHandler_setRemoveStep(uint8_t ledNr, uint8_t seqButtonPressed)
      * removes. Keeping the name avoids unrelated call-site churn during the
      * FrontPanelParser removal.
      */
+    /* S081 H-2b (Q13): silently refuse STEP toggles while T != A. */
+    if (liveRec_activePatternLocked())
+        return;
     uint8_t trackNr;
     uint8_t patternNr;
 
@@ -1691,6 +1888,22 @@ static void handleModeButtons(uint8_t mode)
     default:
         break;
     }
+    /*
+     * BAR overlay LEDs shown only in PERF mode (S081 §5.7, R19).
+     *
+     * What: when the new mode is not PERF, both BAR LEDs are forced off; when it
+     * is PERF they are restored from bh_overlayActive, the same expressions as
+     * buttonHandler_loopCheckDisengage(). bh_overlayActive itself is not changed,
+     * so the overlay is still active on PERF re-entry. Why: the toggled BAR LED
+     * used to stay lit in modes where the BAR LEDs are only press feedback.
+     */
+    if (bh_state.selectButtonMode == SELECT_MODE_PERF) {
+        led_setValue((uint8_t)(bh_overlayActive == 1u), LED_BAR1);
+        led_setValue((uint8_t)(bh_overlayActive == 2u), LED_BAR2);
+    } else {
+        led_setValue(0u, LED_BAR1);
+        led_setValue(0u, LED_BAR2);
+    }
 }
 
 static void handleSelectButton(uint8_t selectNr)
@@ -1836,16 +2049,21 @@ static void handleSelectButton(uint8_t selectNr)
             uint8_t trackMask = (perf_heldVoiceMask != 0u)
                 ? perf_heldVoiceMask : 0x7Fu;
 
+            /*
+             * Record forced off before looper engage (S081 §3.3-9, §19.7,
+             * B-4a, P1 interim). The Sequencer no longer does this; moving the
+             * record-off to the caller keeps the dependency one-way
+             * (buttonHandler -> LiveRecord -> Sequencer). P2 removes it (L-2).
+             */
+            if (liveRec_armed()) {
+                liveRec_forceOff();
+                led_setValue(0u, LED_REC);
+            }
             bh_loopBarModifier = 0u;
             bh_loopTrackMask = seq_loopEngage(trackMask, division,
                                               bh_loopBarModifier);
         } else {
             seq_loopUpdateDivision(division, bh_loopBarModifier);
-        }
-        /* Looping and recording are mutually exclusive (S080 §3, C7). */
-        if (seq_loopActive && bh_state.seqRecording) {
-            bh_state.seqRecording = 0u;
-            led_setValue(0u, LED_REC);
         }
         led_setActiveSelectButton(selectNr);
         /* S080 §3.3: both BAR LEDs are forced off while the looper runs. */
@@ -1949,7 +2167,15 @@ static void buttonHandler_shiftRecMenuEnter(void)
     menu_resetActiveParameter();
     bh_shiftRecMenuActive = 1u;
     led_setValue(1u, LED_SHIFT);
-    led_setValue(1u, LED_REC);
+    /*
+     * REC LED flashes while the settings menu is open and armed (S081 §6,
+     * B-2f). With the menu latched, REC closes the menu instead of toggling
+     * record, so the flashing LED shows that record is still armed.
+     */
+    if (liveRec_armed())
+        led_setBlinkLed(LED_REC, 1u);
+    else
+        led_setValue(1u, LED_REC);
     menu_repaintAll();
 }
 
@@ -1960,7 +2186,8 @@ static void buttonHandler_shiftRecMenuExit(void)
     menu_switchSubPage(bh_shiftRecSavedSubPg);
     menu_resetActiveParameter();
     /* REC returns to its record state; SHIFT reflects whether it is held. */
-    led_setValue((uint8_t)(bh_state.seqRecording ? 1u : 0u), LED_REC);
+    led_setBlinkLed(LED_REC, 0u);
+    led_setValue((uint8_t)(liveRec_mode() == LIVEREC_MODE_LATCH), LED_REC);
     led_setValue(buttonHandler_getShift(), LED_SHIFT);
     menu_repaintAll();
 }
@@ -2290,6 +2517,36 @@ static void processPress(uint8_t buttonNr)
     if (copyClear_buttonPressed(buttonNr))
         return;
 
+    /*
+     * Live erase button router (S081 §10.2, G-1a).
+     *
+     * While erase is enabled, SEQ presses erase the active track (VOICE/STEP)
+     * or the FX sequence (FX), VOICE presses erase that track, and PLAY is a
+     * plain transport toggle. Every other button passes through unchanged.
+     */
+    if (liveRec_mode() == LIVEREC_MODE_ERASE) {
+        int8_t eraseSeq = btn_to_seq(buttonNr);
+        int8_t eraseVoice = btn_to_voice(buttonNr);
+
+        if (eraseSeq >= 0) {
+            if (bh_state.selectButtonMode == SELECT_MODE_FX)
+                liveRec_eraseFxSeqHeld(1u);
+            else
+                liveRec_eraseSeqHeld(1u);
+            return;
+        }
+        if (eraseVoice >= 0) {
+            liveRec_eraseTrackHeld((uint8_t)eraseVoice, 1u);
+            return;
+        }
+        if (buttonNr == BUT_START_STOP) {
+            bh_state.seqRunning = (uint8_t)(1u - bh_state.seqRunning);
+            buttonHandler_setRunStopState(bh_state.seqRunning);
+            seq_setRunning(bh_state.seqRunning);
+            return;
+        }
+    }
+
     int8_t seq = btn_to_seq(buttonNr);
     if (seq >= 0) {
         if (menu_loadSceneButtonPressed((uint8_t)seq)) {
@@ -2385,25 +2642,28 @@ static void processPress(uint8_t buttonNr)
             buttonHandler_shiftRecMenuEnter();
         } else if (seq_loopActive) {
             /*
-             * S080 C7: REC is consumed while the looper is engaged.
-             *
-             * What:      ignore the record toggle and leave the REC state
-             *            unchanged. Why: looping and recording are mutually
-             *            exclusive (S080 §3 resolved #2); engaging the looper
-             *            already forced recording off, so the user cannot
-             *            re-enable it mid-loop. Inputs: seq_loopActive.
-             * Outputs: none (early out). Affiliates: seq_loopEngage() (C2).
+             * P1 interim lockout: REC is ignored while the looper is engaged
+             * (S080 rule; P2 removes it, L-2). Engaged loop already forced
+             * recording off in the caller, so the user cannot re-arm mid-loop.
              */
+            break;
+        } else if (liveRec_mode() == LIVEREC_MODE_ERASE) {
+            /* Live erase is enabled: REC does nothing (S081 §10.3). */
             break;
         } else {
             /*
-             * Recording mode is Sequencer playback/edit state. The REC LED is
-             * local UI feedback, while seq_setRecordingMode() is the source of
-             * truth for how incoming notes and button gestures are recorded.
+             * REC press: start the hold timer for overdub detection
+             * (S081 §6, §19.7, B-2a).
+             *
+             * What: start the hold timer (bh_recPressTick, bh_recArmed). The
+             * press no longer toggles recording. Why: the toggle moves to
+             * release, and a hold past DOUBLE_CLICK_TIMEOUT enters overdub; this
+             * matches the fill hold. Inputs: REC press event. Outputs: hold timer
+             * started. Affiliates: buttonHandler_tick (overdub threshold),
+             * liveRec_overdubBegin, liveRec_setLatch.
              */
-            bh_state.seqRecording = (uint8_t)((1u - bh_state.seqRecording) & 0x01u);
-            led_setValue((uint8_t)bh_state.seqRecording, LED_REC);
-            seq_setRecordingMode((uint8_t)bh_state.seqRecording);
+            bh_recPressTick = time_sysTick;
+            bh_recArmed = 1u;
         }
         break;
 
@@ -2416,15 +2676,15 @@ static void processPress(uint8_t buttonNr)
          * running in the background. Affiliates: copyClear_copyPressed()/
          * copyClear_copyReleased().
          */
+        bh_clearHeld = 1u;
         if (buttonHandler_getShift()) {
-            if (bh_state.seqRecording && bh_state.seqRunning) {
+            if (liveRec_armed()) {
                 /*
-                 * SHIFT+COPY while recording/running enters erase mode. This
-                 * is direct Sequencer state because erase affects playback-time
-                 * recording behavior, not copy/clear PatternData utilities.
+                 * SHIFT+COPY while armed enters live erase (S081 §10, G-5).
+                 * The chord ends when both SHIFT and CLEAR are released.
                  */
-                bh_state.seqErasing = 1;
-                seq_setErasingMode((uint8_t)bh_state.seqErasing);
+                liveRec_eraseBegin();
+                led_setValue(1u, LED_SHIFT);
             } else {
                 (void)copyClear_copyPressed(1u);
             }
@@ -2466,6 +2726,8 @@ static void processPress(uint8_t buttonNr)
             bh_overlayActive = (bh_overlayActive == 1u) ? 0u : 1u;
             led_setValue((uint8_t)(bh_overlayActive == 1u), LED_BAR1);
             led_setValue((uint8_t)(bh_overlayActive == 2u), LED_BAR2);
+            /* Switch/toggle the held overlay trigger while a VOICE is held. */
+            buttonHandler_overlaySwitchHeld();
             break;
         }
         if (menu_currentBar > 0u)
@@ -2501,6 +2763,8 @@ static void processPress(uint8_t buttonNr)
             bh_overlayActive = (bh_overlayActive == 2u) ? 0u : 2u;
             led_setValue((uint8_t)(bh_overlayActive == 1u), LED_BAR1);
             led_setValue((uint8_t)(bh_overlayActive == 2u), LED_BAR2);
+            /* Switch/toggle the held overlay trigger while a VOICE is held. */
+            buttonHandler_overlaySwitchHeld();
             break;
         }
         if (menu_currentBar < (NUM_BARS - 1u))
@@ -2532,6 +2796,10 @@ static void processPress(uint8_t buttonNr)
             return;
         }
         /* _SEQUENCER_ADD_SPIKE_: restore SHIFT-press mode behavior parity with AVR. */
+        /* S081 G-5: SHIFT press completes a live-erase chord with held CLEAR. */
+        bh_shiftHeld = 1u;
+        if (bh_clearHeld && liveRec_armed())
+            liveRec_eraseBegin();
         led_setValue(1, LED_SHIFT);
         switch (bh_state.selectButtonMode) {
         case SELECT_MODE_VOICE:
@@ -2613,17 +2881,61 @@ static void processRelease(uint8_t buttonNr)
 {
     if (buttonNr == BUT_COPY) {
         /*
-         * COPY release ends the held session after Sequencer erase unwinds.
-         * Inputs: physical COPY release. Output: one owner performs the
-         * release cleanup; no legacy global Copy/Clear state remains.
+         * COPY release (S081 G-5): ends the live-erase chord when SHIFT is no
+         * longer held, otherwise the ordinary copy/clear release runs.
          */
-        if (bh_state.seqErasing) {
-            bh_state.seqErasing = 0u;
-            seq_setErasingMode((uint8_t)bh_state.seqErasing);
-        } else {
-            copyClear_copyReleased();
+        bh_clearHeld = 0u;
+        if (liveRec_mode() == LIVEREC_MODE_ERASE) {
+            if (!bh_shiftHeld)
+                liveRec_eraseEnd();
+            return;
         }
+        copyClear_copyReleased();
         return;
+    }
+    if (buttonNr == BUT_REC) {
+        /*
+         * REC release: toggle latch or end overdub (S081 §6, B-2d).
+         *
+         * What: if an overdub is in progress (mode OVERDUB, the hold passed the
+         * threshold), end it and pulse the REC LED. Otherwise, if the hold timer
+         * was still armed (a short press), toggle liveRec_setLatch() and set the
+         * REC LED to the new state. While erase is enabled, release just clears
+         * the hold timer (the prior LATCH/OFF returns through liveRec_eraseEnd).
+         * Why: the toggle moves to release so the hold can be detected first.
+         * Inputs: REC release event. Outputs: mode/LED changed. Affiliates:
+         * liveRec_setLatch, liveRec_overdubEnd, led_pulseLed.
+         */
+        if (liveRec_mode() != LIVEREC_MODE_ERASE) {
+            if (liveRec_mode() == LIVEREC_MODE_OVERDUB) {
+                liveRec_overdubEnd();
+                led_pulseLed(LED_REC);
+            } else if (bh_recArmed) {
+                uint8_t on = (uint8_t)(liveRec_mode() != LIVEREC_MODE_LATCH);
+
+                liveRec_setLatch(on);
+                led_setValue(on, LED_REC);
+            }
+        }
+        bh_recArmed = 0u;
+        return;
+    }
+    /* S081 G-1a: erase release edges for SEQ / VOICE holds. */
+    if (liveRec_mode() == LIVEREC_MODE_ERASE) {
+        int8_t eraseSeq = btn_to_seq(buttonNr);
+        int8_t eraseVoice = btn_to_voice(buttonNr);
+
+        if (eraseSeq >= 0) {
+            if (bh_state.selectButtonMode == SELECT_MODE_FX)
+                liveRec_eraseFxSeqHeld(0u);
+            else
+                liveRec_eraseSeqHeld(0u);
+            return;
+        }
+        if (eraseVoice >= 0) {
+            liveRec_eraseTrackHeld((uint8_t)eraseVoice, 0u);
+            return;
+        }
     }
     {
         /*
@@ -2810,11 +3122,10 @@ static void processRelease(uint8_t buttonNr)
         }
         if (bh_shiftRecMenuActive || menu_chainMenuIsOpen())
             break;
-        /* _SEQUENCER_ADD_SPIKE_: restore shift-release unwind flow from AVR. */
-        if (bh_state.seqErasing) {
-            bh_state.seqErasing = 0;
-            seq_setErasingMode((uint8_t)bh_state.seqErasing);
-        }
+        /* S081 G-5: SHIFT release ends the live-erase chord if CLEAR is free. */
+        bh_shiftHeld = 0u;
+        if (liveRec_mode() == LIVEREC_MODE_ERASE && !bh_clearHeld)
+            liveRec_eraseEnd();
 
         led_setValue(0, LED_SHIFT);
 

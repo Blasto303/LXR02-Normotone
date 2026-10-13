@@ -1338,10 +1338,10 @@ void led_updateCurrentStep(uint8_t step)
  * Refresh the STEP-row LED after a live-recorded note changes pattern data.
  *
  * Inputs: activeTrack is the currently edited Menu voice/track; shownPattern is
- * the pattern slot currently shown by the UI; subStep is the recorded
- * 0..127 bridge step. Output: the corresponding STEP1..16 LED is set from
- * PatternData if the step is inside menu_currentBar. No pattern storage is
- * mutated here.
+ * the pattern slot currently shown by the UI; step is the recorded absolute step
+ * 0..127 (S081 B-8c). Output: the corresponding STEP1..16 LED is set from
+ * PatternData when step is inside menu_currentBar (step / 16 == menu_currentBar).
+ * No pattern storage is mutated here.
  *
  * Common caller: led_processSeqLedState() after sequencer.c marks
  * SEQ_LED_DIRTY_REC_MAIN. Confederates: PatternData owns the step active bit
@@ -1349,13 +1349,13 @@ void led_updateCurrentStep(uint8_t step)
  */
 void led_updateRecordedMainStep(uint8_t activeTrack,
                                 uint8_t shownPattern,
-                                uint8_t subStep)
+                                uint8_t step)
 {
     /* Called after live recording or MIDI recording when one bridge step may
      * have changed. This belongs in ledHandler because it is strictly a physical
      * STEP1..16 presentation update; PatternData owns the active bit queried
      * below. */
-    uint8_t mainStep = (uint8_t)(subStep % NUM_STEPS_PER_BAR);
+    uint8_t mainStep = (uint8_t)(step % NUM_STEPS_PER_BAR);
     uint8_t on = 0;
 
     /* Performance page STEP LEDs select rotation/performance actions rather than
@@ -1364,51 +1364,24 @@ void led_updateRecordedMainStep(uint8_t activeTrack,
         menu_activePage == EFFECT_PAGE ||
         menu_fxVoiceMixOverlayActive())
         return;
-    /* subStep is expected to be 0..127; modulo maps it into STEP1..16. Keep the
-     * guard because seq_ledState is shared state. */
-    if (mainStep >= 16u)
-        return;
-
-    if ((subStep < (uint8_t)(menu_currentBar * NUM_STEPS_PER_BAR)) ||
-        (subStep >= (uint8_t)((menu_currentBar + 1u) * NUM_STEPS_PER_BAR)))
+    /* S081 B-8c: draw only when the absolute step is in the visible bar. */
+    if ((step / NUM_STEPS_PER_BAR) != menu_currentBar)
         return;
 
     /* Query the PatternData owner for the actual bridge step bit. */
     if (pat_trackValid(activeTrack) && pat_patternValid(shownPattern))
-        on = pat_isStepActive(activeTrack, subStep, shownPattern);
+        on = pat_isStepActive(activeTrack, step, shownPattern);
 
     /* STEP1 + mainStep is the physical 16-button row. */
     led_setValue(on, (uint8_t)(LED_STEP1 + mainStep));
 }
 
 /*
- * Ignore SELECT-row record feedback during the 8-bar bridge.
+ * Removed: SEQ_LED_DIRTY_REC_SUB endpoint (S081 §19.8, B-8a/b).
  *
- * Inputs are kept for API stability with sequencer dirty-state callers, but the
- * bridge no longer uses SELECT LEDs to display recorded step data. SELECT1..8
- * identify bars, and led_updateRecordedMainStep() owns STEP-row feedback.
- *
- * Common caller: led_processSeqLedState() after SEQ_LED_DIRTY_REC_SUB. This
- * function deliberately does nothing until the later Scene UI replaces the
- * compatibility dirty bit.
+ * What: led_updateRecordedSubStep() and the recordSubStep field were a
+ * compatibility no-op with no writer. The absolute-step recordMainStep stays.
  */
-void led_updateRecordedSubStep(uint8_t activeTrack,
-                               uint8_t shownPattern,
-                               uint8_t step,
-                               uint8_t selectedStepBase,
-                               uint8_t shiftHeld,
-                               uint8_t selectMode)
-{
-    /* SELECT LEDs now indicate the viewed bar and must not be rewritten by
-     * recording feedback. Preserve the exported helper as a compatibility
-     * endpoint for seq_ledState until the old REC_SUB dirty bit is deleted. */
-    (void)activeTrack;
-    (void)shownPattern;
-    (void)step;
-    (void)selectedStepBase;
-    (void)shiftHeld;
-    (void)selectMode;
-}
 
 /*
  * Repaint sequencer LEDs for one visible track/pattern.

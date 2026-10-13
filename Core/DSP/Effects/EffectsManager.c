@@ -134,11 +134,11 @@ _Static_assert(sizeof(effects_runtime_t) == 76u,
 /*
  * Manager-owned runtime state.
  *
- * The state is SRAM1-resident and exactly 84 bytes: active runtime type and
+ * The state is SRAM1-resident and exactly 80 bytes: active runtime type and
  * Scene, a force-write flag, one last-applied byte per common type domain,
- * live FX step/selection state, the held Morph lock, and the common return
- * settings consumed by the mixer's FX return. The spare `reserved` byte keeps
- * the 84-byte layout.
+ * live FX step/selection state, and the common return settings consumed by the
+ * mixer's FX return. The spare `reserved` byte keeps the layout; the former
+ * held Morph latch was removed (S081 §5.3, one-step Morph lane).
  */
 typedef struct {
     effect_type_id_t runtime_type;
@@ -149,13 +149,11 @@ typedef struct {
     uint8_t seq_step;
     uint8_t seq_step_valid;
     uint8_t seq_sel_step;
-    uint8_t held_morph;
-    uint8_t held_morph_valid;
     uint8_t seq_serial;
     effects_common_runtime_t common;
 } effects_state_t;
 
-_Static_assert(sizeof(effects_state_t) == 84u,
+_Static_assert(sizeof(effects_state_t) == 80u,
                "effects_state_t size is recorded in STORAGE_SRAM_MANIFEST.md");
 _Static_assert(STEP_SCALE_COUNT == EFFECT_SEQ_SCALE_COUNT &&
                STEP_SCALE_DEFAULT == EFFECT_SEQ_SCALE_DEFAULT,
@@ -167,9 +165,8 @@ static effects_state_t effects_state;
  * Pattern-automation and LFO overlay state (Session 072 step 9; plan §9,
  * §10.2-10.3, §16.1 items 4-5).
  *
- * active/value/owner hold one Pattern overlay per Effect-local parameter.
- * pending_end/pending_track bracket the open FX step-marker group. owner_tracks
- * is mirrored to Sequencer so TIM3 queues markers only for owning tracks.
+ * active/value hold one Pattern overlay per Effect-local parameter; menuHold is
+ * the R13 per-parameter menu-hold bitmap and menuHoldMorph its Morph flag.
  * morph_override is the Pattern `fxm` base layer. lfo stores one
  * base-independent direction/depth contribution per source slot and pair.
  * Lifetime: SRAM1, foreground-only writers; retained SceneData is untouched.
@@ -180,25 +177,35 @@ typedef struct {
     uint8_t depth;
 } effects_lfo_entry_t;
 
-#define EFFECT_AUTOMATION_TRACK_NONE  0xFFu
 #define EFFECT_AUTOMATION_TRACK_LIMIT 8u
 
 typedef struct {
     uint64_t active;
-    uint64_t pending_end;
+    uint64_t menuHold;
     uint8_t value[EFFECT_PARAM_COUNT];
-    uint8_t owner[EFFECT_PARAM_COUNT];
     effects_lfo_entry_t lfo[INSTRUMENT_SLOT_COUNT][2];
-    uint8_t pending_track;
-    uint8_t owner_tracks;
     uint8_t morph_override;
     uint8_t morph_override_valid;
+    uint8_t menuHoldMorph;
 } effects_automation_t;
 
-_Static_assert(sizeof(effects_automation_t) == 184u,
+_Static_assert(sizeof(effects_automation_t) == 120u,
                "effects_automation_t size is recorded in STORAGE_SRAM_MANIFEST.md");
 
 static effects_automation_t effects_automation;
+
+/*
+ * FX-sequence live-erase state (S081 §10.4, §19.4, G-3).
+ *
+ * effects_eraseLanes: lanes the live erase is removing; at each FX step start
+ * the locked lanes in this mask are excluded from resolution (they must not
+ * sound) and recorded in the pending accumulator. effects_erasedSteps/
+ * effects_erasedLanesAcc accumulate the (step, lane) pairs LiveRecord drains via
+ * effects_takeErasedLocks() and clears with effects_clearSeqLanes(). RAM: ~6 B.
+ */
+static uint16_t effects_eraseLanes;
+static uint16_t effects_erasedSteps;
+static uint16_t effects_erasedLanesAcc;
 
 #if DEV_MODE_DIAGNOSTIC
 static uint8_t effects_registryCheckCode;
@@ -594,6 +601,25 @@ uint8_t effects_setParameter(uint8_t scene_index, uint8_t index,
         if ((mask & (uint16_t)(1u << s)) != 0u)
             changed |= effects_setParameterScene(s, index, image, value);
     }
+    /*
+     * Menu edit of an Effect parameter clears its overlay and sets menuHold
+     * (S081 §5.3, R13, F-Q).
+     *
+     * What: when the origin Scene matches the active Scene and the row is in the
+     * runtime Effect type, clears the overlay (active bit) for that local
+     * parameter and sets menuHold for it. Why: R13 says a menu edit beats both
+     * lock and overlay until the next automation. Clearing the overlay ensures
+     * the lock can see the menu value when it starts. Setting menuHold prevents
+     * the lock from overriding the menu value for the remainder of its step.
+     * Inputs: local parameter index, origin Scene. Outputs: overlay cleared,
+     * menuHold set. Affiliates: effects_applyAutomation (clears menuHold on next
+     * automation), effects_service resolution.
+     */
+    if (scene_index == effects_state.scene_index && index < EFFECT_PARAM_COUNT &&
+        effects_descriptor(effects_state.runtime_type, index)) {
+        effects_automation.active &= ~(1ULL << index);
+        effects_automation.menuHold |= (1ULL << index);
+    }
     return changed;
 }
 
@@ -712,6 +738,14 @@ uint8_t effects_setMorphAmount(uint8_t scene_index, uint8_t amount)
         if ((mask & (uint16_t)(1u << s)) != 0u)
             changed |= effects_setMorphAmountScene(s, amount);
     }
+    /*
+     * Menu edit of the Effect Morph amount sets menuHoldMorph (S081 §5.3).
+     * effects_setMorphAmountScene() already clears morph_override_valid for the
+     * active Scene; the Morph menuHold then keeps the menu value sounding until
+     * the next Morph automation (an FX lock step start or `fxm`).
+     */
+    if (scene_index == effects_state.scene_index)
+        effects_automation.menuHoldMorph = 1u;
     return changed;
 }
 
@@ -724,23 +758,67 @@ static uint8_t effects_seqLength(const effect_record_t *record)
         ? EFFECT_SEQ_LENGTH_DEFAULT : len;
 }
 
-/* Latch a Morph-lane lock as the held Effect Morph base (plan §9). */
-static void effects_seqLatchMorph(const effect_record_t *record, uint8_t step)
+/*
+ * Clear overlay and menuHold layers at an FX lock step start (S081 §5.3, R13).
+ *
+ * What: for each FX lane locked on the new step, clears the overlay bit and the
+ * menuHold bit of the mapped Effect parameter. For lane 0 (Morph), clears
+ * morph_override_valid and menuHoldMorph. Why: R13 says a lock beats a track
+ * overlay, and a lock start after a menu edit should clear menuHold so the lock
+ * value can apply. After the lock step ends, the parameter returns to the menu
+ * value (not the overlay). Inputs: record and step (already wrapped to length).
+ * Outputs: overlay and menuHold bits cleared. Affiliates: effects_service
+ * resolution (lock > overlay when menuHold not set), live erase lane exclusion
+ * (Phase G).
+ */
+static void effects_lockClearLayers(const effect_record_t *record, uint8_t step)
 {
-    const effect_seq_step_t *entry = &record->steps[step];
+    const effect_registry_entry_t *entry;
+    uint16_t lock_mask;
+    uint8_t lane;
 
-    if ((entry->lock_mask & (uint16_t)(1u << EFFECT_SEQ_LANE_MORPH)) != 0u) {
-        effects_state.held_morph = entry->value[EFFECT_SEQ_LANE_MORPH];
-        effects_state.held_morph_valid = 1u;
+    if (!record)
+        return;
+    entry = effects_registryEntry(record->type);
+    if (!entry)
+        return;
+    lock_mask = record->steps[step].lock_mask;
+    if ((lock_mask & (uint16_t)(1u << EFFECT_SEQ_LANE_MORPH)) != 0u) {
+        if ((effects_eraseLanes &
+             (uint16_t)(1u << EFFECT_SEQ_LANE_MORPH)) != 0u) {
+            /* S081 G-3c: an erased lane must not sound; queue it for removal. */
+            effects_erasedSteps |= (uint16_t)(1u << (step & 15u));
+            effects_erasedLanesAcc |= (uint16_t)(1u << EFFECT_SEQ_LANE_MORPH);
+        } else {
+            effects_automation.morph_override_valid = 0u;
+            effects_automation.menuHoldMorph = 0u;
+        }
+    }
+    for (lane = 1u; lane < EFFECT_SEQ_LANE_COUNT; lane++) {
+        uint8_t index;
+
+        if ((lock_mask & (uint16_t)(1u << lane)) == 0u)
+            continue;
+        if ((effects_eraseLanes & (uint16_t)(1u << lane)) != 0u) {
+            /* S081 G-3c: an erased lane must not sound; queue it for removal. */
+            effects_erasedSteps |= (uint16_t)(1u << (step & 15u));
+            effects_erasedLanesAcc |= (uint16_t)(1u << lane);
+            continue;
+        }
+        index = entry->lanes[lane];
+        if (index >= EFFECT_PARAM_COUNT)
+            continue;
+        effects_automation.active &= ~(1ULL << index);
+        effects_automation.menuHold &= ~(1ULL << index);
     }
 }
 
 /*
  * Consume the one-byte TIM3 FX latch in foreground context.
  *
- * RESET invalidates the previous step and clears the held Morph lane. STEP
- * records the newest position and latches its Morph lock. RESET and STEP may
- * be combined by a start/reset boundary, so RESET is intentionally handled
+ * RESET invalidates the previous step. STEP records the newest position and
+ * clears the overlay/menuHold layers of its locked lanes (R13). RESET and STEP
+ * may be combined by a start/reset boundary, so RESET is intentionally handled
  * first. No DSP, LCD, or physical LED work is performed here.
  */
 static void effects_seqConsume(const effect_record_t *record)
@@ -751,16 +829,15 @@ static void effects_seqConsume(const effect_record_t *record)
         return;
     if ((event & SEQ_FX_EVENT_RESET) != 0u) {
         effects_state.seq_step_valid = 0u;
-        effects_state.held_morph_valid = 0u;
     }
     if ((event & SEQ_FX_EVENT_STEP) != 0u) {
         /* A queued clock event cannot create a selection after a mode change. */
         if (record->seq_run_mode != EFFECT_SEQ_RUN_SEL) {
             effects_state.seq_step = (uint8_t)(event & SEQ_FX_EVENT_INDEX);
             effects_state.seq_step_valid = 1u;
-            effects_seqLatchMorph(record,
-                                   (uint8_t)(effects_state.seq_step %
-                                             effects_seqLength(record)));
+            effects_lockClearLayers(record,
+                                    (uint8_t)(effects_state.seq_step %
+                                              effects_seqLength(record)));
         }
     }
     effects_state.seq_serial++;
@@ -788,7 +865,8 @@ static uint8_t effects_seqOverride(const effect_registry_entry_t *entry,
 
     for (lane = 1u; lane < EFFECT_SEQ_LANE_COUNT; lane++) {
         if (entry->lanes[lane] == index &&
-            (step->lock_mask & (uint16_t)(1u << lane)) != 0u) {
+            (step->lock_mask & (uint16_t)(1u << lane)) != 0u &&
+            (effects_eraseLanes & (uint16_t)(1u << lane)) == 0u) {
             *value = step->value[lane];
             return 1u;
         }
@@ -821,12 +899,12 @@ void effects_seqSelect(uint8_t step)
         return;
     effects_state.seq_sel_step = step;
     /*
-     * An unlocked selection keeps the held Morph value; a Morph lock on the
-     * selected step replaces it. Service still re-latches after RESET/Scene
-     * switch, so this path preserves the held-lane rule in `sel`.
+     * `sel` applies immediately: a lock on the selected step clears the
+     * overlay/menuHold layers of its lanes (R13), so the lock value applies
+     * and, after another selection, the menu value returns.
      */
     if (record->seq_run_mode == EFFECT_SEQ_RUN_SEL)
-        effects_seqLatchMorph(record, step);
+        effects_lockClearLayers(record, step);
     effects_state.seq_serial++;
 }
 
@@ -1143,7 +1221,6 @@ uint8_t effects_pasteSeqStep(uint8_t dst_scene, uint8_t step,
     }
     if (active_changed_morph) {
         effects_state.seq_serial++;
-        effects_state.held_morph_valid = 0u;
     }
     return changed;
 }
@@ -1201,108 +1278,124 @@ uint8_t effects_clearSeqLanes(uint8_t scene_index, uint16_t step_mask,
     }
     if (active_changed_morph) {
         effects_state.seq_serial++;
-        effects_state.held_morph_valid = 0u;
     }
     return changed;
 }
 
-/* Publish the tracks that own at least one Effect overlay. */
-static void effects_automationPublishOwners(void)
-{
-    uint64_t mask = effects_automation.active;
-    uint8_t tracks = 0u;
-
-    while (mask) {
-        uint8_t local = (uint8_t)__builtin_ctzll(mask);
-
-        tracks |= (uint8_t)(1u << effects_automation.owner[local]);
-        mask &= (mask - 1ULL);
-    }
-    if (tracks != effects_automation.owner_tracks) {
-        effects_automation.owner_tracks = tracks;
-        seq_setEffectAutomationTracks(tracks);
-    }
-}
-
-/* Clear parameter overlays, with optional clearing of the Scene-level fxm. */
+/*
+ * Clear parameter overlays, with optional clearing of the Scene-level fxm
+ * (S081 §5.3, R13).
+ *
+ * What: zeroes the per-parameter overlay and menuHold bitmaps, the Morph
+ * menuHold flag, and, when requested, the Pattern `fxm` override. Why: under
+ * R13 every transient Effect layer is last-writer-wins with no per-step
+ * ownership, so the reset clears them all. Removed with R13: the owner/
+ * pending-end step-marker machinery (effects_automationPublishOwners,
+ * effects_automationStepBegin, effects_automationStepFlush) and the owner-track
+ * publication to the Sequencer. Inputs: include_morph. Outputs: overlay/
+ * menuHold/fxm cleared. Affiliates: effects_seqConsume/effects_seqSelect (lock
+ * step start), effects_service (resolution).
+ */
 static void effects_automationClear(uint8_t include_morph)
 {
     effects_automation.active = 0u;
-    effects_automation.pending_end = 0u;
-    effects_automation.pending_track = EFFECT_AUTOMATION_TRACK_NONE;
+    effects_automation.menuHold = 0u;
+    effects_automation.menuHoldMorph = 0u;
     if (include_morph)
         effects_automation.morph_override_valid = 0u;
-    effects_automationPublishOwners();
 }
 
 void effects_automationReset(void)
 {
     /* Common reset path and Scene activation clear all transient Effect layers. */
     effects_automationClear(1u);
+    effects_erasedSteps = 0u;
+    effects_erasedLanesAcc = 0u;
 }
 
-void effects_automationStepFlush(void)
+/*
+ * Register lanes for FX-sequence live erase (S081 §10.4, G-3a).
+ *
+ * What: sets the live-erase lane mask. At each FX step start the locked lanes in
+ * this mask are excluded from resolution and recorded in the pending mask. Why:
+ * FX-sequence erase removes locks as the FX playhead passes, without the locks
+ * ever sounding. Inputs: laneMask (16 bits). Caller: LiveRecord.
+ */
+void effects_setLiveEraseLanes(uint16_t laneMask)
 {
-    /* End owner-track candidates not rewritten by the completed FX step group. */
-    if (effects_automation.pending_end != 0u) {
-        effects_automation.active &= ~effects_automation.pending_end;
-        effects_automation.pending_end = 0u;
-        effects_automationPublishOwners();
-    }
-    effects_automation.pending_track = EFFECT_AUTOMATION_TRACK_NONE;
+    effects_eraseLanes = laneMask;
 }
 
-void effects_automationStepBegin(uint8_t track)
+/*
+ * Drain the FX-erase pending mask (S081 §10.4, G-3b).
+ *
+ * What: copies the accumulated (step, lane) masks into the outputs and clears
+ * them; returns 1 when anything was pending. Why: LiveRecord drains it each
+ * service pass and calls effects_clearSeqLanes() to remove the retained locks
+ * from the origin Scene and its linked Scenes. Caller: liveRec_service().
+ */
+uint8_t effects_takeErasedLocks(uint16_t *stepMask, uint16_t *laneMask)
 {
-    uint64_t mask;
-    uint64_t owned = 0u;
-
-    /* The marker precedes this step's entries, so a later entry re-holds a bit. */
-    effects_automationStepFlush();
-    if (track >= EFFECT_AUTOMATION_TRACK_LIMIT)
-        return;
-    mask = effects_automation.active;
-    while (mask) {
-        uint8_t local = (uint8_t)__builtin_ctzll(mask);
-
-        if (effects_automation.owner[local] == track)
-            owned |= (1ULL << local);
-        mask &= (mask - 1ULL);
+    if (effects_erasedSteps == 0u) {
+        if (stepMask)
+            *stepMask = 0u;
+        if (laneMask)
+            *laneMask = 0u;
+        return 0u;
     }
-    effects_automation.pending_end = owned;
-    effects_automation.pending_track = track;
+    if (stepMask)
+        *stepMask = effects_erasedSteps;
+    if (laneMask)
+        *laneMask = effects_erasedLanesAcc;
+    effects_erasedSteps = 0u;
+    effects_erasedLanesAcc = 0u;
+    return 1u;
 }
 
 uint8_t effects_applyAutomation(uint8_t track, uint8_t local, uint8_t value7)
 {
     const effect_param_descriptor_t *descriptor;
-    uint64_t bit;
     uint8_t value;
 
-    /* Apply one validated Pattern Effect entry as a runtime-only overlay. */
+    /*
+     * Track automation of an Effect parameter clears menuHold (S081 §5.3).
+     *
+     * What: sets the overlay value and active bit for the local parameter, and
+     * clears the menuHold bit. Why: R13 says the next automation of a parameter
+     * after a menu edit clears the menu hold and applies. The track argument is
+     * unused after owner removal but kept for signature stability. Inputs:
+     * owner_track, local, value. Outputs: overlay set, menuHold cleared.
+     * Affiliates: seq_drainPendingAutomation Effect branch, effects_service
+     * resolution.
+     */
     if (track >= EFFECT_AUTOMATION_TRACK_LIMIT ||
+        local >= EFFECT_PARAM_COUNT ||
         !effects_paramAutomatable(effects_state.runtime_type, local))
         return 0u;
     descriptor = effects_descriptor(effects_state.runtime_type, local);
+    if (!descriptor)
+        return 0u;
     value = (uint8_t)(value7 & 0x7Fu);
     if ((descriptor->effect_flags & EFFECT_PARAM_FLAG_WIDE8) != 0u)
         value = descriptor->expand7(value);
     if (value > descriptor->max_value)
         value = descriptor->max_value;
-    bit = 1ULL << local;
     effects_automation.value[local] = value;
-    effects_automation.owner[local] = track;
-    effects_automation.active |= bit;
-    effects_automation.pending_end &= ~bit;
-    effects_automationPublishOwners();
+    effects_automation.active |= (1ULL << local);
+    effects_automation.menuHold &= ~(1ULL << local);
     return 1u;
 }
 
 void effects_setMorphAutomation(uint8_t amount)
 {
-    /* Pattern `fxm` is a runtime-only expanded Morph-base override. */
+    /*
+     * Track automation of the Morph amount clears menuHoldMorph (S081 §5.3).
+     * Pattern `fxm` is a runtime-only expanded Morph-base override; the track
+     * automation of it supersedes a menu edit until the next Scene/lock change.
+     */
     effects_automation.morph_override = amount;
     effects_automation.morph_override_valid = 1u;
+    effects_automation.menuHoldMorph = 0u;
 }
 
 /*
@@ -1559,7 +1652,6 @@ void effects_init(void)
     memset(&effects_state, 0, sizeof(effects_state));
     /* Step 9 overlay/LFO state starts empty; LFO entries target nothing. */
     memset(&effects_automation, 0, sizeof(effects_automation));
-    effects_automation.pending_track = EFFECT_AUTOMATION_TRACK_NONE;
     {
         uint8_t source;
 
@@ -1603,11 +1695,10 @@ void effects_activateScene(uint8_t scene_index)
     }
     /*
      * Scene rule (S072_ST8 D3): the new Scene's lane locks begin at its next
-     * FX boundary; the held Morph lane and Pattern automation overlays never
-     * carry across a Scene switch.
+     * FX boundary; Pattern automation overlays never carry across a Scene
+     * switch (S081 §5.3: one-step Morph lock, no held latch).
      */
     effects_state.seq_step_valid = 0u;
-    effects_state.held_morph_valid = 0u;
     effects_automationReset();
     effects_state.seq_serial++;
     effects_state.force_all = 1u;
@@ -1640,9 +1731,8 @@ static uint8_t effects_changeTypeScene(uint8_t scene_index, effect_type_id_t typ
     }
     memset(record->steps, 0, sizeof(record->steps));
     scene_finishEffectWholeCommit(scene_index);
-    /* Type change clears every lock, including the held Morph lane (F3). */
+    /* Type change clears every lock (S081 §5.3: one-step Morph lane, F3). */
     if (scene_index == effects_state.scene_index) {
-        effects_state.held_morph_valid = 0u;
         /* Old-type local overlays are meaningless; fxm is Scene-level. */
         effects_automationClear(0u);
         effects_state.seq_serial++;
@@ -1701,16 +1791,24 @@ void effects_service(void)
     active_step = effects_seqStepFor(record);
     step = (active_step != EFFECT_SEQ_STEP_NONE)
         ? &record->steps[active_step] : NULL;
-    /* `sel` always applies, so its Morph lock re-latches after RESET/switch. */
-    if (record->seq_run_mode == EFFECT_SEQ_RUN_SEL && step &&
-        !effects_state.held_morph_valid)
-        effects_seqLatchMorph(record, active_step);
-    if (effects_automation.morph_override_valid)
-        morph = effects_automation.morph_override;
-    else if (effects_state.held_morph_valid)
-        morph = effects_state.held_morph;
-    else
+    /*
+     * R13 Morph base resolution (S081 §5.3, A2-2h): menuHoldMorph > lockMorph
+     * (current step only) > Pattern fxm override > menu. The former held Morph
+     * latch is removed; a Morph lane lock applies on its own step only.
+     */
+    if (effects_automation.menuHoldMorph) {
         morph = scene_getEffectMorphAmount(effects_state.scene_index);
+    } else if (step &&
+               (step->lock_mask &
+                (uint16_t)(1u << EFFECT_SEQ_LANE_MORPH)) != 0u &&
+               (effects_eraseLanes &
+                (uint16_t)(1u << EFFECT_SEQ_LANE_MORPH)) == 0u) {
+        morph = step->value[EFFECT_SEQ_LANE_MORPH];
+    } else if (effects_automation.morph_override_valid) {
+        morph = effects_automation.morph_override;
+    } else {
+        morph = scene_getEffectMorphAmount(effects_state.scene_index);
+    }
     morph = effects_lfoResolve(EFFECT_LFO_TARGET_MORPH, morph, 0u, 255u);
     lfo_mask = effects_lfoTargetMask();
     fxbuf_effectShare(&share);
@@ -1722,12 +1820,19 @@ void effects_service(void)
             effects_interpolate(record->normal[index], record->morph[index], morph) :
             record->normal[index];
 
-        /* A locked lane replaces the Morph-interpolated menu value (A16). */
-        if (step && (step->lock_mask & 0xFFFEu) != 0u)
-            (void)effects_seqOverride(entry, step, index, &value);
-        /* Pattern automation is held ahead of the FX lock (A18). */
-        if ((effects_automation.active & (1ULL << index)) != 0u)
-            value = effects_automation.value[index];
+        /*
+         * R13 per-parameter resolution (S081 §5.3, A2-2h):
+         *   menuHold > lock > overlay > menu.
+         * A menuHold bit keeps the menu (interpolated) value and skips both the
+         * overlay and the lock; otherwise the Pattern overlay is applied first
+         * and a locked lane replaces it (lock beats overlay).
+         */
+        if ((effects_automation.menuHold & (1ULL << index)) == 0u) {
+            if ((effects_automation.active & (1ULL << index)) != 0u)
+                value = effects_automation.value[index];
+            if (step && (step->lock_mask & 0xFFFEu) != 0u)
+                (void)effects_seqOverride(entry, step, index, &value);
+        }
         /* LFO resolves around the held value within its modulation domain. */
         if ((lfo_mask & (1ULL << index)) != 0u &&
             (descriptor->base.flags & INSTRUMENT_PARAM_FLAG_MODULATABLE) != 0u &&

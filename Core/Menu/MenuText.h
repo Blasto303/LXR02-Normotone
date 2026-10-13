@@ -26,7 +26,6 @@
 #define MENU_FILTER         1
 #define MENU_WAVEFORM       2
 #define MENU_AUDIO_OUT      3
-#define MENU_ROLL_RATES     4
 #define MENU_SYNC_RATES     5
 #define MENU_LFO_WAVES      6
 #define MENU_RETRIGGER      7
@@ -54,8 +53,16 @@ static const char ppqNames[][4] = {
 static const char midiModes[][4] = {
     {2}, {"trg"}, {"nte"},
 };
+/*
+ * Quantisation display names with trk option (S081 §5.6, R16).
+ *
+ * What: 6 entries. Adds "trk" after "64". Why: R16 adds track-grid
+ * quantisation for recording and looper per-track loop starts. Inputs:
+ * quantisation index 0..5. Affiliates: seq_quantisation, QUANT_TRACK enum,
+ * seq_setQuantisation clamp, seq_loopEventAnchor.
+ */
 static const char quantisationNames[][4] = {
-    {5}, {"off"}, {"8"}, {"16"}, {"32"}, {"64"},
+    {6}, {"off"}, {"8"}, {"16"}, {"32"}, {"64"}, {"trk"},
 };
 static const char transientNames[][4] = {
     {14},
@@ -98,11 +105,7 @@ static const char lfoWaveNames[][4] = {
 static const char lfoPolarityNames[][4] = {
     {3}, {"neg"},{"pos"},{"bi"},
 };
-static const char rollRateNames[][4] = {
-    {14},
-    {"One"},{"1/1"},{"1/2"},{"1/3"},{"1/4"},{"1/6"},{"1/8"},
-    {"12"},{"16"},{"24"},{"32"},{"48"},{"64"},{"128"},
-};
+/* rollRateNames / MENU_ROLL_RATES retired in place (S081 A3-5, Q14). */
 static const char syncRateNames[][4] = {
     {12},
     {"off"},{"4/1"},{"2/1"},{"1/1"},{"1/2"},{"1/3"},
@@ -146,7 +149,8 @@ static const char shortNames[][4] = {
     {"eqg"},{"eqf"},
     {"rol"},{"mrp"},{"nte"},{"prb"},{"stp"},{"len"},{"rot"},
     {"bpm"},{"ch"},{"out"},{"fxm"},{"nxt"},{"mod"},{"vel"},
-    {"fch"},{"flw"},{"qnt"},{"trk"},{"val"},{"shu"},{"ssv"},
+    /* TEXT_AUTOMATION_TRACK reused as the S081 rtk recording-track cell. */
+    {"fch"},{"flw"},{"qnt"},{"rtk"},{"val"},{"shu"},{"ssv"},
     {"x"},{"y"},{"flx"},{"mid"},{"mrt"},{"txf"},{"rxf"},
     {"cki"},{"co1"},{"co2"},{"pcr"},{"cpu"},{"oit"},{"sca"},
     /* PERF per-voice Morph compact labels: voice number + "vm". */
@@ -207,7 +211,7 @@ static const char longNames[][16] = {
     {"RollRate"},{"Morph"},{"Note"},{"Prbablty"},{"Number"},
     {"Length"},{"Steps"},{"Rotation"},{"Tempo"},{"SyncInpt"},
     {"AudioOut"},{"Channel"},{"FX Morph"},{"NextPatt"},{"Phase"},{"Mode"},
-    {"Vol mod"},{"Fetch"},{"Follow"},{"Quantize"},{"AutTrack"},
+    {"Vol mod"},{"Fetch"},{"Follow"},{"Quantize"},{"RecTrk"},
     {"Aut Dest"},{"AutValue"},{"Shuffle"},{"Screensv"},
     {"X Positn"},{"Y Positn"},{"Flux"},{"Velocity"},
     {"Freqcy 1"},{"Freqcy 2"},{"Gain 1"},{"Gain 2"},
@@ -262,10 +266,18 @@ static const char conditionNames[][4] = {
     {"!1m"},{"!2m"},{"!3m"},{"!4m"},{"!5m"},{"!6m"},{"!7m"},
 };
 
-/* Per-step roll rate display names (S079 §4.1). [0]=count; [1..9] = 0..8. */
+/*
+ * Step-roll rate display names, aligned with the §5.4 table (S081 R17).
+ *
+ * What: 10 entries plus the count byte. Drop " 48" (was between 32T and 64).
+ * Add "64t" and "128". Why: the table indices and names must match the new
+ * 10-entry seq_rollPpq table. Stored bytes shift with no migration. Inputs:
+ * roll index 0..9. Affiliates: seq_rollPpq, menu_getRollRateName, STEP roll
+ * clamp.
+ */
 static const char stepRollRateNames[][4] = {
-    {9},
-    {"off"},{"1/8"},{"8tr"},{" 16"},{"16t"},{" 32"},{"32t"},{" 48"},{" 64"},
+    {10},
+    {"off"},{"1/8"},{"8tr"},{" 16"},{"16t"},{" 32"},{"32t"},{" 64"},{"64t"},{"128"},
 };
 
 /*

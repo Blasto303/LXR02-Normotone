@@ -236,5 +236,14 @@ void presetMorph_setTrackParamStepOverride(uint8_t track,
                                            presetMorph_trackParam_t param,
                                            uint8_t value);
 void presetMorph_clearAllTrackParamStepOverrides(void);
+/*
+ * Clear one track's length/scale/shuffle step-automation override and refresh
+ * the effective cache (S081 §5.2). A menu edit of a track timing parameter
+ * clears the override so the new value takes effect immediately. Inputs: track
+ * 0..6 and the presetMorph_trackParam_t lane. Affiliates:
+ * presetMorph_setTrackParamStepOverride(), seq_refreshTrackEffectiveParams().
+ */
+void presetMorph_clearTrackParamStepOverride(uint8_t track,
+                                             presetMorph_trackParam_t param);
 
 #endif

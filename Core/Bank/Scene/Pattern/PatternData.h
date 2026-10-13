@@ -268,7 +268,50 @@ typedef struct {
 #define PAT_AUTOMATION_TARGET_OFF 0x01FFu
 
 pat_step_specials_t pat_readStepSpecials(uint8_t scene_index,
-                                         uint8_t track, uint8_t step);
+                                        uint8_t track, uint8_t step);
+/*
+ * Recorded step spec (S081 D-2b, §8.4).
+ *
+ * What: the fields a live-recorded trigger writes to one step: note, velocity,
+ * micro-timing, roll rate and fill, plus setFil (R10) and noteIsDefault (a `def`
+ * note records no note special). Rhythm is never recorded (cleared). The
+ * condition is kept unless setFil is set.
+ */
+typedef struct {
+    uint8_t note;
+    uint8_t velocity;
+    uint8_t timing;
+    uint8_t roll;
+    uint8_t fill;
+    uint8_t setFil;
+    uint8_t noteIsDefault;
+} pat_record_spec_t;
+
+/*
+ * Write a recorded step's specials and trigger (S081 D-2a, §19.3).
+ *
+ * What: reads the existing specials and automation for the step, applies the
+ * record spec (note, velocity, timing, roll, fill; clears rhythm; keeps the
+ * condition or sets fil), and writes the result with trigger ON. A result with no
+ * specials and no automation only sets bit 15 (pat_setStepActive). Why: the old
+ * seq_recordTrigger only set the trigger bit; live recording writes the full step
+ * in one block replacement. Inputs: scene, track, step, spec. Outputs: nonzero on
+ * commit, 0 when allocation fails (old state untouched). Affiliates:
+ * pat_writeDynamic (trigger ON), pat_readStepSpecials, pat_readStepAutomations.
+ */
+uint8_t pat_recordStep(uint8_t scene_index, uint8_t track, uint8_t step,
+                       const pat_record_spec_t *spec);
+
+/*
+ * Erase a step's specials while keeping automation (S081 D-3a, §10.2).
+ *
+ * What: if automation is present, keeps the condition and removes all other
+ * specials (note, velocity, timing, roll, rhythm, fill). If no automation,
+ * releases the block entirely (trigger KEEP; TIM3 already cleared bit 15). Why:
+ * SEQ-hold erase removes triggers and specials but automation still plays.
+ */
+void pat_eraseSpecials(uint8_t scene_index, uint8_t track, uint8_t step);
+
 
 /*
  * Whole-track and whole-Pattern clear primitives (legacy direct form).

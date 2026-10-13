@@ -1157,3 +1157,28 @@ void presetMorph_clearAllTrackParamStepOverrides(void)
     for (param = 0u; param < PRESETMORPH_TRACK_PARAM_COUNT; param++)
         track_param_override_mask[param] = 0u;
 }
+
+/*
+ * Clear a single track's length/scale/shuffle step-automation override and
+ * refresh the effective cache (S081 §5.2).
+ *
+ * What: clears the per-track step override for the given param
+ * (PRESETMORPH_TRACK_LENGTH, _SCALE or _SHUFFLE) and calls
+ * seq_refreshTrackEffectiveParams() to recompute the effective values from the
+ * Scene base. Why: when the user edits scale or shuffle from the menu, the
+ * override must clear so the edit takes effect (length included: R12 covers
+ * every non-Instrument parameter). The effective cache must also update so TIM3
+ * uses the new interval. Inputs: track 0..6, param (PRESETMORPH_TRACK_LENGTH,
+ * _SCALE or _SHUFFLE). Outputs: override cleared, effective cache refreshed.
+ * Affiliates: presetMorph_setTrackParamStepOverride (set site), menu.c STEP
+ * scale/shuffle commit, seq_effectiveTrackScale/Shuffle arrays,
+ * seq_refreshTrackEffectiveParams.
+ */
+void presetMorph_clearTrackParamStepOverride(uint8_t track,
+                                             presetMorph_trackParam_t param)
+{
+    if (track >= NUM_TRACKS || param >= PRESETMORPH_TRACK_PARAM_COUNT)
+        return;
+    track_param_override_mask[param] &= (uint8_t)~(1u << track);
+    seq_refreshTrackEffectiveParams();
+}

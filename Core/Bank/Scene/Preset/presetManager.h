@@ -449,9 +449,15 @@ void preset_applyVoiceAudioOutRuntime(uint8_t slot, uint8_t route);
  */
 void preset_setAudioOutStepOverride(uint8_t slot, uint8_t route);
 void preset_clearAllAudioOutStepOverrides(uint8_t scene_index);
+/* Clear one slot's audio-out step override and re-apply the Scene route
+** (S081 §5.2). Called by the AudioOut menu-edit R12 clear. */
+void preset_clearAudioOutStepOverride(uint8_t slot);
 uint8_t preset_getEffectiveAudioOut(uint8_t scene_index, uint8_t slot);
 void preset_setFxSendStepOverride(uint8_t slot, uint8_t amount);
 void preset_clearAllFxSendStepOverrides(void);
+/* Clear one slot's FX-send step override (S081 §5.2). Called by the FX-send
+** menu-edit R12 clear. */
+void preset_clearFxSendStepOverride(uint8_t slot);
 uint8_t preset_getEffectiveFxSendAmount(uint8_t scene_index, uint8_t slot);
 uint8_t preset_getFxSendDisplayAmount(uint8_t scene_index, uint8_t slot);
 void preset_applySceneSettings(uint8_t scene_index);

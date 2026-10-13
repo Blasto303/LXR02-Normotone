@@ -44,6 +44,7 @@
 #include "CymbalVoice.h"
 #include "Uart.h"
 #include "sequencer.h"
+#include "LiveRecord.h"
 #include "clockSync.h"
 #include "mixer.h"
 #include "valueShaper.h"
@@ -139,6 +140,15 @@ static void midiParser_enterTaggedParameter(uint8_t slot, const char *key,
 		return;
 	(void)preset_setInstrumentParameterFromMidi(
 		slot, index, menu_clampInstrumentValue(slot, index, value));
+	/*
+	 * MIDI CC automation stub hook for LiveRecord (S081 §19.9, F-4).
+	 *
+	 * What: the target ID comes from the tagged key; the MIDI rework owns that
+	 * mapping, so for now this is a stub (no valid target). Why: R4 says MIDI CC
+	 * automation records the same way as knob edits; the stub keeps the call site
+	 * and API exercised. Affiliates: liveRec_paramIn, MIDI rework (future).
+	 */
+	liveRec_paramIn(0xFFFFu, LIVEREC_SRC_MIDI);
 }
 
 /*
@@ -1546,8 +1556,26 @@ static void midiParser_noteOn(uint8_t voice, uint8_t note, uint8_t vel, uint8_t 
 		const uint8_t chan=midi_MidiChannels[voice];
 
 		// record note if rec is on
-		/* Fixed-grid recording stores only the quantized trigger bit. */
-		seq_recordTrigger(voice);
+		/*
+		 * MIDI note record hook (S081 B-7a, R2, E-1).
+		 *
+		 * What: reports the sounding note to LiveRecord as a SINGLE hit from the
+		 * MIDI source, with the played note and velocity. Why: MIDI notes record the
+		 * same way as overlay triggers (R2). The call is a stub until Phase E fills
+		 * liveRec_triggerIn(), so MIDI note recording is inactive from B to E; the
+		 * old path only recorded bar 1. Affiliates: liveRec_triggerIn(), LiveRecord.h.
+		 */
+		{
+			liveRec_trigger_t lr;
+			lr.track = voice;
+			lr.note = note;
+			lr.velocity = vel;
+			lr.kind = LIVEREC_HIT_SINGLE;
+			lr.roll = 0u;
+			lr.source = LIVEREC_SRC_MIDI;
+			lr.note_is_default = 0u;
+			liveRec_triggerIn(&lr);
+		}
 
 		//if a note is on for that channel send note-off first
 		seq_midiNoteOff(chan);

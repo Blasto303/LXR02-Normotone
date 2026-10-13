@@ -72,6 +72,13 @@ extern uint8_t voiceStatus[NUM_VOICES];
 //---------------------------------------------------
 //------------- Functions ---------------------------
 void voiceControl_noteOn(uint8_t voice, uint8_t note, uint8_t vel);
+/* Enqueue a voice trigger without requesting an automation reset (S081 §5.8).
+** Serves roll retriggers 2+; see voiceControl_noteOnNoReset() in the .c file. */
+void voiceControl_noteOnNoReset(uint8_t voice, uint8_t note, uint8_t vel);
+/* Request an automation reset for a voice with no trigger (S081 §5.8): a roll
+** renewal carried across a step boundary. See voiceControl_resetOnly() in the
+** .c file. */
+void voiceControl_resetOnly(uint8_t voice);
 void voiceControl_noteOff(uint8_t voice);//0xff == all voices
 /* Consumes queued note-on triggers at the audio render boundary. Call before
 ** mixer_calcNextSampleBlock(); producers may be foreground MIDI/buttons or the

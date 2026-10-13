@@ -158,6 +158,25 @@ uint8_t patSvc_removeTrackAutomationByTarget(uint8_t scene, uint8_t track,
 void patSvc_enqueueErase(uint8_t scene, uint8_t track, uint8_t step);
 
 /*
+ * S081 live-record service API (D-4, D-5).
+ *
+ * patSvc_recordStep(): stage a record spec and submit a RECORD_STEP op (direct
+ * when idle). patSvc_enqueueEraseSpecials(): TIM3-safe ERASE_SPECIALS enqueue.
+ * patSvc_requestTarget()/releaseTarget()/targetOpen()/replacePending(): the
+ * recording-target override so Pattern writes can target a track's per-track
+ * Scene, and the filesystem-replacement query LiveRecord uses without calling
+ * Menu. Affiliates: LiveRecord, PatternData pat_recordStep/pat_eraseSpecials.
+ */
+uint8_t patSvc_recordStep(uint8_t scene, uint8_t track, uint8_t step,
+                          const pat_record_spec_t *spec);
+void    patSvc_enqueueEraseSpecials(uint8_t scene, uint8_t track,
+                                    uint8_t step);
+uint8_t patSvc_requestTarget(uint8_t scene);
+void    patSvc_releaseTarget(void);
+uint8_t patSvc_targetOpen(uint8_t scene);
+uint8_t patSvc_replacePending(void);
+
+/*
  * Query and consume one chunk's service-owned trailing reservation.
  *
  * What: patSvc_isChunkReserved() reports whether a backed pool chunk is

@@ -45,6 +45,7 @@
 #include "filesystem.h"
 #include "SampleMemory.h"
 #include "sequencer.h"
+#include "LiveRecord.h"
 #include "StepScale.h"
 #include "EffectsManager.h"
 #include "PatternData.h"
@@ -1098,7 +1099,7 @@ uint8_t voiceModeShowMorph = 0;
 ** ----------------------------------------------------------------------- */
 const enum Datatypes parameter_dtypes[NUM_PARAMS] = {
     [PAR_NONE] = DTYPE_0B127,
-    [PAR_ROLL] = DTYPE_MENU|(MENU_ROLL_RATES<<4),
+    /* PAR_ROLL retired in place (S081 A3-5, Q14): no menu dtype. */
     [PAR_MORPH] = DTYPE_0B255,
     [PAR_VOICE1_MORPH] = DTYPE_0B255,
     [PAR_VOICE2_MORPH] = DTYPE_0B255,
@@ -1141,7 +1142,8 @@ const enum Datatypes parameter_dtypes[NUM_PARAMS] = {
     [PAR_EUKLID_LENGTH] = DTYPE_1B128,
     [PAR_EUKLID_STEPS] = DTYPE_1B128,
     [PAR_EUKLID_ROTATION] = DTYPE_0B127,
-    [PAR_AUTOM_TRACK] = DTYPE_0b1,
+    /* rtk cell: 0..6 shown as 1..7 (S081 §11, B-5c). */
+    [PAR_AUTOM_TRACK] = DTYPE_0B127,
     [PAR_P1_DEST] = DTYPE_AUTOM_TARGET,
     [PAR_P2_DEST] = DTYPE_AUTOM_TARGET,
     [PAR_P1_VAL] = DTYPE_0B127,
@@ -3801,6 +3803,33 @@ static instrument_param_id_t menu_seqCellToTrackTarget(
 }
 
 /*
+ * Clear a track length/scale/shuffle step override and its Scene dirty bit
+ * (S081 §5.2, R12).
+ *
+ * What: calls presetMorph_clearTrackParamStepOverride() for the active track and
+ * the given lane, then clears the matching Scene-automation dirty bit through
+ * seq_clearSceneAutomationBit(). Why: a menu edit of a track timing parameter
+ * must clear the automation override so the new value takes effect immediately
+ * (length included: R12 covers every non-Instrument parameter), and the held
+ * Scene bit must clear so the transport restore cannot revert the edit. Inputs:
+ * the SEQ cell position (0 length, 1 scale, 2 shuffle) and the
+ * presetMorph_trackParam_t lane. Affiliates: menu_seqCellToTrackTarget(),
+ * presetMorph_clearTrackParamStepOverride(), seq_clearSceneAutomationBit().
+ */
+static void menu_clearTrackTimingOverride(uint8_t cell_position,
+                                          presetMorph_trackParam_t param)
+{
+    uint8_t track = menu_getActiveVoice();
+    uint16_t target = (uint16_t)menu_seqCellToTrackTarget(cell_position, track);
+    uint8_t index;
+
+    presetMorph_clearTrackParamStepOverride(track, param);
+    if (target != (uint16_t)INSTRUMENT_PARAM_INVALID &&
+        sceneModTarget_indexFromId(target, &index))
+        seq_clearSceneAutomationBit(index);
+}
+
+/*
  * Write one track automation parameter to every held step (S078 P2 §B).
  *
  * What: resolves the cell position to a track target, seeds the value from the
@@ -4850,6 +4879,27 @@ static uint8_t menu_cellCommitValue(const menu_cell_t *cell, uint16_t value)
                     (uint8_t)(!voiceModeShowMorph &&
                               scene_index == scene_getActiveIndex()));
             }
+            /*
+             * 7dc menu edit clears its step override (S081 §5.2).
+             *
+             * What: calls instrumentManager_clearSlot6Track7StepDecayOverride()
+             * and seq_clearSceneAutomationBit(index) for the generated
+             * slot-6/track-7 decay target. The clear function already exists at
+             * InstrumentManager.c:2695. Why: same as the Scene-setting clears: a
+             * menu edit of this parameter clears the automation override so the
+             * menu value takes effect immediately. Affiliates:
+             * instrumentManager_clearSlot6Track7StepDecayOverride,
+             * sceneModTarget_slot6DecayId, seq_clearSceneAutomationBit.
+             */
+            instrumentManager_clearSlot6Track7StepDecayOverride();
+            {
+                uint16_t target = sceneModTarget_slot6DecayId();
+                uint8_t index;
+
+                if (target != (uint16_t)INSTRUMENT_PARAM_INVALID &&
+                    sceneModTarget_indexFromId(target, &index))
+                    seq_clearSceneAutomationBit(index);
+            }
             return changed;
         }
         return 0u;
@@ -4860,6 +4910,23 @@ static uint8_t menu_cellCommitValue(const menu_cell_t *cell, uint16_t value)
         uint8_t changed = 0u;
         if (!cell->descriptor)
             return 0u;
+        /*
+         * Instrument menu edit sets the override before applying (S081 §5.1, R12).
+         *
+         * What: one call, seq_menuOverrideSet(cell->slot, cell->descriptor_index),
+         * before the edit-mask Scene loop. It applies to Normal and Morph-image
+         * edits (both change the value that sounds). It is not called per Scene:
+         * the edit mask is a set of Scenes, while the override belongs to the one
+         * runtime slot that the active Scene's edit writes, and the active Scene is
+         * always in the commit set. Why: R12 says a menu edit suppresses that
+         * parameter's step automation until the voice's next trigger. Setting it
+         * before preset_setInstrumentParameter() clears the held bit first, so the
+         * guarded runtime write (presetMorph_writeRuntimeBase()) goes through.
+         * Inputs: cell slot and descriptor index. Outputs: override bit set, held
+         * bit cleared. Affiliates: seq_menuOverrideSet(),
+         * preset_setInstrumentParameter(), seq_drainPendingAutomation() filter.
+         */
+        seq_menuOverrideSet(cell->slot, cell->descriptor_index);
         for (scene_index = 0u;
              scene_index < SCENE_COUNT && scene_index < 16u;
              scene_index++) {
@@ -4926,6 +4993,34 @@ static uint8_t menu_cellCommitValue(const menu_cell_t *cell, uint16_t value)
                 break;
             }
         }
+        /*
+         * Scene-setting menu edit clears that slot's override (S081 §5.2).
+         *
+         * What: after the Scene-setting commit, calls the per-slot clear
+         * (preset_clearAudioOutStepOverride or preset_clearFxSendStepOverride)
+         * and seq_clearSceneAutomationBit(index). Why: §5.2 says a menu edit of
+         * these parameters clears the automation override so the menu value takes
+         * effect immediately. Voice Morph needs no clear (its override rule is
+         * unchanged), and fader mode is not automatable. Inputs: slot, Scene
+         * automation index. Outputs: override cleared, dirty bit cleared.
+         * Affiliates: preset_clearAudioOutStepOverride,
+         * preset_clearFxSendStepOverride, seq_clearSceneAutomationBit.
+         */
+        if (cell->scene_setting == MENU_SCENE_SETTING_AUDIO_OUT) {
+            preset_clearAudioOutStepOverride(cell->slot);
+        } else if (cell->scene_setting == MENU_SCENE_SETTING_FX_SEND_AMOUNT) {
+            preset_clearFxSendStepOverride(cell->slot);
+        } else {
+            return changed;
+        }
+        {
+            uint16_t target = (uint16_t)menu_sceneSettingAutomationTarget(cell);
+            uint8_t index;
+
+            if (target != (uint16_t)INSTRUMENT_PARAM_INVALID &&
+                sceneModTarget_indexFromId(target, &index))
+                seq_clearSceneAutomationBit(index);
+        }
         return changed;
     }
     /*
@@ -4991,12 +5086,16 @@ static uint8_t menu_cellCommitValue(const menu_cell_t *cell, uint16_t value)
         switch (cell->static_param) {
         case PAR_TRACK_LENGTH:
             scene_setTrackMorphLength(scene_index, track, (uint8_t)value);
+            /* Morph endpoint edit clears the step override (S081 §5.2). */
+            menu_clearTrackTimingOverride(0u, PRESETMORPH_TRACK_LENGTH);
             break;
         case PAR_TRACK_SCALE:
             scene_setTrackMorphScale(scene_index, track, (uint8_t)value);
+            menu_clearTrackTimingOverride(1u, PRESETMORPH_TRACK_SCALE);
             break;
         default:
             scene_setTrackMorphShuffle(scene_index, track, (uint8_t)value);
+            menu_clearTrackTimingOverride(2u, PRESETMORPH_TRACK_SHUFFLE);
             break;
         }
         return 1u;
@@ -5023,6 +5122,9 @@ static uint8_t menu_cellCommitValue(const menu_cell_t *cell, uint16_t value)
          * filesystem_setAutosaveEnabled().
          */
         if (old_value != *paramValue &&
+            /* rtk is runtime-only; a change must not schedule a settings write
+             * (S081 §11, B-5c). */
+            cell->static_param != PAR_AUTOM_TRACK &&
             (menu_activePage == MENU_MIDI_PAGE ||
              menu_activePage == RECORDING_PAGE)) {
             filesystem_markSettingsDirty();
@@ -5742,6 +5844,10 @@ static void menu_clampCellValue(const menu_cell_t *cell, uint16_t *value)
         case PAR_PERF_NOTE_RT:
             if (*value > 127u) *value = 127u;
             return;
+        case PAR_AUTOM_TRACK:
+            /* rtk is 0..6 (shown 1..7) (S081 §11, B-5c). */
+            if (*value > 6u) *value = 6u;
+            return;
         case PAR_SCENE_CHANGE_DIV:
             if (*value > 9u) *value = 9u;
             return;
@@ -5787,8 +5893,14 @@ static void menu_clampCellValue(const menu_cell_t *cell, uint16_t *value)
     }
     if (cell->kind == MENU_CELL_STATIC &&
         cell->static_param == PAR_STEP_ROLL) {
-        if (*value > 8u)
-            *value = 8u;
+        /*
+         * STEP roll clamp extended for 64T and 128 (S081 §5.4).
+         * What: the upper bound changes from 8 to 9 to allow the two new roll
+         * rates. Inputs: value from encoder. Outputs: clamped to 0..9.
+         * Affiliates: seq_rollPpq table, stepRollRateNames.
+         */
+        if (*value > 9u)
+            *value = 9u;
         return;
     }
     if (cell->kind == MENU_CELL_STATIC &&
@@ -9726,7 +9838,6 @@ static uint8_t getMaxEntriesForMenu(uint8_t menuId)
     case MENU_MIDI:          return (uint8_t)midiModes[0][0];
     case MENU_NEXT_PATTERN:  return (uint8_t)nextPatternNames[0][0];
     case MENU_WAVEFORM:      return (uint8_t)((uint8_t)waveformNames[0][0] + menu_numSamples);
-    case MENU_ROLL_RATES:    return (uint8_t)rollRateNames[0][0];
     case MENU_MIDI_ROUTING:  return (uint8_t)midiRoutingNames[0][0];
     case MENU_MIDI_FILTERING:return (uint8_t)midiFilterNames[0][0];
     case MENU_PPQ:           return (uint8_t)ppqNames[0][0];
@@ -9772,7 +9883,6 @@ static void getMenuItemNameForValue(uint8_t menuId, uint8_t curParmVal, char *bu
     case MENU_SEQ_QUANT:      p = quantisationNames[curParmVal+1];  break;
     case MENU_MIDI:           p = midiModes[curParmVal+1];          break;
     case MENU_NEXT_PATTERN:   p = nextPatternNames[curParmVal+1];   break;
-    case MENU_ROLL_RATES:     p = rollRateNames[curParmVal+1];      break;
     case MENU_MIDI_ROUTING:   p = midiRoutingNames[curParmVal+1];   break;
     case MENU_MIDI_FILTERING: p = midiFilterNames[curParmVal+1];    break;
     case MENU_PPQ:            p = ppqNames[curParmVal+1];           break;
@@ -9935,6 +10045,20 @@ static uint8_t menu_getS080StaticName(const menu_cell_t *cell,
             setNoteName((uint8_t)value, buf);
         }
         return 1u;
+    case PAR_AUTOM_TRACK:
+        /*
+         * rtk display (S081 §11, B-5c): shows liveRec_recordTrack() + 1 (1..7).
+         * Read live from LiveRecord, so there is no parameter_values[] mirror to
+         * keep in sync when rtk follows the active track.
+         */
+        {
+            uint8_t shown = (uint8_t)(liveRec_recordTrack() + 1u);
+
+            buf[0] = (char)('0' + shown);
+            buf[1] = ' ';
+            buf[2] = ' ';
+        }
+        return 1u;
     case PAR_SCENE_CHANGE_DIV:
         menu_nameTable3(sceneChangeDivNames, 10u, value, buf);
         return 1u;
@@ -9975,7 +10099,8 @@ static void menu_getRollRateName(uint16_t value, char *buf)
 {
     const char *p;
 
-    if (value > 8u)
+    /* S081 §5.4: 10 roll rates (0..9) after 64T/128 were added. */
+    if (value > 9u)
         value = 0u;
     p = stepRollRateNames[value + 1u];
     buf[0] = p[0];
@@ -13500,6 +13625,11 @@ void menu_parseEncoder(int8_t inc, uint8_t button)
         }
     }
 
+    /* S081 H-2a (Q13): silent refusal of STEP edits of A while T != A. */
+    if (liveRec_activePatternLocked() && menu_activePage == SEQ_PAGE) {
+        lastEncoderButton = button;
+        return;
+    }
     if (button != lastEncoderButton) {
         btnClicked = button;
         lastEncoderButton = button;
@@ -13913,9 +14043,55 @@ static uint8_t menu_knobClearTarget(uint8_t knobNr, cc_pot_target_t *out)
     return 1u;
 }
 
+/*
+ * Automation record hook for an endless-pot edit (S081 §9, §19.6, F-1a).
+ *
+ * What: when recording and the pot's cell resolves a recordable Pattern target,
+ * marks it via liveRec_paramIn(). Not recorded: PERFORMANCE/RECORDING/MIDI/
+ * LOAD/SAVE pages, Morph views, track length, and non-automatable cells. Why:
+ * every user edit of a recordable parameter must mark it so the step-end table
+ * writes it. Inputs: pot number. Outputs: dirty/latch bit set. Affiliates:
+ * menu_knobClearTarget(), liveRec_paramIn().
+ */
+static void menu_liveRecRecordKnob(uint8_t knobNr)
+{
+    cc_pot_target_t target;
+    const scene_mod_target_descriptor_t *descriptor;
+
+    if (liveRec_mode() != LIVEREC_MODE_LATCH &&
+        liveRec_mode() != LIVEREC_MODE_OVERDUB)
+        return;
+    if (menu_activePage == PERFORMANCE_PAGE ||
+        menu_activePage == RECORDING_PAGE ||
+        menu_activePage == MENU_MIDI_PAGE ||
+        menu_activePage == LOAD_PAGE ||
+        menu_activePage == SAVE_PAGE)
+        return;
+    if (voiceModeShowMorph || menu_patternTrackMorphViewActive())
+        return;
+    if (!menu_knobClearTarget(knobNr, &target))
+        return;
+    if (target.pattern_target == 0xffffu)
+        return;
+    descriptor = sceneModTarget_descriptor(target.pattern_target);
+    if (descriptor && descriptor->kind == SCENE_MOD_TARGET_KIND_TRACK_LENGTH)
+        return;   /* track length is not recordable (R12) */
+    liveRec_paramIn(target.pattern_target, 0u);
+}
+
 void menu_parseKnobDelta(uint8_t knobNr, int8_t delta)
 {
     if (menu_storageBusy) return;
+
+    /*
+     * Q13 silent refusal while T != A (S081 §7.5, H-2a).
+     *
+     * What: while the recording target Scene differs from the active Scene, a
+     * STEP-page edit of A is refused before the display or value changes. No
+     * message. Why: editing A's Pattern while recording into T would conflict.
+     */
+    if (liveRec_activePatternLocked() && menu_activePage == SEQ_PAGE)
+        return;
 
     /*
      * S078 P2 §B: STEP held-step track automation overlay owns the pots.
@@ -13964,6 +14140,26 @@ void menu_parseKnobDelta(uint8_t knobNr, int8_t delta)
      * nothing (spec §6). Affiliates: copyClear_ownsPots(),
      * copyClear_potTurned().
      */
+    /*
+     * Knob erase during live erase (S081 §10.2, G-2).
+     *
+     * What: while erase is enabled, a pot turn over an automatable target marks
+     * that target for removal (and its FX lane) instead of adjusting the value;
+     * the underline search is cleared. Why: knob erase selects a parameter for
+     * erase by turning its knob; the parameter itself is not adjusted. Inputs:
+     * pot number. Outputs: liveRec_eraseParam() called. Affiliates:
+     * liveRec_eraseParam, menu_knobClearTarget, menu_automationTargetCleared.
+     */
+    if (liveRec_mode() == LIVEREC_MODE_ERASE) {
+        cc_pot_target_t eraseTarget;
+
+        if (knobNr < ENDLESS_POT_COUNT && delta != 0u &&
+            menu_knobClearTarget(knobNr, &eraseTarget)) {
+            liveRec_eraseParam(eraseTarget.pattern_target, eraseTarget.fx_lane);
+            menu_automationTargetCleared(eraseTarget.pattern_target);
+        }
+        return;
+    }
     if (copyClear_ownsPots()) {
         cc_pot_target_t target;
         if (delta != 0 && menu_knobClearTarget(knobNr, &target))
@@ -14073,6 +14269,8 @@ void menu_parseKnobDelta(uint8_t knobNr, int8_t delta)
     menu_clampCellValue(&cell, &value);
     if (menu_cellCommitValue(&cell, value))
         menu_knobs_dirty = 1;
+    /* S081 F-1a: every recordable pot edit marks its target. */
+    menu_liveRecRecordKnob(knobNr);
 }
 
 /* Consume the knobs-dirty flag and repaint if set. Call once per main
@@ -15884,6 +16082,8 @@ void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
          * not necessarily the currently playing pattern.
          */
         pat_setTrackLength(menu_getViewedPattern(), menu_getActiveVoice(), value);
+        /* Track length menu edit clears the step override (S081 §5.2). */
+        menu_clearTrackTimingOverride(0u, PRESETMORPH_TRACK_LENGTH);
         break;
 
     case PAR_TRACK_SCALE:
@@ -15894,6 +16094,8 @@ void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
          * index and Sequencer reads the exact ratio during playback scheduling.
          */
         pat_setTrackScale(menu_getViewedPattern(), menu_getActiveVoice(), value);
+        /* Track scale menu edit clears the step override (S081 §5.2). */
+        menu_clearTrackTimingOverride(1u, PRESETMORPH_TRACK_SCALE);
         break;
 
     case PAR_TRACK_MIDI_CHAN:
@@ -15943,6 +16145,8 @@ void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
          * seq_shuffle bridge.
          */
         pat_setTrackShuffle(menu_getViewedPattern(), menu_getActiveVoice(), value);
+        /* Track shuffle menu edit clears the step override (S081 §5.2). */
+        menu_clearTrackTimingOverride(2u, PRESETMORPH_TRACK_SHUFFLE);
         break;
 
     case PAR_TRACK_PLAY_MODE:
@@ -15976,6 +16180,14 @@ void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
          * Sequencer setting and is called directly here.
          */
         seq_setQuantisation(value);
+        break;
+    case PAR_AUTOM_TRACK:
+        /*
+         * rtk commit (S081 §11, B-5c). Runtime only; each change is a new take.
+         * Display is read live from LiveRecord (menu_getS080StaticName), so there
+         * is no parameter_values[] mirror to update here.
+         */
+        liveRec_setRecordTrack(value);
         break;
 
     case PAR_SCREENSAVER_ON_OFF:
@@ -16072,14 +16284,6 @@ void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
          * instead so a load cannot leave the page showing reset zeros.
          */
         preset_syncBusCompMirrors();
-        break;
-
-    case PAR_ROLL:
-        /*
-         * Roll rate controls Sequencer performance behavior. It is not Pattern
-         * storage, so it remains a direct Sequencer call.
-         */
-        seq_setRollRate(value);
         break;
 
     case PAR_EUKLID_LENGTH:
@@ -16365,6 +16569,16 @@ void menu_setActiveVoice(uint8_t v)
         menu_stepAutomationReset();
         va_resetOverlay();
         menu_activeVoice = v;
+        /*
+         * Active-track change updates rtk (S081 §11, §19.6, B-5a).
+         *
+         * What: rtk follows every active-track change (R7); re-selecting the same
+         * track does not reset an rtk override, so the call is inside the != branch
+         * only. Each change is a new take (latches reset). Inputs: new active track
+         * v. Outputs: rtk updated in LiveRecord. Affiliates:
+         * liveRec_onActiveTrackChanged, liveRec_setRecordTrack.
+         */
+        liveRec_onActiveTrackChanged(v);
         if (menu_activePage != EFFECT_PAGE)
             va_searchRestart();
         return;
@@ -16781,7 +16995,6 @@ void menu_init(void)
 
     parameter_values[PAR_EUKLID_LENGTH] = 16;
     parameter_values[PAR_EUKLID_STEPS]  = 16;
-    parameter_values[PAR_ROLL]          = 8;
     parameter_values[PAR_BPM]           = 120;
     parameter_values[PAR_TRACK_SCALE]   = TRACK_SCALE_DEFAULT;
     parameter_values[PAR_OSC_WAVE_INTERP] = 0;
