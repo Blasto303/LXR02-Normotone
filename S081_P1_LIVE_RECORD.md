@@ -34,6 +34,29 @@ Session 081 plan, branch `dev-ph6-cleanup`, base `02553df`.
   - new follow-ups F-R and F-S.
 - **Revision 8 (2026-10-12):** F-R and F-S accepted as recommended. No
   follow-ups remain open.
+- **Revision 9 (2026-10-13):** schedule review. `S081_P1_IMPLEMENTATION.md`
+  was corrected (revision 2). Appendix A records every correction. Plan body
+  corrections, for plan errors and items the user asked to fix in both
+  documents:
+  - §5.2 (track length);
+  - §5.3 and §19.1-4 (realign keeps and realigns the FX sequence);
+  - §14 (RAM);
+  - §19.2 (value source, take boundary);
+  - §19.6 (override call);
+  - §19.15 (reset ordering, atomic mask).
+
+  Item 15 (looper) is open, pending a decision.
+- **Revision 10 (2026-10-13):** looper decisions.
+  - **L-2 decided:** record and live erase no longer lock the looper out,
+    in either direction.
+  - **L-1:** the timing analysis for `trk` loop anchors is recorded
+    (Appendix A-15).
+  - New follow-ups L1–L4 (§18).
+- **Revision 11 (2026-10-13):** L1 kept (`trk` gives per-track loop
+  anchors). L3 adopted in P1: step-end writes and clears only on real
+  changes, which also helps without the looper. Looping while recording
+  (L-2, L2, L4) moves to its own plan, `S081_P2_LOOP_WHILE_RECORD.md`. P1
+  keeps the S080 looper/record lockout as an interim state.
 
 General plan; no code has changed. All follow-ups are decided; the
 implementation schedule (`S081_P1_IMPLEMENTATION.md`) is next. §19 is the
@@ -134,6 +157,9 @@ Authority read: `MEMORY.md`, `SCOPING_TARGETS.md` §4.3/§4.3a/§4.3b/§4.8/§6.
 | F-R | A roll runs its own length (step interval × fill, from its delayed first hit). Only the next step's trigger cuts it: a plain hit ends it, a matching roll carries it, a different roll replaces it. An empty or automation-only step does not. |
 | F-S | Roll steps take the track's shuffle as well as micro-timing (one timing rule for every trigger). |
 | RAM | Approved, including follow-ons (§14). |
+| L-2 | (2026-10-13) The looper is **not** locked out by record or live erase. Engaging the looper no longer turns record off, and REC works normally while looping. Looper actions are not recorded; looping only moves track playheads, and recording or erasing follows the playhead wherever it is. Supersedes the S080 rule "looping and recording are mutually exclusive". **Implemented in P2** (`S081_P2_LOOP_WHILE_RECORD.md`), together with L2 and L4. P1 keeps the S080 lockout until then (revision 11). |
+| L1 | (2026-10-13) Kept: with `qnt trk`, each looped track's loop starts at its own last step start (a per-track anchor computed in `seq_loopSnapshotTracks()`). `off` keeps the fastest-track anchor; 1/8..1/64 keep the grid boundary. Anchors choose only which window a track replays; step timing under the loop is unchanged (Appendix A-15). |
+| L3 | (2026-10-13) Adopted in P1. A step-end automation write is queued only when the step holds no entry for the target or a different value; a clear only when an entry exists. It helps without the looper too: LATCH re-stamps every fired step of `rtk` on every pass of the pattern, so an unchanged held value would otherwise rewrite the same entries every bar (§9.5). |
 
 ---
 
@@ -229,7 +255,8 @@ and BAR overlay triggers are not recorded.
    - LiveRecord depends on the Sequencer, so the Sequencer must not call
      back into LiveRecord.
    - The record-off moves to the caller in buttonHandler, before
-     `seq_loopEngage()`.
+     `seq_loopEngage()` (`liveRec_forceOff()`). P2 removes it outright
+     (L-2).
    - The drain filter reads bitmaps that LiveRecord registers with the
      Sequencer (§19.1), rather than calling LiveRecord.
 10. **LiveRecord must not depend on Menu either.**
@@ -296,7 +323,7 @@ void    liveRec_service(void);                             /* timebase, before p
 /* Mode (buttonHandler) */
 void    liveRec_setLatch(uint8_t on);                      /* REC short press */
 void    liveRec_overdubBegin(void);  void liveRec_overdubEnd(void);
-void    liveRec_forceOff(void);                            /* looper engage */
+void    liveRec_forceOff(void);                            /* looper engage (P1 interim) */
 void    liveRec_eraseBegin(void);    void liveRec_eraseEnd(void);
 uint8_t liveRec_mode(void);                                /* OFF LATCH OVERDUB ERASE */
 uint8_t liveRec_armed(void);                               /* mode != OFF (gates) */
@@ -376,7 +403,7 @@ Sequencer never calls LiveRecord.
 |---|---|---|
 | Voice Morph `Nvm` | menu edit clears the override | none |
 | FX send `Nfx`, audio out `Nou` | override persists until transport restart | menu edit clears that slot's override |
-| Track scale/shuffle (412..425) | override persists | menu edit clears that track's override and refreshes the effective cache |
+| Track length/scale/shuffle (405..425) | override persists | menu edit clears that track's override and refreshes the effective cache (length added in revision 9, Appendix A-21) |
 | `fxm` (Pattern track) | holds until the Scene-rule reset | menu edit clears it; an FX Morph-lane lock beats it for one step (§5.3) |
 
 ### 5.3 Effect parameters (R13)
@@ -402,7 +429,8 @@ eff(i) = menuHold(i) ? menu(i)
     `i` returns to the **menu** value;
   - a menu edit of `i`;
   - a Scene change, reload or re-align (transport reset, double-click
-    realign, Bank/Scene load).
+    realign, Bank/Scene load). A re-align also realigns the FX sequence
+    position to the master clock; it does not reset it (Appendix A-5).
 - **An FX lock** is per step only. The former held Morph lane (a Morph lock
   holding through later unlocked steps) becomes one-step like every other
   lane.
@@ -530,7 +558,7 @@ eff(i) = menuHold(i) ? menu(i)
 | REC short press (released before `DOUBLE_CLICK_TIMEOUT`, 300 ms, the PERF fill delay) | Toggles LATCH on/off **on release** |
 | REC held past the delay | OVERDUB while held. On release the prior state (LATCH or OFF) returns. Entry and exit each start a new take (latches reset). |
 | SHIFT+REC | Latched settings menu (unchanged); REC in the menu closes it without toggling |
-| REC while looping | Ignored; engaging the looper forces record off |
+| REC while looping | P1: ignored, and engaging the looper turns record off (the S080 rule, kept as an interim). P2 lifts it (L-2, `S081_P2_LOOP_WHILE_RECORD.md`) |
 | SHIFT+CLEAR while LATCH or OVERDUB | Live erase (§10); disables overdub |
 
 - Armed while stopped: nothing happens until playback starts; playback then
@@ -577,7 +605,8 @@ eff(i) = menuHold(i) ? menu(i)
 
 ### 8.1 Gates
 
-LATCH or OVERDUB; transport running; looper not engaged; §7 ownership.
+LATCH or OVERDUB; transport running; looper not engaged (P1 interim; P2
+removes this gate, L-2); §7 ownership.
 
 ### 8.2 Capture
 
@@ -768,7 +797,16 @@ mapping.
 
 ### 9.5 Write volume
 
-- One block replacement per write or clear.
+- **Only real changes are written (L3).**
+  - A write is queued only when the step has no entry for the target or a
+    different value.
+  - A clear is queued only when an entry exists.
+  - One foreground `pat_readStepAutomations()` read of the ended step
+    answers all latched targets.
+  - Without this, LATCH would rewrite every fired step's re-stamps on every
+    pattern pass even when nothing changed. That is the bulk of the write
+    traffic in long takes, with or without the looper.
+- One block replacement per write or clear that remains.
 - Latching many parameters on a fast `rtk` can exceed the busy drain (one
   event per 2 ms, 64-entry queue).
 - Drops are counted. A composite per-step op is built only if measured
@@ -915,7 +953,7 @@ Normal SRAM1, static. The schedule fixes exact bytes.
 | Instrument menu-override bitmap, 6 × `u64` (§5.1) | 48 | Sequencer |
 | Effect `menuHold` (64-bit + Morph bit) | ~9 | EffectsManager |
 | FX-erase pending mask (16 × 16 bits) + erase lane mask | ~34 | EffectsManager |
-| **Added** | **~410** | |
+| **Added** | **~410** (revision 9: ~428 in every build plus 16 B DEV-only; Appendix A, minor M-6) | |
 
 Released (not reused, per policy):
 
@@ -1014,8 +1052,11 @@ Each phase lists its §19 subsections.
 
 ## 18. Follow-ups
 
-None open. Every item through F-S is decided (§2). The next step is the
-implementation schedule `S081_P1_IMPLEMENTATION.md`, cut from §19 and §15.
+None open for P1. Every item through F-S, plus L1 and L3, is decided (§2).
+
+Looping while recording, meaning L-2 (lift the lockout), L2 (PERF button
+sharing) and L4 (loop-aware placement and echo), is planned separately in
+`S081_P2_LOOP_WHILE_RECORD.md`. Its open questions are listed there.
 
 ---
 
@@ -1104,11 +1145,19 @@ PRIMASK-published):
    - **Roll end (F-R):** `:2203-2206` changes to end a running roll only
      when the new step has a trigger that fires. The roll engine ends a
      roll by itself after its fill window (`seq_rollRemaining`).
-4. **`seq_fxPublishReset()` callers:** add to
+4. **Realign and the FX sequence** (corrected in revision 9, Appendix A-5):
    `seq_realignActivePatternToMasterClock()` (`:2719`) and
-   `seq_realignTrackToMasterClock()` (`:2820`), the re-align clear for
-   Effect overlays (§3.3-4). These also clear `seq_menuOverride`
-   (transport/realign rule) and bump the epoch.
+   `seq_realignTrackToMasterClock()` (`:2820`) call two new functions:
+   - `seq_fxRealignToMasterClock()` recomputes the FX accumulator, step
+     counter and published step from the master clock, the same mapping as
+     the track realign. This is needed because the FX position drifts after
+     an FX step-scale change.
+   - `seq_requestEffectOverlayReset()` clears the Effect track overlays
+     without touching the FX position.
+
+   Not `seq_fxPublishReset()`: its RESET event invalidates the current FX
+   step and drops the running locks. These sites also clear
+   `seq_menuOverride` (transport/realign rule) and bump the epoch.
 5. **New `seq_menuOverrideSet(slot, local)`:** clears the
    `seq_automation_dirty[slot]` bit and sets the override bit. Foreground
    only; the drain and restore are foreground too, so no PRIMASK is
@@ -1178,7 +1227,9 @@ PRIMASK-published):
 1. **Take boundary.** Start a new take on any of these:
    - an epoch change;
    - a `rtk` change or mode change;
-   - `menu_isStorageBusy()` (any Load: release the target and suspend).
+   - `patSvc_replacePending()` (a Load is replacing Pattern data: release
+     the target and suspend). Revision 9 replaced `menu_isStorageBusy()`,
+     which would have made LiveRecord depend on Menu (Appendix A-11).
 
    A new take:
    - clears `latch`/`dirty`;
@@ -1192,12 +1243,16 @@ PRIMASK-published):
      `seq_setAutomationFilter()`.
    - While `!patSvc_targetOpen(T)`, every write below is dropped and
      counted.
-3. **Ring drain** (`seq_takeRecBoundary()`, one entry = step `N` ended on
-   `track`):
+3. **Ring drain** (`seq_takeRecBoundary()`). An entry marks the start of
+   a step. When a track's next entry arrives, its previous entry, step `N`,
+   has ended; the work below runs for `N` with that entry's fired bit
+   (clarified in revision 11, Appendix A minor M-9):
    - `track == rtk`: run the §9.3/§9.4 step-end table over the set bits of
      `latch`/`dirty`.
      - Value: `liveRec_targetValue7()`.
-     - Existence check for clears: `pat_readStepAutomations()`.
+     - Before any write or clear, one `pat_readStepAutomations()` read of
+       step `N`. A write is queued only if the entry is missing or holds a
+       different value; a clear only if the entry exists (L3).
      - Writes: `patSvc_writeStepAutomation()`; clears:
        `patSvc_removeStepAutomation()`.
      - Erase-bitmap targets present on `N`: removed.
@@ -1215,11 +1270,19 @@ PRIMASK-published):
    (§10.4).
 
 **`liveRec_targetValue7(target)`** reads owner getters (§3.3-10) and the
-shared 7-bit conversions:
+shared 7-bit conversions.
 
-| Target | Value read |
+All values come from the take's origin Scene A: the active Scene, which the
+VOICE, EFFECT and PERF pages display and edit. They never come from the
+target Scene T. Under per-track playback, T = P(rtk) can differ from A, but
+the edit writes A's image and the active-Scene runtime write puts A's value
+on the sounding slot. So A's menu value is what the user hears (Appendix
+A-6). `scl`/`shf` are read from A's Pattern region and are recordable only
+while the viewed Pattern is A.
+
+| Target | Value read (Scene A) |
 |---|---|
-| Instrument | active Scene `instrument_parameters[local]` |
+| Instrument | `instrument_parameters[local]` (Normal endpoint; not `morph_interpolation[]`) |
 | `Nvm` | Morph amount store-7 (127 ↔ 255) |
 | `Nou`, `Nfx` | `scene_getVoiceAudioOut()`, `scene_getVoiceFxSendAmount()` |
 | `7dc` | `scene_getSlot6Track7AmpEnvelopeDecay()` |
@@ -1366,8 +1429,11 @@ shared 7-bit conversions:
 **R12 call sites:**
 
 - `menu_cellCommitValue()` (`:4817`):
-  - INSTRUMENT branch: active Scene in the edit mask, Normal or Morph image
-    → `seq_menuOverrideSet()` before `preset_setInstrumentParameter()`;
+  - INSTRUMENT branch, Normal or Morph image: **one**
+    `seq_menuOverrideSet(cell->slot, cell->descriptor_index)` before the
+    edit-mask Scene loop. The override belongs to the one runtime slot; the
+    edit mask is a set of Scenes, so it is not called per Scene
+    (revision 9, Appendix A-14);
   - SCENE_SETTING `AUDIO_OUT`/`FX_SEND` → the per-slot clears;
   - KIT_SETTING `7dc` → its clear.
 - STEP `len`/`scl`/`shf`: Normal commits at
@@ -1494,8 +1560,12 @@ Every other button passes through unchanged (MODE, SELECT, BAR, ...).
 BAR LEDs; entering PERF restores them from `bh_overlayActive` (as at
 `:1281`).
 
-**Looper:** before every `seq_loopEngage()` call, `liveRec_forceOff()` and
-the REC LED off (replaces the Sequencer-internal call, §3.3-9).
+**Looper:**
+
+- **P1:** before every `seq_loopEngage()` call, `liveRec_forceOff()` and the
+  REC LED off. This replaces the Sequencer-internal call (§3.3-9) and keeps
+  the S080 lockout as an interim.
+- **P2** removes the lockout (L-2, `S081_P2_LOOP_WHILE_RECORD.md`).
 
 ### 19.8 ledHandler
 
@@ -1572,17 +1642,23 @@ cleared under the queue's existing PRIMASK.
 - **Enqueue:** a resetting trigger or `voiceControl_resetOnly()` sets the
   voice's bit. A trigger without reset (roll retriggers 2+) does not touch
   it.
-- **`voiceControl_processPending()`:**
-  - For each popped event: if its voice's bit is set, run
-    `seq_restoreAutomatedParameters()`, clear the bit, then
-    `instrumentManager_triggerTrack()`.
-  - After the ring is empty, run the restore for any bits still set
-    (reset-only renewals, or resets whose trigger entry was dropped), then
-    clear them.
+- **`voiceControl_popPending()`:** inside its existing PRIMASK section,
+  copies the event and tests-and-clears that voice's bit, returning it as a
+  `reset` flag. TIM3 sets bits concurrently, so every read-modify-write of
+  the mask is under PRIMASK (revision 9, Appendix A-13).
+- **`voiceControl_triggerNow(voice, note, vel, reset)`** keeps the existing
+  order:
+  1. `preset_applyDeferredSceneSlotForTrigger()`;
+  2. `seq_restoreAutomatedParameters()`, only if `reset`;
+  3. `instrumentManager_triggerTrack()`, sidechain, LED.
+
+  The restore must not move ahead of the deferred Scene slot apply.
+- **`voiceControl_processPending()`:** pops and triggers as above. After the
+  ring is empty, it takes the remaining mask under PRIMASK (copy, store 0)
+  and runs the restore for each bit taken: reset-only renewals, and resets
+  whose trigger entry was dropped.
   - All of this precedes `seq_drainPendingAutomation()` (`main.c:212-213`),
     so a step's own automation still lands after its reset.
-- **`voiceControl_triggerNow()`** no longer calls the restore
-  unconditionally.
 - **Edge (accepted):** if the foreground falls behind, a reset bit set by
   step N+1 can be consumed by a still-queued roll retrigger of step N within
   the same pass. Both run before the drain, so the only effect is that that
@@ -1619,3 +1695,347 @@ cleared under the queue's existing PRIMASK.
   - S075 F3 amendment;
   - stale BAR1/BAR2 MIDI line;
   - live-record invariants.
+
+---
+
+## Appendix A — Schedule review corrections (2026-10-13)
+
+The first `S081_P1_IMPLEMENTATION.md` was reviewed against this plan and the
+code at `02553df`. Each item below records what was wrong, how it was fixed,
+and where. "Schedule" means `S081_P1_IMPLEMENTATION.md` revision 2. Items
+marked **plan error** were mistakes in this plan; the plan body is corrected
+too.
+
+### A-1 Automation-only steps stopped queueing automation (schedule A1-3c)
+
+- **Problem:** the schedule moved `seq_queueStepAutomations()` out of the
+  step-allowed block and called it only where triggers fire. Steps with
+  automation but no trigger would never play their automation. That breaks
+  `PATTERN_DYNAMIC_STACK.md` §6.1 and §5.8 of this plan.
+- **Fix:** the call stays in the step-allowed block. It is skipped only when
+  this step's own trigger was deferred (`deferred_this_step`); then
+  `seq_fireDeferred()` queues the entries at the deferred fire. A deferral
+  still pending from an earlier step is fired first when the next step
+  queues automation, so entries stay in step order.
+- **Where:** schedule A1-3b, A1-3c.
+
+### A-2 The menu override would never clear at a trigger (schedule A1-4c)
+
+- **Problem:** `seq_restoreAutomatedParameters()` returns early when the held
+  mask is zero, and `seq_menuOverrideSet()` clears the held bit on every menu
+  edit. A clear placed after the held-mask clear was skipped exactly when an
+  override existed.
+- **Fix:** `seq_menuOverride[slot] = 0u` runs before the early return.
+- **Where:** schedule A1-4c.
+
+### A-3 Incomplete `seq_triggerVoice()` caller table (schedule A1-2b)
+
+- **Problem:**
+  - It missed `SomGenerator.c:139`, and `seq_setRoll()` at `:4177` (still
+    present in A1). Both would break the build.
+  - It listed `seq_previewVoice()`, which calls `voiceControl_noteOn()`
+    directly.
+  - It gave the overlay repeat timer reset = 1 for every hit.
+- **Fix:** a complete table from `grep`.
+  - The overlay timer at `buttonHandler.c:950` passes
+    `bh_overlayCount != 0xFFu`: 1 for the flam main, 0 for roll repeats
+    (§5.8).
+  - SOM passes 1 (it must compile; its behaviour is unchanged).
+- **Where:** schedule A1-2b.
+
+### A-4 The early flush lost automation and rolls (schedule A1-3b/A1-3d)
+
+- **Problem:** "flush the pending deferral (fire it now)" fired a plain hit
+  only. With automation now queued at fire time, a flushed step would lose
+  its automation, and a flushed roll step would play a single hit.
+- **Fix:** one `seq_fireDeferred(track)` routine, used by both the expiry
+  path and every early flush. It queues the step's automation, then starts a
+  roll (`seq_rollBegin()`) or fires a plain hit, with reset = 1.
+- **Where:** schedule A1-3b, A1-3d.
+
+### A-5 Realign must realign the FX sequence, not reset it (schedule A2-4) — plan error
+
+- **Problem:** §19.1-4 of this plan said to call `seq_fxPublishReset()` from
+  the realign functions. That sends an FX RESET, which invalidates the
+  current FX step and leaves the FX accumulator un-seeded, so the FX
+  sequence would drop its locks and stay out of phase.
+- **Also:** realign must not ignore the FX sequence (user, 2026-10-13).
+  `seq_fxStepCounter` counts boundaries since the transport reset, so after
+  an FX step-scale change the FX sequence drifts against the Pattern.
+  Realign has to put it back onto the master grid.
+- **Fix:** two new functions, called at the end of both realign functions:
+  - `seq_fxRealignToMasterClock()`: under PRIMASK, same mapping as the track
+    realign (`position = (elapsed << 8) / interval`,
+    `accumulator = remainder`, `counter = position + 1`); publishes the
+    step for `position` as a STEP event; `sel` is untouched.
+  - `seq_requestEffectOverlayReset()`: sets only the overlay reset latch.
+
+  The per-track realign realigns the FX sequence too (idempotent when
+  already aligned).
+- **Where:** schedule A2-4a/b/c; plan §5.3 and §19.1-4 corrected.
+
+### A-6 Value source for recorded automation (schedule F-2a)
+
+- **Problem:** the schedule read Instrument values from
+  `morph_interpolation[]` (the Morph-interpolated runtime image, not the
+  Normal endpoint), and from the target Scene T.
+- **Per-track playback** (user note): the recording track may play a Scene
+  T = P(rtk) different from the active Scene A.
+  - The VOICE page reads and edits A's image (`scene_getActiveIndex()`,
+    `menu.c` ~4770).
+  - The edit's active-Scene runtime write puts A's value on the sounding
+    slot.
+  - T's image still holds its own, unedited value.
+  - So what the user hears is A's menu value.
+- **Fix:**
+  - `liveRec_targetValue7()` reads every value from the take's origin
+    Scene A (captured at the take start). Instrument values come from
+    `instrument_parameters[local]` (the Normal endpoint).
+  - `scl`/`shf` come from A's Pattern region. They are recordable only while
+    the viewed Pattern is A, because with FOLLOW off a single SEQ click
+    changes the viewed Scene without changing playback.
+  - Ownership is unchanged: an Instrument target needs the slot's played
+    Scene = T and the same instrument type in A and T; Effect/Scene targets
+    need T = A.
+- **Where:** schedule F-1c, F-2a; plan §19.2 table corrected.
+
+### A-7 Phase order did not build (schedule B-3, B-7, E-3, G-5)
+
+- **Problem:**
+  - B removed `seq_recordTrigger()` while its MIDI caller changed only in E.
+  - B removed `seq_eraseActive` and `seq_setErasingMode()`, but no step
+    rewrote the TIM3 erase branch that uses them.
+- **Fix:**
+  - The MIDI call site moves to B (B-7a), calling the `liveRec_triggerIn()`
+    stub; MIDI recording is inactive from B to E (the old path only
+    recorded bar 1).
+  - The erase chord, the TIM3 erase branch and the old-erase removals all
+    move to G-5. Phase B keeps the old erase working, gated by
+    `liveRec_armed()`.
+  - The copy/clear and AutoSave gates keep a `seq_eraseActive` term until
+    G-5.
+- **Where:** schedule B-2e, B-3, B-6, B-7a, B-7d, B-7f, E-3, G-5, dependency
+  order.
+
+### A-8 No step for the TIM3 changes in `seq_advanceTrackStep()`
+
+- **Fix:** new schedule section C-9:
+  - the fired bit (bit 15 and condition passed, known at the step start)
+    and the ring push;
+  - the side-effect-free condition check for a muted `rtk`;
+  - the echo and live-hold trigger skips.
+
+  New C-10 covers echo-mark expiry: consumed, pass wrap, transport, epoch
+  sites, length/play-mode change.
+- **Where:** schedule C-9, C-10.
+
+### A-9 No step for the step-end logic
+
+- **Fix:**
+  - F-5: the LATCH/OVERDUB tables, existence checks before clears, and
+    `fil` on written steps;
+  - E-4: fast-roll spans from the ring;
+  - G-6: knob-erase removals.
+- **Where:** schedule E-4, F-5, G-6.
+
+### A-10 STEP toggles escaped the silent refusal (Q13)
+
+- **Problem:** H-2 covered knobs and the encoder only.
+  `buttonHandler_setRemoveStep()` writes bit 15 directly (`pat_toggleStep()`
+  at `:1111`).
+- **Fix:** H-2b adds the refusal there. `buttonHandler_selectActiveStep()`
+  only selects and needs none.
+- **Where:** schedule H-2b.
+
+### A-11 LiveRecord called Menu (schedule H-1) — plan error
+
+- **Problem:** this plan's §19.2 used `menu_isStorageBusy()` for the Load
+  suspend, which breaks "LiveRecord never calls Menu".
+- **Fix:** new `patSvc_replacePending()` (true while a filesystem Pattern
+  replacement is prepared or applied). The load's completion bumps the
+  epoch through `seq_alignActivePatternToScene()`.
+- **Where:** schedule D-5b, H-1; plan §19.2 corrected.
+
+### A-12 Unscheduled items
+
+- Recorded-step LED by absolute step: B-8c, with a new
+  `seq_markRecordedStep()` (the Sequencer owns `seq_ledState`).
+- `rtk` cell (B-5c):
+  - dtype → 0..6;
+  - reuse `TEXT_AUTOMATION_TRACK` as `rtk`/`RecTrk`;
+  - display reads `liveRec_recordTrack()` directly (no mirror);
+  - commit through a `menu_parseGlobalParam()` case;
+  - excluded from the RECORDING_PAGE settings-dirty mark (runtime only).
+- `patSvc_recordStep()` submit, `patSvc_requiredChunks()` and
+  `patSvc_executeEvent()` cases: D-4e.
+- FX lock exclusion at the FX step start: G-3c. Who sets the erase lanes:
+  G-3d.
+- Live-hold ownership (LiveRecord only): E-5.
+- Slow-roll rule (rolls at or slower than the step rate recorded hit by
+  hit): E-1.
+- Drop counters and trace codes, DEV-only: H-3.
+
+### A-13 Reset ordering and atomic mask (schedule A1-1e/f) — fixed in both documents
+
+- **Problem:** the restore was moved ahead of
+  `preset_applyDeferredSceneSlotForTrigger()`, reversing today's order. The
+  mask read-and-clear in `processPending()` was not under PRIMASK, although
+  TIM3 sets bits.
+- **Fix:** `voiceControl_triggerNow()` gains `reset` and keeps the order
+  apply → restore (if reset) → trigger. `voiceControl_popPending()` tests
+  and clears the voice's bit inside its PRIMASK section. The end-of-pass
+  leftovers are taken under PRIMASK.
+- **Where:** schedule A1-1e, A1-1f; plan §19.15 corrected.
+
+### A-14 Override call per slot, not per Scene (schedule A1-7a) — fixed in both documents
+
+- **Problem:** "for each slot in the active Scene's edit mask" mixed Scenes
+  and slots.
+- **Fix:** one `seq_menuOverrideSet(cell->slot, cell->descriptor_index)`
+  before the edit-mask Scene loop.
+- **Where:** schedule A1-7a; plan §19.6 corrected.
+
+### A-15 Looper and `qnt trk` (schedule A3-3c) — decided: keep (L1)
+
+**What `trk` would change in the looper:** only where each looped track's
+loop window starts. It does not change the timing of any step inside a loop.
+
+- **Wrap.** At each wrap (`(elapsed − anchor) % L == 0`) a track restores its
+  snapshot: its state just before the anchor tick's DDA advance. The DDA
+  then replays from there. So each track replays the window
+  `[anchor, anchor + L)` with every step at its original offset from the
+  anchor.
+- **All tracks share the period L.** Each track's content at real time `t`
+  is its original content at a time congruent to `t` modulo L. Steps that
+  sounded together still sound together, and every step keeps its position
+  modulo L. This holds whether the tracks share one anchor or each has its
+  own.
+- **The anchor only selects the content.** It decides which window is
+  replayed, which is the step caught at the loop start. Today:
+  - `off`: one anchor for the gesture, the tick at which the **fastest**
+    track last stepped. A slower track can then be anchored mid-step, so its
+    current step's hit is not caught.
+  - 1/8..1/64: the last grid boundary.
+  - `trk`: each track's **own** last step start, so every track catches its
+    current step. That is the purpose stated for looper quantize.
+- **Existing edge, unchanged:** when a track's step is longer than the loop
+  (for example a 1/2-note step under a 1/16 loop), its anchor lies more than
+  one loop length back. The track jumps back at the next wrap and re-plays
+  that step's start every loop. That is the accepted S080 behaviour for
+  quantise boundaries more than one length back.
+- **Implementation:** the engine already stores one anchor per track
+  (`seq_loopAnchor[7]`). Only the gesture computes a single anchor:
+  `seq_loopEventAnchor()` is called once in `seq_loopSnapshotTracks()`
+  (`sequencer.c:3133`). Per-track anchors for `trk` mean computing the anchor
+  and the `back` offset inside that function's per-track loop. That is
+  binding S080 code (master-clock anchoring), so it is a deliberate change.
+- **Schedule text error:** A3-3c says `trk` "replaces the fastest-track
+  heuristic for NO_QUANTISATION". It does not; `off` keeps that behaviour.
+  Revision 11 rewrites A3-3c: `seq_loopEventAnchor()` is unchanged for
+  `off` and 1/8..1/64, and for `trk` the per-track anchor is computed
+  inside `seq_loopSnapshotTracks()`.
+
+### A-16 Overlay fixes used names that do not exist (schedule A3-4)
+
+- **Problem:** the schedule used `LED_BARLT`, `LED_BARRT`, `bh_overlayType`
+  and `led_setLed`.
+- **Fix:**
+  - `LED_BAR1`/`LED_BAR2` and `led_setValue()`, with the same expressions
+    as `buttonHandler_loopCheckDisengage()`.
+  - The switch-while-held mechanism is specified, with new
+    `bh_overlayHeldType` (+1 B), and F-O (toggle off) added.
+  - Interpretation recorded: single → roll starts repeating one interval
+    after the switch, with no hit at the switch itself.
+- **Where:** schedule A3-4a, A3-4b.
+
+### A-17 REC button details (schedule B-2)
+
+- `bh_recPressTick` is `uint16_t`, with the same wrap-safe subtraction as
+  the fill hold (`time_sysTick` is `volatile uint16_t`).
+- The REC LED flash while the SHIFT+REC menu is open and armed is added
+  (B-2f).
+- Every use of the removed `bh_state.seqRecording` is listed with its
+  replacement (`:1846`, `:1963`, `:2404-2406`, `:2420`).
+- **Where:** schedule B-2b, B-2e, B-2f.
+
+### A-18 Pattern Stack Service return values (schedule D)
+
+- `pat_recordStep()` returns success, for the service's failure
+  classification.
+- The same-step "last write wins, grace never replaces its main" rule moves
+  to LiveRecord (E-1).
+- `patSvc_requestTarget()` returns 0 when refused (exclusive claim,
+  filesystem replacement, non-resident Scene).
+- **Where:** schedule D-2a, D-5b, E-1.
+
+### A-19 Hit kinds (schedule E)
+
+- `LIVEREC_HIT_ROLL_HIT` joins the kind list (needed for slow rolls
+  recorded hit by hit).
+- The flam main is reported from `buttonHandler_overlayTick()`, where it
+  fires; the grace from `buttonHandler_overlayTrigger()`.
+- **Where:** schedule B-1, E-1, E-2a, E-2b.
+
+### A-20 Erase routing (schedule G-1a, G-2a)
+
+- TRACK presses in Load/Save, global settings and SOM_GEN are consumed with
+  no action; SOM_GEN SEQ presses too.
+- Knob erase is its own branch before the copy/clear pot branch, which
+  never runs while armed.
+- **Where:** schedule G-1a, G-2a.
+
+### A-21 Track length override (schedule A1-5c, A1-7d) — plan error
+
+- **Problem:** this plan's §5.2 cleared only the scale/shuffle overrides on
+  a menu edit. R12 covers every non-Instrument parameter, so a `len` edit
+  must clear the length override (targets 405..411) too.
+- **Fix:** `presetMorph_clearTrackParamStepOverride()` takes LENGTH as well,
+  and the `len` commits call it.
+- **Where:** schedule A1-5c, A1-7d; plan §5.2 corrected.
+
+### A-22 Looper not locked out by record or erase (decision L-2) — moved to P2
+
+Revision 11: this work now lives in `S081_P2_LOOP_WHILE_RECORD.md`. The P1
+schedule is back to the interim lockout:
+
+- B-4: `liveRec_forceOff()` before `seq_loopEngage()`;
+- B-2a: REC ignored while looping;
+- E-1: looper gate.
+
+The record of the revision 10 decision follows.
+
+
+- **Decision (user):** the looper may run while recording or erasing.
+  Looper actions are not recorded; looping only moves playheads.
+- **Schedule changes:**
+  - B-2a: REC is no longer ignored while looping;
+  - B-4: the record-off is removed, not moved;
+  - B-2e: the `:1846` row;
+  - E-1: no looper gate.
+- **What recording must handle while a loop runs:** follow-ups L2–L4.
+  - Loop-aware placement for forward snaps.
+  - Echo marks expire at the loop wrap.
+  - Short loops repeat the same steps, so step-end writes must skip values
+    already stored.
+  - In PERF, VOICE and BAR presses are shared with the looper.
+- **S080 documentation to update at close:**
+  - `PATTERN_DYNAMIC_STACK.md` §6.5: the `seq_loopEngage()` row says "turns
+    recording off";
+  - `MODULE_INTERCHANGE_SPEC.md` PERF surface: "Recording is turned off on
+    engage and REC is ignored while looping";
+  - `080_SESSION_HANDOFF_LOG.md` §2.3 is history and stays as written.
+
+### Minor corrections
+
+| # | Fix | Schedule |
+|---|---|---|
+| M-1 | Line references corrected (`seq_rollBegin()` first hit `:1972`, flush `:2259`, `triggerNow` `:153`, and others) | A1-1e, A1-2b, A1-7a, E-2 |
+| M-2 | The A1-4e table and snippet agree: per-track sites clear only their slot | A1-4e |
+| M-3 | Roll-table comment no longer guesses at history; overlay credited to S080, not S079; `SEQ_PENDING_TYPE_FX_STEP_BIT` removed, not "kept but unused" | A3-1a, A3-5e, A2-3a |
+| M-4 | C-2b no longer claims filesystem/copy-clear still read `seq_recordActive` | C-2b |
+| M-5 | FX erase pending mask is filled in the foreground render path, not "at TIM3 speed" | G-3b |
+| M-6 | RAM summary: no double-counted staging table; drop counters DEV-only (logging-allocation policy); new items added. Totals: about 428 B added in every build, plus 16 B DEV-only, about 80 B released | RAM summary |
+| M-7 | Dependency order: C and D are independent; both precede E | Dependency order |
+| M-8 | Phase I document list completed from plan §19.14; the nonexistent "MEMORY.md §5.1" reference removed | I-1 |
+| M-9 | (revision 11) Ring semantics made consistent: TIM3 pushes an entry when a step starts; LiveRecord treats a track's next entry as the end of its previous step. Before, C-9a pushed at step start while F-5/E-4 and §19.2 read entries as "step ended" | C-9a, E-4, F-5; plan §19.2 |
+
