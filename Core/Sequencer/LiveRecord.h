@@ -96,6 +96,9 @@ uint8_t liveRec_patternWriting(void);
 void    liveRec_onActiveTrackChanged(uint8_t track);
 void    liveRec_setRecordTrack(uint8_t track);
 uint8_t liveRec_recordTrack(void);
+/* Is the active Scene's Pattern closed for editing? True only while live
+** record or erase is writing (armed and running) AND the recording target
+** T = P(rtk) differs from the active Scene A (S081 Q13, P1B item 1). */
 uint8_t liveRec_activePatternLocked(void);
 
 /* Triggers (buttonHandler overlay now, MidiParser later). */
@@ -108,9 +111,17 @@ void    liveRec_paramIn(uint16_t target9, uint8_t source);
 
 /* Erase gestures (buttonHandler / Menu). */
 void    liveRec_eraseParam(uint16_t target9, uint8_t fxLane);
-void    liveRec_eraseSeqHeld(uint8_t held);
-/* FX-mode SEQ hold erase: every lock of the FX sequence (S081 §10.2). */
+/* SEQ hold erase on the active track (VOICE/STEP; S081 §10.2, F7). `track` is
+** the active track; the mask is captured on the first press. */
+void    liveRec_eraseSeqHeld(uint8_t track, uint8_t held);
+/* FX-mode SEQ hold erase: counted per held SEQ button; while nonzero every FX
+** lock lane is erased. Knob-erase lanes are separate (S081 §10.2, P1C 2/10). */
 void    liveRec_eraseFxSeqHeld(uint8_t held);
 void    liveRec_eraseTrackHeld(uint8_t track, uint8_t held);
+/* Release every held erase gesture (SEQ/TRACK hold counts, specials, full);
+** keeps erase mode, the knob-erase bitmap and the knob-erase FX lanes (S081
+** §10.1, P1B item 8, P1C 2/16). Callers: handleModeButtons(), eraseEnd,
+** forceOff. */
+void    liveRec_eraseReleaseHeld(void);
 
 #endif /* LIVEREC_H_ */

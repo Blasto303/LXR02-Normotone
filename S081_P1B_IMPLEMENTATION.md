@@ -13,6 +13,56 @@ and a comment block to place next to the change as documentation-in-place.
 Where a function is declared in a header, the same comment block (or its
 first paragraph) goes above the declaration.
 
+---
+
+## Implementation log (P1B)
+
+Executed against `dev-ph6-cleanup`, on top of the committed P1 work
+(`d21e245`). Each entry records what landed; every change carries the adjacent
+comment block from its schedule step. `make all` is the per-phase gate. The
+final build reports the Flash headroom from `tools/link_budget.py`.
+
+### Phase F1 — done (2026-10-13)
+
+- **SQ-1** muted-rtk fired bit now also requires bit 15.
+- **SQ-2** `seq_loopShiftPosition()` body moved to `seq_shiftPositionQ8()`
+  (returns the step-advance count); `seq_loopShiftPosition()` is a whole-tick
+  wrapper.
+- **SQ-3** `seq_projectStep()` replaced by `seq_placeFromSnapshot()` +
+  `seq_place_t`.
+- **SQ-4** `seq_track_time_t.nowUs`, captured inside the PRIMASK section.
+- **SQ-5** `seq_quantiseTick(tick, frac8)` master-grid only; `trk`/`off`
+  return unchanged.
+- **SQ-6/SQ-7** `seq_echoDeadline[7]`; `seq_suppressStepOnce(track, step,
+  aheadTicks)` sets it under PRIMASK; the echo block expires a stale mark before
+  testing it.
+- **SQ-8/SQ-9** `seq_trackShuffleMuteMask`; `seq_cancelPendingTrigger(track,
+  step)` mutes only the matching deferral; `seq_fireDeferred()` queues the
+  automation then returns if muted; a fresh deferral clears the mute bit.
+- **SQ-10** `seq_sceneEpoch` + `seq_getSceneEpoch()`, bumped at the three Scene
+  sites only.
+- **SQ-11** the early deferral flush runs only when the step queues automation.
+- **SQ-12** TIM3-shared live-record state is `volatile`; `seq_takeRecBoundary()`
+  reads the head once.
+
+LiveRecord was adapted minimally (a shim in `liveRec_place()` plus updated call
+signatures) so F1 builds; F3 replaces the shim.
+
+Gate: `make all` clean.
+
+### Phase F2 — done (2026-10-13)
+
+- **PD-1** `pat_recordStep()` stores velocity 100 and fill 100 as "absent".
+- **PT-1** `PAT_TRACE_STAGE_LIVEREC_DROP = 'W'`.
+- **FX-1** `effects_storeValue7()` (WIDE8 inverse).
+- **FX-2** `effects_erasedLanes[16]` replaces the two combined accumulators.
+- **FX-3** `effects_takeErasedLocks(uint8_t *step, uint16_t *laneMask)` returns
+  one step at a time.
+
+Gate: `make all` clean.
+
+---
+
 **Authority:**
 
 - `S081_P1_LIVE_RECORD.md` (revision 11), especially §5.8, §7, §8, §9, §10,
@@ -23,6 +73,72 @@ first paragraph) goes above the declaration.
 
 **Build gate after every phase:** `make all` clean, then
 `python3 tools/link_budget.py arm-none-eabi-nm build/lxr02.elf`.
+
+---
+
+### Phase F3 — done (2026-10-13)
+
+- **LR-1** `liveRec_activePatternLocked()` is true only while writing and T != A.
+- **LR-2** the drain erase filter now gets `liveRec_erase` (was `liveRec_dirty`).
+- **LR-3/4/5** roll state keyed to `liveRec_rollTrack`; span writer uses it and
+  carries `fil`; position/Scene breaks end the roll through `liveRec_endRoll()`.
+- **LR-6** `liveRec_commitHit(track, pl, note, noteIsDefault, vel, roll, setFil)`
+  (ahead → `seq_suppressStepOnce`, current → `seq_cancelPendingTrigger`).
+- **LR-7** `liveRec_triggerIn()` rewritten: slot-type check, live capture with
+  `liveRec_frac8()`, master-grid/trk/off delta, `seq_placeFromSnapshot()`,
+  `liveRec_placeFlam()` for quantized/un-quantized flams, roll classify.
+- **LR-8** `liveRec_eraseSeqHeld(track, held)` with a held-count + captured track.
+- **LR-9** `liveRec_service()` split into a Scene epoch (new take) and a position
+  epoch (capture state only); override requested only while writing; erase masks
+  re-pushed each pass.
+- **LR-10/11** `liveRec_targetOwned()` + the `liveRec_paramIn()` ownership gate.
+- **LR-12** `liveRec_writeStep()` carries `noteIsDefault` and returns success.
+- **LR-13/14/15** `liveRec_endRoll()` (release fill, plain-trigger fallback) and
+  `liveRec_rollRateChange()` re-classification (fast/slow, single->roll promotion).
+- **LR-16** Effect values stored through `effects_storeValue7()`.
+- **LR-17** erase masks gated by ownership (T-track bits; FX lanes only when T==A).
+- **LR-18** DEV-only `liveRec_drop()` at record/ownership/handover/step-end drops.
+- **LR-19** FX erase drained one step at a time.
+- **LR-20** header: `liveRec_eraseSeqHeld(track, held)` and
+  `liveRec_eraseReleaseHeld()`.
+
+Gate: `make all` clean.
+
+### Phase F4 — done (2026-10-13)
+
+- **BH-1/BH-2** the erase router implements the per-mode press/release table
+  (SEQ: active track in VOICE/STEP, FX in FX, consumed elsewhere; VOICE: track in
+  the four modes; PLAY: plain toggle).
+- **BH-3..BH-6** SHIFT/CLEAR hold flags set/cleared before early exits; SHIFT/CLEAR
+  LEDs lit during erase; `buttonHandler_liveEraseEnd()` is the single exit
+  (restores the REC LED, restarts the automation search); `handleModeButtons()`
+  calls `liveRec_eraseReleaseHeld()`.
+- **BH-7** the looper record-off runs after `seq_loopEngage()` and only when the
+  loop engaged.
+- **BH-8** `bh_overlayNoteDefault` threaded through the overlay reports.
+
+Gate: `make all` clean.
+
+### Phase F5 — done (2026-10-13)
+
+- **MN-1** `menu_cellClearTarget(page, position)` split out; `menu_knobClearTarget()`
+  is the pot wrapper.
+- **MN-2** `menu_encoderChangeParameter()` records via `menu_liveRecRecordCell`.
+- **MN-3** `menu_liveRecRecordCell(page, position)` with the Effect-Morph-view and
+  STEP-view-differs-from-A exclusions.
+- **MN-4** the rtk display/edit seed reads `liveRec_recordTrack()`.
+- **MN-5** knob erase no longer drops the Pattern-wide underline.
+
+Gate: `make all` clean. Flash headroom 186,172 B (190,532 B at P1 end).
+
+### Notes / deviations
+
+- LR-18 ring-full drops are counted in the Sequencer ring push, not LiveRecord,
+  so they are absent from `liveRec_drops`.
+- LR-13 release fill uses the placement delay (0..99, clamped to 1..100).
+- LR-20 partial: the `note_is_default` header comment already read as honoured;
+  the `liveRec_activePatternLocked()` header comment was left as P1 text.
+- F6 host tests and F7 documentation are not run here; F7 is prose only.
 
 ---
 
@@ -1631,3 +1747,290 @@ locals.
 F1 and F3 meet in `liveRec_triggerIn()`. If F1 builds alone, keep the P1
 `liveRec_place()` call compiling through a temporary shim, and remove the
 shim in F3.
+
+---
+
+## Code review — P1B implementation (2026-10-13)
+
+**Scope:** the uncommitted P1B working tree on top of `d21e245`, covering
+`sequencer.c/.h`, `LiveRecord.c/.h`, `buttonHandler.c`, `menu.c`,
+`EffectsManager.c/.h`, `PatternData.c` and `PatternTrace.h`. Each step was
+checked against SQ-1..SQ-12, PD-1, PT-1, FX-1..FX-3, LR-1..LR-20, BH-1..BH-9
+and MN-1..MN-5 above, and against plan §5.8, §7, §8, §9 and §10.
+
+**Verdict:** most of the schedule landed as written, and the P1 must-fix
+items 1–13 are resolved in code. **Five defects block the F6 hardware
+matrix:**
+
+- two are in live erase (FX lanes);
+- one is in menu recording;
+- one is in roll recording;
+- one is in the SHIFT/CLEAR chord.
+
+All five are small and local. Nine minor items follow them; none blocks F6.
+
+### Must-fix
+
+**1. FX erase lanes 8–15 are lost — `LiveRecord.c:177-179` (LR-17, item 28).**
+`liveRec_pushEraseMasks()` passes the lane mask to
+`effects_setLiveEraseLanes()` through a `(uint8_t)` cast. The 16-bit mask is
+cut to 8 bits:
+
+- an FX-mode SEQ hold (`0xFFFF`) erases only lanes 0–7;
+- a knob erase on a lane at 8 or above does nothing.
+
+Fix: change the cast to `(uint16_t)`.
+
+**2. Knob-erase FX lanes are wiped by an FX SEQ release or a mode change —
+`LiveRecord.c:1156`, `:1187` (LR-20, §10.2).**
+The knob erase (`:1115`, `|=`) and the FX-mode SEQ hold (`:1156`, `= held ?
+0xFFFF : 0`) share `liveRec_eraseFxLanes`. As a result:
+
+- releasing an FX SEQ hold sets the mask to 0;
+- `liveRec_eraseReleaseHeld()` (`:1187`, called on every MODE press) also sets
+  it to 0.
+
+Both drop knob-erase lanes that §10.2 keeps "until erase ends". LR-20 said
+explicitly "not the knob-erase lanes".
+
+Fix:
+
+- add `static uint16_t liveRec_eraseKnobFxLanes` (+2 B);
+- `eraseParam` sets bits in it;
+- the FX SEQ hold keeps its own `0xFFFF`/0 term;
+- push `knob | hold`;
+- `eraseReleaseHeld()` and `eraseFxSeqHeld(0)` clear only the hold term;
+- `eraseEnd()` and `forceOff()` clear both.
+
+**3. The recordable-page exclusion tests the wrong variable —
+`menu.c:14132` (MN-3, items 14/19).**
+`menu_liveRecRecordCell(page, position)` compares `page` with
+`PERFORMANCE_PAGE`, `RECORDING_PAGE`, `MENU_MIDI_PAGE`, `LOAD_PAGE` and
+`SAVE_PAGE`. Both callers pass the sub-page index
+(`(menuIndex & MASK_PAGE) >> PAGE_SHIFT`), not the top-level page, so:
+
+- on PERF the exclusion no longer fires, and `Nvm` Morph edits that resolve
+  through `menu_cellClearTarget()` are recorded (spec: PERF is never
+  recorded);
+- on any page whose sub-page index happens to equal 7, 8, 9, 10 or 14, edits
+  are silently not recorded.
+
+P1 tested `menu_activePage`. Fix: test `menu_activePage` again; `page` stays
+only as the `menu_cellClearTarget()` argument.
+
+**4. A roll end is written at the wrong place and timing —
+`LiveRecord.c:850-890` (LR-13, item 16).**
+
+- **Quick release (`liveRec_rollHits == 0`):** the plain trigger is written at
+  the *release* step with the *release* delay. LR-13 says "rewrite the start
+  step". The start step keeps its roll (fill 100), and a stray trigger lands
+  where the button was released.
+- **Normal release:** the end step is written with `timing = pl.delay`, which
+  micro-times the step by the release offset.
+  - A step the roll spanned into starts at its boundary, so its timing must
+    be 0.
+  - When the release lands on the start step, the start's own delay must be
+    kept.
+  - Today it overwrites a correctly placed start with the release offset.
+
+The start step is already kept in `liveRec_rollStep` (`:1004`), but the start
+delay is not stored. This is a gap in my LR-13 sketch, not only in the
+implementation.
+
+Fix:
+
+- add `liveRec_rollStartDelay` (+1 B), set alongside `liveRec_rollStep`;
+- `rollHits == 0`: write `liveRec_rollStep` with `liveRec_rollStartDelay`,
+  roll 0, fill 0;
+- otherwise: timing is `(pl.step == liveRec_rollStep) ? liveRec_rollStartDelay
+  : 0`, with roll and fill as now.
+
+**5. Live erase can stay on with both keys released —
+`buttonHandler.c:2711-2721`, `:3217-3231` (BH-4, item 12, §10.3).**
+
+1. In `BUT_REC` press, the SHIFT+REC menu test (`:2711`) comes before the
+   ERASE test (`:2721`). While erase is on, SHIFT is normally held, so REC
+   opens the SHIFT+REC menu. §10.3 says "Erase enabled, then REC held →
+   Nothing".
+2. In `BUT_SHIFT` release, the consume break (`:3220`) and the latched-menu
+   break (`:3223`) both run *before* the ERASE block (`:3231`).
+
+Confirmed sequence:
+
+1. SHIFT+CLEAR turns erase on.
+2. REC opens the menu.
+3. CLEAR is released; SHIFT is still held, so erase is kept.
+4. SHIFT is released; the menu is open, so the handler breaks.
+
+Erase is now on with no key held and both LEDs lit. Only another CLEAR press
+and release gets out.
+
+The same happens if SHIFT+REC opened the menu first and CLEAR was then
+pressed with SHIFT still held, because the COPY press calls
+`liveRec_eraseBegin()` without testing for the menu.
+
+Fix:
+
+- move the ERASE test above the SHIFT+REC test in `BUT_REC` press;
+- in `BUT_SHIFT` release, run the erase-end test (`!bh_clearHeld` →
+  `buttonHandler_liveEraseEnd()`) before the consume and menu breaks;
+- the breaks keep their LED handling otherwise.
+
+### Minor
+
+6. **`trk` flam grace is placed from the unsnapped time —
+   `LiveRecord.c:820-824`.** The main hit is snapped to the track's step
+   (`snapToStep = 1`), but the grace uses `mainDeltaQ8 - 12*256` with the
+   raw delta, so it lands 1/32 before the *hit*, not before the snapped
+   main. Fix: derive the grace from the main's snapped position (step start
+   + delay) or pass the snapped delta.
+7. **Roll fill is measured from the step start.** When the release lands on
+   the start step of a roll that began late in it, the fill includes the part
+   before the roll started. This disappears once item 4 is fixed if the fill
+   on the start step is computed as `delay − startDelay`. Otherwise accept
+   it and note it in §8.8.
+8. **Un-quantized flam grace uses a stale placement.** `liveRec_gracePl`
+   (`rel`, `ahead`) is from the grace's own capture, but it is committed at
+   main time. A grace that was ahead gets an echo deadline up to 1/32 too
+   late, and one that was current gets a cancel that no longer matches. Both
+   are harmless today, because the deadline overshoots and the cancel is
+   step-matched. Re-place it at commit or document it.
+9. **Dead grace state.** `liveRec_graceDeltaQ8` and `liveRec_graceTick`
+   (`:79-80`, written at `:1016-1017`) are never read; LTO removes them.
+   Delete them.
+10. **Erase SEQ count across a mode change.** `liveRec_eraseReleaseHeld()`
+    zeroes the count, but the old buttons' later releases still route to
+    erase in the new mode:
+    - a VOICE/STEP release decrements a count that a new SEQ press started;
+    - an FX-mode release clears an FX SEQ hold started after the change.
+
+    The FX SEQ hold is also not counted, so releasing one of two held SEQ
+    buttons in FX ends it. Low impact; a per-button held mask would fix both.
+11. **The erase masks are published as two separate writes.**
+    `seq_setEraseMasks()` stores specials and full one after the other.
+    TIM3 can see one updated and not the other for one tick. Benign, as
+    noted before.
+12. **Scene-epoch bump site.** The bump sits in
+    `seq_realignTrackToMasterClock()` (`sequencer.c:3684`) instead of
+    `seq_setTrackPlayedScene()`. It is equivalent while the only caller is
+    the buttonHandler Scene path. Accepted; if a second caller of
+    `seq_setTrackPlayedScene()` appears, move the bump there.
+13. **Ring-full drops are not counted anywhere.** The implementation log says
+    they are counted in the Sequencer ring push, but the push
+    (`sequencer.c:3028-3037`) drops silently. Either add a DEV-only counter
+    there (or bump `liveRec_drops` cause 5 from the push), or correct the
+    log.
+14. **LR-20 header comment.** The `liveRec_activePatternLocked()` comment in
+    `LiveRecord.h:99` still describes P1. Update it to "writing and T ≠ A".
+
+### Verified correct
+
+- **Sequencer:**
+  - SQ-1: the muted-rtk fired bit needs `pat_isStepActive`.
+  - SQ-2: `seq_shiftPositionQ8()` returns the advance count; the loop
+    wrapper uses ×256.
+  - SQ-3: `seq_placeFromSnapshot()` handles:
+    - the shuffle rule (odd step with `off < sh` → previous step, delay 99);
+    - the `trk` snap;
+    - delay ≥ 100 → next step;
+    - `rel`/`ahead`.
+  - SQ-4: `nowUs` is captured inside PRIMASK.
+  - SQ-5: master-grid quantiser.
+  - SQ-6/SQ-7: the echo deadline is set under PRIMASK and a stale mark
+    expires before it is tested.
+  - SQ-8/SQ-9:
+    - only a matching deferral is muted;
+    - `seq_fireDeferred()` queues the automation before the mute return;
+    - a fresh deferral clears the mute bit.
+  - SQ-10: separate Scene and position epochs.
+  - SQ-11: the early flush is gated by the automation count.
+  - SQ-12: `volatile` on the TIM3-shared state; the ring head is read once.
+- **PatternData / trace / Effects:**
+  - PD-1: velocity 100 and fill 100 are stored as absent.
+  - PT-1: stage `'W'`.
+  - FX-1: `effects_storeValue7()` is the WIDE8 inverse.
+  - FX-2/FX-3: per-step lane array and a one-step drain. The writer
+    (`effects_service()` → `effects_seqConsume()`/`effects_seqSelect()`) and
+    the drain (`liveRec_service()`) are both foreground, so there is no race.
+- **LiveRecord:**
+  - LR-1, LR-2, LR-3/4/5 (roll keyed to `liveRec_rollTrack`; spans carry
+    `fil`);
+  - LR-6, LR-7 (apart from minor items 6 and 8), LR-8, LR-9;
+  - LR-10/11 (slot-5 rtk rule, type match, Effect/Scene only when T == A);
+  - LR-12, LR-14, LR-15, LR-16;
+  - LR-17 (apart from must-fix item 1), LR-18 (apart from minor item 13),
+    LR-19.
+- **buttonHandler:**
+  - BH-1/BH-2: per-mode table.
+  - BH-3/BH-4: the hold flags are set and cleared before every early exit.
+  - BH-5, BH-6.
+  - BH-7: record-off only after a real engage.
+  - BH-8: `def` note flag on every report, including the overlay switch.
+  - BH-9: unchanged shape.
+  - Must-fix item 5 is a remaining path, not a regression of BH-3..BH-6.
+- **Menu:**
+  - MN-1: `menu_cellClearTarget()` split.
+  - MN-2: encoder hook after the commit.
+  - MN-3: apart from must-fix item 3, the Effect Morph-view and viewed ≠ A
+    exclusions are correct.
+  - MN-4, MN-5.
+
+### Implementer deviations
+
+- **LR-18 ring-full drops:** accepted outside `liveRec_drops`, but the log
+  entry is inaccurate (minor item 13).
+- **LR-13 fill from the placement delay:** this is the schedule's rule.
+  The real defect is the write position and timing (must-fix item 4).
+- **LR-20 partial:** finish the header comment (minor item 14).
+- **F6/F7 not run:** still pending; see below.
+
+### Build
+
+`make all` is clean with no warnings. `tools/link_budget.py` on the current
+tree:
+
+| Region | Use |
+|---|---|
+| Flash | 567,668 / 753,664 B, headroom **185,996 B** (the log says 186,172 B; this rebuild of the current tree is 176 B larger) |
+| ITCM | 4,168 / 16,384 B |
+| DTCM statics | 4,472 B |
+| FXBUF | 126,592 B, margin 3,712 B |
+
+**RAM, checked with `nm`:**
+
+- The F6 table entries are all present.
+- Not in the table:
+  - the flam grace state kept by the linker (`liveRec_gracePl` 6 B,
+    `liveRec_graceVel` 1 B, `liveRec_graceValid` 1 B);
+  - `liveRec_rollNoteDefault` (1 B);
+  - `liveRec_sceneEpochValid` (1 B).
+- Every-build total: about +61 B against the planned ≈ +51 B.
+- This build has `DEV_MODE_LOGGING` on, so `liveRec_drops` (14 B) is
+  included.
+- The must-fix items add 3 B (`liveRec_eraseKnobFxLanes`,
+  `liveRec_rollStartDelay`).
+- F7 must update the RAM table in `STORAGE_SRAM_MANIFEST.md` with these
+  figures.
+
+### Remaining
+
+1. **Fix must-fix items 1–5.** Items 1 and 3 are one-line fixes; items 2, 4
+   and 5 are local to the cited functions. Clean build after.
+2. **Run F6.**
+   - Run the host test of `seq_placeFromSnapshot()` as scheduled.
+   - Add these rows to the hardware matrix:
+     - FX SEQ hold erases lanes 8–15 (item 1);
+     - an FX knob erase survives an FX SEQ release and a MODE press
+       (item 2);
+     - PERF Morph edits are not recorded (item 3);
+     - a quick roll release leaves a plain trigger on the start step;
+     - a roll spanning steps leaves timing 0 on the end step (item 4);
+     - SHIFT+CLEAR, then REC, then release both keys in either order ends
+       erase (item 5).
+3. **Do F7** as scheduled, including:
+   - `decode_devlogs.py` stage `'W'`;
+   - the `seq_projectStep()` → `seq_placeFromSnapshot()` edit in
+     `S081_P2_LOOP_WHILE_RECORD.md` §3.3 and §4;
+   - the corrected RAM table.
+4. **Item 29** (FX realign on non-resetting Scene changes) still needs your
+   decision.

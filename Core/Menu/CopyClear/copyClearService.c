@@ -854,6 +854,10 @@ uint8_t ccSvc_runPatternPaste(const cc_job_t *job)
                 /* S080 P2 Defect 8a: loopable is part of a track copy. */
                 pat_setTrackLoopable(job->scene, job->track,
                                      pat_trackLoopable(src->scene, src->track));
+                /* S081 P2: the automation ramp mode is part of a track copy. */
+                pat_setTrackAutoSmooth(job->scene, job->track,
+                                       pat_trackAutoSmooth(src->scene,
+                                                           src->track));
             }
         } else if (dst) {
             uint16_t last = (uint16_t)g.dst_first + g.count - 1u;
@@ -1031,6 +1035,8 @@ uint8_t ccSvc_runPatternClear(const cc_job_t *job)
             pat_setTrackPlayMode(job->scene, job->track, 0u);
             /* S080 P2 Defect 8a: a cleared track is loopable again. */
             pat_setTrackLoopable(job->scene, job->track, 1u);
+            /* S081 P2: a cleared track's automation ramps are off again. */
+            pat_setTrackAutoSmooth(job->scene, job->track, 0u);
         }
         ccSvc_release();
         ccSvc_patternChangedUi(job->scene,

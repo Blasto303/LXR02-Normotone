@@ -249,8 +249,24 @@ static uint8_t seq_trackShuffleNote[NUM_TRACKS];
  * seq_trackShuffleDelay/Pending/Vel/Note, seq_queueStepAutomations,
  * seq_rollBegin.
  */
-static uint8_t seq_trackShuffleStep[NUM_TRACKS];
-static uint8_t seq_trackShuffleRoll[NUM_TRACKS];
+static volatile uint8_t seq_trackShuffleStep[NUM_TRACKS];
+static volatile uint8_t seq_trackShuffleRoll[NUM_TRACKS];
+
+/*
+ * Deferred-trigger mute mask (S081 §8.6, P1B item 7).
+ *
+ * What: bit N set means track N's pending deferred trigger fires WITHOUT
+ * sounding: seq_fireDeferred() still queues that step's automation (and the
+ * step reset is skipped, because the live hit already reset the voice), but
+ * no voice trigger and no roll start. Why: since A1-3, a deferred step's
+ * automation is queued only when its trigger fires. Dropping the deferral
+ * (the P1 cancel) lost the step's automation for the pass. Inputs: set by
+ * seq_cancelPendingTrigger() under PRIMASK; cleared by seq_fireDeferred()
+ * and whenever a new deferral is stored. Outputs: read by seq_fireDeferred
+ * (TIM3). RAM: 1 B. Affiliates: seq_trackShufflePending[],
+ * seq_trackShuffleStep[].
+ */
+static volatile uint8_t seq_trackShuffleMuteMask;
 
 /*
  * Per-track repeat count for X:Y conditions (S079 §3.2).
@@ -792,6 +808,61 @@ static uint64_t seq_automation_dirty[INSTRUMENT_SLOT_COUNT];
  * Affiliates: seq_automation_dirty[], presetMorph_writeRuntimeBase().
  */
 static uint64_t seq_menuOverride[INSTRUMENT_SLOT_COUNT];
+
+/*
+ * Automation ramp state (S081 P2, asm; +669 B SRAM1, +2 B DEV-only).
+ *
+ * What: seq_ramps[64] are the running linear ramps. Each slot holds the
+ * track and Instrument target, the from/to 7-bit values, the last value the
+ * service wrote (so a pass writes only when the rounded value changes; user
+ * decision, +128 B), and the start/end times in 1/16 master ticks (low 16
+ * bits, wrap-safe differences; a ramp spans at most one step plus its
+ * deferral, far below 2048 ticks).
+ * seq_rampCtx[7] is TIM3's per-track hand-off:
+ *  - a: the step whose automation applies (A) and the "stepped" flag; the
+ *    foreground ends the track's ramps when it consumes the flag;
+ *  - b: the predicted next played step (B) + 1, 0 when no ramp may start;
+ *  - endQ4: B's predicted apply time.
+ * seq_rampBlockDiv paces the writes to every third DSP block.
+ * Why: plan §5. Free slots are id 0, so zero-initialised storage starts
+ * empty; a zero context has b = 0 (no B). Lifetime: static. Writers: TIM3
+ * (seq_rampStepEvent, seq_fireDeferred, break hooks) for the contexts;
+ * foreground (drain, ramp service, restore) for the slots. The foreground
+ * reads a context under PRIMASK. RAM: 640 + 28 + 1 B every build; 2 B
+ * DEV_MODE_LOGGING (slot exhaustion count). Affiliates:
+ * seq_rampStepEvent(), seq_rampStartIfPaired(), seq_rampService(),
+ * seq_restoreAutomatedParameters().
+ */
+typedef struct {
+    uint16_t id;        /* 0 = free; 1 + ((track << 9) | target) */
+    uint8_t  from;
+    uint8_t  to;
+    uint8_t  last;      /* last value written (start: from, written by drain) */
+    uint16_t startQ4;   /* 1/16 master ticks, low 16 bits */
+    uint16_t endQ4;
+} seq_ramp_t;
+
+/* 9 bytes of fields + 1 byte halfword padding (S081 P2, approved +128 B). */
+_Static_assert(sizeof(seq_ramp_t) == 10u, "ramp slot must stay 10 bytes");
+
+typedef struct {
+    uint8_t  a;         /* bits 0..6 A step, bit 7 = stepped (unconsumed) */
+    uint8_t  b;         /* B step + 1; 0 = no ramp target */
+    uint16_t endQ4;     /* B's predicted apply time */
+} seq_rampCtx_t;
+
+_Static_assert(sizeof(seq_rampCtx_t) == 4u, "ramp context must stay 4 bytes");
+
+#define SEQ_RAMP_SLOTS          64u
+#define SEQ_RAMP_STEPPED        0x80u
+#define SEQ_RAMP_BLOCK_DIV      3u     /* 3 x 0.73 ms DSP blocks = ~2.2 ms */
+
+static seq_ramp_t seq_ramps[SEQ_RAMP_SLOTS];
+static volatile seq_rampCtx_t seq_rampCtx[NUM_TRACKS];
+static uint8_t seq_rampBlockDiv;
+#if DEV_MODE_LOGGING
+static uint16_t seq_rampNoSlotDrops;
+#endif
 /*
  * S081 P1 live-record service state (sequencer side, §19.1).
  *
@@ -825,21 +896,85 @@ static uint64_t seq_menuOverride[INSTRUMENT_SLOT_COUNT];
  *
  * RAM: about 62 B SRAM1. TIM3-visible bytes are single-byte or PRIMASK-published.
  */
-static uint16_t seq_recRing[16];
-static uint8_t  seq_recRingHead;
-static uint8_t  seq_recRingTail;
-static uint8_t  seq_recTrack;
-static uint8_t  seq_recWriting;
-static int8_t   seq_echoStep[NUM_TRACKS];
-static uint8_t  seq_eraseSpecialsMask;
-static uint8_t  seq_eraseFullMask;
-static uint8_t  seq_liveHoldMask;
-static uint32_t seq_ppqStampUs;
-static uint32_t seq_ppqPeriodUs;
-static uint8_t  seq_playbackEpoch;
+/*
+ * TIM3 <-> foreground live-record state (S081 C-1..C-7, P1B item 24).
+ *
+ * What: every byte or word written by one context and read by the other is
+ * volatile. The boundary ring is single-producer (TIM3 writes the entry,
+ * then the head) and single-consumer (foreground reads the head once, then
+ * the entry, then advances the tail). Why: with LTO the foreground drain can
+ * be inlined into a loop; without volatile the compiler may keep
+ * seq_recRingHead in a register across iterations, or load the entry before
+ * the head check. Cortex-M7 byte and halfword accesses are single-copy
+ * atomic, and volatile ordering is sufficient on this single core (the
+ * seq_pending_automation precedent). Affiliates: seq_takeRecBoundary(), the
+ * ring push in seq_advanceTrackStep(), liveRec_service().
+ */
+static volatile uint16_t seq_recRing[16];
+static volatile uint8_t  seq_recRingHead;
+static volatile uint8_t  seq_recRingTail;
+/*
+ * Step-boundary ring overflow count (S081 H-3, P1C item 13). DEV only.
+ *
+ * What: the number of ring entries dropped because the 16-entry ring was
+ * full; every drop also records a PatternTrace 'W' event with cause 5
+ * (ring full) and (track << 8) | step. Why: a dropped entry merges two
+ * steps for LiveRecord's step-end table and loses a roll-span write; the
+ * P1B log claimed this was counted, but the push dropped silently.
+ * RAM: 2 B DEV-only (logging-allocation policy). Context: written in TIM3.
+ * Affiliates: the ring push in the step-advance path, liveRec_drop()
+ * causes 1-4, decode_devlogs.py.
+ */
+#if DEV_MODE_LOGGING
+static volatile uint16_t seq_recRingDrops;
+#endif
+
+static volatile uint8_t  seq_recTrack;
+static volatile uint8_t  seq_recWriting;
+static volatile int8_t   seq_echoStep[NUM_TRACKS];
+static volatile uint8_t  seq_eraseSpecialsMask;
+static volatile uint8_t  seq_eraseFullMask;
+static volatile uint8_t  seq_liveHoldMask;
+static volatile uint32_t seq_ppqStampUs;
+static volatile uint32_t seq_ppqPeriodUs;
+static volatile uint8_t  seq_playbackEpoch;
 static const uint8_t *seq_filterLatch;
 static const uint8_t *seq_filterErase;
 static uint8_t  seq_filterEraseTrack;
+
+/*
+ * Echo-mark deadline per track (S081 §8.6, P1B items 6/25).
+ *
+ * What: low 16 bits of the master tick after which a pending echo mark
+ * (seq_echoStep[track]) is void. Set with the mark by
+ * seq_suppressStepOnce(); TIM3 clears an expired mark before testing it.
+ * Why: a mark must only silence the one replay it was set for. If the
+ * playhead never reaches the marked step in that pass (run-mode jump,
+ * once-mode park, play-mode or length change, rnd), a stale mark would
+ * otherwise silence a later, legitimately recorded hit. A deadline covers
+ * every such case without wiring each event (it replaces the unwired C-10
+ * play-mode expiry). Inputs: written by seq_suppressStepOnce (foreground,
+ * PRIMASK). Output: read in seq_advanceTrackStep (TIM3). RAM: 14 B SRAM1.
+ * Affiliates: seq_echoStep[], seq_elapsedPpqTicks.
+ */
+static volatile uint16_t seq_echoDeadline[NUM_TRACKS];
+
+/*
+ * Scene epoch (S081 §9.2 / F11, P1B item 10).
+ *
+ * What: incremented only when the Pattern a track plays from changes: a
+ * direct/queued/chain Scene change, a per-track Scene reassignment, a
+ * Scene/Bank load alignment. seq_playbackEpoch is still incremented at
+ * every playhead discontinuity (those plus transport start/stop, PC reset
+ * and realign). Why: LiveRecord starts a new take (latches reset, target
+ * re-evaluated) only on a Scene change (F11). A transport start or stop is
+ * only a position break: it must not wipe latches set while stopped, nor
+ * end a held live erase ("playback starts with live erase enabled"). Two
+ * counters let LiveRecord tell the cases apart. Inputs: the three Scene
+ * sites. Output: seq_getSceneEpoch(). RAM: 1 B.
+ * Accessors: liveRec_service(). Affiliates: seq_playbackEpoch.
+ */
+static volatile uint8_t seq_sceneEpoch;
 
 /* Ring entry packing (S081 §19.1 item 1): step 7 bits, track 3, fired 1. */
 #define SEQ_REC_RING_STEP_MASK   0x007Fu
@@ -857,8 +992,13 @@ static uint8_t  seq_filterEraseTrack;
 uint8_t seq_takeRecBoundary(seq_rec_boundary_t *out)
 {
     uint16_t e;
+    uint8_t head;
 
-    if (!out || seq_recRingTail == seq_recRingHead)
+    if (!out)
+        return 0u;
+    /* P1B item 24: read the head once so the check and the tail advance agree. */
+    head = seq_recRingHead;
+    if (seq_recRingTail == head)
         return 0u;
     e = seq_recRing[seq_recRingTail];
     seq_recRingTail = (uint8_t)((seq_recRingTail + 1u) & 0x0Fu);
@@ -885,17 +1025,33 @@ void seq_setRecordTarget(uint8_t track, uint8_t writing)
 }
 
 /*
- * Suppress one stored trigger once (S081 §8.6, C-3c).
+ * Mark one stored trigger to be skipped on its next replay (S081 §8.6).
  *
- * What: marks seq_echoStep[track] = step so TIM3 skips that trigger on the next
- * pass (automation still queues). Why: a recorded trigger ahead of the playhead
- * would otherwise sound twice in the same pass. Caller: LiveRecord.
+ * What: records the step and a deadline (capture tick + ticks until the
+ * step + one step interval + 1) under PRIMASK, so TIM3 never sees a step
+ * without its deadline. Why: a hit written onto a step the playhead has
+ * not reached in this pass would otherwise sound twice: live, then stored.
+ * Only steps AHEAD of the playhead are marked (LR-6); a step behind it is
+ * not replayed in this pass, and marking it silenced the new hit on its
+ * next pass. Inputs: track, step, aheadTicks from seq_placeFromSnapshot().
+ * Outputs: seq_echoStep, seq_echoDeadline. Accessors: liveRec_commitHit().
+ * Affiliates: the echo block in seq_advanceTrackStep().
  */
-void seq_suppressStepOnce(uint8_t track, uint8_t step)
+void seq_suppressStepOnce(uint8_t track, uint8_t step, uint16_t aheadTicks)
 {
+    uint16_t interval;
+    uint32_t primask;
+
     if (track >= NUM_TRACKS)
         return;
+    interval = (uint16_t)(stepScale_ticksQ8(seq_effectiveTrackScale[track])
+                          >> 8u);
+    primask = __get_PRIMASK();
+    __disable_irq();
     seq_echoStep[track] = (int8_t)step;
+    seq_echoDeadline[track] =
+        (uint16_t)(seq_elapsedPpqTicks + aheadTicks + interval + 1u);
+    __set_PRIMASK(primask);
 }
 
 /*
@@ -915,35 +1071,69 @@ void seq_setLiveHold(uint8_t track, uint8_t on)
 }
 
 /*
- * Cancel a pending deferred trigger for a track (S081 §19.1, C-3c).
+ * Silence a pending deferred trigger that a live hit replaced
+ * (S081 §8.6, P1B item 7).
  *
- * What: clears seq_trackShufflePending[track]. Why: a record write onto the
- * current step before its delayed trigger fired must not let the old deferred
- * trigger sound afterwards. Caller: LiveRecord.
+ * What: if the track's pending deferral belongs to `step`, marks it muted.
+ * The deferral still fires on time, so the step's automation is queued in
+ * order, but it does not trigger the voice. A deferral that belongs to a
+ * different (earlier) step is left alone. Why: the P1 version cleared the
+ * pending flag. That dropped the replaced step's automation (now queued at
+ * fire time, A1-3), and it also cancelled an earlier step's still-pending
+ * hit. Inputs: track, the step the live hit was written to. Outputs:
+ * seq_trackShuffleMuteMask. Context: foreground (PRIMASK).
+ * Accessors: liveRec_commitHit() (rel == 0). Affiliates: seq_fireDeferred(),
+ * seq_trackShuffleStep[].
  */
-void seq_cancelPendingTrigger(uint8_t track)
+void seq_cancelPendingTrigger(uint8_t track, uint8_t step)
 {
+    uint32_t primask;
+
     if (track >= NUM_TRACKS)
         return;
-    seq_trackShufflePending[track] = 0u;
+    primask = __get_PRIMASK();
+    __disable_irq();
+    if (seq_trackShufflePending[track] && seq_trackShuffleStep[track] == step)
+        seq_trackShuffleMuteMask |= (uint8_t)(1u << track);
+    __set_PRIMASK(primask);
 }
 
 /*
- * Set the per-track live-erase masks (S081 §10, C-4).
+ * Set the per-track live-erase masks (S081 §10, C-4; P1C item 11).
  *
- * What: stores the specials and full erase masks. TIM3 reads them to clear bit
- * 15 + specials (specials) or everything (full). Caller: LiveRecord.
+ * What: stores the specials and full erase masks as one update. TIM3 reads
+ * them to clear bit 15 + specials (specials) or everything (full). Why: the
+ * two stores were separate, so TIM3 could act on one new mask and one old
+ * mask for one tick (for example, a TRACK hold turning into a SEQ hold).
+ * Context: foreground; a two-store PRIMASK section. Caller:
+ * liveRec_pushEraseMasks().
  */
 void seq_setEraseMasks(uint8_t specials, uint8_t full)
 {
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
     seq_eraseSpecialsMask = specials;
     seq_eraseFullMask = full;
+    __set_PRIMASK(primask);
 }
 
 /* Current playback epoch (S081 §19.1 item 6, C-6b). */
 uint8_t seq_getPlaybackEpoch(void)
 {
     return seq_playbackEpoch;
+}
+
+/* Current Scene epoch (S081 §9.2, P1B item 10): bumps only on Scene change. */
+uint8_t seq_getSceneEpoch(void)
+{
+    return seq_sceneEpoch;
+}
+
+/* Current quantisation option (read-only; S081 P1B live-record placement). */
+uint8_t seq_getQuantisation(void)
+{
+    return seq_quantisation;
 }
 
 /*
@@ -1207,6 +1397,17 @@ static void seq_queueStepAutomations(uint8_t track, uint8_t step);
 /* S081 §5.8 deferred-trigger fire with its automation (defined near
 ** seq_processDeferredTriggers()); forward-declared for seq_advanceTrackStep. */
 static void seq_fireDeferred(uint8_t track);
+/* S081 P2 automation ramps (defined after seq_restoreAutomatedParameters()). */
+static void seq_rampStepEvent(uint8_t track, uint8_t applied, uint8_t deferred);
+static void seq_rampBreakTrack(uint8_t track);
+static void seq_rampBreakAll(void);
+static void seq_rampConsumeTrack(uint8_t track);
+static void seq_rampConsumeSteps(void);
+static const ParamDescriptor *seq_writeInstrumentAutomation(
+    uint8_t owner_scene, uint16_t target, uint8_t value);
+static void seq_rampStartIfPaired(uint8_t track, uint8_t scene, uint8_t step,
+                                  uint16_t target, uint8_t from,
+                                  const ParamDescriptor *descriptor);
 /* S080 P2 looper engine (defined after seq_realignTrackToMasterClock()). */
 static void seq_loopRefreshSceneSnapshots(void);
 static void seq_loopRebaseToStart(void);
@@ -1582,6 +1783,13 @@ void seq_setTrackPlayedScene(uint8_t track, uint8_t scene_index)
 	                 ? (INSTRUMENT_SLOT_COUNT - 1u) : track] = 0u;
 	/* S081 C-6/C-10: bump the epoch and expire this track's echo mark. */
 	seq_playbackEpoch++;
+	/* S081 P2: a playhead break ends automation ramps (no B will follow);
+	 * the choke pair changes Scene together, so both tracks break. */
+	seq_rampBreakTrack(track);
+	if (track >= 5u) {
+		seq_rampBreakTrack(5u);
+		seq_rampBreakTrack(6u);
+	}
 	seq_echoStep[track] = -1;
 	if (track >= 5u)
 		seq_echoStep[5] = seq_echoStep[6] = -1;
@@ -1849,6 +2057,10 @@ void seq_selectActivePattern(uint8_t pattern)
 	memset(seq_menuOverride, 0, sizeof(seq_menuOverride));
 	/* S081 C-6/C-10: bump the playback epoch and expire echo marks. */
 	seq_playbackEpoch++;
+	/* S081 P2: a playhead break ends automation ramps (no B will follow). */
+	seq_rampBreakAll();
+	/* S081 P1B item 10: a Scene change also advances the Scene epoch. */
+	seq_sceneEpoch++;
 	seq_liveRecResetMarks();
 	/* S078 §5.4: the played Scenes changed, so rebuild the effective cache. */
 	seq_refreshTrackEffectiveParams();
@@ -1949,6 +2161,10 @@ void seq_alignActivePatternToScene(uint8_t scene_index)
 	memset(seq_menuOverride, 0, sizeof(seq_menuOverride));
 	/* S081 C-6/C-10: bump the playback epoch and expire echo marks. */
 	seq_playbackEpoch++;
+	/* S081 P2: a playhead break ends automation ramps (no B will follow). */
+	seq_rampBreakAll();
+	/* S081 P1B item 10: a Scene change also advances the Scene epoch. */
+	seq_sceneEpoch++;
 	seq_liveRecResetMarks();
 	/* S078 §5.4: the committed Scene change rebuilds the effective cache. */
 	seq_refreshTrackEffectiveParams();
@@ -2116,6 +2332,29 @@ static uint8_t seq_trackEffectTypeMatchesActive(uint8_t track)
  */
 
 /*
+ * Repeat-count condition test (S079 §3; factored for S081 P2).
+ *
+ * What: conditions 11..19 ("X:Y") pass when repeatCount % Y == X - 1;
+ * 20 ("1:-") passes only on the first play (repeatCount 0). Why: playback
+ * and the ramp predictor must apply the identical rule; the predictor passes
+ * the repeat count B will see. Inputs: condition 11..20, repeat count.
+ * Output: pass flag. Context: TIM3. Accessors: seq_conditionEval(),
+ * seq_rampConditionPredict().
+ */
+static uint8_t seq_conditionRepeatPasses(uint8_t cond, uint8_t repeatCount)
+{
+    static const uint8_t xy_table[9][2] = {
+        {1u,2u},{2u,2u},{1u,3u},{2u,3u},{3u,3u},
+        {1u,4u},{2u,4u},{3u,4u},{4u,4u}
+    };
+
+    if (cond == 20u)
+        return (uint8_t)(repeatCount == 0u);
+    return (uint8_t)((repeatCount % xy_table[cond - 11u][1]) ==
+                     (uint8_t)(xy_table[cond - 11u][0] - 1u));
+}
+
+/*
  * Evaluate the per-step trigger condition (S079 §3).
  *
  * What: the single gate before a step fires. Returns 1 (fire) or 0
@@ -2165,20 +2404,9 @@ static uint8_t seq_conditionEval(const pat_step_specials_t *sp,
 
         result = (uint8_t)(rnd < threshold);
     } else if (cond <= 20u) {
-        /* Repeat count: X:Y, values 11..20. */
-        if (cond == 20u) {
-            result = (uint8_t)(seq_trackRepeatCount[track] == 0u);
-        } else {
-            static const uint8_t xy_table[9][2] = {
-                {1u,2u},{2u,2u},{1u,3u},{2u,3u},{3u,3u},
-                {1u,4u},{2u,4u},{3u,4u},{4u,4u}
-            };
-            uint8_t x = xy_table[cond - 11u][0];
-            uint8_t y = xy_table[cond - 11u][1];
-
-            result = (uint8_t)((seq_trackRepeatCount[track] % y) ==
-                               (uint8_t)(x - 1u));
-        }
+        /* Repeat count: X:Y, values 11..20 (shared with the S081 P2 ramp
+         * predictor through seq_conditionRepeatPasses()). */
+        result = seq_conditionRepeatPasses(cond, seq_trackRepeatCount[track]);
     } else if (cond <= 22u) {
         /* Fill / not-fill, values 21..22. */
         if (cond == 21u)
@@ -2510,6 +2738,8 @@ static void seq_advanceTrackStep(uint8_t track)
 	 * seq_trackPlayState[track]. Outputs: seq_stepIndex[track] updated,
 	 * stopped flag set for once modes. Affiliates: seq_trackPlayState[]
 	 * retrigger logic, seq_setTrackPlayedScene().
+	 * Mirrored side-effect-free by seq_rampNextStep() (S081 P2); change both
+	 * together.
 	 */
 	if (play_mode >= 6u)
 		play_mode = 0u;
@@ -2581,6 +2811,9 @@ static void seq_advanceTrackStep(uint8_t track)
 		uint8_t process_step = (uint8_t)(!track_muted);
 		/* Fired bit reported to the boundary ring (S081 §9.1a, C-9a). */
 		uint8_t rec_fired = 0u;
+		/* S081 P2: what this step did with its automation (ramp hand-off). */
+		uint8_t ramp_applied = 0u;
+		uint8_t ramp_deferred = 0u;
 
 		/*
 		 * Mute gate with self-mute bypass (S079 §3.5).
@@ -2630,10 +2863,26 @@ static void seq_advanceTrackStep(uint8_t track)
 		 * fired bit still counts steps that would have fired. Why: F-D counts fired
 		 * steps on a muted rtk; nothing plays. Affiliates: seq_evaluateStepCondition.
 		 */
+		/*
+		 * Would-have-fired for a muted recording track (S081 F-D, P1B item 4).
+		 *
+		 * What: on a muted rtk, the ring's fired bit is set only when the step holds
+		 * a trigger (bit 15) AND its condition would pass, evaluated without side
+		 * effects (seq_conditionPassesPure). Why: F-D counts a muted step as fired
+		 * only if it would have fired. Without the bit-15 test every empty step of a
+		 * muted rtk counted as fired, and LATCH re-stamped own-Instrument values onto
+		 * every step of the track. Inputs: the step's address entry and specials,
+		 * seq_recWriting, seq_recTrack. Output: rec_fired for the ring push (C-9a).
+		 * Context: TIM3. Affiliates: seq_conditionEval(), the ring push below,
+		 * liveRec_stepEnd().
+		 */
 		if (!process_step && seq_recWriting && track == seq_recTrack) {
 			pat_step_specials_t rsp = pat_readStepSpecials(
 			    seq_perTrackPattern[track], track, (uint8_t)seq_stepIndex[track]);
-			rec_fired = seq_conditionPassesPure(&rsp, track);
+			rec_fired = (uint8_t)(pat_isStepActive(track,
+			                          (uint8_t)seq_stepIndex[track],
+			                          seq_perTrackPattern[track]) &&
+			                      seq_conditionPassesPure(&rsp, track));
 		}
 
 		if (process_step) {
@@ -2690,6 +2939,19 @@ static void seq_advanceTrackStep(uint8_t track)
 		{
 			uint8_t echo_hit = 0u;
 
+			/*
+			 * Expire a stale echo mark before testing it (S081 §8.6, P1B items 6/25).
+			 *
+			 * What: a mark whose deadline has passed is dropped without effect. Then,
+			 * as before, a mark equal to this step is consumed and the stored trigger
+			 * skipped (fired still 1). Why: covers every path where the playhead never
+			 * reaches the mark (run-mode jumps, length/play-mode changes, once park).
+			 * Context: TIM3. Affiliates: seq_suppressStepOnce(), seq_echoDeadline[].
+			 */
+			if (seq_echoStep[track] >= 0 &&
+			    (int16_t)((uint16_t)seq_elapsedPpqTicks -
+			              seq_echoDeadline[track]) > 0)
+				seq_echoStep[track] = -1;
 			if (step_allowed && seq_echoStep[track] >= 0 &&
 			    (uint8_t)seq_echoStep[track] == (uint8_t)seq_stepIndex[track]) {
 				echo_hit = 1u;
@@ -2802,6 +3064,8 @@ static void seq_advanceTrackStep(uint8_t track)
 						    (uint8_t)seq_stepIndex[track];
 						seq_trackShuffleRoll[track] =
 						    (uint8_t)(sp.roll > 0u);
+						/* A fresh deferral is never muted (P1B item 7). */
+						seq_trackShuffleMuteMask &= (uint8_t)~(1u << track);
 						deferred_this_step = 1u;
 					} else if (sp.roll > 0u) {
 						seq_rollBegin(track, &sp);
@@ -2836,15 +3100,37 @@ static void seq_advanceTrackStep(uint8_t track)
          */
         if (step_allowed &&
             ((seq_eraseFullMask & (uint8_t)(1u << track)) == 0u)) {
-            if (seq_trackShufflePending[track] && !deferred_this_step)
+            /*
+             * Keep entry order without cutting delays short (S081 A1-3c, P1B
+             * item 23).
+             *
+             * What: a deferral still pending from an earlier step is fired early
+             * only when this step is about to queue automation entries. Otherwise
+             * it keeps its own timing and fires at expiry. Why: the early fire
+             * exists to keep the earlier step's entries ahead of this step's
+             * entries in the pending queue. Firing it at every step start short-
+             * ened long delays (shuffle + up to 99 % micro-timing) to the step
+             * boundary even when the next step was empty.
+             * pat_stepAutomationCount() only reads the address entry and block
+             * header, so it is TIM3-safe like seq_queueStepAutomations().
+             */
+            if (seq_trackShufflePending[track] && !deferred_this_step &&
+                pat_stepAutomationCount(seq_perTrackPattern[track], track,
+                                        (uint8_t)seq_stepIndex[track]) != 0u)
                 seq_fireDeferred(track);
             if (!deferred_this_step) {
                 /* S081 §5.3: the Effect step marker is removed (R13); the
                  * step's own automation entries are queued directly. */
                 seq_queueStepAutomations(track, (uint8_t)seq_stepIndex[track]);
+                ramp_applied = 1u;
+            } else {
+                ramp_deferred = 1u;
             }
         }
 		}
+
+		/* S081 P2: hand the step to the automation ramp engine. */
+		seq_rampStepEvent(track, ramp_applied, ramp_deferred);
 
 		/*
 		 * Report the recording track's step boundaries (S081 §9.1a, §19.1 item 1,
@@ -2856,9 +3142,9 @@ static void seq_advanceTrackStep(uint8_t track)
 		 * per track and treats that track's next entry as "the previous step ended".
 		 * fired = bit 15 set && the condition passed, known at the step start; it is
 		 * set for an echo-suppressed step (the live hit was its sound). A full ring
-		 * drops the entry. Why: LiveRecord's step-end table needs every step of rtk
-		 * and whether its first trigger fired. Affiliates: seq_takeRecBoundary(),
-		 * liveRec_service().
+		 * drops the entry (DEV: counted, trace cause 5, P1C item 13). Why:
+		 * LiveRecord's step-end table needs every step of rtk and whether its first
+		 * trigger fired. Affiliates: seq_takeRecBoundary(), liveRec_service().
 		 */
 		if (seq_recWriting &&
 		    (track == seq_recTrack ||
@@ -2872,6 +3158,13 @@ static void seq_advanceTrackStep(uint8_t track)
 				                SEQ_REC_RING_TRACK_SHIFT) |
 				               (rec_fired ? SEQ_REC_RING_FIRED_BIT : 0u));
 				seq_recRingHead = next;
+			} else {
+#if DEV_MODE_LOGGING
+				seq_recRingDrops++;
+				patternTrace_record(PAT_TRACE_STAGE_LIVEREC_DROP, 5u,
+				                    (uint32_t)(((uint32_t)track << 8u) |
+				                               (uint8_t)(seq_stepIndex[track] & 0x7F)));
+#endif
 			}
 		}
 	}
@@ -3003,6 +3296,10 @@ static uint8_t seq_applySceneAutomation(uint16_t target, uint8_t value)
  * queue handoff. The foreground follows the live producer count and atomically
  * resets only after no append raced the drain. Affiliate: main.c's pre-audio
  * foreground sequence.
+ * S081 P2: before applying entries it ends the ramps of tracks whose next
+ * step has applied; each written Instrument entry of an asm track may start a
+ * ramp toward the same target on the predicted next step
+ * (seq_rampStartIfPaired()).
  */
 void seq_drainPendingAutomation(void)
 {
@@ -3017,6 +3314,9 @@ void seq_drainPendingAutomation(void)
         __set_PRIMASK(primask);
         effects_automationReset();
     }
+
+    /* S081 P2: ramps of tracks whose next step applied end first. */
+    seq_rampConsumeSteps();
 
     if (!seq_pending_automation_drain)
         return;
@@ -3101,18 +3401,23 @@ void seq_drainPendingAutomation(void)
                         i++;
                         continue;
                     }
-                    const kit_instrument_slot_t *instrument =
-                        scene_instrumentSlotConst(owner_scene, slot);
-                    const ParamDescriptor *descriptor = instrument
-                        ? instrumentManager_descriptor(
-                              instrument->type, instrumentParam_local(target))
-                        : 0;
+                    /*
+                     * Write the value and mark it held for the next trigger's
+                     * restore (seq_writeInstrumentAutomation(), shared with
+                     * the S081 P2 ramp service). A successful write of an
+                     * asm track's entry may start a ramp toward the same
+                     * target on the predicted next step.
+                     */
+                    {
+                        const ParamDescriptor *descriptor =
+                            seq_writeInstrumentAutomation(owner_scene, target,
+                                                          value);
 
-                    /* Mark only successful voice overlays for retrigger restore. */
-                    if (descriptor &&
-                        instrumentManager_writeRuntime(slot, descriptor, value)) {
-                        uint8_t local = instrumentParam_local(target);
-                        seq_automation_dirty[slot] |= (1ULL << local);
+                        if (descriptor)
+                            seq_rampStartIfPaired(owner_track, owner_scene,
+                                (uint8_t)((identity & SEQ_PENDING_STEP_ID_MASK) %
+                                          NUM_STEPS),
+                                target, value, descriptor);
                     }
                 } else if (sceneModTarget_isSceneTarget(target)) {
                     (void)seq_applySceneAutomation(target, value);
@@ -3167,17 +3472,26 @@ void seq_drainPendingAutomation(void)
  * Invalid/stale bits are discarded safely; Scene-level targets remain
  * outside this voice-descriptor restore path until their runtime boundary is
  * defined. Affiliate: MidiVoiceControl.c's single trigger funnel.
+ * S081 P2 (D3): the trigger track's own ramps end first
+ * (seq_rampConsumeTrack); parameters still held by a running ramp of this
+ * slot (a live press, MIDI note, flam main or roll renewal mid-step) are
+ * neither restored nor un-marked, so the ramp continues without a dip to the
+ * menu value. Ramps of the other track sharing slot 5 (tracks 5/6) keep
+ * running.
  */
 void seq_restoreAutomatedParameters(uint8_t trigger_track)
 {
     uint8_t slot;
     uint64_t mask;
+    uint64_t rampHeld = 0u;
     const kit_instrument_slot_t *instrument;
 
     if (trigger_track >= NUM_TRACKS)
         return;
     slot = (trigger_track >= INSTRUMENT_SLOT_COUNT)
         ? (INSTRUMENT_SLOT_COUNT - 1u) : trigger_track;
+    /* S081 P2: this track's ramps end at its own next step first. */
+    seq_rampConsumeTrack(trigger_track);
     /*
      * R12 override clear (S081 §5.8, Appendix A-2): the menu override must be
      * cleared before the early return so it ends at every trigger of the voice,
@@ -3189,6 +3503,24 @@ void seq_restoreAutomatedParameters(uint8_t trigger_track)
     mask = seq_automation_dirty[slot];
     if (!mask)
         return;
+    /*
+     * S081 P2 (D3): collect the parameters of this slot that a running ramp
+     * still holds; they are skipped below and keep their held bit.
+     */
+    {
+        uint8_t i;
+
+        for (i = 0u; i < SEQ_RAMP_SLOTS; i++) {
+            uint16_t key;
+
+            if (seq_ramps[i].id == 0u)
+                continue;
+            key = (uint16_t)((seq_ramps[i].id - 1u) & 0x01FFu);
+            if (instrumentParam_slot(key) == slot)
+                rampHeld |= (1ULL << instrumentParam_local(key));
+        }
+        mask &= ~rampHeld;
+    }
 
     /*
      * Retrigger restore reads the track's played Scene (S077 P2 §3.2).
@@ -3213,7 +3545,580 @@ void seq_restoreAutomatedParameters(uint8_t trigger_track)
             mask &= (mask - 1ULL);
         }
     }
-    seq_automation_dirty[slot] = 0u;
+    /* S081 P2: ramp-held parameters stay marked (automation keeps priority). */
+    seq_automation_dirty[slot] = rampHeld & seq_automation_dirty[slot];
+}
+
+/* ===== S081 P2 automation ramps ===== */
+
+/*
+ * Predict the next played step for an automation ramp (S081 P2 §5.2).
+ *
+ * What: mirrors seq_advanceTrackStep()'s play-mode switch without side
+ * effects: fwd/rev wrap at the effective length, pip repeats its boundary
+ * step and turns, onc/1fr have no step after the last, rnd is never
+ * predicted (D7). *repeatInc is 1 when the advance to B increments the
+ * track's repeat count (wrap or pip turn), so B's repeat conditions are
+ * evaluated with the count B will see. Why: a ramp needs B before B is
+ * reached. The looper is ignored on purpose (D8): ramps follow the unlooped
+ * segment; at a loop wrap the restored step's apply ends the ramps
+ * (SQ-11). Inputs: track, its played Scene region, live index/play state,
+ * effective length. Output: B index or -1. Context: TIM3. Keep in step with
+ * the switch in seq_advanceTrackStep(). Affiliates: seq_rampPredict().
+ */
+static int16_t seq_rampNextStep(uint8_t track,
+                                const pat_scene_region_t *region,
+                                uint8_t *repeatInc)
+{
+    uint8_t len = seq_effectiveTrackLength[track];
+    uint8_t mode = region->track_play_mode[track];
+    int16_t idx = seq_stepIndex[track];
+
+    if (len < 1u)
+        len = NUM_STEPS_PER_BAR;
+    if (mode >= 6u)
+        mode = 0u;
+    if (idx >= (int16_t)len)
+        idx = (int16_t)(len - 1u);
+    *repeatInc = 0u;
+    switch (mode) {
+    case 1u: /* rev */
+        if (--idx < 0) {
+            idx = (int16_t)(len - 1u);
+            *repeatInc = 1u;
+        }
+        return idx;
+    case 2u: /* pip: the boundary plays twice */
+        if (seq_trackPlayState[track] & SEQ_PLAY_STATE_PIP_REV) {
+            if (idx <= 0) {
+                *repeatInc = 1u;
+                return idx;
+            }
+            return (int16_t)(idx - 1);
+        }
+        if (idx >= (int16_t)(len - 1u)) {
+            *repeatInc = 1u;
+            return idx;
+        }
+        return (int16_t)(idx + 1);
+    case 3u: /* rnd: never predicted (D7) */
+        return -1;
+    case 4u: /* onc */
+    case 5u: /* 1fr */
+        return (idx + 1 >= (int16_t)len) ? -1 : (int16_t)(idx + 1);
+    default: /* fwd */
+        if (++idx >= (int16_t)len) {
+            idx = 0;
+            *repeatInc = 1u;
+        }
+        return idx;
+    }
+}
+
+/*
+ * Will B play, as far as can be known now? (S081 P2 D1)
+ *
+ * What: 1 when B's condition is predictable at A's apply time AND passes:
+ * no condition, the repeat counters (with the count B will see), or
+ * lst/!ls (seq_trackLastConditionFired already holds A's result; no other
+ * condition on this track is evaluated before B). Probability, fill, loop
+ * and mute conditions return 0, so B is never ramped to and jumps as today.
+ * Why: the ramp rule requires both steps to play; a step that might not
+ * play must not be ramped toward. Condition evaluation itself is unchanged.
+ * Context: TIM3. Affiliates: seq_conditionEval(), seq_rampPredict().
+ */
+static uint8_t seq_rampConditionPredict(const pat_step_specials_t *sp,
+                                        uint8_t track, uint8_t repeatInc)
+{
+    uint8_t cond = sp->condition;
+
+    if (cond == 0u || cond > 40u)
+        return 1u;
+    if (cond >= 11u && cond <= 20u)
+        return seq_conditionRepeatPasses(
+            cond, (uint8_t)(seq_trackRepeatCount[track] + repeatInc));
+    if (cond == 25u)
+        return seq_trackLastConditionFired[track];
+    if (cond == 26u)
+        return (uint8_t)(!seq_trackLastConditionFired[track]);
+    return 0u;              /* rNN, fil/!fl, lop/!lp, mute: not predictable */
+}
+
+/*
+ * Predict B and its apply time for step A (S081 P2 §5.2).
+ *
+ * What: at A's step start on an asm track, fills the context's B (+1) and
+ * B's apply time, or leaves b = 0 when no ramp may start because:
+ *  - A has no automation, or the track is muted / full-erased;
+ *  - there is no predictable B (rnd, once end);
+ *  - B has no automation, or B's condition is not predictably passing.
+ * B's start is the next DDA advance (ceil((interval - remainder) / 256)
+ * ticks after this tick). B's automation is deferred like B's trigger when
+ * B holds a trigger: shuffle on odd steps plus micro-timing, the same
+ * arithmetic as the deferral in seq_advanceTrackStep(). Why: a ramp must end
+ * where B's value lands today. Inputs: live index, accumulator remainder,
+ * effective scale/shuffle, B's specials, erase/mute masks. Output: *ctx b
+ * and endQ4 (a is set by the caller). Context: TIM3, called from
+ * seq_rampStepEvent() at A's step start (also for a deferred A, whose
+ * prediction is taken before the playhead moves on). Affiliates:
+ * seq_rampNextStep(), seq_rampConditionPredict(), pat_stepAutomationCount().
+ */
+static void seq_rampPredict(uint8_t track, const pat_scene_region_t *region,
+                            seq_rampCtx_t *ctx)
+{
+    uint8_t scene = seq_perTrackPattern[track];
+    uint8_t bit = (uint8_t)(1u << track);
+    uint8_t repeatInc;
+    int16_t b;
+    pat_step_specials_t spb;
+    uint16_t interval;
+    uint16_t r;
+    uint16_t ticksToB;
+    uint16_t dB = 0u;
+
+    ctx->b = 0u;
+    ctx->endQ4 = 0u;
+    if (pat_stepAutomationCount(scene, track,
+                                (uint8_t)seq_stepIndex[track]) == 0u)
+        return;
+    if ((seq_mutedTracks & bit) || (seq_eraseFullMask & bit))
+        return;
+    b = seq_rampNextStep(track, region, &repeatInc);
+    if (b < 0 || pat_stepAutomationCount(scene, track, (uint8_t)b) == 0u)
+        return;
+    spb = pat_readStepSpecials(scene, track, (uint8_t)b);
+    if (!seq_rampConditionPredict(&spb, track, repeatInc))
+        return;
+    interval = stepScale_ticksQ8(seq_effectiveTrackScale[track]);
+    r = seq_trackAccumulator[track];
+    ticksToB = (interval > r) ? (uint16_t)((interval - r + 255u) >> 8u) : 1u;
+    /* B's automation is deferred with B's trigger (shuffle + micro-timing). */
+    if (pat_isStepActive(track, (uint8_t)b, scene) &&
+        (seq_eraseSpecialsMask & bit) == 0u) {
+        uint8_t shuffle = seq_effectiveTrackShuffle[track];
+
+        if (shuffle > 0u && (b & 1))
+            dB = (uint16_t)(((uint16_t)shuffle * 24u) / 256u);
+        if (spb.timing > 0u)
+            dB = (uint16_t)(dB + (uint16_t)(((uint32_t)(interval >> 8u) *
+                                             spb.timing) / 100u));
+    }
+    ctx->endQ4 = (uint16_t)((seq_elapsedPpqTicks + ticksToB + dB) << 4u);
+    ctx->b = (uint8_t)(b + 1);
+}
+
+/*
+ * TIM3 ramp hand-off at a step (S081 P2 §5.1/§5.5).
+ *
+ * What: on an asm track only, records what happened at this step for the
+ * foreground:
+ *  - applied (automation queued now): stepped flag + prediction of B;
+ *  - deferred (automation queues at the deferred fire): prediction only;
+ *    seq_fireDeferred() sets the stepped flag when the entries queue, so
+ *    the ramps into this step run until its value actually lands;
+ *  - neither (condition failed, muted, full-erased, no automation block):
+ *    stepped flag with no B, so ramps toward this step end at its start.
+ * Tracks with asm off write nothing; the ramp service cancels any ramp left
+ * on them. Why: ramps end at the next played step's apply time, and that
+ * step's own value then takes over. Context: TIM3. Accessors:
+ * seq_advanceTrackStep(). Affiliates: seq_rampPredict(), seq_fireDeferred(),
+ * seq_rampConsumeTrack().
+ */
+static void seq_rampStepEvent(uint8_t track, uint8_t applied, uint8_t deferred)
+{
+    const pat_scene_region_t *region =
+        pat_sceneRegion(seq_perTrackPattern[track]);
+    seq_rampCtx_t ctx;
+
+    if (!region || ((region->track_auto_smooth >> track) & 1u) == 0u)
+        return;
+    ctx.a = (uint8_t)(seq_stepIndex[track] & 0x7F);
+    if (!applied && !deferred) {
+        ctx.a |= SEQ_RAMP_STEPPED;
+        ctx.b = 0u;
+        ctx.endQ4 = 0u;
+    } else {
+        if (applied)
+            ctx.a |= SEQ_RAMP_STEPPED;
+        seq_rampPredict(track, region, &ctx);
+    }
+    seq_rampCtx[track] = ctx;
+}
+
+/*
+ * Position break for automation ramps (S081 P2 §5.5).
+ *
+ * What: marks the track's context "stepped, no B", so the foreground ends
+ * its ramps at the next consume and no ramp starts until the next step's
+ * prediction. seq_rampBreakAll() does it for every track. Why: after a
+ * transport change, realign, Scene change, PC reset, loop wrap/resume or a
+ * chain stop, the predicted B will not follow. A ramp left running would
+ * drift toward a value that never plays. Context: TIM3 or foreground
+ * (PRIMASK section). Accessors: every seq_playbackEpoch bump site,
+ * seq_loopProcessTick() wrap, seq_loopResumeTrack(), the chain stop.
+ */
+static void seq_rampBreakTrack(uint8_t track)
+{
+    uint32_t primask = __get_PRIMASK();
+
+    if (track >= NUM_TRACKS)
+        return;
+    __disable_irq();
+    seq_rampCtx[track].a = (uint8_t)(SEQ_RAMP_STEPPED | 0x7Fu);
+    seq_rampCtx[track].b = 0u;
+    __set_PRIMASK(primask);
+}
+
+static void seq_rampBreakAll(void)
+{
+    uint8_t track;
+
+    for (track = 0u; track < NUM_TRACKS; track++)
+        seq_rampBreakTrack(track);
+}
+
+/*
+ * Ramp time base (S081 P2 §5.5).
+ *
+ * What: the current master position in 1/16 ticks (low 16 bits): the 96-PPQ
+ * tick count plus the sub-tick fraction from the tick's microsecond stamp.
+ * Why: ramps measured in master ticks stretch with a tempo change; the
+ * sub-tick fraction keeps the ~2 ms updates smooth between 5 ms ticks. The
+ * fraction is clamped to 15/16, so a stalled clock (external sync stopped)
+ * holds the ramp just before the next tick instead of running past it.
+ * Context: foreground (PRIMASK copy). Affiliates: seq_ppqStampUs,
+ * seq_captureTrackTime() (the same fields), seq_rampPredict() (same units).
+ */
+static uint16_t seq_rampNowQ4(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    uint32_t ticks;
+    uint32_t stamp;
+    uint32_t period;
+    uint32_t now;
+    uint32_t frac = 0u;
+
+    __disable_irq();
+    ticks = seq_elapsedPpqTicks;
+    stamp = seq_ppqStampUs;
+    period = seq_ppqPeriodUs;
+    now = timebase_tim2Now();
+    __set_PRIMASK(primask);
+    if (period != 0u) {
+        uint32_t since = now - stamp;
+
+        frac = (since >= period)
+            ? 15u : (uint32_t)(((uint64_t)since * 16u) / period);
+        if (frac > 15u)
+            frac = 15u;
+    }
+    return (uint16_t)((ticks << 4u) + frac);
+}
+
+/*
+ * End a track's ramps when its next step applies (S081 P2 §5.5).
+ *
+ * What: consumes the TIM3 stepped flag of one track (or all) and frees that
+ * track's ramp slots. The values stay where they are; the new step's own
+ * entries (drain) or today's restore rules take over. Why: a ramp lives
+ * exactly from A's apply to the next played step's apply. Ending at B's
+ * arrival (not at the computed time) keeps a late ramp sample from
+ * overwriting B's value. At a loop wrap the restored step's apply ends the
+ * ramps, so nothing ramps across the wrap (D8). Order: the trigger restore
+ * consumes its own track first, the drain consumes all tracks before
+ * applying entries, the ramp service consumes all tracks each block, and
+ * seq_rampStartIfPaired() consumes A's own flag when TIM3 set it after the
+ * drain's consume. Context: foreground. Affiliates: seq_rampStepEvent(),
+ * seq_fireDeferred(), seq_restoreAutomatedParameters(),
+ * seq_drainPendingAutomation().
+ */
+static void seq_rampEndTrack(uint8_t track)
+{
+    uint8_t i;
+
+    for (i = 0u; i < SEQ_RAMP_SLOTS; i++) {
+        if (seq_ramps[i].id != 0u &&
+            (uint8_t)((seq_ramps[i].id - 1u) >> 9u) == track)
+            seq_ramps[i].id = 0u;
+    }
+}
+
+static void seq_rampConsumeTrack(uint8_t track)
+{
+    uint32_t primask;
+    uint8_t stepped;
+
+    if (track >= NUM_TRACKS)
+        return;
+    primask = __get_PRIMASK();
+    __disable_irq();
+    stepped = (uint8_t)(seq_rampCtx[track].a & SEQ_RAMP_STEPPED);
+    if (stepped)
+        seq_rampCtx[track].a =
+            (uint8_t)(seq_rampCtx[track].a & (uint8_t)~SEQ_RAMP_STEPPED);
+    __set_PRIMASK(primask);
+    if (stepped)
+        seq_rampEndTrack(track);
+}
+
+static void seq_rampConsumeSteps(void)
+{
+    uint32_t primask;
+    uint8_t steppedMask = 0u;
+    uint8_t track;
+
+    /* One PRIMASK section for all seven flags (runs every DSP block). */
+    primask = __get_PRIMASK();
+    __disable_irq();
+    for (track = 0u; track < NUM_TRACKS; track++) {
+        if (seq_rampCtx[track].a & SEQ_RAMP_STEPPED) {
+            seq_rampCtx[track].a = (uint8_t)(seq_rampCtx[track].a &
+                                             (uint8_t)~SEQ_RAMP_STEPPED);
+            steppedMask |= (uint8_t)(1u << track);
+        }
+    }
+    __set_PRIMASK(primask);
+    for (track = 0u; steppedMask != 0u; track++, steppedMask >>= 1u) {
+        if (steppedMask & 1u)
+            seq_rampEndTrack(track);
+    }
+}
+
+/*
+ * Which Instrument parameters ramp (S081 P2 D2).
+ *
+ * What: only automatable descriptors with a numeric-range dtype (0B127,
+ * PM63, and the numeric 0B255/0B15/1B16/1B128 should a descriptor use
+ * them). Menu tables (waveforms, filter types), FM mode, on/off, LFO
+ * polarity and target/voice selections never ramp: their in-between values
+ * are other choices, not intermediate settings. Why: user decision D2.
+ * Inputs: the descriptor of the target's slot in the played Scene. Output:
+ * flag. Affiliates: seq_rampStartIfPaired().
+ */
+static uint8_t seq_rampDtypeOk(const ParamDescriptor *descriptor)
+{
+    if (!descriptor ||
+        (descriptor->flags & INSTRUMENT_PARAM_FLAG_AUTOMATABLE) == 0u)
+        return 0u;
+    switch (descriptor->dtype & 0x0Fu) {
+    case DTYPE_0B127:
+    case DTYPE_PM63:
+    case DTYPE_0B255:
+    case DTYPE_0B15:
+    case DTYPE_1B16:
+    case DTYPE_1B128:
+        return 1u;
+    default:
+        return 0u;
+    }
+}
+
+/*
+ * Is the track's asm mode on in its played Scene? (S081 P2)
+ *
+ * What: reads pat_scene_region_t.track_auto_smooth of
+ * seq_perTrackPattern[track]. Why: ramps start and keep running only while
+ * the flag is on; turning it off (or a played-Scene change to a Pattern
+ * with it off) cancels them at the next service pass. Context: foreground.
+ * Affiliates: seq_rampStartIfPaired(), seq_rampService().
+ */
+static uint8_t seq_rampTrackOn(uint8_t track)
+{
+    const pat_scene_region_t *region;
+
+    if (track >= NUM_TRACKS)
+        return 0u;
+    region = pat_sceneRegion(seq_perTrackPattern[track]);
+    return (uint8_t)(region && ((region->track_auto_smooth >> track) & 1u));
+}
+
+/*
+ * Write one Instrument automation value (drain and ramps, S081 P2).
+ *
+ * What: resolves the descriptor in the owning track's played Scene, writes
+ * the runtime value, and marks the parameter held for the next trigger's
+ * restore. Returns the descriptor on success. Why: ramp samples are
+ * automation values under the binding priority rule (MEMORY.md): the same
+ * write path keeps the Morph sweep and menu apply from overwriting them.
+ * The caller has already validated the target and the R12 override.
+ * Context: foreground. Accessors: seq_drainPendingAutomation(),
+ * seq_rampService(). Affiliates: instrumentManager_writeRuntime(),
+ * seq_automation_dirty[].
+ */
+static const ParamDescriptor *seq_writeInstrumentAutomation(
+    uint8_t owner_scene, uint16_t target, uint8_t value)
+{
+    uint8_t slot = instrumentParam_slot(target);
+    uint8_t local = instrumentParam_local(target);
+    const kit_instrument_slot_t *instrument =
+        scene_instrumentSlotConst(owner_scene, slot);
+    const ParamDescriptor *descriptor = instrument
+        ? instrumentManager_descriptor(instrument->type, local) : 0;
+
+    if (!descriptor || !instrumentManager_writeRuntime(slot, descriptor, value))
+        return 0;
+    seq_automation_dirty[slot] |= (1ULL << local);
+    return descriptor;
+}
+
+/*
+ * Start a ramp for a just-written entry of step A (S081 P2 §5.4).
+ *
+ * What: when A's entry was written on an asm track for a rampable target,
+ * and TIM3's context for this track still describes this A with a
+ * predicted B that holds the same target, takes a slot that ramps from A's
+ * value (just written) to B's value, from now to B's predicted apply time.
+ * An existing slot for the same track/target is reused. With all 64 slots
+ * busy the pair jumps as today (D10; DEV count). If A's stepped flag is
+ * still set (TIM3 queued A's entries and set the flag after this drain
+ * pass's consume), the flag is consumed here and the track's older ramps end
+ * first; otherwise the next consume would end the ramp started here. Why:
+ * plan §5.4; the context check drops the pair (jump) if TIM3 has already
+ * moved past A, which can only happen when the foreground lags a whole
+ * step. Inputs: owning track/Scene, A's step (from the pending identity),
+ * target, written value, descriptor. Output: one slot. Context: foreground
+ * (drain). Affiliates: pat_findStepAutomation(), seq_rampDtypeOk(),
+ * seq_rampNowQ4(), seq_rampEndTrack().
+ */
+static void seq_rampStartIfPaired(uint8_t track, uint8_t scene, uint8_t step,
+                                  uint16_t target, uint8_t from,
+                                  const ParamDescriptor *descriptor)
+{
+    seq_rampCtx_t ctx;
+    uint32_t primask;
+    uint16_t now;
+    uint16_t id;
+    uint8_t to;
+    uint8_t i;
+    uint8_t freeSlot = SEQ_RAMP_SLOTS;
+    uint8_t stepped = 0u;
+
+    if (!seq_rampTrackOn(track) || !seq_rampDtypeOk(descriptor))
+        return;
+    primask = __get_PRIMASK();
+    __disable_irq();
+    ctx = seq_rampCtx[track];
+    if ((uint8_t)(ctx.a & 0x7Fu) == step && (ctx.a & SEQ_RAMP_STEPPED)) {
+        seq_rampCtx[track].a = (uint8_t)(ctx.a & (uint8_t)~SEQ_RAMP_STEPPED);
+        stepped = 1u;
+    }
+    __set_PRIMASK(primask);
+    if (stepped)
+        seq_rampEndTrack(track);
+    if ((uint8_t)(ctx.a & 0x7Fu) != step || ctx.b == 0u)
+        return;
+    if (!pat_findStepAutomation(scene, track, (uint8_t)(ctx.b - 1u), target,
+                                &to))
+        return;
+    now = seq_rampNowQ4();
+    if ((int16_t)(ctx.endQ4 - now) <= 0)
+        return;
+    id = (uint16_t)(1u + (((uint16_t)track << 9u) | target));
+    for (i = 0u; i < SEQ_RAMP_SLOTS; i++) {
+        if (seq_ramps[i].id == id) {
+            freeSlot = i;
+            break;
+        }
+        if (seq_ramps[i].id == 0u && freeSlot == SEQ_RAMP_SLOTS)
+            freeSlot = i;
+    }
+    if (freeSlot == SEQ_RAMP_SLOTS) {
+#if DEV_MODE_LOGGING
+        seq_rampNoSlotDrops++;
+#endif
+        return;                         /* cap reached: jump as today (D10) */
+    }
+    seq_ramps[freeSlot].id = id;
+    seq_ramps[freeSlot].from = from;
+    seq_ramps[freeSlot].to = to;
+    seq_ramps[freeSlot].last = from;    /* the drain has just written it */
+    seq_ramps[freeSlot].startQ4 = now;
+    seq_ramps[freeSlot].endQ4 = ctx.endQ4;
+}
+
+/*
+ * Automation ramp service (S081 P2 §5.5, D6/D9).
+ *
+ * What: every DSP block it ends the ramps of tracks whose next step has
+ * applied. Every third block (~2.2 ms) it writes each running ramp's value
+ * from + (to - from) x elapsed / duration, rounded to the 7-bit descriptor
+ * value, holding `to` after the predicted end until the next step applies
+ * (from is set to `to` then, so the held value stays exact however long the
+ * hold lasts). A value is written only when it differs from the slot's last
+ * written value (user decision; the held bit keeps every other writer off the
+ * parameter, so an unchanged value is still in the runtime). A ramp is
+ * cancelled (its value stays) when:
+ *  - the track's asm turned off;
+ *  - live record latches or erases the target (the drain's filters);
+ *  - an R12 menu override is set;
+ *  - the target is no longer valid in the track's played Scene.
+ * Why: plan §5.5. Writes go through seq_writeInstrumentAutomation(), so ramp
+ * values are held automation values (binding priority rule). Cost: at most
+ * 64 runtime writes per pass (every ramp changing value each pass), the worst
+ * case measured on the stress Scene (DSP CPU policy; plan §7). Context: foreground, audio render loop, right
+ * after seq_drainPendingAutomation(). Accessors: main.c
+ * audio_check_and_render(). Affiliates: seq_rampConsumeSteps(),
+ * seq_rampStartIfPaired().
+ */
+void seq_rampService(void)
+{
+    uint16_t now;
+    uint8_t i;
+
+    seq_rampConsumeSteps();
+    if (++seq_rampBlockDiv < SEQ_RAMP_BLOCK_DIV)
+        return;
+    seq_rampBlockDiv = 0u;
+    now = seq_rampNowQ4();
+    for (i = 0u; i < SEQ_RAMP_SLOTS; i++) {
+        seq_ramp_t *r = &seq_ramps[i];
+        uint16_t key;
+        uint8_t track;
+        uint16_t target;
+        uint8_t scene;
+        uint8_t slot;
+        int16_t num;
+        int16_t den;
+        uint8_t value;
+
+        if (r->id == 0u)
+            continue;
+        key = (uint16_t)(r->id - 1u);
+        track = (uint8_t)(key >> 9u);
+        target = (uint16_t)(key & 0x01FFu);
+        scene = seq_perTrackPattern[track];
+        slot = instrumentParam_slot(target);
+        if (!seq_rampTrackOn(track) ||
+            (seq_filterLatch != 0 &&
+             (seq_filterLatch[target >> 3u] & (uint8_t)(1u << (target & 7u)))) ||
+            (seq_filterErase != 0 && track == seq_filterEraseTrack &&
+             (seq_filterErase[target >> 3u] & (uint8_t)(1u << (target & 7u)))) ||
+            (slot < INSTRUMENT_SLOT_COUNT &&
+             (seq_menuOverride[slot] & (1ULL << instrumentParam_local(target)))) ||
+            !instrumentManager_targetValid(scene, target,
+                                           INSTRUMENT_TARGET_AUTOMATION)) {
+            r->id = 0u;                 /* cancel: value stays */
+            continue;
+        }
+        num = (int16_t)(now - r->startQ4);
+        den = (int16_t)(r->endQ4 - r->startQ4);
+        if (den <= 0 || num >= den) {
+            value = r->to;
+            r->from = r->to;            /* hold `to` exactly from now on */
+        } else if (num <= 0) {
+            value = r->from;
+        } else {
+            int32_t delta = ((int32_t)r->to - (int32_t)r->from) * num;
+
+            value = (uint8_t)((int32_t)r->from +
+                ((delta >= 0) ? (delta + den / 2) / den
+                              : -((-delta + den / 2) / den)));
+        }
+        if (value == r->last)
+            continue;                   /* unchanged: runtime already holds it */
+        r->last = value;
+        (void)seq_writeInstrumentAutomation(scene, target, value);
+    }
 }
 
 /*
@@ -3442,6 +4347,8 @@ void seq_realignActivePatternToMasterClock(void)
 	memset(seq_menuOverride, 0, sizeof(seq_menuOverride));
 	/* S081 C-6/C-10: bump the playback epoch and expire echo marks. */
 	seq_playbackEpoch++;
+	/* S081 P2: a playhead break ends automation ramps (no B will follow). */
+	seq_rampBreakAll();
 	seq_liveRecResetMarks();
 	/*
 	 * Realign keeps the FX sequence on the master grid and clears Effect track
@@ -3518,6 +4425,21 @@ void seq_realignTrackToMasterClock(uint8_t track)
 	                 ? (INSTRUMENT_SLOT_COUNT - 1u) : track] = 0u;
 	/* S081 C-6/C-10: bump the epoch and expire this track's echo mark. */
 	seq_playbackEpoch++;
+	/* S081 P2: a playhead break ends automation ramps (no B will follow). */
+	seq_rampBreakTrack(track);
+	/*
+	 * A per-track Scene change advances the Scene epoch (S081 P1B item 10,
+	 * P1C item 12).
+	 *
+	 * What: LiveRecord starts a new take when this epoch moves. Why here and
+	 * not in seq_setTrackPlayedScene(): today the only per-track Scene change
+	 * is the buttonHandler Scene path, which sets the played Scene and then
+	 * realigns, so both sites see the same events. If a second caller of
+	 * seq_setTrackPlayedScene() appears without a realign, move this bump into
+	 * seq_setTrackPlayedScene(). Affiliates: seq_getSceneEpoch(),
+	 * liveRec_service() step 1.
+	 */
+	seq_sceneEpoch++;
 	seq_echoStep[track] = -1;
 	/* Realign the FX sequence and clear Effect track overlays (S081 §3.3-4). */
 	seq_fxRealignToMasterClock();
@@ -3568,26 +4490,26 @@ typedef struct {
 } seq_loop_pos_t;
 
 /*
- * Move a track position by a signed number of master ticks (S080 P2).
+ * Move a track position image by a signed Q8.8 tick delta (S080 P2, S081 P1B).
  *
- * What: applies `ticks` PPQ ticks (negative = rewind) to the DDA accumulator
- * and walks the step cursor by the resulting number of step advances under
- * the track's play mode: fwd/rev wrap modulo the effective length (from the
- * pre-start cursor -1 the first forward step is 0 and the first reverse step
- * is len-1); pip walks its 2 x len cycle and sets the direction bit; rnd draws
- * a new random step; onc/1fr clamp at the ends and set or clear the stopped
- * bit. Why: the looper must find a track's state at a past tick (loop start,
- * D4) and where a looped track would be now (resume, D3) without keeping a
- * shadow DDA running for every track. Uses the current effective scale and
- * length for the whole span (a Morph change during the span is approximated).
- * Inputs: track 0..6, position image, signed ticks. Outputs: position image
- * updated. Context: foreground (64-bit arithmetic; never called from TIM3).
- * Accessors: seq_loopSnapshotTracks(), seq_loopResumeTrack(). Affiliates:
+ * What: adds deltaQ8 (1/256 tick units; negative = rewind) to the image's
+ * DDA accumulator and walks the step cursor by the resulting number of step
+ * advances under the track's play mode (fwd/rev wrap, pip 2 x len cycle with
+ * direction bit, rnd fresh draw, onc/1fr clamp with the stopped bit). Returns
+ * the signed number of step advances applied (0 = same step). Why: the
+ * looper needs whole-tick shifts (seq_loopShiftPosition wraps this with
+ * ticks * 256, numerically unchanged). Live-record placement needs sub-tick
+ * shifts and to know whether a target step is behind, current or ahead of
+ * the playhead. Uses the current effective scale and length for the whole
+ * span (accepted S080 approximation). Inputs: track 0..6, position image,
+ * signed Q8 delta. Outputs: image updated; return = step advances.
+ * Context: foreground only (64-bit maths). Accessors: seq_loopShiftPosition()
+ * (looper), seq_placeFromSnapshot() (live record). Affiliates:
  * seq_advanceTrackStep() (the per-step semantics mirrored here),
  * stepScale_ticksQ8().
  */
-static void seq_loopShiftPosition(uint8_t track, seq_loop_pos_t *pos,
-                                  int32_t ticks)
+static int32_t seq_shiftPositionQ8(uint8_t track, seq_loop_pos_t *pos,
+                                   int32_t deltaQ8)
 {
 	const pat_scene_region_t *region =
 	    pat_sceneRegion(seq_perTrackPattern[track]);
@@ -3603,7 +4525,7 @@ static void seq_loopShiftPosition(uint8_t track, seq_loop_pos_t *pos,
 		len = NUM_STEPS_PER_BAR;
 	if (mode >= 6u)
 		mode = 0u;
-	total = (int64_t)pos->accum + (int64_t)ticks * 256;
+	total = (int64_t)pos->accum + (int64_t)deltaQ8;
 	steps = total / interval;
 	rem = total % interval;
 	if (rem < 0) {
@@ -3612,7 +4534,7 @@ static void seq_loopShiftPosition(uint8_t track, seq_loop_pos_t *pos,
 	}
 	pos->accum = (uint16_t)rem;
 	if (steps == 0)
-		return;
+		return 0;
 
 	switch (mode) {
 	case 1u: { /* rev */
@@ -3676,6 +4598,14 @@ static void seq_loopShiftPosition(uint8_t track, seq_loop_pos_t *pos,
 		break;
 	}
 	}
+	return (int32_t)steps;
+}
+
+/* Looper wrapper: whole-tick shift, numerically identical to P1 (S080). */
+static void seq_loopShiftPosition(uint8_t track, seq_loop_pos_t *pos,
+                                  int32_t ticks)
+{
+	(void)seq_shiftPositionQ8(track, pos, ticks * 256);
 }
 
 /*
@@ -3742,6 +4672,8 @@ void seq_captureTrackTime(uint8_t track, seq_track_time_t *out)
     out->elapsedTick = seq_elapsedPpqTicks;
     out->stampUs = seq_ppqStampUs;
     out->periodUs = seq_ppqPeriodUs;
+    /* S081 P1B item 17: the µs time of this capture, same section as the tick. */
+    out->nowUs = timebase_tim2Now();
     out->stepIndex = seq_stepIndex[track];
     out->accumulator = seq_trackAccumulator[track];
     out->interval = (uint16_t)stepScale_ticksQ8(seq_effectiveTrackScale[track]);
@@ -3755,90 +4687,120 @@ void seq_captureTrackTime(uint8_t track, seq_track_time_t *out)
 }
 
 /*
- * Project a master-clock tick to a track's step and offset (S081 §19.1, C-8b).
+ * Place a captured hit on a track's live step grid (S081 §8.3, P1B item 5).
  *
- * What: given a master tick, computes which step of the track would be playing
- * and the Q8 offset within that step. Built on the same math as
- * seq_loopCanonicalPreAdvance(). Returns 0 (unknown) for the rnd run mode.
- * Why: LiveRecord converts a captured trigger's master time to a step index.
+ * What: starting from the PRIMASK snapshot of the track's live cursor,
+ * accumulator and play state taken when the hit sounded, shifts the image by
+ * deltaQ8 (the quantised or sub-tick offset from the capture tick) and
+ * reports the step the hit lands on, the micro-timing delay (0..99) from
+ * that step's nominal start, and whether the step is behind, current or
+ * ahead of the playhead. snapToStep rounds to the nearest step start of the
+ * track's own grid (qnt trk). Shuffle is not used: it applies only at
+ * playback, so a recorded step gets the track's shuffle like any other
+ * step. Why: the P1 code mapped ticks through the canonical master-clock
+ * position (tick*256/current interval), which differs from the playing step
+ * as soon as the track's scale or length changed during playback (menu
+ * edit, Morph, scale/length automation). Hits then landed on the wrong
+ * step. Placement must follow the track that is actually playing. P1B
+ * measured the delay from the shuffled start of odd steps, so a hit before
+ * that start (including a quantised hit exactly on the grid) was written to
+ * the previous step at delay 99. Inputs: track, snapshot, signed Q8 delta,
+ * snap flag. Outputs: *out (step, delay, rel, ahead, snapQ8); returns 0
+ * when the track has not started (cursor -1). Context: foreground.
+ * Accessors: liveRec_triggerIn(), liveRec_placeFlam(), liveRec_endRoll().
+ * Affiliates: seq_shiftPositionQ8(), seq_captureTrackTime().
  */
-uint8_t seq_projectStep(uint8_t track, uint32_t tick,
-                        uint8_t *step, uint16_t *offsetQ8)
+uint8_t seq_placeFromSnapshot(uint8_t track, const seq_track_time_t *snap,
+                              int32_t deltaQ8, uint8_t snapToStep,
+                              seq_place_t *out)
 {
-    const pat_scene_region_t *region;
-    uint8_t len;
-    uint8_t mode;
+    seq_loop_pos_t pos;
+    int32_t steps;
     uint16_t interval;
-    uint64_t master_q8;
-    uint32_t position;
+    uint16_t off;
+    uint8_t mode;
+    uint8_t delay = 0u;
+    int32_t snapQ8 = 0;
 
-    if (track >= NUM_TRACKS)
+    if (!snap || !out || track >= NUM_TRACKS)
         return 0u;
-    region = pat_sceneRegion(seq_perTrackPattern[track]);
-    len = seq_effectiveTrackLength[track];
-    if (len < 1u)
-        len = NUM_STEPS_PER_BAR;
-    mode = region ? region->track_play_mode[track] : 0u;
+    if (snap->stepIndex < 0)
+        return 0u;
+    pos.step = snap->stepIndex;
+    pos.accum = snap->accumulator;
+    pos.play_state = snap->playState;
+    mode = snap->playMode;
     if (mode >= 6u)
         mode = 0u;
-    /* rnd cannot be projected from a tick. */
-    if (mode == 3u)
-        return 0u;
-    interval = (uint16_t)stepScale_ticksQ8(seq_effectiveTrackScale[track]);
+    /* rnd: backward only (plan §8.3). */
+    if (mode == 3u && deltaQ8 > 0)
+        deltaQ8 = 0;
+    steps = seq_shiftPositionQ8(track, &pos, deltaQ8);
+    off = pos.accum;
+    interval = snap->interval;
     if (interval == 0u)
         interval = 1u;
-    master_q8 = (uint64_t)tick << 8u;
-    position = (uint32_t)(master_q8 / interval);
-    if (step)
-        *step = (uint8_t)seq_stepIndexForMode(mode, position, len);
-    if (offsetQ8)
-        *offsetQ8 = (uint16_t)(master_q8 % interval);
+
+    if (snapToStep) {
+        if ((uint32_t)off * 2u >= (uint32_t)interval) {
+            snapQ8 = (int32_t)interval - (int32_t)off;
+            steps += seq_shiftPositionQ8(track, &pos, snapQ8);
+            off = pos.accum;
+        } else {
+            snapQ8 = -(int32_t)off;
+            off = 0u;
+        }
+    }
+
+    delay = (uint8_t)(((uint32_t)off * 100u + interval / 2u) / interval);
+    if (delay >= 100u) {
+        steps += seq_shiftPositionQ8(track, &pos,
+                                     (int32_t)interval - (int32_t)off);
+        off = pos.accum;
+        delay = 0u;
+    }
+
+    out->step = (uint8_t)pos.step;
+    out->delay = delay;
+    out->rel = (int8_t)((steps > 0) ? 1 : ((steps < 0) ? -1 : 0));
+    out->snapQ8 = (int16_t)snapQ8;
+    out->ahead = 0u;
+    if (steps > 0) {
+        /* The trk snap's shift counts toward the distance (P1C review C-2). */
+        int32_t aheadQ8 = deltaQ8 + snapQ8 - (int32_t)off;
+
+        out->ahead = (aheadQ8 > 0) ? (uint16_t)(aheadQ8 >> 8) : 0u;
+    }
     return 1u;
 }
 
 /*
- * Quantise a master-clock tick to the nearest boundary (S081 §19.1, C-8c).
+ * Quantise a capture to the master-clock grid (S081 §8.3, P1B item 5).
  *
- * What: for 1/8..1/64, snaps the tick to the nearest master-clock grid
- * (48/24/12/6 PPQ). For QUANT_TRACK, snaps to the nearest step start of the
- * given track's own grid. For NO_QUANTISATION, returns the input.
- * Why: LiveRecord quantises captured triggers before placement; the same
- * per-track snap serves the qnt trk option.
+ * What: for qnt 1/8, 1/16, 1/32, 1/64 (48/24/12/6 ticks) returns the
+ * nearest grid tick to (tick + frac8/256); for off and trk returns tick
+ * unchanged. Why: master-grid quantise is the same for every track; the
+ * track-grid snap (trk) must follow the track's live step starts, so it
+ * lives in seq_placeFromSnapshot(). The sub-tick fraction makes the
+ * half-way decision exact. Inputs: capture tick, sub-tick fraction 0..255.
+ * Output: grid tick. Context: any. Accessors: liveRec_triggerIn().
+ * Affiliates: seq_quantisation, seq_loopEventAnchor() (same grid).
  */
-uint32_t seq_quantiseTick(uint8_t track, uint32_t tick)
+uint32_t seq_quantiseTick(uint32_t tick, uint8_t frac8)
 {
-    if (seq_quantisation == QUANT_TRACK) {
-        uint16_t interval;
-        uint64_t master_q8;
-        uint64_t low;
-        uint32_t low_tick;
-        uint32_t high_tick;
+    uint32_t q;
+    uint32_t rem;
 
-        if (track >= NUM_TRACKS)
-            return tick;
-        interval = (uint16_t)stepScale_ticksQ8(seq_effectiveTrackScale[track]);
-        if (interval == 0u)
-            return tick;
-        master_q8 = (uint64_t)tick << 8u;
-        low = (master_q8 / interval) * interval;
-        low_tick = (uint32_t)(low >> 8u);
-        high_tick = (uint32_t)((low + interval + 255u) >> 8u);
-        return ((tick - low_tick) <= (high_tick - tick)) ? low_tick : high_tick;
+    switch (seq_quantisation) {
+    case QUANT_8:  q = 48u; break;
+    case QUANT_16: q = 24u; break;
+    case QUANT_32: q = 12u; break;
+    case QUANT_64: q = 6u;  break;
+    default:       return tick;   /* off / trk */
     }
-    {
-        uint32_t q;
-        uint32_t rem;
-
-        switch (seq_quantisation) {
-        case QUANT_8:  q = 48u; break;
-        case QUANT_16: q = 24u; break;
-        case QUANT_32: q = 12u; break;
-        case QUANT_64: q = 6u;  break;
-        default:       return tick;   /* NO_QUANTISATION */
-        }
-        rem = tick % q;
-        return (rem * 2u >= q) ? (tick + (q - rem)) : (tick - rem);
-    }
+    rem = tick % q;
+    return ((rem * 256u + frac8) >= (q * 128u)) ? (tick + (q - rem))
+                                                : (tick - rem);
 }
 
 /*
@@ -3988,6 +4950,8 @@ static void seq_loopResumeTrack(uint8_t track)
 	seq_trackAccumulator[track] = pos.accum;
 	seq_trackPlayState[track] = pos.play_state;
 	seq_lastMasterStep[track] = (uint8_t)((pos.step < 0) ? 0 : pos.step);
+	/* S081 P2: a playhead break ends automation ramps (no B will follow). */
+	seq_rampBreakTrack(track);
 	if (track == menu_getActiveVoice()) {
 		seq_ledState.chaseStep = seq_stepIndex[track];
 		seq_ledState.dirty |= SEQ_LED_DIRTY_CHASE;
@@ -4213,6 +5177,9 @@ static void seq_loopProcessTick(void)
 		seq_stepIndex[track] = seq_loopStartStep[track];
 		seq_trackAccumulator[track] = seq_loopStartAccum[track];
 		seq_trackPlayState[track] = seq_loopStartPlayState[track];
+		/* S081 P2 (D8): no ramp across the loop wrap; the restored step's
+		 * apply starts fresh. */
+		seq_rampBreakTrack(track);
 	}
 }
 
@@ -4419,6 +5386,8 @@ static void seq_chainEvaluate(uint8_t at_bar, uint8_t at_rep)
 	next = scene_getChainNext(scene, (uint8_t)(which - 1u));
 	if (next == SCENE_CHAIN_NEXT_STOP) {
 		seq_chainStopped = 1u;
+		/* S081 P2: frozen tracks reach no B; end their ramps. */
+		seq_rampBreakAll();
 		return;
 	}
 	target = seq_chainResolveNext(next, scene);
@@ -4514,14 +5483,26 @@ void seq_chainRepeatSelf(uint8_t restart)
  * seq_trackShuffleStep/Roll/Vel/Note. Outputs: entries queued, trigger
  * enqueued, pending cleared. Affiliates: seq_processDeferredTriggers()
  * (expiry), seq_advanceTrackStep() (early flush), seq_rollBegin().
+ * S081 P2: sets the ramp context's stepped flag, so ramps into this step end
+ * when its value lands.
  */
 static void seq_fireDeferred(uint8_t track)
 {
 	uint8_t step = seq_trackShuffleStep[track];
 	uint8_t roll = seq_trackShuffleRoll[track];
+	uint8_t muted;
 
+	muted = (uint8_t)((seq_trackShuffleMuteMask >> track) & 1u);
+	seq_trackShuffleMuteMask &= (uint8_t)~(1u << track);
 	seq_trackShufflePending[track] = 0u;
 	seq_queueStepAutomations(track, step);
+	/* S081 P2: the deferred step's automation lands now; end the ramps
+	 * into it (the context still describes this step unless the next step
+	 * has already started, in which case that step's event ended them). */
+	if ((uint8_t)(seq_rampCtx[track].a & 0x7Fu) == step)
+		seq_rampCtx[track].a |= SEQ_RAMP_STEPPED;
+	if (muted)
+		return;                 /* P1B item 7: automation kept, no trigger */
 	if (roll) {
 		pat_step_specials_t sp = pat_readStepSpecials(
 		    seq_perTrackPattern[track], track, step);
@@ -4944,6 +5925,8 @@ void seq_setRunning(uint8_t isRunning)
 {
 	/* S081 §19.1 item 6: a transport change is a take boundary. */
 	seq_playbackEpoch++;
+	/* S081 P2: a playhead break ends automation ramps (no B will follow). */
+	seq_rampBreakAll();
 	if (!isRunning)
 	{
 		seq_running = 0u;
@@ -5204,6 +6187,8 @@ static void seq_setStepIndexToStart()
 	memset(seq_menuOverride, 0, sizeof(seq_menuOverride));
 	/* S081 C-6/C-10: bump the playback epoch and expire echo marks. */
 	seq_playbackEpoch++;
+	/* S081 P2: a playhead break ends automation ramps (no B will follow). */
+	seq_rampBreakAll();
 	seq_liveRecResetMarks();
 	/*
 	 * S078 §5.5: recompute the effective track cache after the restore cleared

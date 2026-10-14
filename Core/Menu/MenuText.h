@@ -178,6 +178,8 @@ static const char shortNames[][4] = {
     {"cn1"},{"nx1"},{"cn2"},{"nx2"},
     /* S080 P2 Defect 8a: per-track loopable. */
     {"lop"},
+    /* S081 P2: per-track automation ramp. */
+    {"asm"},
 };
 
 static const char catNames[][16] = {
@@ -237,6 +239,8 @@ static const char longNames[][16] = {
     {"Conditn1"},{"NxtScn1"},{"Conditn2"},{"NxtScn2"},
     /* S080 P2 Defect 8a. */
     {"Loopable"},
+    /* S081 P2. */
+    {"Automtn"},
 };
 
 /*

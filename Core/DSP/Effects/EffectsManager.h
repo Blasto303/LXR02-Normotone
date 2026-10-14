@@ -303,6 +303,9 @@ typedef enum {
 uint8_t effects_paramMorphable(effect_type_id_t type, uint8_t index);
 uint8_t effects_getParameter(uint8_t scene_index, uint8_t index,
                              effect_image_t image);
+/* Convert a retained Effect value to its 7-bit Pattern form (S081 §9.2,
+** P1B item 18). WIDE8 rows use the smallest v with expand7(v) >= value. */
+uint8_t effects_storeValue7(uint8_t scene_index, uint8_t local, uint8_t value);
 uint8_t effects_setParameter(uint8_t scene_index, uint8_t index,
                              effect_image_t image, uint8_t value);
 uint8_t effects_setSeqRunMode(uint8_t scene_index, uint8_t mode);
@@ -439,9 +442,9 @@ uint16_t effects_stepTarget(uint8_t scene_index, uint16_t current,
 void effects_automationReset(void);
 /* Register/reset the FX-sequence live-erase lane mask (S081 §10.4, G-3a). */
 void effects_setLiveEraseLanes(uint16_t laneMask);
-/* Drain the (step, lane) FX-erase pending mask; 1 when anything was pending
-** (S081 §10.4, G-3b). Caller: liveRec_service(). */
-uint8_t effects_takeErasedLocks(uint16_t *stepMask, uint16_t *laneMask);
+/* Take one FX step's erased lanes (S081 §10.4, P1B item 28): lowest pending
+** step + its lane mask, cleared; 0 when none. Caller: liveRec_service(). */
+uint8_t effects_takeErasedLocks(uint8_t *step, uint16_t *laneMask);
 uint8_t effects_applyAutomation(uint8_t track, uint8_t local, uint8_t value7);
 void effects_setMorphAutomation(uint8_t amount);
 /*

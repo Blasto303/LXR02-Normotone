@@ -615,9 +615,11 @@ MIDI uses processing time until the MIDI rework.
 
 ### 8.3 Placement
 
-- **Un-quantized:** the latest step whose played start (nominal + shuffle)
-  is at or before `t`.
-  - Delay = `(t − played_start) × 100 / interval`, clamped 0..99.
+- **Un-quantized:** the latest step whose nominal start is at or before
+  `t`.
+  - Delay = `(t − step_start) × 100 / interval`, clamped 0..99.
+  - Shuffle is never used in placement; it applies only at playback, to
+    recorded steps like any other step (2026-10-13 decision).
   - A rounded 100 goes to the next step at delay 0.
 - **1/8..1/64:** snap on the master clock (48/24/12/6 ticks), then place as
   above.

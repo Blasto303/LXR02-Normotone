@@ -134,13 +134,15 @@ const Page menuPages[NUM_PAGES][NUM_SUB_PAGES] = {
 /* SEQ_PAGE
  * Subpage 0 is the track-settings front page. S078 §7 groups the three
  * morphable parameters (len, scl, shf) on the left, followed by the discrete
- * play mode (run), MIDI channel, MIDI note and the S080 P2 looper opt-out
- * (lop, Defect 8a). The last cell is the traversal terminator. Clients:
+ * play mode (run), MIDI channel, MIDI note, the S080 P2 looper opt-out
+ * (lop, Defect 8a) and the S081 P2 automation ramp mode (asm). All eight
+ * cells are populated; the generic traversal stops at column 8. Clients:
  * STEP-mode VOICE re-press toggles menuIndex through Menu helpers, and encoder
  * scrolling reaches every cell through normal traversal.
  */
 /* SEQ_PAGE */ {
-  {TEXT_PAT_LENGTH,TEXT_TRACK_SCALE,TEXT_SHUFFLE,TEXT_TRACK_PLAY_MODE,TEXT_MIDI_CHANNEL,TEXT_NOTE,TEXT_TRACK_LOOPABLE,TEXT_EMPTY, PAR_TRACK_LENGTH,PAR_TRACK_SCALE,PAR_SHUFFLE,PAR_TRACK_PLAY_MODE,PAR_TRACK_MIDI_CHAN,PAR_TRACK_MIDI_NOTE,PAR_TRACK_LOOPABLE,PAR_NONE},
+  /* S081 P2: cell 7 = asm (automation ramp mode), after lop. */
+  {TEXT_PAT_LENGTH,TEXT_TRACK_SCALE,TEXT_SHUFFLE,TEXT_TRACK_PLAY_MODE,TEXT_MIDI_CHANNEL,TEXT_NOTE,TEXT_TRACK_LOOPABLE,TEXT_TRACK_AUTO_SMOOTH, PAR_TRACK_LENGTH,PAR_TRACK_SCALE,PAR_SHUFFLE,PAR_TRACK_PLAY_MODE,PAR_TRACK_MIDI_CHAN,PAR_TRACK_MIDI_NOTE,PAR_TRACK_LOOPABLE,PAR_TRACK_AUTO_SMOOTH},
   /*
    * Step specials subpage 1 (S079): vel, note, condition, micro-timing. The
    * four fixed cells end at micro-timing; scrolling past it enters the

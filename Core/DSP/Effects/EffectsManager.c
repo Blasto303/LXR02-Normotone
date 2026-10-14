@@ -195,17 +195,19 @@ _Static_assert(sizeof(effects_automation_t) == 120u,
 static effects_automation_t effects_automation;
 
 /*
- * FX-sequence live-erase state (S081 §10.4, §19.4, G-3).
+ * Locks excluded by live erase, per FX step (S081 §10.4, P1B item 28).
  *
- * effects_eraseLanes: lanes the live erase is removing; at each FX step start
- * the locked lanes in this mask are excluded from resolution (they must not
- * sound) and recorded in the pending accumulator. effects_erasedSteps/
- * effects_erasedLanesAcc accumulate the (step, lane) pairs LiveRecord drains via
- * effects_takeErasedLocks() and clears with effects_clearSeqLanes(). RAM: ~6 B.
+ * What: effects_eraseLanes is the set of lanes the live erase is removing;
+ * effects_erasedLanes[s] is the set of lanes whose locks were kept from
+ * sounding on FX step s since the last drain. Why: one combined
+ * (stepMask, laneMask) pair cleared the union of lanes on every step seen in
+ * a drain window, erasing locks that were never passed. Per-step masks make
+ * the retained clear exact. Inputs: effects_lockClearLayers(). Outputs:
+ * effects_takeErasedLocks(). RAM: 2 + 32 B. Affiliates: liveRec_service(),
+ * effects_clearSeqLanes().
  */
 static uint16_t effects_eraseLanes;
-static uint16_t effects_erasedSteps;
-static uint16_t effects_erasedLanesAcc;
+static uint16_t effects_erasedLanes[EFFECT_SEQ_STEP_COUNT];
 
 #if DEV_MODE_DIAGNOSTIC
 static uint8_t effects_registryCheckCode;
@@ -508,6 +510,40 @@ uint8_t effects_getParameter(uint8_t scene_index, uint8_t index,
         return record->morph[index];
     return record->normal[index];
 }
+/*
+ * Convert a retained Effect value to its 7-bit Pattern form (S081 §9.2,
+ * P1B item 18).
+ *
+ * What: for a WIDE8 row (0..255 retained, expand7 on playback) returns the
+ * 7-bit value whose expand7() first reaches `value`. For any other row it
+ * returns the value clamped to 127. Why: Pattern automation stores 7 bits
+ * (packed with & 0x7F). A WIDE8 value above 127 written raw would wrap and
+ * play back as a different value. Inputs: Scene (for its Effect type),
+ * local parameter, retained value. Output: 0..127. Context: foreground.
+ * Accessors: liveRec_targetValue7(). Affiliates: effects_getParameter(),
+ * effect_param_descriptor_t.expand7, EFFECT_PARAM_FLAG_WIDE8.
+ */
+uint8_t effects_storeValue7(uint8_t scene_index, uint8_t local,
+                            uint8_t value)
+{
+    const effect_record_t *record = scene_effectConst(scene_index);
+    const effect_param_descriptor_t *descriptor;
+    uint8_t v;
+
+    if (!record || local >= EFFECT_PARAM_COUNT)
+        return 0u;
+    descriptor = effects_descriptor(record->type, local);
+    if (!descriptor ||
+        (descriptor->effect_flags & EFFECT_PARAM_FLAG_WIDE8) == 0u)
+        return (uint8_t)((value > 127u) ? 127u : value);
+    /* WIDE8: smallest v in 0..127 whose expand7(v) reaches value. */
+    for (v = 0u; v < 127u; v++) {
+        if (descriptor->expand7(v) >= value)
+            return v;
+    }
+    return 127u;
+}
+
 
 /*
  * Resolve which resident Scenes one Effect edit reaches (plan §7.4, A44).
@@ -787,8 +823,8 @@ static void effects_lockClearLayers(const effect_record_t *record, uint8_t step)
         if ((effects_eraseLanes &
              (uint16_t)(1u << EFFECT_SEQ_LANE_MORPH)) != 0u) {
             /* S081 G-3c: an erased lane must not sound; queue it for removal. */
-            effects_erasedSteps |= (uint16_t)(1u << (step & 15u));
-            effects_erasedLanesAcc |= (uint16_t)(1u << EFFECT_SEQ_LANE_MORPH);
+            effects_erasedLanes[step & 15u] |=
+                (uint16_t)(1u << EFFECT_SEQ_LANE_MORPH);
         } else {
             effects_automation.morph_override_valid = 0u;
             effects_automation.menuHoldMorph = 0u;
@@ -801,8 +837,7 @@ static void effects_lockClearLayers(const effect_record_t *record, uint8_t step)
             continue;
         if ((effects_eraseLanes & (uint16_t)(1u << lane)) != 0u) {
             /* S081 G-3c: an erased lane must not sound; queue it for removal. */
-            effects_erasedSteps |= (uint16_t)(1u << (step & 15u));
-            effects_erasedLanesAcc |= (uint16_t)(1u << lane);
+            effects_erasedLanes[step & 15u] |= (uint16_t)(1u << lane);
             continue;
         }
         index = entry->lanes[lane];
@@ -1309,8 +1344,7 @@ void effects_automationReset(void)
 {
     /* Common reset path and Scene activation clear all transient Effect layers. */
     effects_automationClear(1u);
-    effects_erasedSteps = 0u;
-    effects_erasedLanesAcc = 0u;
+    memset(effects_erasedLanes, 0, sizeof(effects_erasedLanes));
 }
 
 /*
@@ -1327,29 +1361,35 @@ void effects_setLiveEraseLanes(uint16_t laneMask)
 }
 
 /*
- * Drain the FX-erase pending mask (S081 §10.4, G-3b).
+ * Take one FX step's erased lanes (S081 §10.4, P1B item 28).
  *
- * What: copies the accumulated (step, lane) masks into the outputs and clears
- * them; returns 1 when anything was pending. Why: LiveRecord drains it each
- * service pass and calls effects_clearSeqLanes() to remove the retained locks
- * from the origin Scene and its linked Scenes. Caller: liveRec_service().
+ * What: returns the lowest FX step with pending erased lanes and its lane
+ * mask, and clears that entry. Returns 0 when nothing is pending. Why: the
+ * caller clears the retained locks step by step with
+ * effects_clearSeqLanes(scene, 1 << step, lanes), including the linked-Scene
+ * fan-out, without touching lanes that were never passed. Context:
+ * foreground. Accessors: liveRec_service() (loops until 0). Affiliates:
+ * effects_erasedLanes[], effects_clearSeqLanes().
  */
-uint8_t effects_takeErasedLocks(uint16_t *stepMask, uint16_t *laneMask)
+uint8_t effects_takeErasedLocks(uint8_t *step, uint16_t *laneMask)
 {
-    if (effects_erasedSteps == 0u) {
-        if (stepMask)
-            *stepMask = 0u;
-        if (laneMask)
-            *laneMask = 0u;
-        return 0u;
+    uint8_t s;
+
+    for (s = 0u; s < EFFECT_SEQ_STEP_COUNT; s++) {
+        if (effects_erasedLanes[s] != 0u) {
+            if (step)
+                *step = s;
+            if (laneMask)
+                *laneMask = effects_erasedLanes[s];
+            effects_erasedLanes[s] = 0u;
+            return 1u;
+        }
     }
-    if (stepMask)
-        *stepMask = effects_erasedSteps;
+    if (step)
+        *step = 0u;
     if (laneMask)
-        *laneMask = effects_erasedLanesAcc;
-    effects_erasedSteps = 0u;
-    effects_erasedLanesAcc = 0u;
-    return 1u;
+        *laneMask = 0u;
+    return 0u;
 }
 
 uint8_t effects_applyAutomation(uint8_t track, uint8_t local, uint8_t value7)

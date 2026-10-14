@@ -169,6 +169,25 @@ static volatile struct {
 static uint8_t bh_shiftHeld;
 static uint8_t bh_clearHeld;
 
+/*
+ * Buttons holding a live-erase gesture (S081 §10.2, P1C items 10/16).
+ *
+ * What: one bit per SEQ button (bh_eraseSeqMask: an active-track SEQ hold
+ * in VOICE/STEP; bh_eraseFxSeqMask: an FX-sequence hold in FX) and per
+ * TRACK button (bh_eraseVoiceMask) whose press started an erase gesture.
+ * A release ends a gesture only if its bit is set, whatever the mode or
+ * erase state is by then. Cleared at a MODE press during erase (the
+ * gestures were released by liveRec_eraseReleaseHeld()) and when erase
+ * starts from off. Why: releases were routed by the mode at release time,
+ * so after a mode change an old button's release ended a gesture started
+ * by a new button, and a release after erase end was lost. RAM: 5 B.
+ * Affiliates: processPress()/processRelease() erase routers,
+ * handleModeButtons(), buttonHandler_liveEraseBegin().
+ */
+static uint16_t bh_eraseSeqMask;
+static uint16_t bh_eraseFxSeqMask;
+static uint8_t  bh_eraseVoiceMask;
+
 static uint8_t lastActiveSubPage = 0;
 uint8_t buttonHandler_selectedStep = 0;
 static uint8_t selectedStepLed = LED_STEP1;
@@ -375,6 +394,17 @@ static uint16_t bh_overlayNext      = 0u;
  * buttonHandler_overlayTrigger(), buttonHandler_overlaySwitchHeld().
  */
 static uint8_t bh_overlayHeldType = 0xFFu;
+
+/*
+ * Overlay note is "default" (S081 Q12, P1B item 15).
+ *
+ * What: 1 when the active overlay's note parameter is 0 (`def`): the hit
+ * plays the track's MIDI note, and a recording stores no note special.
+ * Why: Q12. Without the flag LiveRecord could not tell `def` from an
+ * explicit note. RAM: 1 B. Affiliates: buttonHandler_overlayReport(),
+ * liveRec_triggerIn().
+ */
+static uint8_t bh_overlayNoteDefault;
 
 
 #define DBLCLICK_FIRST  0u
@@ -911,6 +941,7 @@ static uint16_t buttonHandler_overlayDivisionMs(uint8_t idx)
  * each hit when it sounds. Affiliates: liveRec_triggerIn().
  */
 static void buttonHandler_overlayReport(uint8_t voiceNr, uint8_t note,
+                                        uint8_t noteIsDefault,
                                         uint8_t velocity, uint8_t kind,
                                         uint8_t roll)
 {
@@ -922,7 +953,7 @@ static void buttonHandler_overlayReport(uint8_t voiceNr, uint8_t note,
     t.kind = kind;
     t.roll = roll;
     t.source = LIVEREC_SRC_OVERLAY;
-    t.note_is_default = 0u;
+    t.note_is_default = noteIsDefault;
     liveRec_triggerIn(&t);
 }
 
@@ -942,6 +973,8 @@ static void buttonHandler_overlayTrigger(uint8_t voiceNr)
     }
     if (type > 11u)
         type = 0u;
+    /* P1B item 15: `def` note (param 0) records no note special. */
+    bh_overlayNoteDefault = (uint8_t)(note == 0u);
     if (note == 0u)
         note = scene_getTrackMidiNote(seq_getTrackPlayedScene(voiceNr), voiceNr);
     if (note == 0u)
@@ -956,14 +989,16 @@ static void buttonHandler_overlayTrigger(uint8_t voiceNr)
         static const uint8_t singleVel[4] = {127u, 100u, 64u, 32u};
 
         seq_triggerVoice(voiceNr, singleVel[type], note, 1);
-        buttonHandler_overlayReport(voiceNr, note, singleVel[type],
+        buttonHandler_overlayReport(voiceNr, note, bh_overlayNoteDefault,
+                                    singleVel[type],
                                     LIVEREC_HIT_SINGLE, 0u);
         return;
     }
     if (type == 4u || type == 5u) {
         /* Flam: soft leading hit now, main hit one 1/32 later. */
         seq_triggerVoice(voiceNr, 64u, note, 1);
-        buttonHandler_overlayReport(voiceNr, note, 64u, LIVEREC_HIT_FLAM_GRACE, 0u);
+        buttonHandler_overlayReport(voiceNr, note, bh_overlayNoteDefault,
+                                    64u, LIVEREC_HIT_FLAM_GRACE, 0u);
         interval = buttonHandler_overlayDivisionMs(5u);
         vel = 100u;
         count = 1u;
@@ -980,8 +1015,9 @@ static void buttonHandler_overlayTrigger(uint8_t voiceNr)
         {
             static const uint8_t rollIdx[6] = {1u, 3u, 5u, 7u, 8u, 9u};
 
-            buttonHandler_overlayReport(voiceNr, note, 100u,
-                                        LIVEREC_HIT_ROLL_START, rollIdx[idx]);
+            buttonHandler_overlayReport(voiceNr, note, bh_overlayNoteDefault,
+                                        100u, LIVEREC_HIT_ROLL_START,
+                                        rollIdx[idx]);
         }
         vel = 100u;
         count = 0xFFu;                                  /* repeat while held */
@@ -1063,6 +1099,8 @@ static void buttonHandler_overlaySwitchHeld(void)
                                     : parameter_values[PAR_PERF_NOTE_RT];
     if (type > 11u)
         type = 0u;
+    /* P1B item 15: track the `def` flag across an overlay switch. */
+    bh_overlayNoteDefault = (uint8_t)(note == 0u);
     if (note == 0u)
         note = scene_getTrackMidiNote(
             seq_getTrackPlayedScene(bh_overlayTrack), bh_overlayTrack);
@@ -1111,6 +1149,49 @@ static void buttonHandler_overlaySwitchHeld(void)
     }
 }
 
+/*
+ * Start live erase from the key-press paths (S081 §10.1, P1C item 16).
+ *
+ * What: enables erase (LiveRecord ends an overdub and keeps the prior
+ * LATCH/OFF) and lights SHIFT and CLEAR. Entering from off also clears the
+ * gesture masks, so a button still held from an earlier session cannot end
+ * a gesture of this one. A repeat call while erase is already on (SHIFT
+ * pressed again with CLEAR held) keeps the masks. Why: one entry point for
+ * both key orders, mirroring buttonHandler_liveEraseEnd(). Affiliates:
+ * liveRec_eraseBegin(), BC-3 masks.
+ */
+static void buttonHandler_liveEraseBegin(void)
+{
+    if (liveRec_mode() != LIVEREC_MODE_ERASE) {
+        bh_eraseSeqMask = 0u;
+        bh_eraseFxSeqMask = 0u;
+        bh_eraseVoiceMask = 0u;
+    }
+    liveRec_eraseBegin();
+    led_setValue(1u, LED_SHIFT);
+    led_setValue(1u, LED_COPY);
+}
+
+/*
+ * End live erase from the key-release paths (S081 §10.1, P1B items 12/27).
+ *
+ * What: ends erase (LiveRecord restores the prior LATCH/OFF state), turns
+ * SHIFT and CLEAR off, restores the REC LED to the record state, and asks
+ * Menu to restart the automation search. Why: one exit point for both key
+ * orders. Knob erase removes automation progressively and only from rtk,
+ * so the underline must be recomputed by the search at the end rather than
+ * dropped at the first turn (MN-5). Affiliates: liveRec_eraseEnd(),
+ * menu_patternContentChanged().
+ */
+static void buttonHandler_liveEraseEnd(void)
+{
+    liveRec_eraseEnd();
+    led_setValue(0u, LED_SHIFT);
+    led_setValue(0u, LED_COPY);
+    led_setValue((uint8_t)(liveRec_mode() == LIVEREC_MODE_LATCH), LED_REC);
+    menu_patternContentChanged();
+}
+
 static void buttonHandler_overlayTick(void)
 {
     if (bh_overlayCount == 0u)
@@ -1123,10 +1204,12 @@ static void buttonHandler_overlayTick(void)
     /* S081 E-2b: the flam main / a roll repeat, reported when it sounds. */
     if (bh_overlayCount == 0xFFu)
         buttonHandler_overlayReport(bh_overlayTrack, bh_overlayNote,
-                                    bh_overlayVel, LIVEREC_HIT_ROLL_HIT, 0u);
+                                    bh_overlayNoteDefault, bh_overlayVel,
+                                    LIVEREC_HIT_ROLL_HIT, 0u);
     else
         buttonHandler_overlayReport(bh_overlayTrack, bh_overlayNote,
-                                    bh_overlayVel, LIVEREC_HIT_FLAM_MAIN, 0u);
+                                    bh_overlayNoteDefault, bh_overlayVel,
+                                    LIVEREC_HIT_FLAM_MAIN, 0u);
     if (bh_overlayCount != 0xFFu) {
         bh_overlayCount--;
         if (bh_overlayCount == 0u)
@@ -1757,6 +1840,21 @@ static void handleModeButtons(uint8_t mode)
         buttonHandler_shiftRecMenuExit();
     if (menu_chainMenuIsOpen())
         menu_chainMenuClose();
+    /*
+     * A mode change ends held erase gestures (S081 §10.1, P1B item 8).
+     *
+     * What: SEQ and TRACK buttons change meaning with the mode, so their held
+     * erase gestures stop at a MODE press; erase itself (SHIFT/CLEAR) and the
+     * knob-erase targets stay enabled. Affiliates: liveRec_eraseReleaseHeld().
+     */
+    if (liveRec_mode() == LIVEREC_MODE_ERASE) {
+        liveRec_eraseReleaseHeld();
+        /* The BC-3 masks are cleared with them, so the old buttons' later
+         * releases are consumed as no-ops (P1C item 10). */
+        bh_eraseSeqMask = 0u;
+        bh_eraseFxSeqMask = 0u;
+        bh_eraseVoiceMask = 0u;
+    }
     {
         /* Same mode arithmetic as below; SHIFT+MODE1 stays in VOICE. */
         uint8_t next;
@@ -2049,19 +2147,26 @@ static void handleSelectButton(uint8_t selectNr)
             uint8_t trackMask = (perf_heldVoiceMask != 0u)
                 ? perf_heldVoiceMask : 0x7Fu;
 
-            /*
-             * Record forced off before looper engage (S081 §3.3-9, §19.7,
-             * B-4a, P1 interim). The Sequencer no longer does this; moving the
-             * record-off to the caller keeps the dependency one-way
-             * (buttonHandler -> LiveRecord -> Sequencer). P2 removes it (L-2).
-             */
-            if (liveRec_armed()) {
-                liveRec_forceOff();
-                led_setValue(0u, LED_REC);
-            }
             bh_loopBarModifier = 0u;
             bh_loopTrackMask = seq_loopEngage(trackMask, division,
                                               bh_loopBarModifier);
+            /*
+             * Looper engage turns record off only if the loop engaged
+             * (S081 P1 interim, P1B item 13).
+             *
+             * What: after seq_loopEngage(), if the loop is now active and live
+             * record or erase is armed, record is forced off and the REC LED
+             * cleared. Why: seq_loopEngage() does nothing while the transport is
+             * stopped (a SELECT press then only lights its LED); P1 disarmed
+             * record before the call, so a SELECT press while stopped lost the
+             * armed state. This restores the S080 order (engage, then test
+             * seq_loopActive). P2 removes the lockout (L-2). Affiliates:
+             * seq_loopEngage(), liveRec_forceOff().
+             */
+            if (seq_loopActive && liveRec_armed()) {
+                liveRec_forceOff();
+                led_setValue(0u, LED_REC);
+            }
         } else {
             seq_loopUpdateDivision(division, bh_loopBarModifier);
         }
@@ -2518,25 +2623,50 @@ static void processPress(uint8_t buttonNr)
         return;
 
     /*
-     * Live erase button router (S081 §10.2, G-1a).
+     * Live erase button router, press edge (S081 §10.2, P1B items 8/9).
      *
-     * While erase is enabled, SEQ presses erase the active track (VOICE/STEP)
-     * or the FX sequence (FX), VOICE presses erase that track, and PLAY is a
-     * plain transport toggle. Every other button passes through unchanged.
+     * What: while live erase is enabled, implements the per-mode table:
+     *  - SEQ in VOICE/STEP erases the ACTIVE track's triggers/specials while
+     *    held; SEQ in FX erases the FX sequence; SEQ in PERF (Scene buttons),
+     *    Load/Save, global settings and SOM_GEN is consumed with no action;
+     *  - VOICE in VOICE/STEP/PERF/FX erases that whole track while held, and is
+     *    consumed elsewhere;
+     *  - PLAY is a plain transport toggle (never the SHIFT+PLAY chain chord).
+     * Why: P1 erased in every mode, so PERF Scene buttons removed triggers, and
+     * it used rtk instead of the active track. Inputs: button, mode, active
+     * voice. Outputs: LiveRecord erase gestures or nothing. Accessors:
+     * processPress(). Affiliates: liveRec_eraseSeqHeld(),
+     * liveRec_eraseFxSeqHeld(), liveRec_eraseTrackHeld(), BH-2 (release edge).
+     *
+     * Each press that starts a gesture sets its button's bit in
+     * bh_eraseSeqMask / bh_eraseFxSeqMask / bh_eraseVoiceMask; the release
+     * edge ends exactly that gesture (P1C item 10).
      */
     if (liveRec_mode() == LIVEREC_MODE_ERASE) {
         int8_t eraseSeq = btn_to_seq(buttonNr);
         int8_t eraseVoice = btn_to_voice(buttonNr);
+        uint8_t eraseMode = bh_state.selectButtonMode;
 
         if (eraseSeq >= 0) {
-            if (bh_state.selectButtonMode == SELECT_MODE_FX)
+            uint16_t bit = (uint16_t)(1u << eraseSeq);
+
+            if (eraseMode == SELECT_MODE_VOICE || eraseMode == SELECT_MODE_STEP) {
+                bh_eraseSeqMask |= bit;
+                liveRec_eraseSeqHeld(menu_getActiveVoice(), 1u);
+            } else if (eraseMode == SELECT_MODE_FX) {
+                bh_eraseFxSeqMask |= bit;
                 liveRec_eraseFxSeqHeld(1u);
-            else
-                liveRec_eraseSeqHeld(1u);
+            }
+            /* PERF, LOAD_SAVE, MENU, SOM_GEN: consumed */
             return;
         }
         if (eraseVoice >= 0) {
-            liveRec_eraseTrackHeld((uint8_t)eraseVoice, 1u);
+            if (eraseMode == SELECT_MODE_VOICE || eraseMode == SELECT_MODE_STEP ||
+                eraseMode == SELECT_MODE_PERF  || eraseMode == SELECT_MODE_FX) {
+                bh_eraseVoiceMask |= (uint8_t)(1u << eraseVoice);
+                liveRec_eraseTrackHeld((uint8_t)eraseVoice, 1u);
+            }
+            /* other modes: consumed */
             return;
         }
         if (buttonNr == BUT_START_STOP) {
@@ -2637,6 +2767,18 @@ static void processPress(uint8_t buttonNr)
             buttonHandler_shiftRecMenuExit();
             break;
         }
+        /*
+         * REC while live erase is enabled (S081 §10.3, P1C item 5).
+         *
+         * What: REC does nothing while erase is on, including with SHIFT held
+         * (which it almost always is during erase). An already-open SHIFT+REC
+         * menu still closes. Why: SHIFT+REC was tested first, so REC during erase
+         * opened the settings menu; the menu then swallowed the SHIFT release and
+         * erase stayed on with both keys up. Affiliates: processRelease() BUT_SHIFT
+         * (BC-2), buttonHandler_shiftRecMenuEnter().
+         */
+        if (liveRec_mode() == LIVEREC_MODE_ERASE)
+            break;
         if (buttonHandler_getShift()) {
             /* S080 E7: SHIFT+REC opens the settings menu (overlay + quant). */
             buttonHandler_shiftRecMenuEnter();
@@ -2646,9 +2788,6 @@ static void processPress(uint8_t buttonNr)
              * (S080 rule; P2 removes it, L-2). Engaged loop already forced
              * recording off in the caller, so the user cannot re-arm mid-loop.
              */
-            break;
-        } else if (liveRec_mode() == LIVEREC_MODE_ERASE) {
-            /* Live erase is enabled: REC does nothing (S081 §10.3). */
             break;
         } else {
             /*
@@ -2683,8 +2822,7 @@ static void processPress(uint8_t buttonNr)
                  * SHIFT+COPY while armed enters live erase (S081 §10, G-5).
                  * The chord ends when both SHIFT and CLEAR are released.
                  */
-                liveRec_eraseBegin();
-                led_setValue(1u, LED_SHIFT);
+                buttonHandler_liveEraseBegin();
             } else {
                 (void)copyClear_copyPressed(1u);
             }
@@ -2776,6 +2914,14 @@ static void processPress(uint8_t buttonNr)
 
     case BUT_SHIFT:
         /*
+         * SHIFT hold flag tracks the physical key (S081 §10.1, P1B item 12).
+         * Set on every SHIFT press, including the press that closes a latched
+         * menu (whose release is consumed). Why: the live-erase chord ends only
+         * when BOTH SHIFT and CLEAR are released; a flag skipped on an early
+         * return left erase unable to end, or able to end with SHIFT still held.
+         */
+        bh_shiftHeld = 1u;
+        /*
          * S080 P2 Defect 3 / Phase G: SHIFT closes a latched menu.
          *
          * What: if the SHIFT+REC settings menu or the chain editor is open,
@@ -2797,9 +2943,8 @@ static void processPress(uint8_t buttonNr)
         }
         /* _SEQUENCER_ADD_SPIKE_: restore SHIFT-press mode behavior parity with AVR. */
         /* S081 G-5: SHIFT press completes a live-erase chord with held CLEAR. */
-        bh_shiftHeld = 1u;
         if (bh_clearHeld && liveRec_armed())
-            liveRec_eraseBegin();
+            buttonHandler_liveEraseBegin();
         led_setValue(1, LED_SHIFT);
         switch (bh_state.selectButtonMode) {
         case SELECT_MODE_VOICE:
@@ -2887,7 +3032,9 @@ static void processRelease(uint8_t buttonNr)
         bh_clearHeld = 0u;
         if (liveRec_mode() == LIVEREC_MODE_ERASE) {
             if (!bh_shiftHeld)
-                liveRec_eraseEnd();
+                buttonHandler_liveEraseEnd();
+            else
+                led_setValue(1u, LED_COPY);   /* keep lit while SHIFT held */
             return;
         }
         copyClear_copyReleased();
@@ -2920,22 +3067,49 @@ static void processRelease(uint8_t buttonNr)
         bh_recArmed = 0u;
         return;
     }
-    /* S081 G-1a: erase release edges for SEQ / VOICE holds. */
-    if (liveRec_mode() == LIVEREC_MODE_ERASE) {
+    /*
+     * Live erase button router, release edge (S081 §10.2, P1B items 8/9,
+     * P1C items 10/16).
+     *
+     * What: a SEQ or TRACK release ends the gesture its own press started
+     * (BC-3 masks), whatever the mode is now, and is consumed, even after
+     * erase has ended. Any other SEQ/TRACK release while erase is on is
+     * consumed. Why: P1B routed by the mode at release time, so after a mode
+     * change an old button's release could end a new button's gesture, and a
+     * release after erase end was lost (leaving LiveRecord's hold count set,
+     * item 16). Affiliates: BC-4 (press edge), liveRec_eraseSeqHeld(),
+     * liveRec_eraseFxSeqHeld(), liveRec_eraseTrackHeld().
+     */
+    {
         int8_t eraseSeq = btn_to_seq(buttonNr);
         int8_t eraseVoice = btn_to_voice(buttonNr);
 
         if (eraseSeq >= 0) {
-            if (bh_state.selectButtonMode == SELECT_MODE_FX)
+            uint16_t bit = (uint16_t)(1u << eraseSeq);
+
+            if ((bh_eraseSeqMask & bit) != 0u) {
+                bh_eraseSeqMask &= (uint16_t)~bit;
+                liveRec_eraseSeqHeld(menu_getActiveVoice(), 0u);
+                return;
+            }
+            if ((bh_eraseFxSeqMask & bit) != 0u) {
+                bh_eraseFxSeqMask &= (uint16_t)~bit;
                 liveRec_eraseFxSeqHeld(0u);
-            else
-                liveRec_eraseSeqHeld(0u);
-            return;
+                return;
+            }
         }
         if (eraseVoice >= 0) {
-            liveRec_eraseTrackHeld((uint8_t)eraseVoice, 0u);
-            return;
+            uint8_t bit = (uint8_t)(1u << eraseVoice);
+
+            if ((bh_eraseVoiceMask & bit) != 0u) {
+                bh_eraseVoiceMask &= (uint8_t)~bit;
+                liveRec_eraseTrackHeld((uint8_t)eraseVoice, 0u);
+                return;
+            }
         }
+        if (liveRec_mode() == LIVEREC_MODE_ERASE &&
+            (eraseSeq >= 0 || eraseVoice >= 0))
+            return;                                   /* consumed */
     }
     {
         /*
@@ -3101,7 +3275,9 @@ static void processRelease(uint8_t buttonNr)
         led_setValue(0, LED_BAR2);
         break;
 
-    case BUT_SHIFT:
+    case BUT_SHIFT: {
+        uint8_t eraseEnded = 0u;
+
         /*
          * S080 P2 Defect 3 / Phase G: latched-menu SHIFT release.
          *
@@ -3115,19 +3291,37 @@ static void processRelease(uint8_t buttonNr)
          * menu_chainMenuIsOpen(). Outputs: SHIFT LED; no page change.
          * Affiliates: processPress() BUT_SHIFT (5.2).
          */
+        /*
+         * SHIFT release and live erase (S081 §10.1, P1B item 12, P1C item 5).
+         *
+         * What: the hold flag is cleared first; then, if erase is on and CLEAR is
+         * also free, erase ends here, before the latched-menu exits. The menu exits
+         * keep their LED rules (consume: off; open menu: stays lit). If erase is on
+         * and CLEAR is still held, the SHIFT LED stays lit. Why: the consume and
+         * open-menu breaks ran before the erase test, so with the SHIFT+REC menu
+         * open (BC-1) or a CLEAR press made inside it, releasing both keys left
+         * erase on. Affiliates: BC-1, buttonHandler_liveEraseEnd(),
+         * processRelease() BUT_COPY.
+         */
+        bh_shiftHeld = 0u;
+        if (liveRec_mode() == LIVEREC_MODE_ERASE && !bh_clearHeld) {
+            buttonHandler_liveEraseEnd();             /* SHIFT/CLEAR LEDs off */
+            eraseEnded = 1u;
+        }
         if (bh_shiftReleaseConsume) {
             bh_shiftReleaseConsume = 0u;
             led_setValue(0u, LED_SHIFT);
             break;
         }
-        if (bh_shiftRecMenuActive || menu_chainMenuIsOpen())
+        if (bh_shiftRecMenuActive || menu_chainMenuIsOpen()) {
+            if (eraseEnded)
+                led_setValue(1u, LED_SHIFT);          /* latched menu keeps it lit */
             break;
-        /* S081 G-5: SHIFT release ends the live-erase chord if CLEAR is free. */
-        bh_shiftHeld = 0u;
-        if (liveRec_mode() == LIVEREC_MODE_ERASE && !bh_clearHeld)
-            liveRec_eraseEnd();
-
-        led_setValue(0, LED_SHIFT);
+        }
+        if (liveRec_mode() == LIVEREC_MODE_ERASE)
+            led_setValue(1u, LED_SHIFT);              /* CLEAR still held */
+        else
+            led_setValue(0, LED_SHIFT);
 
         switch (bh_state.selectButtonMode) {
         case SELECT_MODE_VOICE:
@@ -3204,6 +3398,7 @@ static void processRelease(uint8_t buttonNr)
             buttonHandler_showMuteLEDs();
 
         break;
+    }
 
     default:
         break;

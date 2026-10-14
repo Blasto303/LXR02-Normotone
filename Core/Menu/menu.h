@@ -168,6 +168,8 @@ enum NamesEnum {
     TEXT_CHAIN_COND1, TEXT_CHAIN_NEXT1, TEXT_CHAIN_COND2, TEXT_CHAIN_NEXT2,
     /* S080 P2 Defect 8a: per-track loopable label (lop) on the STEP page. */
     TEXT_TRACK_LOOPABLE,
+    /* S081 P2: per-track automation ramp label (asm). */
+    TEXT_TRACK_AUTO_SMOOTH,
     NUM_NAMES
 };
 
@@ -231,6 +233,8 @@ enum longNamesEnum {
     LONG_CHAIN_COND1, LONG_CHAIN_NEXT1, LONG_CHAIN_COND2, LONG_CHAIN_NEXT2,
     /* S080 P2 Defect 8a: "Loopable". */
     LONG_TRACK_LOOPABLE,
+    /* S081 P2: "Automtn". */
+    LONG_TRACK_AUTO_SMOOTH,
 };
 
 enum shortNamesEnum {
@@ -272,7 +276,9 @@ enum shortNamesEnum {
     SHORT_SCENE_CHANGE_DIV, SHORT_SCENE_QUEUE_DIV, SHORT_SCENE_QUEUE_ACTION,
     SHORT_CHAIN_COND1, SHORT_CHAIN_NEXT1, SHORT_CHAIN_COND2, SHORT_CHAIN_NEXT2,
     /* S080 P2 Defect 8a: "lop". */
-    SHORT_TRACK_LOOPABLE
+    SHORT_TRACK_LOOPABLE,
+    /* S081 P2: "asm". */
+    SHORT_TRACK_AUTO_SMOOTH
 };
 
 #define PAR_RUNTIME_CPU_USE 0xFFFEu
@@ -614,6 +620,14 @@ void menu_patternContentChanged(void);
  * Caller: ccClear_potTurned().
  */
 void menu_automationTargetCleared(uint16_t target);
+/*
+ * Add one target's underline after a live-record write (S081 §12): sets the
+ * matching bit of the current search result when the write is on the shown
+ * Pattern (and, on VOICE/STEP pages, the searched track), then repaints.
+ * Caller: liveRec_stepEnd().
+ */
+void menu_automationTargetRecorded(uint8_t scene, uint8_t track,
+                                   uint16_t target);
 /*
  * Copy/clear menu bridge (S075).
  *

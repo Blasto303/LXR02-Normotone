@@ -34,6 +34,8 @@
 #include "InstrumentManager.h"
 #include "SceneModTargets.h"
 #include "EffectTypes.h"
+#include "PatternTrace.h"
+#include "menu.h"
 #include <string.h>
 
 /* 9-bit target ID space for the latch/dirty/erase bitmaps (S081 §9.2). */
@@ -62,42 +64,162 @@ static uint8_t liveRec_dirty[LIVEREC_TARGET_BYTES];
 static uint8_t liveRec_erase[LIVEREC_TARGET_BYTES];
 
 /*
- * Open fast-roll capture (S081 §8.8, E-4).
+ * Open fast-roll capture (S081 §8.8, E-4; P1C items 4/15).
  *
- * What: when a fast roll starts, liveRec_rollHeld is 1 and liveRec_rollStep/
- * liveRec_rollIndex/liveRec_rollStartTick describe the step the roll began on.
- * E-4 extends it across the steps the playhead reaches until liveRec_rollRelease().
+ * What: while a fast roll is held, liveRec_rollHeld is 1 and:
+ *  - liveRec_rollTrack/rollStep/rollStartDelay give the start step and
+ *    its micro-timing as written at the start;
+ *  - liveRec_rollIndex is the current rate;
+ *  - liveRec_rollSpan is 1 once the playhead has reached the start step
+ *    (at once when the start is the current step or behind it; at the
+ *    start step's ring entry when the hit was quantised forward).
+ * The span writer only writes steps after the start, and only while
+ * liveRec_rollSpan is set; the start and the end drain the ring first
+ * (liveRec_syncRing()), so both are decided on the capture's step. Why:
+ * P1B rewrote the start step with timing 0 when it ended, and wrote a roll
+ * onto the step before a forward-quantised start; the end writer had no
+ * start delay to keep. RAM: +2 B.
+ * Affiliates: liveRec_triggerIn() (start), liveRec_service() (span),
+ * liveRec_endRoll().
  */
 static uint8_t  liveRec_rollHeld = 0u;
 static uint8_t  liveRec_rollStep = 0u;
 static uint8_t  liveRec_rollIndex = 0u;
+static uint8_t  liveRec_rollStartDelay = 0u;
+static uint8_t  liveRec_rollSpan = 0u;
 
-/* Pending flam grace (S081 §8.7, E-1 step 6). */
-static uint8_t liveRec_graceStep = 0u;
-static uint8_t liveRec_graceDelay = 0u;
+/*
+ * Pending flam grace (S081 §8.7; P1B item 5, P1C items 8/9).
+ *
+ * What: the grace hit's capture, as the master tick and the Q8 delta from
+ * it (quantised or sub-tick), plus its velocity. The main hit re-places it
+ * from its own capture (liveRec_placeFlam()). Cleared at every position
+ * break and after each main. Why: a placement stored at grace time had a
+ * stale rel/ahead by the time it was committed. RAM: 10 B
+ * (the 6 B stored placement is removed).
+ */
+static int32_t liveRec_graceDeltaQ8;
+static uint32_t liveRec_graceTick;
 static uint8_t liveRec_graceVel = 0u;
 static uint8_t liveRec_graceValid = 0u;
 
 static uint8_t liveRec_rollNote = 0u;
+static uint8_t liveRec_rollNoteDefault = 0u;
 static uint8_t liveRec_rollVel = 0u;
 
 /* Last boundary-ring step per track, so the next entry ends it (S081 C-9a). */
 static uint8_t liveRec_prevStep[NUM_TRACKS];
 static uint8_t liveRec_prevValid[NUM_TRACKS];
 
+/*
+ * S081 P1B/P1C added state (items 3/9/10/16/26; P1C 2/4/10/15). RAM about 14 B
+ * (P1B 10 B + P1C 4 B), plus DEV-only counters.
+ *  lastSceneEpoch/sceneEpochValid  last seen seq_getSceneEpoch() (LR-9);
+ *  rollTrack  the track the open fast roll belongs to (LR-3);
+ *  rollHits  retriggers seen since ROLL_START (LR-13 plain-trigger fallback);
+ *  rollPendingIdx  a fast roll to start at the next ROLL_HIT (LR-14);
+ *  rollStartDelay/rollSpan  the roll start's micro-timing and whether the
+ *  playhead has reached the start step (P1C LC-7);
+ *  eraseSeqCount/eraseSeqTrack  held SEQ erase buttons and the captured
+ *  active track (LR-8); eraseFxSeqCount  held FX-mode SEQ buttons (LC-2).
+ */
+static uint8_t liveRec_lastSceneEpoch;
+static uint8_t liveRec_sceneEpochValid;
+static uint8_t liveRec_rollTrack = 0u;
+static uint8_t liveRec_rollHits;
+static uint8_t liveRec_rollPendingIdx;
+static uint8_t liveRec_eraseSeqCount;
+static uint8_t liveRec_eraseSeqTrack;
+#if DEV_MODE_LOGGING
+static uint16_t liveRec_drops[7];
+#endif
+
 /* Step-end table (F-5) and knob-erase removals (G-6); defined below. */
 static void liveRec_stepEnd(uint8_t track, uint8_t step, uint8_t fired);
+/* End an open fast roll; defined below with the roll helpers (LR-13). */
+static void liveRec_endRoll(uint8_t writeEnd);
 
 /* Live-erase masks owned by LiveRecord, pushed to the Sequencer/Effects (G). */
 static uint8_t  liveRec_eraseSpecials;
 static uint8_t  liveRec_eraseFull;
-static uint16_t liveRec_eraseFxLanes;
+/*
+ * FX-sequence erase sources (S081 §10.2, P1C item 2).
+ *
+ * What: liveRec_eraseKnobFxLanes holds the lanes chosen by knob erase; they
+ * stay until erase ends. liveRec_eraseFxSeqCount counts the SEQ buttons held
+ * in FX mode; while nonzero every lane is erased. liveRec_pushEraseMasks()
+ * combines the two. Why: P1B kept both in one mask, so releasing an FX SEQ
+ * hold, or any MODE press, also dropped the knob-erase lanes, which §10.2
+ * keeps "until erase ends". A count (not a flag) keeps the hold on until the
+ * last of several held SEQ buttons is released (item 10). RAM: +1 B.
+ * Affiliates: liveRec_eraseParam(), liveRec_eraseFxSeqHeld(),
+ * liveRec_eraseReleaseHeld(), liveRec_pushEraseMasks().
+ */
+static uint16_t liveRec_eraseKnobFxLanes;
+static uint8_t  liveRec_eraseFxSeqCount;
+/*
+ * Count a dropped live-record action (S081 H-3, P1B item 26).
+ *
+ * What: in DEV builds, increments liveRec_drops[cause] and records one
+ * PatternTrace 'W' event (cause in flags, track/step in value). Compiles to
+ * nothing when DEV_MODE_LOGGING is 0. Why: best-effort recording drops by
+ * design (handover, ownership, full queues); without a witness, a missing
+ * recorded step cannot be told apart from a placement defect.
+ * RAM: 14 B DEV-only (logging-allocation policy). Affiliates:
+ * patternTrace_record(), decode_devlogs.py.
+ */
+#if DEV_MODE_LOGGING
+static void liveRec_drop(uint8_t cause, uint8_t track, uint8_t step)
+{
+    if (cause < 7u)
+        liveRec_drops[cause]++;
+    patternTrace_record(PAT_TRACE_STAGE_LIVEREC_DROP, cause,
+                        (uint32_t)(((uint32_t)track << 8u) | step));
+}
+#else
+static void liveRec_drop(uint8_t cause, uint8_t track, uint8_t step)
+{
+    (void)cause;
+    (void)track;
+    (void)step;
+}
+#endif
+
 
 /* Push the current erase masks to the Sequencer and EffectsManager. */
 static void liveRec_pushEraseMasks(void)
 {
-    seq_setEraseMasks(liveRec_eraseSpecials, liveRec_eraseFull);
-    effects_setLiveEraseLanes(liveRec_eraseFxLanes);
+    /*
+     * Push the live-erase masks through the ownership gate (S081 §7, §10.2,
+     * P1B item 21).
+     *
+     * What: only tracks that play the target Scene T receive their
+     * specials/full erase bits; the FX-sequence erase lanes apply only when
+     * T == A. The FX lane mask is 16 bits (lane 0 = Morph, 1..15 = parameter
+     * lanes): the knob-erase lanes OR all lanes while an FX-mode SEQ hold is
+     * down (P1C items 1/2). P1B cast it to 8 bits, dropping lanes 8..15.
+     * Called on every gesture change and on every service pass, so a Scene
+     * change re-gates held erases at once. Why: TIM3 clears bit 15 in the
+     * track's played Scene directly. Ungated, a held TRACK erase on a track
+     * playing another Scene wrote into a non-target Pattern (and its pool
+     * reclaim was then refused). Inputs: gesture masks, seq_getTrackPlayedScene,
+     * T, A. Outputs: seq_setEraseMasks(), effects_setLiveEraseLanes().
+     * Accessors: liveRec_erase*Held(), liveRec_eraseParam(), liveRec_service().
+     */
+    uint8_t owned = 0u;
+    uint8_t t;
+
+    for (t = 0u; t < NUM_TRACKS; t++) {
+        if (seq_getTrackPlayedScene(t) == liveRec_target)
+            owned |= (uint8_t)(1u << t);
+    }
+    seq_setEraseMasks((uint8_t)(liveRec_eraseSpecials & owned),
+                      (uint8_t)(liveRec_eraseFull & owned));
+    effects_setLiveEraseLanes(
+        (uint16_t)((liveRec_target == scene_getActiveIndex())
+                   ? (uint16_t)(liveRec_eraseKnobFxLanes |
+                                ((liveRec_eraseFxSeqCount != 0u) ? 0xFFFFu : 0u))
+                   : 0u));
 }
 
 /* Step-roll tick table duplicated for the slow/fast classification (§5.4). */
@@ -115,49 +237,38 @@ static uint8_t liveRec_rollPpqTicks(uint8_t rate)
  * it, and returns the delay percent within that step (0..99). A rounded 100 goes
  * to the next step at delay 0. Returns 0 when the mode cannot be projected (rnd).
  */
-static uint8_t liveRec_place(uint8_t track, uint32_t tick,
-                             const seq_track_time_t *snap,
-                             uint8_t *stepOut, uint8_t *delayOut)
-{
-    uint8_t step = 0u;
-    uint16_t offQ8 = 0u;
-    uint16_t interval;
-    uint8_t len;
-    uint32_t delay;
-
-    if (!seq_projectStep(track, tick, &step, &offQ8))
-        return 0u;
-    interval = snap->interval;
-    if (interval == 0u)
-        interval = 1u;
-    len = snap->length ? snap->length : 16u;
-    delay = ((uint32_t)offQ8 * 100u) / interval;
-    if (delay >= 100u) {
-        step = (uint8_t)((step + 1u) % len);
-        delay = 0u;
-    }
-    *stepOut = step;
-    *delayOut = (uint8_t)delay;
-    return 1u;
-}
-
 /* Submit one recorded step (trigger ON) with the current target gate. */
-static void liveRec_writeStep(uint8_t track, uint8_t step, uint8_t note,
-                              uint8_t vel, uint8_t timing, uint8_t roll,
-                              uint8_t fill, uint8_t setFil)
+/*
+ * Submit one recorded step (S081 §8.4, P1B item 15).
+ *
+ * What: builds the record spec (note or "default note", velocity, timing,
+ * roll, fill, fil) and submits it through patSvc_recordStep() to the track's
+ * played Scene; on acceptance, marks the recorded-step LED. Why: Q12, an
+ * overlay hit with note `def` stores no note special (playback then uses the
+ * default note); P1 always stored the resolved MIDI note. Inputs: step
+ * fields. Output: nonzero when accepted (else a counted drop, LR-18).
+ * Affiliates: pat_recordStep(), seq_markRecordedStep().
+ */
+static uint8_t liveRec_writeStep(uint8_t track, uint8_t step, uint8_t note,
+                                 uint8_t noteIsDefault, uint8_t vel,
+                                 uint8_t timing, uint8_t roll, uint8_t fill,
+                                 uint8_t setFil)
 {
     pat_record_spec_t spec;
 
     spec.note = note;
+    spec.noteIsDefault = noteIsDefault;
     spec.velocity = vel;
     spec.timing = timing;
     spec.roll = roll;
     spec.fill = fill;
     spec.setFil = setFil;
-    spec.noteIsDefault = 0u;
     if (patSvc_recordStep(seq_getTrackPlayedScene(track), track, step, &spec)) {
         seq_markRecordedStep(track, seq_getTrackPlayedScene(track), step);
+        return 1u;
     }
+    liveRec_drop(4u, track, step);
+    return 0u;
 }
 
 /*
@@ -190,34 +301,131 @@ void liveRec_init(uint8_t activeTrack)
     memset(liveRec_erase, 0, sizeof(liveRec_erase));
 }
 
-void liveRec_service(void)
+/* Position epoch -> end per-step capture state (latches/erase kept). */
+static void liveRec_syncPosition(void)
 {
-    uint8_t epoch = seq_getPlaybackEpoch();
+    uint8_t posEpoch = seq_getPlaybackEpoch();
 
-    /*
-     * S081 P1 live-record service (plan §19.2, H-1).
-     *
-     * Order: (1) take boundary; (2) target negotiation; (3) boundary-ring drain
-     * (E-4 roll spans; F-5/G-6 step-end tables). Runs before patSvc_tick() so
-     * idle-direct writes execute in the same pass.
-     */
-
-    /* 1. Take boundary (epoch change is the single catch-all). */
     if (!liveRec_epochValid) {
         liveRec_epochValid = 1u;
-        liveRec_lastEpoch = epoch;
-    } else if (epoch != liveRec_lastEpoch) {
-        liveRec_lastEpoch = epoch;
-        liveRec_newTake();
-        liveRec_rollHeld = 0u;
-        liveRec_graceValid = 0u;
+        liveRec_lastEpoch = posEpoch;
+    } else if (posEpoch != liveRec_lastEpoch) {
+        liveRec_lastEpoch = posEpoch;
         memset(liveRec_prevValid, 0, sizeof(liveRec_prevValid));
-        seq_setLiveHold(liveRec_rtk, 0u);
-        seq_setEraseMasks(0u, 0u);
-        effects_setLiveEraseLanes(0u);
+        liveRec_endRoll(0u);
+        liveRec_graceValid = 0u;
+    }
+}
+
+/* Boundary-ring drain: span writes and the step-end tables. */
+static void liveRec_drainRing(void)
+{
+    seq_rec_boundary_t b;
+
+    while (seq_takeRecBoundary(&b)) {
+        if (b.track < NUM_TRACKS && liveRec_prevValid[b.track]) {
+            uint8_t prev = liveRec_prevStep[b.track];
+
+            /*
+             * Extend a held fast roll over the step that just ended
+             * (S081 §8.8 E-4, P1B items 3/16, P1C item 15).
+             *
+             * What: when the rolled track's next ring entry arrives, its
+             * previous step has ended under the held roll. That step is
+             * written as an active step with the roll rate, timing 0 and
+             * fill 100 (carry-over), but only if the roll's start step has
+             * been reached (liveRec_rollSpan) and the ended step is not the
+             * start step itself. The start step keeps the delay and fill it
+             * was written with at the start; the end step is written by
+             * liveRec_endRoll(). fil applies while PERF is held. Roll start
+             * and end drain the ring first (liveRec_syncRing()), so prev is
+             * never a step from before the capture. Why: the steps the roll
+             * spans must replay it. P1B rewrote the start step with timing 0
+             * and, for a forward-quantised start, wrote a roll on the step
+             * before it. Affiliates: seq_takeRecBoundary(),
+             * liveRec_writeStep(), LC-7 state.
+             */
+            if (liveRec_rollHeld && b.track == liveRec_rollTrack &&
+                liveRec_rollSpan && prev != liveRec_rollStep) {
+                liveRec_writeStep(liveRec_rollTrack, prev, liveRec_rollNote,
+                                  liveRec_rollNoteDefault, liveRec_rollVel,
+                                  0u, liveRec_rollIndex, 100u,
+                                  seq_fillActive);
+            }
+            liveRec_stepEnd(b.track, prev, b.fired);
+        }
+        if (b.track < NUM_TRACKS) {
+            liveRec_prevStep[b.track] = b.step;
+            liveRec_prevValid[b.track] = 1u;
+            /* LC-8: a forward-quantised roll start is reached here. */
+            if (liveRec_rollHeld && b.track == liveRec_rollTrack &&
+                b.step == liveRec_rollStep)
+                liveRec_rollSpan = 1u;
+        }
+    }
+}
+
+/*
+ * Bring the ring view up to a live capture (S081 §8.8, P1C review C-1).
+ *
+ * What: the service's position-epoch check and ring drain, also run at a
+ * fast-roll start and a roll end, right after their live capture. Every
+ * step that began before the capture already has its entry in the ring, so
+ * afterwards liveRec_prevStep[] and liveRec_rollSpan match the capture.
+ * Why: the 500 Hz drain lags the playhead by up to 2 ms; a roll started or
+ * released in that window was decided on the previous step (span written
+ * onto the step before the start, or a covered step left unwritten).
+ * No drain while a filesystem replacement is pending (as the service).
+ * Context: foreground only. Accessors: liveRec_triggerIn(),
+ * liveRec_endRoll(). Affiliates: liveRec_syncPosition(),
+ * liveRec_drainRing(), liveRec_service().
+ */
+static void liveRec_syncRing(void)
+{
+    liveRec_syncPosition();
+    if (!patSvc_replacePending())
+        liveRec_drainRing();
+}
+
+void liveRec_service(void)
+{
+    uint8_t sceneEpoch = seq_getSceneEpoch();
+
+    /*
+     * LiveRecord service, one 500 Hz foreground pass (S081 §19.2, P1B 10/21/22).
+     *
+     * What: (1) a Scene change (seq_getSceneEpoch) starts a new take: latches
+     * and dirty bits cleared, origin re-captured. (2) Any playhead break
+     * (seq_getPlaybackEpoch: also transport start/stop, PC reset, realign)
+     * only ends per-step capture state: the previous ring step, an open roll, a
+     * pending flam grace. Latches and held erase gestures survive, so arming or
+     * erasing while stopped carries into playback. (3) A filesystem replacement
+     * suspends writing. (4) The target override is requested only while
+     * writing (armed and running) and T != A, so Pattern AutoSave is not
+     * blocked while armed and stopped (F-M). Erase masks are re-pushed each pass
+     * through the ownership gate. (5) The boundary ring drives span writes and
+     * the step-end tables. (6) FX-sequence erase is cleared step by step. Why:
+     * P1 treated every epoch as a take boundary: transport start wiped latches,
+     * zeroed held erase masks in the Sequencer while LiveRecord kept stale
+     * copies, and the override was held while stopped. Context: foreground,
+     * before patSvc_tick(). Affiliates: seq_getSceneEpoch(),
+     * seq_getPlaybackEpoch(), patSvc_requestTarget/releaseTarget(),
+     * liveRec_pushEraseMasks(), effects_takeErasedLocks().
+     */
+
+    /* 1. Scene epoch -> new take. */
+    if (!liveRec_sceneEpochValid) {
+        liveRec_sceneEpochValid = 1u;
+        liveRec_lastSceneEpoch = sceneEpoch;
+    } else if (sceneEpoch != liveRec_lastSceneEpoch) {
+        liveRec_lastSceneEpoch = sceneEpoch;
+        liveRec_newTake();
     }
 
-    /* A filesystem Pattern replacement suspends writing (H-1, Appendix A-11). */
+    /* 2. Position epoch -> end per-step capture state (latches/erase kept). */
+    liveRec_syncPosition();
+
+    /* 3. A filesystem Pattern replacement suspends writing. */
     if (patSvc_replacePending()) {
         patSvc_releaseTarget();
         seq_setRecordTarget(liveRec_rtk, 0u);
@@ -225,55 +433,34 @@ void liveRec_service(void)
         return;
     }
 
-    /* 2. Target negotiation: T = P(rtk). */
+    /* 4. Target negotiation: T = P(rtk), override only while writing. */
     liveRec_target = seq_getTrackPlayedScene(liveRec_rtk);
-    if (liveRec_armed()) {
-        if (liveRec_target != scene_getActiveIndex())
-            (void)patSvc_requestTarget(liveRec_target);
-        else
-            patSvc_releaseTarget();
-        seq_setRecordTarget(liveRec_rtk, liveRec_patternWriting());
-        seq_setAutomationFilter(liveRec_latch, liveRec_dirty, liveRec_rtk);
+    if (liveRec_patternWriting() && liveRec_target != scene_getActiveIndex()) {
+        if (!patSvc_requestTarget(liveRec_target))
+            liveRec_drop(1u, liveRec_rtk, 0u);
     } else {
         patSvc_releaseTarget();
-        seq_setRecordTarget(liveRec_rtk, 0u);
+    }
+    seq_setRecordTarget(liveRec_rtk, liveRec_patternWriting());
+    if (liveRec_armed())
+        seq_setAutomationFilter(liveRec_latch, liveRec_erase, liveRec_rtk);
+    else
         seq_setAutomationFilter(0, 0, 0);
-    }
+    /* LR-17: re-push erase masks every pass; ownership can change with Scene. */
+    if (liveRec_modeState == LIVEREC_MODE_ERASE)
+        liveRec_pushEraseMasks();
 
-    /* 3. Boundary-ring drain. */
+    /* 5. Boundary-ring drain. */
+    liveRec_drainRing();
+
+    /* 6. FX-sequence erase drain: one step at a time (P1B item 28). */
     {
-        seq_rec_boundary_t b;
+        uint8_t fxStep;
+        uint16_t lanes;
 
-        while (seq_takeRecBoundary(&b)) {
-            if (b.track < NUM_TRACKS && liveRec_prevValid[b.track]) {
-                uint8_t prev = liveRec_prevStep[b.track];
-
-                /*
-                 * E-4 fast-roll span: the previous step of the live-hold track
-                 * has ended; write it as a carry-over step (trigger + rate, fill
-                 * 100) so the roll spans the step.
-                 */
-                if (liveRec_rollHeld && b.track == liveRec_rtk) {
-                    liveRec_writeStep(liveRec_rtk, prev, liveRec_rollNote,
-                                      liveRec_rollVel, 0u, liveRec_rollIndex,
-                                      100u, 0u);
-                }
-                liveRec_stepEnd(b.track, prev, b.fired);
-            }
-            if (b.track < NUM_TRACKS) {
-                liveRec_prevStep[b.track] = b.step;
-                liveRec_prevValid[b.track] = 1u;
-            }
-        }
-    }
-
-    /* 4. FX-sequence erase drain (S081 §10.4, G-3d). */
-    {
-        uint16_t stepMask = 0u;
-        uint16_t laneMask = 0u;
-
-        while (effects_takeErasedLocks(&stepMask, &laneMask))
-            effects_clearSeqLanes(liveRec_origin, stepMask, laneMask);
+        while (effects_takeErasedLocks(&fxStep, &lanes))
+            effects_clearSeqLanes(liveRec_origin,
+                                  (uint16_t)(1u << fxStep), lanes);
     }
 }
 
@@ -342,9 +529,13 @@ static uint8_t liveRec_targetValue7(uint16_t target)
             return 0u;
         }
     }
-    if (effectTarget_isEffectId(target))
-        return effects_getParameter(a, effectTarget_local(target),
-                                    EFFECT_IMAGE_NORMAL);
+    if (effectTarget_isEffectId(target)) {
+        /* P1B item 18: WIDE8 retained values stored as their 7-bit inverse. */
+        uint8_t local = effectTarget_local(target);
+
+        return effects_storeValue7(a, local,
+            effects_getParameter(a, local, EFFECT_IMAGE_NORMAL));
+    }
     return 0u;
 }
 
@@ -375,6 +566,51 @@ static uint8_t liveRec_isOwnInstrument(uint16_t target)
     slot = instrumentParam_slot(target);
     return (uint8_t)(slot == ((liveRec_rtk >= INSTRUMENT_SLOT_COUNT)
                              ? (INSTRUMENT_SLOT_COUNT - 1u) : liveRec_rtk));
+}
+
+/*
+ * Does a recordable target belong to the recording target Scene T?
+ * (S081 §7, P1B item 11)
+ *
+ * What: an Instrument parameter is owned when the track that plays its slot
+ * plays T and the slot holds the same instrument type in the active Scene A
+ * (whose image the menu edits) and in T (whose Pattern stores the entry).
+ * An Effect or Scene parameter is owned only when T == A, because the
+ * edited object is the active Scene's. Why: plan §7 says anything belonging
+ * to another Scene is not recorded; P1 recorded Effect and Scene edits into
+ * a per-track Scene T and never compared instrument types, so a descriptor
+ * index could mean a different parameter on playback. Inputs: target ID.
+ * Output: 1 owned / 0 drop. Accessors: liveRec_paramIn(),
+ * liveRec_eraseParam(). Affiliates: seq_getTrackPlayedScene(),
+ * scene_instrumentSlotConst().
+ */
+static uint8_t liveRec_targetOwned(uint16_t target)
+{
+    uint8_t a = scene_getActiveIndex();
+
+    if (instrumentParam_isVoiceParameter(target)) {
+        uint8_t slot = instrumentParam_slot(target);
+        uint8_t track;
+        const kit_instrument_slot_t *slot_a;
+        const kit_instrument_slot_t *slot_t;
+
+        if (slot >= INSTRUMENT_SLOT_COUNT)
+            return 0u;
+        /* Slot 5 (voice 6/7) is played by rtk when rtk is 5 or 6, else by 5. */
+        if (slot == (INSTRUMENT_SLOT_COUNT - 1u))
+            track = (uint8_t)((liveRec_rtk >= 5u) ? liveRec_rtk : 5u);
+        else
+            track = slot;
+        if (seq_getTrackPlayedScene(track) != liveRec_target)
+            return 0u;
+        slot_a = scene_instrumentSlotConst(a, slot);
+        slot_t = scene_instrumentSlotConst(liveRec_target, slot);
+        if (!slot_a || !slot_t || slot_a->type != slot_t->type)
+            return 0u;
+        return 1u;
+    }
+    /* Effect and Scene targets belong to the active Scene only. */
+    return (uint8_t)(liveRec_target == a);
 }
 
 /*
@@ -410,7 +646,8 @@ static void liveRec_stepEnd(uint8_t track, uint8_t step, uint8_t fired)
                 continue;
             (void)liveRec_autoValue(autos, count, target, &present);
             if (present)
-                patSvc_removeStepAutomation(t, liveRec_rtk, step, target);
+                if (!patSvc_removeStepAutomation(t, liveRec_rtk, step, target))
+                    liveRec_drop(4u, liveRec_rtk, step);
         }
         return;
     }
@@ -439,7 +676,10 @@ static void liveRec_stepEnd(uint8_t track, uint8_t step, uint8_t fired)
             uint8_t v = liveRec_targetValue7(target);
 
             if (!present || old_val != v) {
-                patSvc_writeStepAutomation(t, liveRec_rtk, step, target, v);
+                if (patSvc_writeStepAutomation(t, liveRec_rtk, step, target, v))
+                    menu_automationTargetRecorded(t, liveRec_rtk, target);
+                else
+                    liveRec_drop(4u, liveRec_rtk, step);
                 wrote = 1u;
             }
             liveRec_dirty[bi] &= (uint8_t)~bit;
@@ -453,14 +693,20 @@ static void liveRec_stepEnd(uint8_t track, uint8_t step, uint8_t fired)
                 uint8_t v = liveRec_targetValue7(target);
 
                 if (!present || old_val != v) {
-                    patSvc_writeStepAutomation(t, liveRec_rtk, step, target, v);
+                    if (patSvc_writeStepAutomation(t, liveRec_rtk, step, target,
+                                                   v))
+                        menu_automationTargetRecorded(t, liveRec_rtk, target);
+                    else
+                        liveRec_drop(4u, liveRec_rtk, step);
                     wrote = 1u;
                 }
             } else if (present) {
-                patSvc_removeStepAutomation(t, liveRec_rtk, step, target);
+                if (!patSvc_removeStepAutomation(t, liveRec_rtk, step, target))
+                    liveRec_drop(4u, liveRec_rtk, step);
             }
         } else if (present) {
-            patSvc_removeStepAutomation(t, liveRec_rtk, step, target);
+            if (!patSvc_removeStepAutomation(t, liveRec_rtk, step, target))
+                liveRec_drop(4u, liveRec_rtk, step);
         }
     }
     if (wrote && seq_fillActive)
@@ -504,15 +750,22 @@ void liveRec_overdubEnd(void)
     liveRec_newTake();
 }
 
+/*
+ * Force record and erase off (S081 P1 looper interim; P1C item 16).
+ *
+ * What: clears every erase source (knob bitmap, knob FX lanes, SEQ/FX-SEQ
+ * hold counts, TRACK holds), pushes the empty masks and starts a new take.
+ * Why: P1B left the SEQ-hold count set, so a later release could stretch
+ * the next erase session. Accessor: handleSelectButton() (BH-7).
+ * Affiliates: liveRec_eraseReleaseHeld().
+ */
 void liveRec_forceOff(void)
 {
     liveRec_modeState = LIVEREC_MODE_OFF;
     liveRec_priorMode = LIVEREC_MODE_OFF;
     memset(liveRec_erase, 0, sizeof(liveRec_erase));
-    liveRec_eraseSpecials = 0u;
-    liveRec_eraseFull = 0u;
-    liveRec_eraseFxLanes = 0u;
-    liveRec_pushEraseMasks();
+    liveRec_eraseKnobFxLanes = 0u;
+    liveRec_eraseReleaseHeld();          /* counts, specials, full; pushes */
     liveRec_newTake();
 }
 
@@ -527,15 +780,24 @@ void liveRec_eraseBegin(void)
     liveRec_modeState = LIVEREC_MODE_ERASE;
 }
 
+/*
+ * End live erase (S081 §10.1, P1C item 16).
+ *
+ * What: clears every erase source (knob bitmap, knob FX lanes, SEQ/FX-SEQ
+ * hold counts, TRACK holds), pushes the empty masks, restores the prior
+ * LATCH/OFF mode and starts a new take. Why: P1B left the SEQ-hold count
+ * set when a SEQ button was still held at erase end; its release then
+ * arrived outside erase and was ignored, so the next session's SEQ hold
+ * captured no track and never ended. Accessors:
+ * buttonHandler_liveEraseEnd(). Affiliates: liveRec_eraseReleaseHeld().
+ */
 void liveRec_eraseEnd(void)
 {
     if (liveRec_modeState != LIVEREC_MODE_ERASE)
         return;
     memset(liveRec_erase, 0, sizeof(liveRec_erase));
-    liveRec_eraseSpecials = 0u;
-    liveRec_eraseFull = 0u;
-    liveRec_eraseFxLanes = 0u;
-    liveRec_pushEraseMasks();
+    liveRec_eraseKnobFxLanes = 0u;
+    liveRec_eraseReleaseHeld();          /* counts, specials, full; pushes */
     liveRec_modeState = liveRec_priorMode;
     liveRec_newTake();
 }
@@ -570,11 +832,24 @@ void liveRec_setRecordTrack(uint8_t track)
 
 uint8_t liveRec_recordTrack(void) { return liveRec_rtk; }
 
+/*
+ * Is the active Scene's Pattern closed for editing? (S081 Q13, P1B item 1)
+ *
+ * What: true only while live record or erase is writing (armed and the
+ * transport running) AND the recording target T = P(rtk) differs from the
+ * active Scene A. Only then does the Pattern Stack Service hold the target
+ * override, which refuses edits of A. Why: the P1 version returned true
+ * whenever P(rtk) != A, including with REC off. Selecting a track that plays
+ * another Scene (S077 per-track playback) then silently locked STEP editing
+ * and step toggles. Inputs: mode, transport, liveRec_target, the active
+ * Scene. Output: lock flag. Accessors: menu_parseKnobDelta(),
+ * menu_parseEncoder(), buttonHandler_setRemoveStep(). Affiliates:
+ * patSvc_requestTarget() (LR-9).
+ */
 uint8_t liveRec_activePatternLocked(void)
 {
-    /* Q13: locked when the recording target Scene differs from the active one. */
-    return (uint8_t)(seq_getTrackPlayedScene(liveRec_rtk) !=
-                     scene_getActiveIndex());
+    return (uint8_t)(liveRec_patternWriting() &&
+                     liveRec_target != scene_getActiveIndex());
 }
 
 /* Triggers / automation / erase entry points (Phase E/F/G fill these). */
@@ -587,35 +862,194 @@ uint8_t liveRec_activePatternLocked(void)
  * a write ahead of the playhead suppresses the stored trigger once. The LED is
  * marked by liveRec_writeStep on success.
  */
-static void liveRec_commitHit(uint8_t track, uint8_t step, uint8_t delay,
-                              uint8_t note, uint8_t vel, uint8_t roll,
-                              uint8_t curStep, uint8_t setFil)
+/*
+ * Write one placed hit and apply the echo rules (S081 §8.4/§8.6, P1B 5/6/7).
+ *
+ * What: writes the step (trigger ON). Then: a step AHEAD of the playhead
+ * is marked to skip its stored trigger once (it would otherwise replay the
+ * hit moments later in this pass); the CURRENT step mutes its own pending
+ * deferred trigger, if any (the live hit replaced it; its automation is
+ * kept); a step BEHIND the playhead needs nothing (not replayed this pass).
+ * Why: P1 marked every non-current step, including steps already passed,
+ * which silenced the new hit on its next pass; and its cancel dropped the
+ * replaced step's automation. Inputs: track, placement (step, delay, rel,
+ * ahead), note, velocity, roll, fil. Output: nonzero when the write was
+ * accepted. Accessors: liveRec_triggerIn(), liveRec_placeFlam().
+ * Affiliates: seq_suppressStepOnce(), seq_cancelPendingTrigger(),
+ * patSvc_recordStep().
+ */
+static uint8_t liveRec_commitHit(uint8_t track, const seq_place_t *pl,
+                                 uint8_t note, uint8_t noteIsDefault,
+                                 uint8_t vel, uint8_t roll, uint8_t setFil)
 {
-    liveRec_writeStep(track, step, note, vel, delay, roll,
-                      (uint8_t)(roll ? 100u : 0u), setFil);
-    if (step == curStep)
-        seq_cancelPendingTrigger(track);
-    else
-        seq_suppressStepOnce(track, step);
+    if (!liveRec_writeStep(track, pl->step, note, noteIsDefault, vel,
+                           pl->delay, roll, (uint8_t)(roll ? 100u : 0u),
+                           setFil))
+        return 0u;
+    if (pl->rel > 0)
+        seq_suppressStepOnce(track, pl->step, pl->ahead);
+    else if (pl->rel == 0)
+        seq_cancelPendingTrigger(track, pl->step);
+    return 1u;
 }
 
+/* Sub-tick fraction (0..255) of the capture within the current PPQ tick. */
+static uint8_t liveRec_frac8(const seq_track_time_t *snap)
+{
+    uint32_t f;
+
+    if (snap->periodUs == 0u)
+        return 0u;
+    f = (uint32_t)(((snap->nowUs - snap->stampUs) * 256u) / snap->periodUs);
+    return (uint8_t)((f > 255u) ? 255u : f);
+}
+
+/*
+ * Record a flam as two steps (S081 R9/Q9, P1B item 5, P1C items 6/8).
+ *
+ * What: both hits are placed from the MAIN's capture, so the echo rules
+ * see the playhead as it is when they are written:
+ *  - quantised (1/8..1/64 or trk): the grace is 12 master ticks (1/32)
+ *    before the main's quantised or snapped position (deltaQ8 + snapQ8);
+ *  - un-quantised: the grace's stored capture (tick + sub-tick) is
+ *    re-placed relative to the main's capture.
+ * If both land in one step, only the main is written. Why: under trk the
+ * grace was placed from the raw hit time, not the snapped main; un-
+ * quantised, P1B committed the grace with the placement taken at grace
+ * time, so its rel/ahead (echo deadline, cancel) were up to 1/32 stale.
+ * Inputs: main snapshot and placement, liveRec_grace* (LC-11). Outputs:
+ * one or two writes. Accessors: liveRec_triggerIn() (FLAM_MAIN).
+ * Affiliates: seq_placeFromSnapshot(), liveRec_commitHit().
+ */
+static void liveRec_placeFlam(uint8_t track, const seq_track_time_t *snap,
+                              const seq_place_t *mainPl, int32_t mainDeltaQ8,
+                              const liveRec_trigger_t *t, uint8_t setFil)
+{
+    seq_place_t gracePl;
+    uint8_t haveGrace = 0u;
+
+    if (seq_getQuantisation() != NO_QUANTISATION) {
+        /* Quantised: 12 master ticks (1/32) before the snapped main. */
+        haveGrace = seq_placeFromSnapshot(
+            track, snap, mainDeltaQ8 + mainPl->snapQ8 - (12 * 256), 0u,
+            &gracePl);
+    } else if (liveRec_graceValid) {
+        /* Un-quantised: the grace's own time, re-placed now. */
+        int32_t graceQ8 = liveRec_graceDeltaQ8 +
+            (int32_t)(liveRec_graceTick - snap->elapsedTick) * 256;
+
+        haveGrace = seq_placeFromSnapshot(track, snap, graceQ8, 0u, &gracePl);
+    }
+    if (haveGrace && gracePl.step != mainPl->step)
+        (void)liveRec_commitHit(track, &gracePl, t->note, t->note_is_default,
+                                liveRec_graceVel, 0u, setFil);
+    liveRec_graceValid = 0u;
+    (void)liveRec_commitHit(track, mainPl, t->note, t->note_is_default,
+                            t->velocity, 0u, setFil);
+}
+
+/*
+ * End a recorded fast roll (S081 §8.8, P1B item 16, P1C items 4/7).
+ *
+ * What: places the release on the rolled track and writes one step:
+ *  - released before the second hit, or before a forward-quantised start
+ *    step was reached: the START step is rewritten as a plain trigger at
+ *    its start delay (roll and fill removed);
+ *  - released on the start step: the start step keeps its delay and gets
+ *    fill = release delay - start delay (1..100);
+ *  - released on a later step: that step gets timing 0 (a spanned step
+ *    starts at its boundary) and fill = release delay (1..99).
+ * The live hold on the rolled track is lifted. With writeEnd = 0 (stop,
+ * Scene change, realign: the playhead has jumped) nothing is written.
+ * Why: the Sequencer runs a roll's fill window from its delayed first hit
+ * (seq_rollBegin()), so on the start step the fill must be measured from
+ * the start delay. P1B wrote the quick-release trigger at the release
+ * point, and micro-timed the end step by the release offset. Inputs:
+ * liveRec_roll* state (LC-7), the live capture. Outputs: one write, live
+ * hold off. Accessors: liveRec_rollRelease(), liveRec_rollRateChange(),
+ * liveRec_service(). Affiliates: seq_placeFromSnapshot(), seq_setLiveHold(),
+ * pat_recordStep() (fill 100 stored as absent, PD-1).
+ */
+static void liveRec_endRoll(uint8_t writeEnd)
+{
+    if (!liveRec_rollHeld) {
+        liveRec_rollPendingIdx = 0u;
+        return;
+    }
+    if (writeEnd && seq_isRunning()) {
+        seq_track_time_t snap;
+        seq_place_t pl;
+
+        seq_captureTrackTime(liveRec_rollTrack, &snap);
+        /* Span every step that ended before the release; a position break
+         * found here has already ended the roll (P1C review C-1). */
+        liveRec_syncRing();
+        if (!liveRec_rollHeld)
+            return;
+        if (seq_placeFromSnapshot(liveRec_rollTrack, &snap,
+                                  liveRec_frac8(&snap), 0u, &pl)) {
+            if (liveRec_rollHits == 0u || !liveRec_rollSpan) {
+                /* Released before the second hit, or before a forward-
+                 * quantised start: the start step becomes a plain trigger. */
+                liveRec_writeStep(liveRec_rollTrack, liveRec_rollStep,
+                                  liveRec_rollNote, liveRec_rollNoteDefault,
+                                  liveRec_rollVel, liveRec_rollStartDelay,
+                                  0u, 0u, seq_fillActive);
+            } else if (pl.step == liveRec_rollStep) {
+                /* Released on the start step: keep its delay; the fill is
+                 * the part of the step from the roll's start to the release. */
+                int16_t f = (int16_t)pl.delay - (int16_t)liveRec_rollStartDelay;
+
+                liveRec_writeStep(liveRec_rollTrack, liveRec_rollStep,
+                                  liveRec_rollNote, liveRec_rollNoteDefault,
+                                  liveRec_rollVel, liveRec_rollStartDelay,
+                                  liveRec_rollIndex,
+                                  (uint8_t)((f < 1) ? 1 : ((f > 100) ? 100 : f)),
+                                  seq_fillActive);
+            } else {
+                /* Released on a later step: it starts at its boundary. */
+                liveRec_writeStep(liveRec_rollTrack, pl.step,
+                                  liveRec_rollNote, liveRec_rollNoteDefault,
+                                  liveRec_rollVel, 0u, liveRec_rollIndex,
+                                  (uint8_t)((pl.delay < 1u) ? 1u : pl.delay),
+                                  seq_fillActive);
+            }
+        }
+    }
+    seq_setLiveHold(liveRec_rollTrack, 0u);
+    liveRec_rollHeld = 0u;
+    liveRec_rollSpan = 0u;
+    liveRec_rollPendingIdx = 0u;
+}
+
+/*
+ * Capture one live hit and record it (S081 §8, P1B items 5/11/17).
+ *
+ * What: gates (LATCH/OVERDUB, running, P1 looper lockout, P(track) == T,
+ * same instrument type in A and T); captures the track's live state with
+ * the µs time; derives the sub-tick fraction; quantises on the master grid
+ * (1/8..1/64) or snaps to the track's own steps (trk); places the hit with
+ * seq_placeFromSnapshot() (live cursor, nominal step grid, run-mode next
+ * step; shuffle applies only at playback); then records it by kind
+ * (single, flam, roll). Why: placement
+ * must follow the track that is playing, not its canonical master-clock
+ * position; the type check keeps an Instrument trigger from being recorded
+ * into a Scene whose slot holds a different instrument (plan §7). Inputs:
+ * liveRec_trigger_t. Outputs: Pattern writes, echo marks, live hold, LED.
+ * Accessors: buttonHandler overlay (E-2), midiParser_noteOn().
+ * Affiliates: seq_captureTrackTime(), seq_quantiseTick(),
+ * seq_placeFromSnapshot(), liveRec_commitHit(), liveRec_placeFlam().
+ */
 void liveRec_triggerIn(const liveRec_trigger_t *t)
 {
     seq_track_time_t snap;
+    seq_place_t pl;
     uint8_t track;
-    uint32_t qt;
-    uint8_t step = 0u;
-    uint8_t delay = 0u;
-    uint8_t curStep;
+    uint8_t frac8;
+    int32_t deltaQ8;
+    uint8_t snapToStep = 0u;
     uint8_t setFil;
 
-    /*
-     * Trigger capture entry point (S081 §8, §19.2, E-1).
-     *
-     * Gate (LATCH/OVERDUB, transport running, P1 looper lockout, ownership
-     * P(track) == T); capture; slow/fast roll classification; quantise; place;
-     * flam pairing; same-step rule; fil; write; echo/cancel; LED.
-     */
     if (!t || t->track >= NUM_TRACKS)
         return;
     track = t->track;
@@ -629,141 +1063,262 @@ void liveRec_triggerIn(const liveRec_trigger_t *t)
     if (seq_getTrackPlayedScene(track) != liveRec_target)
         return;                       /* S081 §7 ownership */
 
-    seq_captureTrackTime(track, &snap);
-    qt = seq_quantiseTick(track, snap.elapsedTick);
-    if (!liveRec_place(track, qt, &snap, &step, &delay)) {
-        if (snap.stepIndex < 0)
+    /* Slot-type check when recording into a per-track Scene T != A (item 11). */
+    if (liveRec_target != scene_getActiveIndex()) {
+        uint8_t slot = (uint8_t)((track >= INSTRUMENT_SLOT_COUNT)
+                                 ? (INSTRUMENT_SLOT_COUNT - 1u) : track);
+        const kit_instrument_slot_t *slot_a =
+            scene_instrumentSlotConst(scene_getActiveIndex(), slot);
+        const kit_instrument_slot_t *slot_t =
+            scene_instrumentSlotConst(liveRec_target, slot);
+
+        if (slot_a && slot_t && slot_a->type != slot_t->type) {
+            liveRec_drop(2u, track, 0u);
             return;
-        step = (uint8_t)snap.stepIndex;
-        delay = 0u;
+        }
     }
-    curStep = (snap.stepIndex >= 0) ? (uint8_t)snap.stepIndex : step;
+
+    seq_captureTrackTime(track, &snap);
+    frac8 = liveRec_frac8(&snap);
     setFil = seq_fillActive;
 
-    if (t->kind == LIVEREC_HIT_ROLL_START) {
-        uint8_t rollTicks = liveRec_rollPpqTicks(t->roll);
-        uint16_t stepTicks = (uint16_t)(snap.interval >> 8u);
+    /* Quantise: master grid for 1/8..1/64, own steps for trk, none for off. */
+    switch (seq_getQuantisation()) {
+    case QUANT_TRACK:
+        deltaQ8 = frac8;
+        snapToStep = 1u;
+        break;
+    case QUANT_8:
+    case QUANT_16:
+    case QUANT_32:
+    case QUANT_64: {
+        uint32_t q = seq_quantiseTick(snap.elapsedTick, frac8);
 
-        if (stepTicks == 0u)
-            stepTicks = 1u;
-        if (rollTicks == 0u || rollTicks >= stepTicks) {
-            /* Slow roll: recorded hit by hit (F-L). */
-            liveRec_commitHit(track, step, delay, t->note, t->velocity, 0u,
-                              curStep, setFil);
-        } else {
-            /* Fast roll: live-hold and record the start step with the rate. */
-            seq_setLiveHold(track, 1u);
-            liveRec_rollHeld = 1u;
-            liveRec_rollStep = step;
-            liveRec_rollIndex = t->roll;
-            liveRec_rollNote = t->note;
-            liveRec_rollVel = t->velocity;
-            liveRec_commitHit(track, step, delay, t->note, t->velocity, t->roll,
-                              curStep, setFil);
-        }
+        deltaQ8 = (int32_t)(((int32_t)q - (int32_t)snap.elapsedTick) * 256);
+        break; }
+    default:
+        deltaQ8 = frac8;
+        break;
+    }
+    if (!seq_placeFromSnapshot(track, &snap, deltaQ8, snapToStep, &pl)) {
+        liveRec_drop(2u, track, 0u);
         return;
     }
-    if (t->kind == LIVEREC_HIT_ROLL_HIT) {
-        if (liveRec_rollHeld)
-            return;                   /* fast roll: spanned by E-4 */
-        liveRec_commitHit(track, step, delay, t->note, t->velocity, 0u,
-                          curStep, setFil);
+
+    if (t->kind == LIVEREC_HIT_ROLL_HIT && liveRec_rollHeld) {
+        /* Fast roll: spanned by E-4, no per-hit write. */
+        liveRec_rollHits++;
+        return;
+    }
+    if (t->kind == LIVEREC_HIT_ROLL_START || t->kind == LIVEREC_HIT_ROLL_HIT) {
+        uint8_t rollIndex;
+        uint8_t rollTicks;
+        uint16_t stepTicks;
+
+        if (t->kind == LIVEREC_HIT_ROLL_HIT) {
+            /* A single/flam -> roll switch starts the roll at this hit. */
+            if (liveRec_rollPendingIdx == 0u) {
+                (void)liveRec_commitHit(track, &pl, t->note,
+                                        t->note_is_default, t->velocity, 0u,
+                                        setFil);
+                return;
+            }
+            rollIndex = liveRec_rollPendingIdx;
+            liveRec_rollPendingIdx = 0u;
+        } else {
+            rollIndex = t->roll;
+        }
+        stepTicks = (uint16_t)(snap.interval >> 8u);
+        if (stepTicks == 0u)
+            stepTicks = 1u;
+        rollTicks = liveRec_rollPpqTicks(rollIndex);
+        if (rollTicks == 0u || rollTicks >= stepTicks) {
+            /* Slow roll: recorded hit by hit (F-L). */
+            (void)liveRec_commitHit(track, &pl, t->note, t->note_is_default,
+                                    t->velocity, 0u, setFil);
+            return;
+        }
+        /* Fast roll: live-hold and record the start step with the rate.
+         * Drain first so prevStep is the capture's step (P1C review C-1). */
+        liveRec_syncRing();
+        seq_setLiveHold(track, 1u);
+        liveRec_rollHeld = 1u;
+        liveRec_rollTrack = track;
+        liveRec_rollStep = pl.step;
+        liveRec_rollStartDelay = pl.delay;
+        /* A forward-quantised start is reached at its own ring entry (LC-8). */
+        liveRec_rollSpan = (uint8_t)(pl.rel <= 0);
+        liveRec_rollIndex = rollIndex;
+        liveRec_rollHits = 0u;
+        liveRec_rollNote = t->note;
+        liveRec_rollNoteDefault = t->note_is_default;
+        liveRec_rollVel = t->velocity;
+        (void)liveRec_commitHit(track, &pl, t->note, t->note_is_default,
+                                t->velocity, rollIndex, setFil);
         return;
     }
     if (t->kind == LIVEREC_HIT_FLAM_GRACE) {
-        liveRec_graceStep = step;
-        liveRec_graceDelay = delay;
+        liveRec_graceDeltaQ8 = deltaQ8;
+        liveRec_graceTick = snap.elapsedTick;
         liveRec_graceVel = t->velocity;
         liveRec_graceValid = 1u;
         return;
     }
     if (t->kind == LIVEREC_HIT_FLAM_MAIN) {
-        if (liveRec_graceValid && liveRec_graceStep != step)
-            liveRec_commitHit(track, liveRec_graceStep, liveRec_graceDelay,
-                              t->note, liveRec_graceVel, 0u, curStep, setFil);
-        liveRec_graceValid = 0u;
-        liveRec_commitHit(track, step, delay, t->note, t->velocity, 0u,
-                          curStep, setFil);
+        liveRec_placeFlam(track, &snap, &pl, deltaQ8, t, setFil);
         return;
     }
-    liveRec_commitHit(track, step, delay, t->note, t->velocity, 0u,
-                      curStep, setFil);
+    (void)liveRec_commitHit(track, &pl, t->note, t->note_is_default,
+                            t->velocity, 0u, setFil);
 }
 
+/*
+ * Overlay rate switch while a roll is held (S081 §8.8 F-C, R19, P1B 16).
+ *
+ * What: re-classifies the roll at every switch: a fast roll that becomes
+ * slow ends (its later hits record as singles); a roll that becomes fast
+ * (from slow, or single -> roll with no hit at the switch) starts as a
+ * recorded fast roll at its next hit; fast -> fast changes the rate from
+ * the step containing the switch. Why: P1 only updated the index, so a
+ * single -> roll switch recorded a fast roll as many single hits, and a
+ * fast -> slow switch kept writing roll steps. Inputs: track, new step-roll
+ * index (0 = roll ended). Outputs: liveRec_roll* state. Accessors:
+ * buttonHandler_overlaySwitchHeld(). Affiliates: liveRec_endRoll(), the
+ * ROLL_HIT branch of liveRec_triggerIn().
+ */
 void liveRec_rollRateChange(uint8_t track, uint8_t rollIndex)
 {
-    /* A held fast roll changed rate (S081 §8.8, F-C); 0 ends the roll. */
-    (void)track;
-    if (!liveRec_rollHeld)
-        return;
+    seq_track_time_t snap;
+    uint16_t stepTicks;
+    uint8_t rollTicks;
+
     if (rollIndex == 0u) {
-        liveRec_rollRelease(track);
+        liveRec_endRoll(1u);
         return;
     }
-    liveRec_rollIndex = rollIndex;
+    seq_captureTrackTime(track, &snap);
+    stepTicks = (uint16_t)(snap.interval >> 8u);
+    if (stepTicks == 0u)
+        stepTicks = 1u;
+    rollTicks = liveRec_rollPpqTicks(rollIndex);
+    if (rollTicks == 0u || rollTicks >= stepTicks) {
+        /* New rate is slow: end any fast roll; later hits record as singles. */
+        if (liveRec_rollHeld)
+            liveRec_endRoll(1u);
+        liveRec_rollPendingIdx = 0u;
+        return;
+    }
+    if (liveRec_rollHeld)
+        liveRec_rollIndex = rollIndex;       /* fast -> fast */
+    else
+        liveRec_rollPendingIdx = rollIndex;  /* single/flam -> roll */
 }
 
 void liveRec_rollRelease(uint8_t track)
 {
-    /* Held roll released: clear the live hold and end the recorded roll. */
     (void)track;
-    if (!liveRec_rollHeld)
-        return;
-    seq_setLiveHold(liveRec_rtk, 0u);
-    liveRec_rollHeld = 0u;
+    liveRec_endRoll(1u);
 }
 
 
+/*
+ * Mark an adjusted parameter for recording (S081 §9, P1B item 11).
+ *
+ * What: every recordable gesture (pots, encoder; MIDI CC later) marks its
+ * target dirty, and in LATCH also latched, provided the target belongs to
+ * the recording target Scene. Why: see liveRec_targetOwned(). The value is
+ * not passed: the step-end write reads the current menu value. Inputs:
+ * target ID, source. Outputs: liveRec_dirty/latch bits. Accessors:
+ * menu_liveRecRecordCell(), midiParser_enterTaggedParameter().
+ * Affiliates: liveRec_stepEnd(), liveRec_targetValue7().
+ */
 void liveRec_paramIn(uint16_t target9, uint8_t source)
 {
-    /*
-     * Automation record hook (S081 §9, §19.2, F-1).
-     *
-     * What: marks the target dirty (every adjustment) and, in LATCH mode, latched
-     * so the step-end table writes or re-stamps it. OVERDUB marks dirty only.
-     */
     (void)source;
     if (target9 >= LIVEREC_TARGET_BITS)
         return;
     if (liveRec_modeState != LIVEREC_MODE_LATCH &&
         liveRec_modeState != LIVEREC_MODE_OVERDUB)
         return;
+    if (!liveRec_targetOwned(target9)) {
+        liveRec_drop(2u, liveRec_rtk, (uint8_t)(target9 & 0x7Fu));
+        return;
+    }
     liveRec_dirty[target9 >> 3] |= (uint8_t)(1u << (target9 & 7u));
     if (liveRec_modeState == LIVEREC_MODE_LATCH)
         liveRec_latch[target9 >> 3] |= (uint8_t)(1u << (target9 & 7u));
 }
 
+/*
+ * Knob erase target mark (S081 §10.2, G-2; P1C item 2).
+ *
+ * What: adds the target to the erase bitmap (removed from rtk step by step)
+ * and, for an Effect cell, its FX lane to the knob-erase lane mask. Both
+ * stay until erase ends; SEQ/TRACK releases and MODE presses do not clear
+ * them. Affiliates: menu_parseKnobDelta() (erase branch),
+ * liveRec_pushEraseMasks().
+ */
 void liveRec_eraseParam(uint16_t target9, uint8_t fxLane)
 {
-    /* Knob erase target mark (S081 §10.2, G-2). */
     if (liveRec_modeState != LIVEREC_MODE_ERASE)
         return;
     if (target9 < LIVEREC_TARGET_BITS)
         liveRec_erase[target9 >> 3] |= (uint8_t)(1u << (target9 & 7u));
     if (fxLane < 16u) {
-        liveRec_eraseFxLanes |= (uint16_t)(1u << fxLane);
+        liveRec_eraseKnobFxLanes |= (uint16_t)(1u << fxLane);
         liveRec_pushEraseMasks();
     }
 }
 
-void liveRec_eraseSeqHeld(uint8_t held)
+/*
+ * SEQ-hold live erase on the active track (S081 §10.2, F7, P1B item 9).
+ *
+ * What: while any SEQ button is held in VOICE/STEP mode during live erase,
+ * the active track's triggers and specials are removed as the playhead
+ * passes (TIM3 specials-erase mask); the step's condition is kept where
+ * automation exists. The track is captured on the first press and released
+ * when the last SEQ button is released, so a track change mid-hold cannot
+ * strand a mask bit. Why: F7 names the active track; P1 used rtk, which
+ * differs after an rtk override. Inputs: active track (from buttonHandler),
+ * held flag. Outputs: liveRec_eraseSpecials, pushed masks. Accessors:
+ * buttonHandler erase router (BH-1/BH-2). Affiliates:
+ * liveRec_pushEraseMasks(), seq_setEraseMasks().
+ */
+void liveRec_eraseSeqHeld(uint8_t track, uint8_t held)
 {
-    /* SEQ hold erase: the active track's triggers/specials (S081 §10.2). */
     if (liveRec_modeState != LIVEREC_MODE_ERASE)
         return;
-    if (held)
-        liveRec_eraseSpecials |= (uint8_t)(1u << liveRec_rtk);
-    else
-        liveRec_eraseSpecials &= (uint8_t)~(1u << liveRec_rtk);
+    if (held) {
+        if (liveRec_eraseSeqCount == 0u)
+            liveRec_eraseSeqTrack = track;
+        liveRec_eraseSeqCount++;
+        liveRec_eraseSpecials |= (uint8_t)(1u << liveRec_eraseSeqTrack);
+    } else if (liveRec_eraseSeqCount > 0u) {
+        liveRec_eraseSeqCount--;
+        if (liveRec_eraseSeqCount == 0u)
+            liveRec_eraseSpecials &= (uint8_t)~(1u << liveRec_eraseSeqTrack);
+    }
     liveRec_pushEraseMasks();
 }
 
+/*
+ * FX-mode SEQ hold erase (S081 §10.2, P1C items 2/10).
+ *
+ * What: while any SEQ button is held in FX mode, every lock lane of each FX
+ * step the FX playhead reaches is erased. Counted per held button; the
+ * knob-erase lanes are separate and untouched. Why: P1B wrote 0 on any
+ * release, ending the hold while another SEQ button was still down and
+ * wiping knob-erase lanes. Accessors: buttonHandler erase router (BC-4,
+ * BC-5). Affiliates: liveRec_pushEraseMasks().
+ */
 void liveRec_eraseFxSeqHeld(uint8_t held)
 {
-    /* FX-mode SEQ hold erase: every FX lock lane (S081 §10.2). */
     if (liveRec_modeState != LIVEREC_MODE_ERASE)
         return;
-    liveRec_eraseFxLanes = (uint16_t)(held ? 0xFFFFu : 0u);
+    if (held)
+        liveRec_eraseFxSeqCount++;
+    else if (liveRec_eraseFxSeqCount > 0u)
+        liveRec_eraseFxSeqCount--;
     liveRec_pushEraseMasks();
 }
 
@@ -776,5 +1331,26 @@ void liveRec_eraseTrackHeld(uint8_t track, uint8_t held)
         liveRec_eraseFull |= (uint8_t)(1u << track);
     else
         liveRec_eraseFull &= (uint8_t)~(1u << track);
+    liveRec_pushEraseMasks();
+}
+
+/*
+ * Release every held erase gesture (S081 §10.1, P1B item 8, P1C 2/16).
+ *
+ * What: drops the SEQ-hold (count, specials), TRACK-hold (full) and FX
+ * SEQ-hold (count) gestures at once. Erase mode, the knob-erase bitmap and
+ * the knob-erase FX lanes are kept. Why: a mode change re-maps SEQ and
+ * VOICE buttons, so their held gestures must stop. It is also the gesture
+ * reset at erase end and force-off, so a button still held then cannot
+ * leave a count that stretches the next erase session's SEQ hold.
+ * Accessors: handleModeButtons(), liveRec_eraseEnd(), liveRec_forceOff().
+ * Affiliates: liveRec_pushEraseMasks().
+ */
+void liveRec_eraseReleaseHeld(void)
+{
+    liveRec_eraseSeqCount = 0u;
+    liveRec_eraseFxSeqCount = 0u;
+    liveRec_eraseSpecials = 0u;
+    liveRec_eraseFull = 0u;
     liveRec_pushEraseMasks();
 }

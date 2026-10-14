@@ -3091,10 +3091,14 @@ static void filesystem_patternBuildHeader(uint8_t *header,
         /*
          * S080 P2 Defect 8a: byte 4 stores the looper exclusion (1 = track
          * not loopable). The byte was reserved and written as zero, so older
-         * files read as loopable and the PAT4 version stays 2.
+         * files read as loopable and the PAT4 version stays 2. Byte 5 (S081
+         * P2, automation ramp mode) follows the same rule.
          */
         header[base + 4u] =
             (uint8_t)((region->track_loop_exclude >> track) & 1u);
+        /* S081 P2: byte 5 stores the automation ramp mode (1 = on). */
+        header[base + 5u] =
+            (uint8_t)((region->track_auto_smooth >> track) & 1u);
     }
 }
 
@@ -13216,6 +13220,7 @@ static void filesystem_loadSceneDirectory_tick(void)
             region->pattern_change_bar = staging_buf[32];
             region->pattern_next = staging_buf[33];
             region->track_loop_exclude = 0u;
+            region->track_auto_smooth = 0u;
             for (track = 0u; track < NUM_TRACKS; track++) {
                 uint16_t base = (uint16_t)(48u +
                     track * PATTERN_FILE_TRACK_HEADER_BYTES);
@@ -13227,6 +13232,9 @@ static void filesystem_loadSceneDirectory_tick(void)
                 /* S080 P2 Defect 8a: byte 4 = looper exclusion (old files 0). */
                 if (staging_buf[base + 4u] != 0u)
                     region->track_loop_exclude |= (uint8_t)(1u << track);
+                /* S081 P2: byte 5 = automation ramp mode (files read 0). */
+                if (staging_buf[base + 5u] != 0u)
+                    region->track_auto_smooth |= (uint8_t)(1u << track);
             }
             op_stream_index = 0u;
             op_phase = 48u;
@@ -15252,6 +15260,7 @@ static void filesystem_loadPattern_tick(void)
             region->pattern_change_bar = staging_buf[32u];
             region->pattern_next = staging_buf[33u];
             region->track_loop_exclude = 0u;
+            region->track_auto_smooth = 0u;
             for (track = 0u; track < NUM_TRACKS; track++) {
                 uint16_t base = (uint16_t)(48u +
                     track * PATTERN_FILE_TRACK_HEADER_BYTES);
@@ -15263,6 +15272,9 @@ static void filesystem_loadPattern_tick(void)
                 /* S080 P2 Defect 8a: byte 4 = looper exclusion (old files 0). */
                 if (staging_buf[base + 4u] != 0u)
                     region->track_loop_exclude |= (uint8_t)(1u << track);
+                /* S081 P2: byte 5 = automation ramp mode (files read 0). */
+                if (staging_buf[base + 5u] != 0u)
+                    region->track_auto_smooth |= (uint8_t)(1u << track);
             }
             op_stream_index = 0u; op_phase = 9u; return;
         }
@@ -28557,6 +28569,7 @@ static uint8_t filesystem_bootReaderReadPatternFile(const char *file_name,
     region->pattern_change_bar = staging_buf[32u];
     region->pattern_next = staging_buf[33u];
     region->track_loop_exclude = 0u;
+    region->track_auto_smooth = 0u;
     for (track = 0u; track < NUM_TRACKS; track++) {
         uint16_t base = (uint16_t)(48u +
             track * PATTERN_FILE_TRACK_HEADER_BYTES);
@@ -28568,6 +28581,9 @@ static uint8_t filesystem_bootReaderReadPatternFile(const char *file_name,
         /* S080 P2 Defect 8a: byte 4 = looper exclusion (old files 0). */
         if (staging_buf[base + 4u] != 0u)
             region->track_loop_exclude |= (uint8_t)(1u << track);
+        /* S081 P2: byte 5 = automation ramp mode (files read 0). */
+        if (staging_buf[base + 5u] != 0u)
+            region->track_auto_smooth |= (uint8_t)(1u << track);
     }
     if (filesystem_blockRead(file, (uint8_t *)region->address,
                              PATTERN_FILE_ADDRESS_BYTES) !=

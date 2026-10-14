@@ -212,6 +212,8 @@ static void audio_check_and_render(void)
             uint32_t basepri;
             voiceControl_processPending();
             seq_drainPendingAutomation();
+            /* S081 P2: automation ramps, after the step values land. */
+            seq_rampService();
             basepri = dsp_maskLowPriorityIrqs();
             mixer_calcNextSampleBlock(&buf[frame * 2], &buf2[frame * 2]);
             irq_setBasepri(basepri);

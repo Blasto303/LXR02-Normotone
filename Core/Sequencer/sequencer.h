@@ -303,8 +303,27 @@ void seq_alignActivePatternToScene(uint8_t scene_index);
  * front-panel service without MIDI-CC-style 7-bit expansion; Scene targets
  * remain queued only for the later Scene-target session. Affiliate: main.c
  * calls this before audio rendering.
+ * S081 P2: first ends the ramps of tracks whose next step has applied; each
+ * written Instrument entry of an asm track may start a linear ramp toward the
+ * same target on the predicted next step.
  */
 void seq_drainPendingAutomation(void);
+/*
+ * Automation ramp service (S081 P2, asm).
+ *
+ * What: every call (one per DSP block) ends the ramps of tracks whose next
+ * step has applied; every third call (~2.2 ms) writes each running ramp's
+ * interpolated 7-bit value, when it differs from the last value written,
+ * through the drain's Instrument write path, so
+ * ramp samples are held automation values (binding priority rule). Ramps are
+ * cancelled, value kept, on asm off, live-record latch/erase, an R12 menu
+ * override or an invalid target. Inputs: the ramp table filled by the drain,
+ * TIM3's per-track ramp contexts, the master tick clock. Outputs: runtime
+ * Instrument writes, seq_automation_dirty bits. Context: foreground only.
+ * Client: main.c audio_check_and_render(), right after
+ * seq_drainPendingAutomation().
+ */
+void seq_rampService(void);
 /*
  * Restore transient automation overlays for one visible trigger track.
  *
@@ -313,6 +332,9 @@ void seq_drainPendingAutomation(void);
  * Scene endpoint image immediately before the trigger and their bitmap is
  * cleared. Scene-level targets are intentionally not handled by this API.
  * Client: MidiVoiceControl.c's common trigger path.
+ * S081 P2 (D3): first ends the trigger track's own ramps; parameters still
+ * held by a running ramp of the slot (a mid-step live press, MIDI note, flam
+ * or roll renewal) are neither restored nor un-marked.
  */
 void seq_restoreAutomatedParameters(uint8_t trigger_track);
 /*
@@ -422,6 +444,7 @@ typedef struct {
     uint32_t elapsedTick;
     uint32_t stampUs;
     uint32_t periodUs;
+    uint32_t nowUs;      /* P1B item 17: capture µs time (same section) */
     int16_t  stepIndex;
     uint16_t accumulator;
     uint16_t interval;
@@ -439,19 +462,41 @@ typedef struct {
     uint8_t fired;
 } seq_rec_boundary_t;
 
+/*
+ * One placed live hit (S081 §8.3, P1B item 5, P1C item 6).
+ *
+ * step  landing step index. delay  micro-timing 0..99 from the nominal start.
+ * rel  -1 behind the current step, 0 current, +1 ahead. ahead  whole ticks
+ * from capture to the landed step start when rel > 0. snapQ8  the signed Q8
+ * shift the trk snap added to deltaQ8 (0 without snap): deltaQ8 + snapQ8 is
+ * the snapped hit's offset from the capture. Why snapQ8: a quantised flam
+ * places its grace 1/32 before the SNAPPED main; without it the grace was
+ * placed from the raw hit time under trk. Affiliates: liveRec_placeFlam().
+ */
+typedef struct {
+    uint8_t step;
+    uint8_t delay;
+    int8_t  rel;
+    uint16_t ahead;
+    int16_t  snapQ8;
+} seq_place_t;
+
 void    seq_setRecordTarget(uint8_t track, uint8_t writing);
 void    seq_setAutomationFilter(const uint8_t *latch, const uint8_t *erase,
                                 uint8_t eraseTrack);
 void    seq_setEraseMasks(uint8_t specials, uint8_t full);
-void    seq_suppressStepOnce(uint8_t track, uint8_t step);
+void    seq_suppressStepOnce(uint8_t track, uint8_t step, uint16_t aheadTicks);
 void    seq_setLiveHold(uint8_t track, uint8_t on);
-void    seq_cancelPendingTrigger(uint8_t track);
+void    seq_cancelPendingTrigger(uint8_t track, uint8_t step);
 uint8_t seq_takeRecBoundary(seq_rec_boundary_t *out);
 void    seq_captureTrackTime(uint8_t track, seq_track_time_t *out);
-uint8_t seq_projectStep(uint8_t track, uint32_t tick,
-                        uint8_t *step, uint16_t *offsetQ8);
-uint32_t seq_quantiseTick(uint8_t track, uint32_t tick);
+uint8_t seq_placeFromSnapshot(uint8_t track, const seq_track_time_t *snap,
+                              int32_t deltaQ8, uint8_t snapToStep,
+                              seq_place_t *out);
+uint32_t seq_quantiseTick(uint32_t tick, uint8_t frac8);
 uint8_t seq_getPlaybackEpoch(void);
+uint8_t seq_getSceneEpoch(void);
+uint8_t seq_getQuantisation(void);
 
 void seq_midiNoteOff(uint8_t chan);
 void seq_sendMidiNoteOn(const uint8_t channel, const uint8_t note, const uint8_t veloc);
