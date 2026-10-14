@@ -36,7 +36,14 @@
 #include "EffectTypes.h"
 #include "PatternTrace.h"
 #include "menu.h"
+#include "config.h"
 #include <string.h>
+
+/* S081 P2 follow-up: the step-value rule must be chosen explicitly; an
+ * undefined switch would silently read as 0 in the #if tests below. */
+#ifndef LIVEREC_AUTOMATION_FIRST_CHANGE
+#error "config.h must define LIVEREC_AUTOMATION_FIRST_CHANGE (0 or 1)"
+#endif
 
 /* 9-bit target ID space for the latch/dirty/erase bitmaps (S081 §9.2). */
 #define LIVEREC_TARGET_BITS   512u
@@ -50,6 +57,10 @@
  * priorMode  the LATCH/OFF state to restore after OVERDUB or ERASE ends.
  * lastEpoch/epochValid  playback-epoch poll state for take boundaries.
  * latch/dirty/erase  the three 512-bit target bitmaps (64 B each).
+ *   dirty with LIVEREC_AUTOMATION_FIRST_CHANGE 0: adjusted since its last
+ *   write (written at the step end). With 1: the current step of rtk already
+ *   has this target's value (its first change), or, while no step is known,
+ *   a change waiting for the next step start (S081 P2 follow-up).
  * RAM: about 220 B SRAM1 in every build.
  */
 static uint8_t liveRec_modeState = LIVEREC_MODE_OFF;
@@ -136,6 +147,11 @@ static uint16_t liveRec_drops[7];
 
 /* Step-end table (F-5) and knob-erase removals (G-6); defined below. */
 static void liveRec_stepEnd(uint8_t track, uint8_t step, uint8_t fired);
+#if LIVEREC_AUTOMATION_FIRST_CHANGE
+/* First-change writes (S081 P2 follow-up); defined beside the step-end table. */
+static void liveRec_writeCurrentValue(uint8_t step, uint16_t target);
+static void liveRec_writePendingFirst(uint8_t step);
+#endif
 /* End an open fast roll; defined below with the roll helpers (LR-13). */
 static void liveRec_endRoll(uint8_t writeEnd);
 
@@ -354,6 +370,23 @@ static void liveRec_drainRing(void)
             }
             liveRec_stepEnd(b.track, prev, b.fired);
         }
+#if LIVEREC_AUTOMATION_FIRST_CHANGE
+        /*
+         * First step of rtk after a start or playhead break (S081 P2
+         * follow-up).
+         *
+         * What: changes made while no step of rtk was known are waiting as
+         * dirty bits; their current values are written into the step that
+         * starts with this entry, which then counts as having them.
+         * Why: with the first-change rule a value is written into the step
+         * it was made in; with no step known the next step start is the
+         * nearest one. Affiliates: liveRec_paramIn(),
+         * liveRec_writePendingFirst().
+         */
+        if (b.track == liveRec_rtk && b.track < NUM_TRACKS &&
+            !liveRec_prevValid[b.track])
+            liveRec_writePendingFirst(b.step);
+#endif
         if (b.track < NUM_TRACKS) {
             liveRec_prevStep[b.track] = b.step;
             liveRec_prevValid[b.track] = 1u;
@@ -613,6 +646,67 @@ static uint8_t liveRec_targetOwned(uint16_t target)
     return (uint8_t)(liveRec_target == a);
 }
 
+#if LIVEREC_AUTOMATION_FIRST_CHANGE
+/*
+ * Write one target's current value into one step of rtk now (S081 P2
+ * follow-up, LIVEREC_AUTOMATION_FIRST_CHANGE).
+ *
+ * What: reads the target's current menu value (liveRec_targetValue7()) and
+ * writes it into `step` of rtk in T = P(rtk), unless the step already holds
+ * that value (L3: only real changes are queued; the read uses
+ * pat_findStepAutomation(), so a write still in the service FIFO can cause
+ * one redundant write, never a missing one). A successful write marks the
+ * STEP underline (menu_automationTargetRecorded()); a refused one is a
+ * counted drop (cause 4). fil (R10) is set on the step while PERF is held,
+ * as the step-end table does for its writes. Why: the first-change rule
+ * writes at the change, not at the step end. Inputs: step, target. Context:
+ * foreground. Accessors: liveRec_paramIn(), liveRec_writePendingFirst().
+ * Affiliates: liveRec_stepEnd() (the same write rules at the step end).
+ */
+static void liveRec_writeCurrentValue(uint8_t step, uint16_t target)
+{
+    uint8_t t = seq_getTrackPlayedScene(liveRec_rtk);
+    uint8_t v = liveRec_targetValue7(target);
+    uint8_t old;
+
+    if (pat_findStepAutomation(t, liveRec_rtk, step, target, &old) &&
+        old == v)
+        return;
+    if (patSvc_writeStepAutomation(t, liveRec_rtk, step, target, v))
+        menu_automationTargetRecorded(t, liveRec_rtk, target);
+    else
+        liveRec_drop(4u, liveRec_rtk, step);
+    if (seq_fillActive)
+        patSvc_setStepCondition(t, liveRec_rtk, step, 21u);
+}
+
+/*
+ * Write the waiting changes into the first known step (S081 P2 follow-up).
+ *
+ * What: in LATCH or OVERDUB, writes every dirty target's current value into
+ * `step` (the first step of rtk after a transport start or a playhead
+ * break); the dirty bits stay set, so that step counts as having its value
+ * and the step end only clears them. Why: changes made while no step was
+ * known (stopped, or between a break and the next step start) have no step
+ * of their own; this also carries a change from the step a break cut short,
+ * as the step-end rule (0) does. Inputs: the starting step. Context:
+ * foreground, from liveRec_drainRing(). Affiliates: liveRec_paramIn(),
+ * liveRec_writeCurrentValue().
+ */
+static void liveRec_writePendingFirst(uint8_t step)
+{
+    uint16_t target;
+
+    if (liveRec_modeState != LIVEREC_MODE_LATCH &&
+        liveRec_modeState != LIVEREC_MODE_OVERDUB)
+        return;
+    for (target = 0u; target < LIVEREC_TARGET_BITS; target++) {
+        if (liveRec_dirty[target >> 3] & (uint8_t)(1u << (target & 7u)))
+            liveRec_writeCurrentValue(step, target);
+    }
+}
+#endif
+
 /*
  * Step-end table (S081 §9.3/§9.4/§9.5, F-5).
  *
@@ -621,6 +715,10 @@ static uint8_t liveRec_targetOwned(uint16_t target)
  * parameters on fired steps, clears others), OVERDUB writes only dirty targets.
  * Only real changes are queued (L3): one pat_readStepAutomations() read answers
  * every target. fil (R10) is set when the step received a write.
+ * S081 P2 follow-up: with LIVEREC_AUTOMATION_FIRST_CHANGE 1 a dirty target
+ * was already written at its first change in this step (or at the step
+ * start); the end only clears its dirty bit. The not-dirty LATCH rules
+ * (re-stamp / clear) are unchanged.
  */
 static void liveRec_stepEnd(uint8_t track, uint8_t step, uint8_t fired)
 {
@@ -673,8 +771,19 @@ static void liveRec_stepEnd(uint8_t track, uint8_t step, uint8_t fired)
         old_val = liveRec_autoValue(autos, count, target, &present);
 
         if (dirty) {
-            uint8_t v = liveRec_targetValue7(target);
+            uint8_t v;
 
+#if LIVEREC_AUTOMATION_FIRST_CHANGE
+            /*
+             * First-change rule (S081 P2 follow-up): this step already got
+             * the value of its first change (liveRec_paramIn()) or of a
+             * waiting change at its start (liveRec_writePendingFirst()).
+             * The end only closes it; later changes are not written here.
+             */
+            liveRec_dirty[bi] &= (uint8_t)~bit;
+            continue;
+#endif
+            v = liveRec_targetValue7(target);
             if (!present || old_val != v) {
                 if (patSvc_writeStepAutomation(t, liveRec_rtk, step, target, v))
                     menu_automationTargetRecorded(t, liveRec_rtk, target);
@@ -1227,10 +1336,20 @@ void liveRec_rollRelease(uint8_t track)
  * What: every recordable gesture (pots, encoder; MIDI CC later) marks its
  * target dirty, and in LATCH also latched, provided the target belongs to
  * the recording target Scene. Why: see liveRec_targetOwned(). The value is
- * not passed: the step-end write reads the current menu value. Inputs:
- * target ID, source. Outputs: liveRec_dirty/latch bits. Accessors:
- * menu_liveRecRecordCell(), midiParser_enterTaggedParameter().
+ * not passed: the write reads the current menu value (callers commit the
+ * edit first). Inputs: target ID, source. Outputs: liveRec_dirty/latch bits.
+ * Accessors: menu_liveRecRecordCell(), midiParser_enterTaggedParameter().
  * Affiliates: liveRec_stepEnd(), liveRec_targetValue7().
+ *
+ * S081 P2 follow-up (LIVEREC_AUTOMATION_FIRST_CHANGE 1): the FIRST change of
+ * a target in a step is written at once into the step rtk is playing (the
+ * live step from seq_captureTrackTime(), after the ring is brought up to
+ * date so the previous step's end has run); the dirty bit then marks the
+ * step as having its value and further changes in the step are ignored for
+ * it. With no step known (not writing, Pattern replacement pending, or no
+ * ring entry for rtk since a start/break) the change waits as a dirty bit
+ * and liveRec_writePendingFirst() writes it at the next step start. With 0
+ * the step end writes the value held then (P1 rule).
  */
 void liveRec_paramIn(uint16_t target9, uint8_t source)
 {
@@ -1244,9 +1363,35 @@ void liveRec_paramIn(uint16_t target9, uint8_t source)
         liveRec_drop(2u, liveRec_rtk, (uint8_t)(target9 & 0x7Fu));
         return;
     }
+#if LIVEREC_AUTOMATION_FIRST_CHANGE
+    {
+        uint8_t bit = (uint8_t)(1u << (target9 & 7u));
+        uint8_t stepKnown = 0u;
+
+        if (liveRec_modeState == LIVEREC_MODE_LATCH)
+            liveRec_latch[target9 >> 3] |= bit;
+        /* Run any pending step ends first, so the dirty bit below belongs
+         * to the step that is playing now. */
+        if (liveRec_patternWriting() && !patSvc_replacePending()) {
+            liveRec_syncRing();
+            stepKnown = liveRec_prevValid[liveRec_rtk];
+        }
+        if (liveRec_dirty[target9 >> 3] & bit)
+            return;                 /* this step already has its value */
+        liveRec_dirty[target9 >> 3] |= bit;
+        if (stepKnown) {
+            seq_track_time_t now;
+
+            seq_captureTrackTime(liveRec_rtk, &now);
+            if (now.stepIndex >= 0)
+                liveRec_writeCurrentValue((uint8_t)now.stepIndex, target9);
+        }
+    }
+#else
     liveRec_dirty[target9 >> 3] |= (uint8_t)(1u << (target9 & 7u));
     if (liveRec_modeState == LIVEREC_MODE_LATCH)
         liveRec_latch[target9 >> 3] |= (uint8_t)(1u << (target9 & 7u));
+#endif
 }
 
 /*

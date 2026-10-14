@@ -1607,3 +1607,84 @@ documentation.
 **Image:** `make img` → `build/LXRV2_lxr02.img` (571,804 B payload,
 including writes-on-change), built 2026-10-14 from this tree, ready for the
 Phase E matrix.
+
+---
+
+## Follow-up: live record writes the first change (user, 2026-10-14)
+
+**Request:** the value live record writes into a step is the parameter's
+first change in that step, not its value at the step end, behind a switch
+in `config.h`. Plan: `S081_P2_LINEAR_AUTOMATION.md` §13 (D12).
+
+**Why:** a step's automation plays back at the step start. The P1 rule wrote
+the value read at the step's end, so recorded moves played back up to one
+step early (with `asm` on, the whole ramped curve was one step early).
+
+### Changes
+
+| File | Change |
+|---|---|
+| `config.h` (after `ENABLE_EUKLID_PAGE`) | ADD `#define LIVEREC_AUTOMATION_FIRST_CHANGE 1` with its contract block (1 = first change, 0 = P1 step-end rule). |
+| `LiveRecord.c` includes | ADD `#include "config.h"` and an `#error` when the switch is undefined (an undefined name reads as 0 in `#if`). |
+| `LiveRecord.c` state comment | The `dirty` meaning for both settings. |
+| `LiveRecord.c` forward declarations | `liveRec_writeCurrentValue()`, `liveRec_writePendingFirst()` (switch 1 only). |
+| `liveRec_drainRing()` | Switch 1: at the first ring entry of rtk after a start/break (`prevValid` false), `liveRec_writePendingFirst(b.step)` writes the waiting dirty targets into the starting step. |
+| new `liveRec_writeCurrentValue()` | Writes one target's current menu value into one step of rtk now: L3 compare through `pat_findStepAutomation()`, `menu_automationTargetRecorded()` on success, drop cause 4 on refusal, fil while PERF is held. |
+| new `liveRec_writePendingFirst()` | LATCH/OVERDUB only: writes every dirty target into the given step; the bits stay set. |
+| `liveRec_stepEnd()` | Switch 1: a dirty target only has its bit cleared (it was written at its first change or at the step start). The not-dirty LATCH re-stamp/clear rules and erase are unchanged. Function comment extended. |
+| `liveRec_paramIn()` | Switch 1: sets latch as before; while writing (armed, running, no Pattern replacement) it drains the ring first (`liveRec_syncRing()`), so the previous step's end has run. If the dirty bit is already set it returns (the step has its value). Otherwise it sets the bit and, when a ring entry for rtk has been seen, writes the current value into the live step (`seq_captureTrackTime()`). With no step known, the change waits for the next step start. Comment extended. |
+
+With the switch at 0 every path is the P1 code; the build size equals the
+previous image (flash 571,804 B), confirming the 0 path is unchanged.
+
+### Design notes
+
+- **No RAM:** the existing `dirty` bitmap carries the state. Switch 1:
+  "this step has its value", or "waiting" while no step is known.
+- **Callers commit first:** both the pot path (`menu_parseKnobDelta()`) and
+  the encoder path commit the edit before `menu_liveRecRecordCell()` calls
+  `liveRec_paramIn()`, so the immediate write reads the new value.
+- **Live step, not the ring's last step:** after REC is armed while running,
+  the ring's last step for rtk can be from an earlier take. The write goes
+  to the live playhead step. The next ring entry then ends the stale step,
+  which in switch 1 only clears the bit.
+
+### Limits (documented, not changed)
+
+- If TIM3 advances between the ring drain and the step read in
+  `liveRec_paramIn()` (microseconds), the value goes to the new step and that
+  step's end processing can clear its bit early. A later change in the same
+  step is then written once more.
+- A change while a Pattern replacement is pending, with a step known, sets
+  the bit without a write. That step's end clears it, so the change is not
+  recorded (a Pattern Load during recording).
+- Unchanged from P1 (both settings): the first ring entry after arming while
+  running ends the stale step left from an earlier take. In switch 0 a dirty
+  target can be written into that stale step. This is a pre-existing P1 issue
+  and is out of scope here; it is recorded here for a later review.
+
+### Gate
+
+`make all` clean with the switch at 1 and at 0 (no new warnings).
+
+| | Before follow-up | Switch 1 | Switch 0 |
+|---|---|---|---|
+| Flash used | 571,804 | 572,204 (+400) | 571,804 |
+| bss | 429,104 | 429,104 | 429,104 |
+
+**Image:** `build/LXRV2_lxr02.img` rebuilt with the switch at 1 (572,204 B
+payload).
+
+### Hardware checks (user)
+
+1. LATCH, slow knob sweep across several steps on a running track: on
+   playback each step's value matches where the sweep was early in that
+   step (no one-step lead). With `asm` on, the ramp follows the gesture in
+   time.
+2. Several moves within one step: only the first value is written; the knob
+   resting value plays where nothing is recorded.
+3. Knob moved while stopped with LATCH armed, then start: the value lands on
+   the first step played.
+4. OVERDUB: same as 1 and 2; untouched targets keep their entries.
+5. fil: recording with PERF held sets `fil` on written steps.
+6. Switch at 0 (rebuild): P1 behaviour (step-end value) returns.

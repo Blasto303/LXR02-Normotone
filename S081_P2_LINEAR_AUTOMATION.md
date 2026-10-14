@@ -281,7 +281,8 @@ For each Instrument entry of A on an `on` track with a valid ramp context:
   - recording on an `on` track writes per-step values exactly as today;
   - latched targets play the menu value, so they never ramp;
   - erased targets on rtk are filtered, so they never ramp;
-  - no recording rule changes.
+  - the value written per step changed after implementation: see §13
+    (first change, `LIVEREC_AUTOMATION_FIRST_CHANGE`).
 - **Per-track Scene playback:** the `asm` flag and B's entries are read from
   the track's played Scene (`seq_perTrackPattern[track]`), like all
   per-track data.
@@ -412,3 +413,64 @@ All static, normal SRAM1.
    - per-track Scene playback;
    - menu-to-automation and automation-to-menu still jump.
 4. **Docs.**
+
+---
+
+## 13. Follow-ups decided after implementation (user, 2026-10-14)
+
+| # | Decision |
+|---|---|
+| D11 | The ramp service writes a ramp's value only when the rounded value changes (§7). The ramp slot grows to 10 B (a `last` byte plus padding): **+128 B SRAM1 approved**. P2 RAM is 686 B every build + 2 B DEV. |
+| D12 | Live record writes the value of a parameter's **first change** in a step, not the value it holds when the step ends. Switch: `LIVEREC_AUTOMATION_FIRST_CHANGE` in `config.h` (1 = first change, the default; 0 = the P1 step-end rule). |
+
+### 13.1 Why D12
+
+- A step's automation plays back at the step's start (its apply time).
+- The P1 rule (`S081_P1_LIVE_RECORD.md` §9.2/§9.3) wrote, at the end of
+  step N, the value the parameter held then. Every recorded move therefore
+  played back up to one step early. With `asm` on, the ramped curve was
+  shifted one step earlier than the gesture.
+- The first change in step N is the start of that step's motion, so it
+  belongs at the step's start.
+
+### 13.2 Rule with `LIVEREC_AUTOMATION_FIRST_CHANGE` 1
+
+- **First change in a step:** written at once into the step rtk is playing,
+  as the current menu value just after the edit.
+  - The step is the live playhead step (`seq_captureTrackTime()`), after the
+    boundary ring is drained so the previous step's end has run.
+  - The `dirty` bit then means "this step has its value". Further changes of
+    that target in the same step are not written to it.
+- **Step end:** a dirty target only has its bit cleared; nothing is written.
+  The LATCH rules for targets that were not changed are unchanged: own
+  Instrument parameters are written again on fired steps, other entries are
+  cleared.
+- **No step known** (transport stopped, Pattern replacement pending, or no
+  ring entry for rtk since a start or playhead break): the change waits as a
+  dirty bit. Its current value is written into the next step that starts,
+  which then counts as having it.
+  - This also carries a change from a step that a break cut short, as the P1
+    rule does.
+- **Unchanged:**
+  - at most one value per step and target;
+  - L3: a write is queued only when the value differs;
+  - fil (R10) while PERF is held;
+  - ownership and target rules (§7 of P1);
+  - erase.
+- **Where the knob comes to rest:** later changes in a step are not written
+  to it. The resting value is still what plays: OVERDUB and the cleared
+  LATCH steps play the menu value, which is the knob's value, and LATCH
+  writes own Instrument parameters again on later fired steps.
+- **RAM:** none. The `dirty` bitmap carries the state.
+
+### 13.3 Example
+
+A knob moves from 20 to 80 across steps 4 and 5. Its first change in step 4
+is 21, it is 50 at the end of step 4, its first change in step 5 is 51, and
+it rests at 80.
+
+| Rule | Step 4 | Step 5 | Playback |
+|---|---|---|---|
+| P1 (0) | 50 | 80 | each value heard up to one step before it was played |
+| First change (1) | 21 | 51 | each value heard where its step's motion started |
+
