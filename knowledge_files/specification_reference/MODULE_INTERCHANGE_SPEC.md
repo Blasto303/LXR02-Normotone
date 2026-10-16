@@ -291,20 +291,30 @@ settings). Engine maths: `PATTERN_DYNAMIC_STACK.md` §6.5 (looper) and §6.6
 | SELECT1..8 (hold) | Looper division 1 bar, 1/2, 1/4, 1/8 bar, 1/16, 1/32, 1/64, 1/128; last pressed wins |
 | VOICE then SELECT | Loop only the held VOICE tracks |
 | SELECT held, VOICE press | Move the loop to the currently held VOICE set (kept tracks keep their loop start) |
+| VOICE press, looping, no SELECT held | Add that track to the loop with a fresh loop start (S081 P3 Q1/FQ1); a `lop`-off track does not join but still holds the loop |
+| VOICE (looping) | Looper only: never fires the overlay trigger, never toggles a mute, never starts an erase gesture (S081 P3 Q2/Q4) |
 | VOICE release (looped track) | Drops that track; it resumes where it would have been |
 | BAR1 / BAR2 (looping) | Momentary triplet ×2/3 / dot ×3/2 |
 | BAR1 / BAR2 (not looping) | Toggle VOICE-trigger overlay `<` / `>` (one at a time, LED lit) |
-| VOICE (overlay on, no SHIFT) | Fire the overlay trigger (`pb<`/`pn<` or `pb>`/`pn>`); release = note-off |
+| VOICE (overlay on, no SHIFT) | Fire the overlay trigger (`pb<`/`pn<` or `pb>`/`pn>`); release = note-off. Not while the loop is engaged: the loop pre-empts the overlay (S081 P3 Q2/Q4) |
 | SHIFT+VOICE (overlay on) | Normal mute toggle |
 | VOICE release (no loop, no overlay, no action during hold) | Mute toggle (S077) |
 | SHIFT+REC | Latched settings menu (RECORDING_PAGE) — any mode |
 | MODE press | Closes SHIFT+REC and the chain editor; leaving PERF force-releases the looper |
 
-The loop is engaged while any looper SELECT, any VOICE of a still-looped
-track, or any BAR button is held (`buttonHandler_loopCheckDisengage()`),
-only while the transport runs, and is filtered by each track's Loopable flag.
-Recording is turned off on engage and REC is ignored while looping.
-Event-ring overflow force-releases the looper and closes latched menus.
+The loop is engaged while any looper SELECT, any VOICE or any BAR button is
+held (`buttonHandler_loopCheckDisengage()`), only while the transport runs,
+and is filtered by each track's Loopable flag. While the loop is engaged,
+SELECT, BAR and TRACK (VOICE) always keep their looper functions: a VOICE
+press with no SELECT held adds its track with a fresh loop start, a VOICE
+release drops its track (S080 D1), and no VOICE fires the overlay trigger,
+toggles a mute or starts an erase gesture (S081 P3 Q1/Q4). A VOICE that is
+held as an overlay trigger when the loop engages ends that gesture and
+becomes an ordinary TRACK hold (S081 P3 FQ2). Live record and live erase are
+not turned off: the looper and the record modes run together, and REC works
+while looping (S081 P3 L-2). Leaving PERF force-releases the looper and
+clears the VOICE holds. Event-ring overflow force-releases the looper and
+closes latched menus.
 
 ### Latched menus
 
@@ -647,7 +657,7 @@ Sequencer LED feedback via `SeqLedState`.
 | `led_setValue(val, ledNr)` / `led_setValueTemp(val, ledNr)` | Set physical/logical LED value. | buttonHandler, Menu, ledHandler helpers |
 | `led_reset(ledNr)` / `led_toggle(ledNr)` / `led_toggleTemp(ledNr)` | Direct LED edits. | buttonHandler, Menu |
 | `led_clearAll()` | Clear all LED state. | UI flows |
-| `led_tickHandler()` | Blink/pulse maintenance. | foreground/timer service |
+| `led_tickHandler()` | Blink/pulse/flash maintenance, plus the S080 fast blink. S081 P4: pulse and flash deadlines are compared by signed 16-bit distance (`led_timeReached()`), so an effect started just before the 16-bit `time_sysTick` wrap lasts its full time (the former `now > deadline` test could lose a pulse and end a flash at once or flicker its phase). | foreground/timer service |
 | `led_pulseLed(ledNr)` | Pulse one LED. | voice trigger indication paths |
 | `led_setBlinkLed(ledNr, onOff)` / `led_clearAllBlinkLeds()` | Blink management; starting blink for an already-blinking LED is idempotent so duplicate slots cannot cancel visually. | buttonHandler, Menu |
 | `led_setActivePage(pageNr)` | Light one page/select LED. | buttonHandler load/save |
@@ -681,6 +691,23 @@ blink/chase, base. On layer expiry, `led_renderFromStack()`
 clears the expired layer's bit and renders the highest remaining active layer.
 Chase runs at blink priority. The held-step automation overlay writes LEDs
 directly and does not participate in the layer system.
+
+**VOICE-mode bar pulse (S081 P4).** In VOICE mode the SELECT LED of the bar
+the active track is playing pulses once (50 ms `led_pulseLed()`, the pulse
+layer) whenever that bar changes, without touching the SELECT row's base
+state, so the sub-page indicator keeps working. The bar is read live from the
+active track with `seq_captureTrackTime()` (not `seq_ledState.chaseStep`,
+which carries no track id), in the `SEQ_LED_DIRTY_CHASE` branch of
+`led_processSeqLedState()` via `led_updateVoiceBarPulse()`. There is no pulse
+when the effective track length is 16 or less (a single bar, including after a
+Morph or length automation), when the play mode is `rnd` (3), when the bar is
+the one being left (pip boundary repeat, wrap within a bar), when the active
+voice changed since the last drain, or on the first step after a transport
+start (the bar is forgotten while stopped). A jump into another bar (realign,
+looper resume, per-track Scene or length change) pulses once, like any bar
+change. The track and bar are remembered in every mode. State:
+`led_barPulseTrack`/`led_barPulseBar` (0xFF = none), 2 B SRAM1, ledHandler.
+STEP mode keeps its own bar chaselight; PERF never shows the bar.
 
 ## Core/Hardware/frontPanel/buttonHandler
 
@@ -913,6 +940,7 @@ Sequencer no longer exposes `seq_patternSet`, `seq_tmpPattern`, or
 | `seq_fxTakeEvent()` | Take the newest FX RESET/STEP latch byte. | `effects_service()` |
 | `seq_setEffectAutomationTracks(mask)` | Publish the tracks owning Effect overlays; TIM3 queues step markers only for them. | EffectsManager |
 | Looper (S080) `seq_loopActive` / `seq_loopEngage(mask, div, mod)` / `seq_loopUpdateMask(mask)` / `seq_loopDisengage()` / `seq_loopUpdateDivision(div, mod)` / `seq_loopableTrackMask()` | Master-clock-anchored per-track loop (`PATTERN_DYNAMIC_STACK.md` §6.5). Engage returns the mask now looping (0 when stopped); UpdateMask resumes leaving tracks, snapshots joining ones, keeps the rest. All publishes under PRIMASK; wrap in TIM3 before the DDA. | buttonHandler PERF |
+| Live record service (S081 P1, extended P3) `seq_setRecordTarget()` / `seq_takeRecBoundary()` / `seq_captureTrackTime()` / `seq_placeFromSnapshot()` / `seq_suppressStepOnce()` / `seq_setLiveHold()` / `seq_setAutomationFilter()` / `seq_setEraseMasks()` / `seq_cancelPendingTrigger()` / `seq_getPlaybackEpoch()` / `seq_getSceneEpoch()` / `seq_getQuantisation()` | Sequencer side of the LiveRecord interface (`S081_P1_LIVE_RECORD.md` §19.1). `seq_rec_boundary_t` is one step-boundary ring entry: `step`, `track`, `fired` (the step's trigger fired at its start) and, since S081 P3, `jump` (a looper position jump began the step — a mid-step wrap or a resume — so it is a partial replay whose trigger did not fire this pass). Every entry is pushed by `seq_recRingPush()`, from TIM3 (step advance, mid-step wrap) or the foreground under the looper's PRIMASK (resume). `seq_track_time_t` is the PRIMASK capture; since S081 P3 it also carries the loop state (`looped`, `loopAnchor`, `loopStartStep/Accum/PlayState`, `loopTicks`) so `seq_placeFromSnapshot()` can map a shift that crosses a wrap onto the pass the target lands in. The looper and record modes run together (S081 P3 L-2); the P1 interim `liveRec_forceOff()` is removed, so engaging the loop never disarms record. The global Morph (`mrp`) is never recorded (S081 P3 G-1): it has no target, and LiveRecord writes a voice/FX Morph from the value captured at its individual edit (`liveRec_morphValue[7]`), never a value a global change overwrote. | LiveRecord |
 | Scene change / queue (S080) `seq_requestSceneChange()` / `seq_queueSceneChange()` / `seq_sceneChangeFirePending()` / `seq_pendingSceneTarget()` / `seq_pendingSceneIsQueue()` / `seq_pendingSceneIsChain()` / `seq_queuedSceneTarget()` / `seq_clearPendingSceneChange()` / `seq_cancelPendingDirectChange()` | Deferred direct (`scd`) and queued (`qcd`) changes; TIM3 raises the fire flag at the division boundary (`seq_handleMasterBoundary()`); instant or stopped queue fires at once (§6.6). | Menu, buttonHandler |
 | Scene chaining (S080) `seq_chainRepeatSelf(restart)` + TIM3 chain engine | Per-tick bar/repetition detection, condition weights, next-scene resolve, `stp` freeze; a chain fire becomes a chain-marked direct change (§6.6). | Menu executor |
 | `seq_evaluateStepCondition(track, step)` | Read step specials and evaluate the conditional gate (41 entries since S080, incl. `lop`/`!lp` = `seq_loopActive`; `PATTERN_DYNAMIC_STACK.md` §6). Returns `step_allowed`. Called before the trigger-active check in `seq_advanceTrackStep()`. Both trigger and automation are gated by the result; erase is independent (Session 070). | Sequencer only |

@@ -85,7 +85,6 @@ void liveRec_service(void);
 void    liveRec_setLatch(uint8_t on);
 void    liveRec_overdubBegin(void);
 void    liveRec_overdubEnd(void);
-void    liveRec_forceOff(void);
 void    liveRec_eraseBegin(void);
 void    liveRec_eraseEnd(void);
 uint8_t liveRec_mode(void);
@@ -106,7 +105,10 @@ void    liveRec_triggerIn(const liveRec_trigger_t *t);
 void    liveRec_rollRateChange(uint8_t track, uint8_t rollIndex);
 void    liveRec_rollRelease(uint8_t track);
 
-/* Automation (Menu now, MidiParser later). */
+/* Automation (Menu now, MidiParser later). S081 P3 (G-1): a voice or FX
+** Morph edit captures its value at the edit and that value is written, so a
+** global Morph change (never recorded) cannot leak into a pending Morph
+** write. The global Morph (mrp) has no target and never reaches this call. */
 void    liveRec_paramIn(uint16_t target9, uint8_t source);
 
 /* Erase gestures (buttonHandler / Menu). */
@@ -120,8 +122,7 @@ void    liveRec_eraseFxSeqHeld(uint8_t held);
 void    liveRec_eraseTrackHeld(uint8_t track, uint8_t held);
 /* Release every held erase gesture (SEQ/TRACK hold counts, specials, full);
 ** keeps erase mode, the knob-erase bitmap and the knob-erase FX lanes (S081
-** §10.1, P1B item 8, P1C 2/16). Callers: handleModeButtons(), eraseEnd,
-** forceOff. */
+** §10.1, P1B item 8, P1C 2/16). Callers: handleModeButtons() and eraseEnd. */
 void    liveRec_eraseReleaseHeld(void);
 
 #endif /* LIVEREC_H_ */

@@ -305,7 +305,8 @@ static uint8_t dblclick_armed = 0u;
  * bh_loopBarModifier - momentary BAR modifier (0 none, 1 dot, 2 triplet).
  * bh_loopBarHeld - BAR1 (bit 0) / BAR2 (bit 1) physically held in PERF,
  * tracked in event order. Why: the loop stays engaged while any SELECT, any
- * VOICE of a looped track, or any BAR is held (Defect 8); event-order BAR
+ * VOICE or any BAR is held (S081 P3 Q1; S080 counted only VOICEs of looped
+ * tracks), until all are released or the mode leaves PERF. Event-order BAR
  * state replaces btn_held[], which the ISR updates ahead of the queued edges.
  * Inputs: SELECT/VOICE/BAR press/release in PERF. Outputs: seq_loop*() calls,
  * SELECT/BAR LEDs. RAM: +5 bytes SRAM1 (S080 P2 adds bh_loopBarHeld).
@@ -1532,23 +1533,25 @@ uint8_t buttonHandler_loopSelectLed(void)
 }
 
 /*
- * End the loop when nothing sustains it any more (S080 P2 Defect 8).
+ * End the loop when nothing holds it any more (S080 P2 Defect 8; S081 P3 Q1).
  *
- * What: returns while any looper SELECT, any VOICE of a still-looped track,
- * or any BAR button is held. Otherwise disengages the loop (every looped track
- * resumes where it would have been), clears the modifier and track mirror, and
- * restores the SELECT row (dark) and the BAR overlay LEDs. Why: the loop must
- * survive a SELECT release while a looped VOICE or a BAR is still held (plan
- * Defect 8 example). Inputs: bh_loopSelectHeldMask, perf_heldVoiceMask,
- * bh_loopTrackMask, bh_loopBarHeld. Outputs: seq_loopDisengage(), LEDs.
- * Accessors: SELECT, VOICE and BAR release paths. Affiliates:
- * menu_syncPerfSelectLed(), bh_overlayActive.
+ * What: returns while any looper SELECT, any VOICE or any BAR is held.
+ * Otherwise disengages the loop (every looped track resumes where it would
+ * have been), clears the modifier and track mirror, and restores the SELECT
+ * row (dark) and the BAR overlay LEDs. Why: user rule Q1: the loop runs from
+ * the first SELECT press until every SELECT, TRACK and BAR button is
+ * released (or the mode leaves PERF), with or without record. A held VOICE
+ * of a track that is not looped (lop off, or dropped) also holds it.
+ * Inputs: bh_loopSelectHeldMask, perf_heldVoiceMask, bh_loopBarHeld.
+ * Outputs: seq_loopDisengage(), LEDs. Accessors: SELECT, VOICE and BAR
+ * release paths. Affiliates: menu_syncPerfSelectLed(), bh_overlayActive,
+ * buttonHandler_perfVoiceReleased().
  */
 static void buttonHandler_loopCheckDisengage(void)
 {
     if (bh_loopSelectHeldMask != 0u)
         return;
-    if ((perf_heldVoiceMask & bh_loopTrackMask) != 0u)
+    if (perf_heldVoiceMask != 0u)
         return;
     if (bh_loopBarHeld != 0u)
         return;
@@ -1569,8 +1572,9 @@ static void buttonHandler_loopCheckDisengage(void)
  * What: clears the SELECT and BAR hold state, disengages the loop (tracks
  * resume where they would have been) and clears the mirrors. Why: leaving
  * PERF and an event-ring overflow both lose the release edges that would end
- * the loop normally. Accessors: handleModeButtons(),
- * buttonHandler_processEvents() overflow path.
+ * the loop normally. S081 P3: also clears the PERF VOICE holds
+ * (`perf_heldVoiceMask`), which now hold the loop. Accessors:
+ * handleModeButtons(), buttonHandler_processEvents() overflow path.
  */
 static void buttonHandler_loopForceRelease(void)
 {
@@ -1580,6 +1584,13 @@ static void buttonHandler_loopForceRelease(void)
         seq_loopDisengage();
     bh_loopTrackMask = 0u;
     bh_loopBarModifier = 0u;
+    /*
+     * S081 P3 (Q1): the PERF VOICE holds end with PERF. Their releases arrive
+     * in the new mode, where the PERF release path does not run, so a bit
+     * left set would hold the next loop for ever.
+     */
+    perf_heldVoiceMask = 0u;
+    perf_voiceActionOccurred = 0u;
 }
 
 /*
@@ -1602,26 +1613,23 @@ static void buttonHandler_perfVoiceReleased(uint8_t voiceNr)
         return;
     perf_heldVoiceMask = (uint8_t)(perf_heldVoiceMask & ~bit);
     /*
-     * S080 P2 Defect 8 (D1): releasing a looped track's VOICE drops it.
+     * VOICE release while looping (S080 P2 Defect 8 D1; S081 P3 Q1/Q4).
      *
-     * What: the track leaves the loop at once and resumes where it would have
-     * been (inside seq_loopUpdateMask(), before the mask is committed); the
-     * other looped tracks keep their loop starts. Then the loop ends if
-     * nothing sustains it any more. Why: real-time control of which tracks
-     * loop (Defect 8 follow-up). The mute toggle below is already suppressed
-     * because the loop gesture set perf_voiceActionOccurred. Inputs: bit,
+     * What: a looped track's release drops it from the loop at once (it
+     * resumes where it would have been; the others keep their loop starts).
+     * Every release while looping is a looper gesture: it never toggles a
+     * mute, and the loop ends if nothing holds it any more (any SELECT,
+     * VOICE or BAR). Why: Q4, TRACK buttons keep their looper functions
+     * while the loop is engaged; Q1, any held TRACK holds the loop, so the
+     * release of a non-looped VOICE can be the last hold. Inputs: bit,
      * bh_loopTrackMask, seq_loopActive. Outputs: seq_loopUpdateMask(),
      * possibly seq_loopDisengage(). Affiliates:
      * buttonHandler_loopCheckDisengage().
      */
-    if (seq_loopActive && (bh_loopTrackMask & bit) != 0u) {
-        bh_loopTrackMask =
-            seq_loopUpdateMask((uint8_t)(bh_loopTrackMask & (uint8_t)~bit));
-        /*
-         * Mark the release as a looper gesture so the mute toggle below stays
-         * suppressed, including the VOICE-then-SELECT engage order (the VOICE
-         * press predated the loop, so it could not set the flag itself).
-         */
+    if (seq_loopActive) {
+        if ((bh_loopTrackMask & bit) != 0u)
+            bh_loopTrackMask = seq_loopUpdateMask(
+                (uint8_t)(bh_loopTrackMask & (uint8_t)~bit));
         perf_voiceActionOccurred = 1u;
         buttonHandler_loopCheckDisengage();
     }
@@ -2134,7 +2142,8 @@ static void handleSelectButton(uint8_t selectNr)
          * Why:        SELECT is otherwise unused in PERF.
          * Inputs:     selectNr 0..7, perf_heldVoiceMask, seq_loopActive.
          * Outputs:    seq_loopEngage()/seq_loopUpdateDivision(); the pressed
-         *             SELECT LED lit; REC forced off; BAR LEDs off.
+         *             SELECT LED lit; BAR LEDs off; the record mode is kept
+         *             (S081 P3, L-2).
          * Accessors:  handleSelectButton() PERF case (here); the release half
          *             is buttonHandler_partButtonReleased().
          * Affiliates: seq_loopEngage(), buttonHandler_loopCheckDisengage().
@@ -2144,28 +2153,49 @@ static void handleSelectButton(uint8_t selectNr)
         bh_loopSelectHeldMask |= (uint8_t)(1u << selectNr);
         bh_loopLastSelectButton = selectNr;
         if (!seq_loopActive) {
-            uint8_t trackMask = (perf_heldVoiceMask != 0u)
-                ? perf_heldVoiceMask : 0x7Fu;
+            uint8_t held = (uint8_t)(perf_heldVoiceMask | bh_overlayVoiceMask);
+            uint8_t trackMask = (held != 0u) ? held : 0x7Fu;
 
             bh_loopBarModifier = 0u;
             bh_loopTrackMask = seq_loopEngage(trackMask, division,
                                               bh_loopBarModifier);
             /*
-             * Looper engage turns record off only if the loop engaged
-             * (S081 P1 interim, P1B item 13).
+             * Held VOICEs at a successful engage (S081 P3 FQ2, Q4).
              *
-             * What: after seq_loopEngage(), if the loop is now active and live
-             * record or erase is armed, record is forced off and the REC LED
-             * cleared. Why: seq_loopEngage() does nothing while the transport is
-             * stopped (a SELECT press then only lights its LED); P1 disarmed
-             * record before the call, so a SELECT press while stopped lost the
-             * armed state. This restores the S080 order (engage, then test
-             * seq_loopActive). P2 removes the lockout (L-2). Affiliates:
-             * seq_loopEngage(), liveRec_forceOff().
+             * What: only if the loop engaged (transport running):
+             *  1. every VOICE still firing an overlay trigger ends that
+             *     gesture as its release would (buttonHandler_overlayRelease():
+             *     repeats stop, note-off, liveRec_rollRelease() writes the
+             *     recorded roll's end; a flam still waiting for its main hit
+             *     loses it, as on an early release);
+             *  2. those VOICEs become ordinary looper TRACK holds
+             *     (perf_heldVoiceMask): their tracks are already in the
+             *     engage mask above, they hold the loop, and their release
+             *     drops the track with no mute toggle and no second overlay
+             *     release;
+             *  3. every held VOICE is marked as a looper gesture
+             *     (perf_voiceActionOccurred), so no release toggles a mute
+             *     while looping (Q4).
+             * The record mode is left as it is (L-2; the P1 interim looper
+             * force-off call is removed). With the transport stopped the
+             * engage does nothing and the overlay gesture continues. Why: user
+             * answer FQ2 ("roll ends when loop starts, track hold acts as
+             * normal for loop operation"). Inputs: bh_overlayVoiceMask,
+             * perf_heldVoiceMask, seq_loopActive. Outputs: overlay ended,
+             * hold masks. Affiliates: buttonHandler_overlayRelease(),
+             * liveRec_rollRelease(), buttonHandler_perfVoiceReleased().
              */
-            if (seq_loopActive && liveRec_armed()) {
-                liveRec_forceOff();
-                led_setValue(0u, LED_REC);
+            if (seq_loopActive) {
+                uint8_t overlay = bh_overlayVoiceMask;
+                uint8_t v;
+
+                for (v = 0u; v < NUM_TRACKS; v++) {
+                    if ((overlay & (uint8_t)(1u << v)) != 0u)
+                        buttonHandler_overlayRelease(v);
+                }
+                perf_heldVoiceMask |= overlay;
+                if (perf_heldVoiceMask != 0u)
+                    perf_voiceActionOccurred = 1u;
             }
         } else {
             seq_loopUpdateDivision(division, bh_loopBarModifier);
@@ -2200,12 +2230,13 @@ static void buttonHandler_partButtonReleased(uint8_t partNr)
      * What:      clears this SELECT's hold bit. If other SELECTs remain, the
      *            division moves to the highest remaining one when the
      *            released button owned it. When the last SELECT is released
-     *            the loop ends only if no looped VOICE and no BAR is held;
+     *            the loop ends only if no VOICE and no BAR is held (S081 P3
+     *            Q1);
      *            otherwise it keeps running and the SELECT row keeps showing
      *            its division.
-     * Why:       the loop is sustained by SELECT, looped VOICE or BAR holds
-     *            (Defect 8). SHIFT+SELECT never sets a hold bit, so its
-     *            release skips this block.
+     * Why:       the loop is held by SELECT, VOICE or BAR holds (Defect 8;
+     *            S081 P3 Q1: any VOICE). SHIFT+SELECT never sets a hold bit,
+     *            so its release skips this block.
      * Inputs:    partNr 0..7, bh_loopSelectHeldMask.
      * Outputs:   seq_loopUpdateDivision(), possibly seq_loopDisengage(),
      *            SELECT LED.
@@ -2384,23 +2415,37 @@ static void handleVoiceButton(uint8_t voiceNr)
      */
     if (bh_state.selectButtonMode == SELECT_MODE_PERF) {
         /*
-         * S080 D1 / P2 Defect 7: VOICE pressed while a looper SELECT is held.
+         * VOICE press while the loop is engaged (S080 D1/P2 Defect 7;
+         * S081 P3 Q4/FQ1).
          *
-         * What:      the loop moves to the set of currently held VOICE tracks
-         *            (including this one): tracks leaving it resume where
-         *            they would have been, tracks already looping keep their
-         *            loop starts, new tracks get a fresh loop start at this
-         *            press. Why: real-time track swapping without disturbing
-         *            the tracks that stay (Defect 7). Inputs: voiceNr,
-         *            seq_loopActive, bh_loopSelectHeldMask, perf_heldVoiceMask.
-         *            Outputs: seq_loopUpdateMask(); the press never toggles a
-         *            mute. Affiliates: buttonHandler_perfVoiceReleased().
+         * What: the press is a looper gesture, before the overlay trigger,
+         * the mute arm and (via BH-7) the erase router:
+         *  - a SELECT held: the loop moves to the held VOICE set (swap,
+         *    S080 D1): leaving tracks resume, staying ones keep their loop
+         *    starts, new ones get a fresh start;
+         *  - no SELECT held: this track joins the loop with a fresh loop
+         *    start (FQ1); tracks already looping keep theirs. A track the
+         *    looper may not capture (lop off) does not join.
+         * Either way the VOICE holds the loop (Q1), its release drops the
+         * track (S080 D1), and it never fires an overlay trigger, toggles a
+         * mute or starts an erase gesture (Q2/Q4). SHIFT+VOICE behaves the
+         * same. Inputs: voiceNr, seq_loopActive, bh_loopSelectHeldMask,
+         * perf_heldVoiceMask, bh_loopTrackMask. Outputs:
+         * seq_loopUpdateMask(), perf_heldVoiceMask, perf_voiceActionOccurred.
+         * Affiliates: buttonHandler_perfVoiceReleased(),
+         * seq_loopableTrackMask().
          */
-        if (seq_loopActive && bh_loopSelectHeldMask != 0u) {
-            perf_heldVoiceMask |= (uint8_t)(1u << voiceNr);
-            bh_loopTrackMask = seq_loopUpdateMask(perf_heldVoiceMask);
+        if (seq_loopActive) {
+            uint8_t bit = (uint8_t)(1u << voiceNr);
+
+            perf_heldVoiceMask |= bit;
             perf_voiceActionOccurred = 1u;
             dblclick_cancel();
+            if (bh_loopSelectHeldMask != 0u)
+                bh_loopTrackMask = seq_loopUpdateMask(perf_heldVoiceMask);
+            else
+                bh_loopTrackMask = seq_loopUpdateMask(
+                    (uint8_t)(bh_loopTrackMask | bit));
             return;
         }
         /*
@@ -2416,6 +2461,8 @@ static void handleVoiceButton(uint8_t voiceNr)
          *            Outputs: buttonHandler_overlayTrigger(); the release half
          *            is handled in processRelease(). Affiliates:
          *            bh_overlayActive (E8), the overlay params (E1).
+         *            Not reached while the loop is engaged (S081 P3 Q2/Q4:
+         *            the loop pre-empts the overlay).
          */
         if (bh_overlayActive != 0u && !buttonHandler_getShift()) {
             buttonHandler_overlayTrigger(voiceNr);
@@ -2630,7 +2677,9 @@ static void processPress(uint8_t buttonNr)
      *    held; SEQ in FX erases the FX sequence; SEQ in PERF (Scene buttons),
      *    Load/Save, global settings and SOM_GEN is consumed with no action;
      *  - VOICE in VOICE/STEP/PERF/FX erases that whole track while held, and is
-     *    consumed elsewhere;
+     *    consumed elsewhere; except VOICE in PERF while the loop is engaged: it
+     *    keeps its looper function (S081 P3 Q4) and falls through to
+     *    handleVoiceButton();
      *  - PLAY is a plain transport toggle (never the SHIFT+PLAY chain chord).
      * Why: P1 erased in every mode, so PERF Scene buttons removed triggers, and
      * it used rtk instead of the active track. Inputs: button, mode, active
@@ -2660,7 +2709,8 @@ static void processPress(uint8_t buttonNr)
             /* PERF, LOAD_SAVE, MENU, SOM_GEN: consumed */
             return;
         }
-        if (eraseVoice >= 0) {
+        if (eraseVoice >= 0 &&
+            !(eraseMode == SELECT_MODE_PERF && seq_loopActive)) {
             if (eraseMode == SELECT_MODE_VOICE || eraseMode == SELECT_MODE_STEP ||
                 eraseMode == SELECT_MODE_PERF  || eraseMode == SELECT_MODE_FX) {
                 bh_eraseVoiceMask |= (uint8_t)(1u << eraseVoice);
@@ -2782,13 +2832,6 @@ static void processPress(uint8_t buttonNr)
         if (buttonHandler_getShift()) {
             /* S080 E7: SHIFT+REC opens the settings menu (overlay + quant). */
             buttonHandler_shiftRecMenuEnter();
-        } else if (seq_loopActive) {
-            /*
-             * P1 interim lockout: REC is ignored while the looper is engaged
-             * (S080 rule; P2 removes it, L-2). Engaged loop already forced
-             * recording off in the caller, so the user cannot re-arm mid-loop.
-             */
-            break;
         } else {
             /*
              * REC press: start the hold timer for overdub detection
@@ -3079,6 +3122,10 @@ static void processRelease(uint8_t buttonNr)
      * release after erase end was lost (leaving LiveRecord's hold count set,
      * item 16). Affiliates: BC-4 (press edge), liveRec_eraseSeqHeld(),
      * liveRec_eraseFxSeqHeld(), liveRec_eraseTrackHeld().
+     * S081 P3: a VOICE release whose press was a PERF hold (perf_heldVoiceMask,
+     * looper or per-track gesture) is not consumed: it continues to the PERF
+     * release path, so a looper TRACK hold ends normally during erase (Q4) and
+     * the hold bit cannot be stranded.
      */
     {
         int8_t eraseSeq = btn_to_seq(buttonNr);
@@ -3108,7 +3155,9 @@ static void processRelease(uint8_t buttonNr)
             }
         }
         if (liveRec_mode() == LIVEREC_MODE_ERASE &&
-            (eraseSeq >= 0 || eraseVoice >= 0))
+            (eraseSeq >= 0 ||
+             (eraseVoice >= 0 &&
+              (perf_heldVoiceMask & (uint8_t)(1u << eraseVoice)) == 0u)))
             return;                                   /* consumed */
     }
     {

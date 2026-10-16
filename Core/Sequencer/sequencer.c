@@ -976,11 +976,21 @@ static volatile uint16_t seq_echoDeadline[NUM_TRACKS];
  */
 static volatile uint8_t seq_sceneEpoch;
 
-/* Ring entry packing (S081 §19.1 item 1): step 7 bits, track 3, fired 1. */
+/*
+ * Ring entry packing (S081 §19.1 item 1; S081 P3 adds the jump bit).
+ *
+ * step 7 bits, track 3, fired 1, jump 1 (bits 0..11 of 16). fired: the step
+ * holds a trigger and its condition passed, known at its start. jump: the
+ * entry was pushed by a looper position jump (wrap mid-step, resume), not by
+ * a step advance; the step it begins is a partial replay whose trigger did
+ * not fire on this pass (plan §3.9). Affiliates: seq_recRingPush(),
+ * seq_takeRecBoundary(), liveRec_drainRing().
+ */
 #define SEQ_REC_RING_STEP_MASK   0x007Fu
 #define SEQ_REC_RING_TRACK_MASK  0x0380u
 #define SEQ_REC_RING_TRACK_SHIFT 7u
 #define SEQ_REC_RING_FIRED_BIT   0x0400u
+#define SEQ_REC_RING_JUMP_BIT    0x0800u
 
 /*
  * Pop one step-boundary entry from the ring (S081 §19.1, C-1b).
@@ -988,6 +998,8 @@ static volatile uint8_t seq_sceneEpoch;
  * What: if the ring is non-empty, copies the tail entry into the output struct
  * and advances the tail. Returns 1 on success, 0 if empty. Why: single-producer
  * (TIM3) single-consumer (foreground) with byte head/tail needs no PRIMASK.
+ * S081 P3: also reports whether a looper position jump (not a step advance)
+ * pushed the entry.
  */
 uint8_t seq_takeRecBoundary(seq_rec_boundary_t *out)
 {
@@ -1006,7 +1018,53 @@ uint8_t seq_takeRecBoundary(seq_rec_boundary_t *out)
     out->track = (uint8_t)((e & SEQ_REC_RING_TRACK_MASK) >>
                            SEQ_REC_RING_TRACK_SHIFT);
     out->fired = (uint8_t)((e & SEQ_REC_RING_FIRED_BIT) ? 1u : 0u);
+    /* S081 P3: a looper position jump began this step (plan §3.9). */
+    out->jump = (uint8_t)((e & SEQ_REC_RING_JUMP_BIT) ? 1u : 0u);
     return 1u;
+}
+
+/*
+ * Push one step-boundary entry for the recording track (S081 C-9a; S081 P3).
+ *
+ * What: when recording is writing and the track is rtk or live-held, writes
+ * {step, track, fired, jump} at the ring head and publishes the head; a full
+ * ring drops the entry (DEV: counted, trace cause 5). A negative step (not
+ * started) pushes nothing. Why: the step advance (C-9a) and, from P3, the
+ * looper's position jumps (wrap mid-step, resume) must report the step that
+ * begins in one format; one producer function keeps the head/tail protocol
+ * in one place. Context: TIM3 (step advance, wrap) or foreground with
+ * PRIMASK held (resume). The ring stays single-producer because the
+ * foreground pushes only inside the looper's PRIMASK sections, and
+ * single-consumer (liveRec_drainRing()). Inputs: track, step, fired, jump.
+ * Output: one ring entry. Accessors: seq_advanceTrackStep(),
+ * seq_loopProcessTick(), seq_loopResumeTrack(). Affiliates:
+ * seq_takeRecBoundary(), seq_recRingDrops, liveRec_drainRing().
+ */
+static void seq_recRingPush(uint8_t track, int16_t step, uint8_t fired,
+                            uint8_t jump)
+{
+    uint8_t next;
+
+    if (!seq_recWriting || step < 0 ||
+        (track != seq_recTrack &&
+         (seq_liveHoldMask & (uint8_t)(1u << track)) == 0u))
+        return;
+    next = (uint8_t)((seq_recRingHead + 1u) & 0x0Fu);
+    if (next != seq_recRingTail) {
+        seq_recRing[seq_recRingHead] =
+            (uint16_t)(((uint16_t)(step & 0x7F)) |
+                       ((uint16_t)(track & 0x7u) << SEQ_REC_RING_TRACK_SHIFT) |
+                       (fired ? SEQ_REC_RING_FIRED_BIT : 0u) |
+                       (jump ? SEQ_REC_RING_JUMP_BIT : 0u));
+        seq_recRingHead = next;
+    } else {
+#if DEV_MODE_LOGGING
+        seq_recRingDrops++;
+        patternTrace_record(PAT_TRACE_STAGE_LIVEREC_DROP, 5u,
+                            (uint32_t)(((uint32_t)track << 8u) |
+                                       (uint8_t)(step & 0x7F)));
+#endif
+    }
 }
 
 /*
@@ -3145,28 +3203,10 @@ static void seq_advanceTrackStep(uint8_t track)
 		 * drops the entry (DEV: counted, trace cause 5, P1C item 13). Why:
 		 * LiveRecord's step-end table needs every step of rtk and whether its first
 		 * trigger fired. Affiliates: seq_takeRecBoundary(), liveRec_service().
+		 * The push itself is seq_recRingPush() (S081 P3), shared with the
+		 * looper's jump entries.
 		 */
-		if (seq_recWriting &&
-		    (track == seq_recTrack ||
-		     (seq_liveHoldMask & (uint8_t)(1u << track)) != 0u)) {
-			uint8_t next = (uint8_t)((seq_recRingHead + 1u) & 0x0Fu);
-
-			if (next != seq_recRingTail) {
-				seq_recRing[seq_recRingHead] =
-				    (uint16_t)(((uint16_t)(seq_stepIndex[track] & 0x7F)) |
-				               ((uint16_t)(track & 0x7u) <<
-				                SEQ_REC_RING_TRACK_SHIFT) |
-				               (rec_fired ? SEQ_REC_RING_FIRED_BIT : 0u));
-				seq_recRingHead = next;
-			} else {
-#if DEV_MODE_LOGGING
-				seq_recRingDrops++;
-				patternTrace_record(PAT_TRACE_STAGE_LIVEREC_DROP, 5u,
-				                    (uint32_t)(((uint32_t)track << 8u) |
-				                               (uint8_t)(seq_stepIndex[track] & 0x7F)));
-#endif
-			}
-		}
+		seq_recRingPush(track, seq_stepIndex[track], rec_fired, 0u);
 	}
 
 	/*
@@ -4659,6 +4699,8 @@ static void seq_loopCanonicalPreAdvance(uint8_t track, uint32_t anchor,
  * the DDA accumulator, the effective interval/length/shuffle, play mode/state
  * and the played Scene under PRIMASK. Why: LiveRecord runs in the foreground and
  * needs a consistent snapshot of TIM3-mutated state for placement math.
+ * S081 P3: also copies the track's loop anchor, snapshot and loop length when
+ * it is looped.
  */
 void seq_captureTrackTime(uint8_t track, seq_track_time_t *out)
 {
@@ -4683,7 +4725,72 @@ void seq_captureTrackTime(uint8_t track, seq_track_time_t *out)
     out->playMode = region ? region->track_play_mode[track] : 0u;
     out->playState = seq_trackPlayState[track];
     out->playedScene = seq_perTrackPattern[track];
+    /*
+     * S081 P3: the track's loop state under the same PRIMASK, so placement
+     * sees the anchor and snapshot that the next wraps will use (plan §3.3).
+     * Not looped (or before the first scheduler tick): looped = 0.
+     */
+    out->looped = (uint8_t)(seq_loopActive && !seq_initialSchedulerTick &&
+                            (seq_loopTrackMask & (uint8_t)(1u << track)) != 0u);
+    out->loopAnchor = seq_loopAnchor[track];
+    out->loopStartStep = seq_loopStartStep[track];
+    out->loopStartAccum = seq_loopStartAccum[track];
+    out->loopStartPlayState = seq_loopStartPlayState[track];
+    out->loopTicks = seq_loopLengthTicks(seq_loopDivision, seq_loopModifier);
     __set_PRIMASK(primask);
+}
+
+/*
+ * Map a placement shift that crosses a loop wrap (S081 P3, plan §3.3, Q6).
+ *
+ * What: for a looped track, finds which loop pass the target time falls in.
+ * Times are Q8 ticks relative to the snapshot (the state after tick
+ * anchor - 1): the capture is nowRel = (elapsed - anchor + 1) * 256; pass k
+ * covers relative times 256 + k*L*256 .. 255 + (k+1)*L*256 (the wrap at tick
+ * anchor + k*L restores the snapshot and the same tick's DDA adds 256).
+ *  - Same pass as the capture, or from the first pass back into the
+ *    unlooped history: returns 0, the caller walks the live cursor (exact).
+ *  - A later or earlier pass: the image is the snapshot shifted by the
+ *    target's phase in its pass (x - k*L*256 + 256), i.e. exactly what that
+ *    pass plays. A forward snap across the wrap lands on the replayed step
+ *    after it (Q6).
+ *  - Before the loop's first pass (kTgt < 0) from a later pass: the
+ *    unlooped history, the snapshot shifted by the full relative offset.
+ * Why: the live-cursor walk (P1B) continues past the window end as if
+ * unlooped. Verified against a TIM3 timeline simulation: 0 mismatches in
+ * 86,593,860 cases (S081_P3_IMPLEMENTATION.md §0). Inputs: track, capture
+ * snapshot with loop fields, signed Q8 delta. Output: *pos and 1 when the
+ * snapshot branch applies, else 0 (pos untouched). Context: foreground
+ * (64-bit maths). Accessors: seq_placeFromSnapshot(). Affiliates:
+ * seq_shiftPositionQ8(), seq_loopProcessTick(), seq_captureTrackTime().
+ */
+static uint8_t seq_placeLoopImage(uint8_t track, const seq_track_time_t *snap,
+                                  int32_t deltaQ8, seq_loop_pos_t *pos)
+{
+    int64_t span;
+    int64_t nowRel;
+    int64_t tgtRel;
+    int64_t kNow;
+    int64_t kTgt;
+    int64_t x;
+
+    if (!snap->looped || snap->loopTicks == 0u ||
+        snap->elapsedTick < snap->loopAnchor)
+        return 0u;
+    span = (int64_t)snap->loopTicks * 256;
+    nowRel = ((int64_t)snap->elapsedTick - (int64_t)snap->loopAnchor + 1) * 256;
+    tgtRel = nowRel + (int64_t)deltaQ8;
+    kNow = (nowRel - 256) / span;
+    x = tgtRel - 256;
+    kTgt = (x >= 0) ? (x / span) : -((-x + span - 1) / span);
+    if (kTgt == kNow || (kNow == 0 && kTgt < 0))
+        return 0u;                      /* same pass: live cursor is exact */
+    pos->step = snap->loopStartStep;
+    pos->accum = snap->loopStartAccum;
+    pos->play_state = snap->loopStartPlayState;
+    (void)seq_shiftPositionQ8(track, pos,
+        (int32_t)((kTgt < 0) ? tgtRel : (x - kTgt * span + 256)));
+    return 1u;
 }
 
 /*
@@ -4709,6 +4816,12 @@ void seq_captureTrackTime(uint8_t track, seq_track_time_t *out)
  * when the track has not started (cursor -1). Context: foreground.
  * Accessors: liveRec_triggerIn(), liveRec_placeFlam(), liveRec_endRoll().
  * Affiliates: seq_shiftPositionQ8(), seq_captureTrackTime().
+ * S081 P3: for a looped track, a shift that crosses a loop wrap is mapped
+ * onto the pass the target falls in (seq_placeLoopImage()): a forward snap
+ * across the wrap lands on the replayed step after it, a backward one at the
+ * end of the previous pass (or in the unlooped history before the loop's
+ * first pass). rel is then decided by time; ahead is the time to the landed
+ * step, so the echo mark covers the play after the wrap.
  */
 uint8_t seq_placeFromSnapshot(uint8_t track, const seq_track_time_t *snap,
                               int32_t deltaQ8, uint8_t snapToStep,
@@ -4721,6 +4834,7 @@ uint8_t seq_placeFromSnapshot(uint8_t track, const seq_track_time_t *snap,
     uint8_t mode;
     uint8_t delay = 0u;
     int32_t snapQ8 = 0;
+    uint8_t crossed;
 
     if (!snap || !out || track >= NUM_TRACKS)
         return 0u;
@@ -4735,7 +4849,11 @@ uint8_t seq_placeFromSnapshot(uint8_t track, const seq_track_time_t *snap,
     /* rnd: backward only (plan §8.3). */
     if (mode == 3u && deltaQ8 > 0)
         deltaQ8 = 0;
-    steps = seq_shiftPositionQ8(track, &pos, deltaQ8);
+    /* S081 P3: a shift across a loop wrap maps onto the replayed pass. */
+    crossed = seq_placeLoopImage(track, snap, deltaQ8, &pos);
+    steps = crossed ? 0 : seq_shiftPositionQ8(track, &pos, deltaQ8);
+    if (pos.step < 0)
+        return 0u;
     off = pos.accum;
     interval = snap->interval;
     if (interval == 0u)
@@ -4762,10 +4880,18 @@ uint8_t seq_placeFromSnapshot(uint8_t track, const seq_track_time_t *snap,
 
     out->step = (uint8_t)pos.step;
     out->delay = delay;
-    out->rel = (int8_t)((steps > 0) ? 1 : ((steps < 0) ? -1 : 0));
+    /*
+     * S081 P3: behind / current / ahead by TIME when the shift crossed a
+     * wrap (the landed step is in another pass; its index may be lower even
+     * though it plays later). Otherwise by step advances, as before.
+     */
+    if (crossed)
+        out->rel = (int8_t)((deltaQ8 > 0) ? 1 : -1);
+    else
+        out->rel = (int8_t)((steps > 0) ? 1 : ((steps < 0) ? -1 : 0));
     out->snapQ8 = (int16_t)snapQ8;
     out->ahead = 0u;
-    if (steps > 0) {
+    if (out->rel > 0) {
         /* The trk snap's shift counts toward the distance (P1C review C-2). */
         int32_t aheadQ8 = deltaQ8 + snapQ8 - (int32_t)off;
 
@@ -4932,11 +5058,14 @@ static void seq_loopSnapshotTracks(uint8_t mask)
  * position. Inputs: track, snapshot, anchor, seq_elapsedPpqTicks. Outputs:
  * live track state. Context: foreground under PRIMASK. Accessors:
  * seq_loopUpdateMask(), seq_loopDisengage().
+ * S081 P3: also drops the track's echo mark and pushes a jump entry when the
+ * step changes.
  */
 static void seq_loopResumeTrack(uint8_t track)
 {
 	seq_loop_pos_t pos;
 	uint32_t ahead;
+	int16_t before = seq_stepIndex[track];
 
 	pos.step = seq_loopStartStep[track];
 	pos.accum = seq_loopStartAccum[track];
@@ -4952,6 +5081,24 @@ static void seq_loopResumeTrack(uint8_t track)
 	seq_lastMasterStep[track] = (uint8_t)((pos.step < 0) ? 0 : pos.step);
 	/* S081 P2: a playhead break ends automation ramps (no B will follow). */
 	seq_rampBreakTrack(track);
+	/*
+	 * Live record across a resume (S081 P3, plan §3.4/§3.9).
+	 *
+	 * What: (1) the track's echo mark is dropped: the cursor jumps, so a
+	 * marked step index no longer means the play it was set for. (2) If the
+	 * resumed cursor is on another step, a jump entry reports that step as
+	 * beginning now (fired 0); the next DDA advance reports the following
+	 * step as usual. Why: release, a track leaving in a swap and disengage
+	 * move the playhead without a step advance, so LiveRecord would keep the
+	 * pre-resume step. Same step index: no entry (the playhead continues the
+	 * step it was in). Context: foreground; every caller
+	 * (seq_loopUpdateMask(), seq_loopDisengage()) holds PRIMASK, so the push
+	 * cannot interleave with the TIM3 producer. Affiliates:
+	 * seq_recRingPush(), seq_suppressStepOnce(), liveRec_drainRing().
+	 */
+	seq_echoStep[track] = -1;
+	if (pos.step >= 0 && pos.step != before)
+		seq_recRingPush(track, pos.step, 0u, 1u);
 	if (track == menu_getActiveVoice()) {
 		seq_ledState.chaseStep = seq_stepIndex[track];
 		seq_ledState.dirty |= SEQ_LED_DIRTY_CHASE;
@@ -5151,6 +5298,9 @@ static void seq_loopRebaseToStart(void)
  * division/modifier, mask, anchors, snapshots, seq_elapsedPpqTicks. Outputs:
  * seq_stepIndex[]/seq_trackAccumulator[]/seq_trackPlayState[] of wrapped
  * tracks. Context: TIM3 ISR. Affiliates: seq_processSchedulerTick().
+ * S081 P3: a wrap that lands mid-step pushes a jump entry for the recording
+ * track (no step advance follows on this tick); echo marks are not cleared
+ * here (plan §3.4: the P1B deadline expires them).
  */
 static void seq_loopProcessTick(void)
 {
@@ -5180,6 +5330,27 @@ static void seq_loopProcessTick(void)
 		/* S081 P2 (D8): no ramp across the loop wrap; the restored step's
 		 * apply starts fresh. */
 		seq_rampBreakTrack(track);
+		/*
+		 * Report a mid-step wrap to live record (S081 P3 FQ3, plan §3.9).
+		 *
+		 * What: when this tick's DDA will not advance the restored track
+		 * (accumulator + 256 < interval), no step-advance entry follows, so
+		 * a jump entry reports the restored step as beginning now (fired 0).
+		 * When the DDA does advance, its own entry reports the replayed step
+		 * and nothing is pushed here. Why: with qnt off or a 1/8..1/64 grid,
+		 * a track whose step does not start at the anchor wraps mid-step;
+		 * without an entry LiveRecord keeps treating the pre-wrap step as
+		 * playing (wrong-step writes; the first-change dirty bit blocks the
+		 * next pass). Every wrap must be a new pass for live record, also
+		 * for loops shorter than a step. Inputs: restored cursor and
+		 * accumulator, effective scale. Output: at most one ring entry.
+		 * Context: TIM3, before the DDA. Affiliates: seq_recRingPush(),
+		 * liveRec_drainRing(), liveRec_stepEnd() (jump rule).
+		 */
+		if (!seq_SomModeActive &&
+		    (uint32_t)seq_trackAccumulator[track] + 256u <
+		        (uint32_t)stepScale_ticksQ8(seq_effectiveTrackScale[track]))
+			seq_recRingPush(track, seq_stepIndex[track], 0u, 1u);
 	}
 }
 

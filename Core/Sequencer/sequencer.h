@@ -435,10 +435,16 @@ void seq_markRecordedStep(uint8_t track, uint8_t scene, uint8_t step);
 ** ------------------------------------------------------------------------- */
 
 /*
- * PRIMASK snapshot of a track's timing state (S081 §19.1 item 11, C-8a).
+ * PRIMASK snapshot of a track's timing state (S081 §19.1 item 11, C-8a;
+ * S081 P3 loop fields).
  *
- * Inputs: track 0..6. Outputs: a consistent snapshot of TIM3-mutated state for
- * LiveRecord's placement math.
+ * Inputs: track 0..6. Outputs: a consistent snapshot of TIM3-mutated state
+ * for LiveRecord's placement math. S081 P3: when the track is looped,
+ * looped = 1 and the loopAnchor, loopStartStep/Accum/PlayState and loopTicks
+ * fields copy its loop anchor tick, snapshot (cursor, accumulator, play
+ * state before the anchor tick's advance) and loop length, so
+ * seq_placeFromSnapshot() can map a shift that crosses a wrap (plan §3.3).
+ * Stack only (+12 B per local).
  */
 typedef struct {
     uint32_t elapsedTick;
@@ -453,13 +459,30 @@ typedef struct {
     uint8_t  playMode;
     uint8_t  playState;
     uint8_t  playedScene;
+    /* S081 P3: loop state at the capture (looped = 0: the rest is unused). */
+    uint8_t  looped;
+    uint8_t  loopStartPlayState;
+    int16_t  loopStartStep;
+    uint16_t loopStartAccum;
+    uint16_t loopTicks;
+    uint32_t loopAnchor;
 } seq_track_time_t;
 
-/* One step-boundary ring entry (S081 §19.1 item 1). */
+/*
+ * One step-boundary ring entry (S081 §19.1 item 1; S081 P3).
+ *
+ * step: the step that begins. track: 0..6. fired: that step holds a trigger
+ * and its condition passed (known at its start). jump: the entry comes from a
+ * looper position jump (a wrap that lands mid-step, or a resume), not from a
+ * step advance; the step is a partial replay and its trigger did not fire on
+ * this pass. Producer: seq_recRingPush(). Consumer: liveRec_drainRing(),
+ * which applies a step's own fired and jump flags when that step ends.
+ */
 typedef struct {
     uint8_t step;
     uint8_t track;
     uint8_t fired;
+    uint8_t jump;
 } seq_rec_boundary_t;
 
 /*
@@ -490,6 +513,12 @@ void    seq_setLiveHold(uint8_t track, uint8_t on);
 void    seq_cancelPendingTrigger(uint8_t track, uint8_t step);
 uint8_t seq_takeRecBoundary(seq_rec_boundary_t *out);
 void    seq_captureTrackTime(uint8_t track, seq_track_time_t *out);
+/*
+ * Place a captured hit on a track's step grid (S081 §8.3, P1B item 5;
+ * S081 P3 loop-aware): shifts the live cursor by deltaQ8, or, for a looped
+ * track when the shift crosses a wrap, the loop snapshot by the target's
+ * phase. Returns 0 when the track has not started.
+ */
 uint8_t seq_placeFromSnapshot(uint8_t track, const seq_track_time_t *snap,
                               int32_t deltaQ8, uint8_t snapToStep,
                               seq_place_t *out);

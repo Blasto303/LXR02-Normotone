@@ -745,7 +745,7 @@ position — the reason the looper does not resume through
 
 | Function | Behaviour |
 |---|---|
-| `seq_loopEngage(mask, div, mod)` | returns 0 and does nothing while stopped; turns recording off; filters `mask` by `seq_loopableTrackMask()`; snapshots at one anchor; returns the mask now looping |
+| `seq_loopEngage(mask, div, mod)` | returns 0 and does nothing while stopped (recording is not touched: S081 P3, L-2); filters `mask` by `seq_loopableTrackMask()`; snapshots at one anchor; returns the mask now looping |
 | `seq_loopUpdateMask(newMask)` | engaged only: tracks leaving resume (inside the call, before the mask is committed), tracks joining get one fresh anchor, tracks staying keep theirs; returns the committed mask |
 | `seq_loopDisengage()` | clears gate and mask, resumes every looped track (if running) |
 | `seq_loopUpdateDivision(div, mod)` | single-byte stores; anchors untouched |
@@ -778,6 +778,31 @@ the mask before the reset, so a transport stop ends the loop.
 un-anchored snapshot taken at the press (both drift off the grid); never
 publish looper state outside PRIMASK; keep the wrap before the DDA advance;
 FX sequencer and Effects are never looped.
+
+**Looping while recording (S081 P3).** Live record (LATCH or OVERDUB) and live
+erase run while the loop is engaged; the looper and the record modes no longer
+exclude each other (plan L-2). The looper never touches Pattern data, so the
+record engine simply follows the looped playhead:
+
+- **Jump entries.** A wrap that lands mid-step (with `qnt off` or a 1/8..1/64
+  grid, when the track's step does not start at the anchor) pushes a ring
+  entry with the jump flag (`SEQ_REC_RING_JUMP_BIT`), because no step advance
+  follows on that tick; `seq_loopResumeTrack()` does the same when a resume
+  moves the track to another step, and drops that track's echo mark. The
+  step a jump entry begins is a partial replay: its trigger did not fire on
+  this pass, so its step end runs dirty writes and erase but no LATCH
+  re-stamp or clear.
+- **Placement.** `seq_placeFromSnapshot()` maps a captured hit that crosses a
+  wrap onto the pass the target falls in (`seq_placeLoopImage()`): a forward
+  snap across the wrap lands on the replayed step after it, a backward one at
+  the end of the previous pass, or in the unlooped history before the loop's
+  first pass. `rel` is decided by time when the shift crossed a wrap.
+- **Echo.** No echo mark is cleared at the wrap; the P1B deadline expires it,
+  measured through the wrap, so exactly the one replay after the capture is
+  silenced. A resume clears the track's mark directly.
+- **Ring producer.** Every ring entry comes from one function,
+  `seq_recRingPush()`: TIM3 for a step advance and a mid-step wrap, the
+  foreground under the looper's PRIMASK for a resume.
 
 ### 6.6 Scene change timing, queued changes and scene chaining (S080)
 

@@ -75,6 +75,28 @@ static uint8_t liveRec_dirty[LIVEREC_TARGET_BYTES];
 static uint8_t liveRec_erase[LIVEREC_TARGET_BYTES];
 
 /*
+ * Individual Morph values captured at the edit (S081 P3 global Morph fix,
+ * G-1; user rule: the global Morph is never recorded).
+ *
+ * What: index 0..5 = voice Morph of slot 1..6 (Nvm target), 6 = FX Morph
+ * (fxm target). Each holds the 7-bit value the user set by the last
+ * INDIVIDUAL edit of that Morph (PERF 1VM..6VM/fxm, VOICE mix Nvm, Effect
+ * page Morph cell). Why: live record reads a target's stored value when it
+ * writes, but a global Morph change (preset_morphScene()) overwrites all six
+ * voice Morph amounts and the FX Morph amount. A pending individual change
+ * (step-end rule, or the first-change rule with no step known) would
+ * otherwise be written with the global Morph's value. Writing the captured
+ * value means a recorded Morph is always an individual edit. Writer:
+ * liveRec_paramIn() (every individual Morph edit). Reader:
+ * liveRec_recordValue7(), only while the target is dirty, and dirty is only
+ * set by an individual edit, so a stale value is never written. Lifetime:
+ * static, runtime-only. RAM: 7 B SRAM1 (approved 2026-10-16). Affiliates:
+ * liveRec_morphIndex(), liveRec_stepEnd(), liveRec_writeCurrentValue().
+ */
+#define LIVEREC_MORPH_TARGETS 7u
+static uint8_t liveRec_morphValue[LIVEREC_MORPH_TARGETS];
+
+/*
  * Open fast-roll capture (S081 §8.8, E-4; P1C items 4/15).
  *
  * What: while a fast roll is held, liveRec_rollHeld is 1 and:
@@ -118,9 +140,29 @@ static uint8_t liveRec_rollNote = 0u;
 static uint8_t liveRec_rollNoteDefault = 0u;
 static uint8_t liveRec_rollVel = 0u;
 
-/* Last boundary-ring step per track, so the next entry ends it (S081 C-9a). */
+/*
+ * Last boundary-ring entry per track (S081 C-9a; S081 P3 FQ3/FQ4).
+ *
+ * What: liveRec_prevStep[t] is the step that began with track t's last ring
+ * entry; liveRec_prevFlags[t] holds that entry's flags:
+ *  - LIVEREC_PREV_VALID: an entry has been seen since the last playhead
+ *    break (the step is known);
+ *  - LIVEREC_PREV_FIRED: that step's trigger fired at its start;
+ *  - LIVEREC_PREV_JUMP: that step began with a looper jump (partial
+ *    replay, plan §3.9).
+ * The track's next entry ends this step, and the step-end table runs with
+ * THESE flags. Why: P1 M-9 says the ended step uses its own entry's fired
+ * bit; the drain passed the next entry's bit (plan §7). Storing the flags
+ * per track fixes that and carries the jump flag with no new RAM (the
+ * former 0/1 valid byte). Writers: liveRec_drainRing(); cleared at every
+ * playhead break (liveRec_syncPosition()). Readers: liveRec_drainRing(),
+ * liveRec_paramIn(). RAM: unchanged (7 + 7 B).
+ */
+#define LIVEREC_PREV_VALID  0x01u
+#define LIVEREC_PREV_FIRED  0x02u
+#define LIVEREC_PREV_JUMP   0x04u
 static uint8_t liveRec_prevStep[NUM_TRACKS];
-static uint8_t liveRec_prevValid[NUM_TRACKS];
+static uint8_t liveRec_prevFlags[NUM_TRACKS];
 
 /*
  * S081 P1B/P1C added state (items 3/9/10/16/26; P1C 2/4/10/15). RAM about 14 B
@@ -146,7 +188,8 @@ static uint16_t liveRec_drops[7];
 #endif
 
 /* Step-end table (F-5) and knob-erase removals (G-6); defined below. */
-static void liveRec_stepEnd(uint8_t track, uint8_t step, uint8_t fired);
+static void liveRec_stepEnd(uint8_t track, uint8_t step, uint8_t fired,
+                            uint8_t jump);
 #if LIVEREC_AUTOMATION_FIRST_CHANGE
 /* First-change writes (S081 P2 follow-up); defined beside the step-end table. */
 static void liveRec_writeCurrentValue(uint8_t step, uint16_t target);
@@ -327,19 +370,26 @@ static void liveRec_syncPosition(void)
         liveRec_lastEpoch = posEpoch;
     } else if (posEpoch != liveRec_lastEpoch) {
         liveRec_lastEpoch = posEpoch;
-        memset(liveRec_prevValid, 0, sizeof(liveRec_prevValid));
+        memset(liveRec_prevFlags, 0, sizeof(liveRec_prevFlags));
         liveRec_endRoll(0u);
         liveRec_graceValid = 0u;
     }
 }
 
-/* Boundary-ring drain: span writes and the step-end tables. */
+/*
+ * Boundary-ring drain: span writes and the step-end tables. Each entry ends
+ * the track's previous step with that step's own fired/jump flags (S081 P3)
+ * and stores its own flags for its end.
+ */
 static void liveRec_drainRing(void)
 {
     seq_rec_boundary_t b;
 
     while (seq_takeRecBoundary(&b)) {
-        if (b.track < NUM_TRACKS && liveRec_prevValid[b.track]) {
+        uint8_t flags = (b.track < NUM_TRACKS) ? liveRec_prevFlags[b.track]
+                                               : 0u;
+
+        if ((flags & LIVEREC_PREV_VALID) != 0u) {
             uint8_t prev = liveRec_prevStep[b.track];
 
             /*
@@ -368,7 +418,18 @@ static void liveRec_drainRing(void)
                                   0u, liveRec_rollIndex, 100u,
                                   seq_fillActive);
             }
-            liveRec_stepEnd(b.track, prev, b.fired);
+            /*
+             * The ended step's own flags (S081 P3 FQ4/FQ3).
+             *
+             * What: the step-end table runs with the fired and jump flags
+             * stored when this step BEGAN, not with the new entry's. Why:
+             * P1 M-9; the P1 code used b.fired, so LATCH re-stamped or
+             * cleared step N by whether step N+1 fired. Affiliates:
+             * liveRec_prevFlags[], liveRec_stepEnd().
+             */
+            liveRec_stepEnd(b.track, prev,
+                            (uint8_t)((flags & LIVEREC_PREV_FIRED) != 0u),
+                            (uint8_t)((flags & LIVEREC_PREV_JUMP) != 0u));
         }
 #if LIVEREC_AUTOMATION_FIRST_CHANGE
         /*
@@ -384,12 +445,14 @@ static void liveRec_drainRing(void)
          * liveRec_writePendingFirst().
          */
         if (b.track == liveRec_rtk && b.track < NUM_TRACKS &&
-            !liveRec_prevValid[b.track])
+            (flags & LIVEREC_PREV_VALID) == 0u)
             liveRec_writePendingFirst(b.step);
 #endif
         if (b.track < NUM_TRACKS) {
             liveRec_prevStep[b.track] = b.step;
-            liveRec_prevValid[b.track] = 1u;
+            liveRec_prevFlags[b.track] = (uint8_t)(LIVEREC_PREV_VALID |
+                (b.fired ? LIVEREC_PREV_FIRED : 0u) |
+                (b.jump ? LIVEREC_PREV_JUMP : 0u));
             /* LC-8: a forward-quantised roll start is reached here. */
             if (liveRec_rollHeld && b.track == liveRec_rollTrack &&
                 b.step == liveRec_rollStep)
@@ -572,6 +635,58 @@ static uint8_t liveRec_targetValue7(uint16_t target)
     return 0u;
 }
 
+/*
+ * Morph capture slot of a target (S081 P3 global Morph fix, G-1).
+ *
+ * What: 0..5 for the voice Morph of slot 1..6 (SCENE_MOD_TARGET_KIND_
+ * VOICE_MORPH), 6 for the FX Morph (SCENE_MOD_TARGET_KIND_EFFECT_MORPH),
+ * 0xFF for every other target. Why: these seven targets are the ones a
+ * global Morph change overwrites; only they need the captured value.
+ * Inputs: target ID. Output: slot index or 0xFF. Accessors:
+ * liveRec_paramIn(), liveRec_recordValue7(). Affiliates:
+ * liveRec_morphValue[], sceneModTarget_descriptor().
+ */
+static uint8_t liveRec_morphIndex(uint16_t target)
+{
+    const scene_mod_target_descriptor_t *d;
+
+    if (!sceneModTarget_isSceneTarget(target))
+        return 0xFFu;
+    d = sceneModTarget_descriptor(target);
+    if (!d)
+        return 0xFFu;
+    if (d->kind == SCENE_MOD_TARGET_KIND_VOICE_MORPH &&
+        d->voice_slot < INSTRUMENT_SLOT_COUNT)
+        return d->voice_slot;
+    if (d->kind == SCENE_MOD_TARGET_KIND_EFFECT_MORPH)
+        return (uint8_t)(LIVEREC_MORPH_TARGETS - 1u);
+    return 0xFFu;
+}
+
+/*
+ * Value to WRITE for an adjusted target (S081 P3 global Morph fix, G-1).
+ *
+ * What: for a voice or FX Morph target, the value captured at the last
+ * individual edit (liveRec_morphValue[]); for every other target, the
+ * current menu value (liveRec_targetValue7()). Why: the global Morph is never
+ * recorded (user rule). It overwrites the stored voice/FX Morph amounts, so
+ * re-reading them at write time would record the global Morph through a
+ * pending individual change. Inputs: target ID (dirty). Output: 7-bit value.
+ * Accessors: liveRec_stepEnd() (dirty write, step-end rule),
+ * liveRec_writeCurrentValue() (first-change rule, immediate and pending).
+ * The LATCH re-stamp keeps liveRec_targetValue7(): it only covers
+ * own-Instrument parameters, never a Morph. Affiliates:
+ * liveRec_morphIndex(), liveRec_paramIn().
+ */
+static uint8_t liveRec_recordValue7(uint16_t target)
+{
+    uint8_t m = liveRec_morphIndex(target);
+
+    if (m < LIVEREC_MORPH_TARGETS)
+        return liveRec_morphValue[m];
+    return liveRec_targetValue7(target);
+}
+
 /* Value of an existing automation entry, or 0 with *present = 0. */
 static uint8_t liveRec_autoValue(const pat_automation_entry_t *autos,
                                  uint8_t count, uint16_t target,
@@ -651,7 +766,8 @@ static uint8_t liveRec_targetOwned(uint16_t target)
  * Write one target's current value into one step of rtk now (S081 P2
  * follow-up, LIVEREC_AUTOMATION_FIRST_CHANGE).
  *
- * What: reads the target's current menu value (liveRec_targetValue7()) and
+ * What: reads the value to record (liveRec_recordValue7(): the current menu
+ * value, or for a voice/FX Morph the value of its last individual edit) and
  * writes it into `step` of rtk in T = P(rtk), unless the step already holds
  * that value (L3: only real changes are queued; the read uses
  * pat_findStepAutomation(), so a write still in the service FIFO can cause
@@ -666,7 +782,8 @@ static uint8_t liveRec_targetOwned(uint16_t target)
 static void liveRec_writeCurrentValue(uint8_t step, uint16_t target)
 {
     uint8_t t = seq_getTrackPlayedScene(liveRec_rtk);
-    uint8_t v = liveRec_targetValue7(target);
+    /* S081 P3 G-1: a Morph writes its captured individual value. */
+    uint8_t v = liveRec_recordValue7(target);
     uint8_t old;
 
     if (pat_findStepAutomation(t, liveRec_rtk, step, target, &old) &&
@@ -719,8 +836,13 @@ static void liveRec_writePendingFirst(uint8_t step)
  * was already written at its first change in this step (or at the step
  * start); the end only clears its dirty bit. The not-dirty LATCH rules
  * (re-stamp / clear) are unchanged.
+ * S081 P3: `fired` and `jump` are the ended step's OWN flags (stored when it
+ * began; P1 M-9, plan §7). A step begun by a looper jump (`jump`) is a
+ * partial replay: dirty targets and erase run as usual, the LATCH re-stamp
+ * and clear do not.
  */
-static void liveRec_stepEnd(uint8_t track, uint8_t step, uint8_t fired)
+static void liveRec_stepEnd(uint8_t track, uint8_t step, uint8_t fired,
+                            uint8_t jump)
 {
     uint8_t t;
     pat_automation_entry_t autos[PAT_BLOCK_AUTO_COUNT_MASK];
@@ -783,7 +905,9 @@ static void liveRec_stepEnd(uint8_t track, uint8_t step, uint8_t fired)
             liveRec_dirty[bi] &= (uint8_t)~bit;
             continue;
 #endif
-            v = liveRec_targetValue7(target);
+            /* S081 P3 G-1: a Morph writes its captured individual value,
+             * never one a global Morph change has overwritten. */
+            v = liveRec_recordValue7(target);
             if (!present || old_val != v) {
                 if (patSvc_writeStepAutomation(t, liveRec_rtk, step, target, v))
                     menu_automationTargetRecorded(t, liveRec_rtk, target);
@@ -797,6 +921,19 @@ static void liveRec_stepEnd(uint8_t track, uint8_t step, uint8_t fired)
         if (overdub)
             continue;               /* overdub never re-stamps or clears */
         /* LATCH, not dirty (and not overdub). */
+        /*
+         * Partial replay after a looper jump (S081 P3 FQ3, plan §3.9).
+         *
+         * What: a step begun by a jump entry gets no re-stamp and no clear;
+         * only its dirty targets were handled above. Why: its trigger did not
+         * fire on this pass because the wrap or resume entered it mid-step,
+         * so "not fired" would wipe the own-Instrument entries of a step that
+         * does play when it is entered from its start. Inputs: jump (the
+         * step's own flag, liveRec_prevFlags). Affiliates:
+         * seq_loopProcessTick(), seq_loopResumeTrack().
+         */
+        if (jump)
+            continue;
         if (liveRec_isOwnInstrument(target)) {
             if (fired) {
                 uint8_t v = liveRec_targetValue7(target);
@@ -856,25 +993,6 @@ void liveRec_overdubEnd(void)
     if (liveRec_modeState != LIVEREC_MODE_OVERDUB)
         return;
     liveRec_modeState = liveRec_priorMode;
-    liveRec_newTake();
-}
-
-/*
- * Force record and erase off (S081 P1 looper interim; P1C item 16).
- *
- * What: clears every erase source (knob bitmap, knob FX lanes, SEQ/FX-SEQ
- * hold counts, TRACK holds), pushes the empty masks and starts a new take.
- * Why: P1B left the SEQ-hold count set, so a later release could stretch
- * the next erase session. Accessor: handleSelectButton() (BH-7).
- * Affiliates: liveRec_eraseReleaseHeld().
- */
-void liveRec_forceOff(void)
-{
-    liveRec_modeState = LIVEREC_MODE_OFF;
-    liveRec_priorMode = LIVEREC_MODE_OFF;
-    memset(liveRec_erase, 0, sizeof(liveRec_erase));
-    liveRec_eraseKnobFxLanes = 0u;
-    liveRec_eraseReleaseHeld();          /* counts, specials, full; pushes */
     liveRec_newTake();
 }
 
@@ -1134,8 +1252,8 @@ static void liveRec_endRoll(uint8_t writeEnd)
 /*
  * Capture one live hit and record it (S081 §8, P1B items 5/11/17).
  *
- * What: gates (LATCH/OVERDUB, running, P1 looper lockout, P(track) == T,
- * same instrument type in A and T); captures the track's live state with
+ * What: gates (LATCH/OVERDUB, running, P(track) == T, same instrument type in
+ * A and T); captures the track's live state with
  * the µs time; derives the sub-tick fraction; quantises on the master grid
  * (1/8..1/64) or snaps to the track's own steps (trk); places the hit with
  * seq_placeFromSnapshot() (live cursor, nominal step grid, run-mode next
@@ -1167,8 +1285,6 @@ void liveRec_triggerIn(const liveRec_trigger_t *t)
         return;
     if (!seq_isRunning())
         return;
-    if (seq_loopActive)
-        return;                       /* P1 interim looper lockout (P2 removes) */
     if (seq_getTrackPlayedScene(track) != liveRec_target)
         return;                       /* S081 §7 ownership */
 
@@ -1341,6 +1457,11 @@ void liveRec_rollRelease(uint8_t track)
  * Accessors: menu_liveRecRecordCell(), midiParser_enterTaggedParameter().
  * Affiliates: liveRec_stepEnd(), liveRec_targetValue7().
  *
+ * S081 P3 (G-1): a voice or FX Morph edit also captures its value
+ * (liveRec_morphValue[]); its write uses that value, never one a global
+ * Morph change has overwritten. The global Morph (mrp) itself never reaches
+ * this function: it has no recording target.
+ *
  * S081 P2 follow-up (LIVEREC_AUTOMATION_FIRST_CHANGE 1): the FIRST change of
  * a target in a step is written at once into the step rtk is playing (the
  * live step from seq_captureTrackTime(), after the ring is brought up to
@@ -1363,6 +1484,22 @@ void liveRec_paramIn(uint16_t target9, uint8_t source)
         liveRec_drop(2u, liveRec_rtk, (uint8_t)(target9 & 0x7Fu));
         return;
     }
+    /*
+     * Capture an individual Morph edit (S081 P3 global Morph fix, G-1).
+     *
+     * What: for a voice or FX Morph target, store the value the user just
+     * set (the caller committed it first), on every edit, before any early
+     * return, so a change that waits for its write carries the latest
+     * individual value. Why: the global Morph is never recorded; a later
+     * global change must not leak into this target's write. Affiliates:
+     * liveRec_morphValue[], liveRec_recordValue7().
+     */
+    {
+        uint8_t m = liveRec_morphIndex(target9);
+
+        if (m < LIVEREC_MORPH_TARGETS)
+            liveRec_morphValue[m] = liveRec_targetValue7(target9);
+    }
 #if LIVEREC_AUTOMATION_FIRST_CHANGE
     {
         uint8_t bit = (uint8_t)(1u << (target9 & 7u));
@@ -1374,7 +1511,8 @@ void liveRec_paramIn(uint16_t target9, uint8_t source)
          * to the step that is playing now. */
         if (liveRec_patternWriting() && !patSvc_replacePending()) {
             liveRec_syncRing();
-            stepKnown = liveRec_prevValid[liveRec_rtk];
+            stepKnown = (uint8_t)((liveRec_prevFlags[liveRec_rtk] &
+                                   LIVEREC_PREV_VALID) != 0u);
         }
         if (liveRec_dirty[target9 >> 3] & bit)
             return;                 /* this step already has its value */
@@ -1486,9 +1624,9 @@ void liveRec_eraseTrackHeld(uint8_t track, uint8_t held)
  * SEQ-hold (count) gestures at once. Erase mode, the knob-erase bitmap and
  * the knob-erase FX lanes are kept. Why: a mode change re-maps SEQ and
  * VOICE buttons, so their held gestures must stop. It is also the gesture
- * reset at erase end and force-off, so a button still held then cannot
- * leave a count that stretches the next erase session's SEQ hold.
- * Accessors: handleModeButtons(), liveRec_eraseEnd(), liveRec_forceOff().
+ * reset at erase end, so a button still held then cannot leave a count that
+ * stretches the next erase session's SEQ hold.
+ * Accessors: handleModeButtons(), liveRec_eraseEnd().
  * Affiliates: liveRec_pushEraseMasks().
  */
 void liveRec_eraseReleaseHeld(void)

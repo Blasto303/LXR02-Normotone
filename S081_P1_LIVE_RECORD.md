@@ -55,7 +55,7 @@ Session 081 plan, branch `dev-ph6-cleanup`, base `02553df`.
 - **Revision 11 (2026-10-13):** L1 kept (`trk` gives per-track loop
   anchors). L3 adopted in P1: step-end writes and clears only on real
   changes, which also helps without the looper. Looping while recording
-  (L-2, L2, L4) moves to its own plan, `S081_P2_LOOP_WHILE_RECORD.md`. P1
+  (L-2, L2, L4) moves to its own plan, `S081_P3_LOOP_WHILE_RECORD.md`. P1
   keeps the S080 looper/record lockout as an interim state.
 
 General plan; no code has changed. All follow-ups are decided; the
@@ -86,7 +86,7 @@ Authority read: `MEMORY.md`, `SCOPING_TARGETS.md` §4.3/§4.3a/§4.3b/§4.8/§6.
 | R2 | MIDI notes record the same way (later; API unchanged). |
 | R3 | Knob edits of Instrument, Effect and Scene parameters record automation onto the recording track `rtk` under the LATCH rules (§9.3). |
 | R4 | MIDI CC automation, same rules (later; API compatible). |
-| R5 | PERF-page actions are not recorded. |
+| R5 | PERF-page actions are not recorded, except the Morph cells (`1VM`..`6VM`, `fxm`), which record like the same targets on the VOICE mix and Effect pages (S081 P3 FQ5, `S081_P3_LOOP_WHILE_RECORD.md` §3.10). `mrp` is never recorded. |
 | R6 | One recording-target Scene: the played Scene of `rtk`. Anything belonging to another Scene is not recorded. Best effort; playback always has priority. |
 | R7 | `rtk` follows every active-track change in any mode. SHIFT+REC can override it until the next track selection. At boot it is the active track. |
 | R8 | A recorded trigger overwrites trigger, note, velocity, micro-timing and roll; never automation; never the condition except R10. |
@@ -157,7 +157,7 @@ Authority read: `MEMORY.md`, `SCOPING_TARGETS.md` §4.3/§4.3a/§4.3b/§4.8/§6.
 | F-R | A roll runs its own length (step interval × fill, from its delayed first hit). Only the next step's trigger cuts it: a plain hit ends it, a matching roll carries it, a different roll replaces it. An empty or automation-only step does not. |
 | F-S | Roll steps take the track's shuffle as well as micro-timing (one timing rule for every trigger). |
 | RAM | Approved, including follow-ons (§14). |
-| L-2 | (2026-10-13) The looper is **not** locked out by record or live erase. Engaging the looper no longer turns record off, and REC works normally while looping. Looper actions are not recorded; looping only moves track playheads, and recording or erasing follows the playhead wherever it is. Supersedes the S080 rule "looping and recording are mutually exclusive". **Implemented in P2** (`S081_P2_LOOP_WHILE_RECORD.md`), together with L2 and L4. P1 keeps the S080 lockout until then (revision 11). |
+| L-2 | (2026-10-13) The looper is **not** locked out by record or live erase. Engaging the looper no longer turns record off, and REC works normally while looping. Looper actions are not recorded; looping only moves track playheads, and recording or erasing follows the playhead wherever it is. Supersedes the S080 rule "looping and recording are mutually exclusive". **Implemented in P3** (`S081_P3_LOOP_WHILE_RECORD.md`), together with L2 and L4. P1 keeps the S080 lockout until then (revision 11). |
 | L1 | (2026-10-13) Kept: with `qnt trk`, each looped track's loop starts at its own last step start (a per-track anchor computed in `seq_loopSnapshotTracks()`). `off` keeps the fastest-track anchor; 1/8..1/64 keep the grid boundary. Anchors choose only which window a track replays; step timing under the loop is unchanged (Appendix A-15). |
 | L3 | (2026-10-13) Adopted in P1. A step-end automation write is queued only when the step holds no entry for the target or a different value; a clear only when an entry exists. It helps without the looper too: LATCH re-stamps every fired step of `rtk` on every pass of the pattern, so an unchanged held value would otherwise rewrite the same entries every bar (§9.5). |
 
@@ -255,7 +255,7 @@ and BAR overlay triggers are not recorded.
    - LiveRecord depends on the Sequencer, so the Sequencer must not call
      back into LiveRecord.
    - The record-off moves to the caller in buttonHandler, before
-     `seq_loopEngage()` (`liveRec_forceOff()`). P2 removes it outright
+     `seq_loopEngage()` (`liveRec_forceOff()`). P3 removes it outright
      (L-2).
    - The drain filter reads bitmaps that LiveRecord registers with the
      Sequencer (§19.1), rather than calling LiveRecord.
@@ -558,7 +558,7 @@ eff(i) = menuHold(i) ? menu(i)
 | REC short press (released before `DOUBLE_CLICK_TIMEOUT`, 300 ms, the PERF fill delay) | Toggles LATCH on/off **on release** |
 | REC held past the delay | OVERDUB while held. On release the prior state (LATCH or OFF) returns. Entry and exit each start a new take (latches reset). |
 | SHIFT+REC | Latched settings menu (unchanged); REC in the menu closes it without toggling |
-| REC while looping | P1: ignored, and engaging the looper turns record off (the S080 rule, kept as an interim). P2 lifts it (L-2, `S081_P2_LOOP_WHILE_RECORD.md`) |
+| REC while looping | P1: ignored, and engaging the looper turns record off (the S080 rule, kept as an interim). P3 lifts it (L-2, `S081_P3_LOOP_WHILE_RECORD.md`) |
 | SHIFT+CLEAR while LATCH or OVERDUB | Live erase (§10); disables overdub |
 
 - Armed while stopped: nothing happens until playback starts; playback then
@@ -605,7 +605,7 @@ eff(i) = menuHold(i) ? menu(i)
 
 ### 8.1 Gates
 
-LATCH or OVERDUB; transport running; looper not engaged (P1 interim; P2
+LATCH or OVERDUB; transport running; looper not engaged (P1 interim; P3
 removes this gate, L-2); §7 ownership.
 
 ### 8.2 Capture
@@ -710,19 +710,27 @@ Targets are resolved by `menu_knobClearTarget()`, the pot-clear resolver:
 - `Nvm`, `Nou`, `Nfx`, `7dc`;
 - EFFECT-page AUTOMATABLE rows and `mrp` (`fxm`);
 - SEQ-page `scl`, `shf`;
+- PERF-page Morph cells `1VM`..`6VM` (-> `Nvm`) and `fxm` (-> the Effect Morph
+  target), S081 P3 FQ5: they resolve to the same targets and commit the same
+  values as the VOICE mix and Effect pages;
 - later: external CC.
 
 Not recorded:
 
-- PERF, RECORDING, global and Load/Save pages;
+- RECORDING, global and Load/Save pages (PERF is recorded from S081 P3,
+  Morph cells only);
 - step editors and held-step overlays, FX lane locks;
 - LFO/velocity target cells, `typ`;
 - SHIFT Morph-view edits;
 - `len`;
 - non-automatable targets.
 
-The Morph view and PERF knobs are not recordable, but they can still
-**select** a parameter for copy, clear and live erase.
+The Morph *view* is not recordable, but it can still **select** a parameter
+for copy, clear and live erase. The PERF Morph cells are recordable since
+S081 P3 (FQ5). The global Morph `mrp` is never recorded and never triggers a
+record, from the menu or MIDI, and the voice/FX Morph values it writes are
+never recorded through it (S081 P3 G-1). The Effect page's Morph cell, also
+labelled `mrp`, is the FX Morph (`fxm`) and is recorded.
 
 ### 9.1a Terms
 
@@ -761,8 +769,11 @@ mapping.
 | `dirty` | every adjustment (LATCH and OVERDUB), including clamped detents | the step-end write | adjusted since its last write |
 | `erase` | knob turn during live erase | erase end | automation of this target is being erased from `rtk` |
 
-- The value written is always the parameter's **current menu value**
-  (`liveRec_targetValue7()`, §19.2). No values are stored.
+- The value written is the parameter's **current menu value**
+  (`liveRec_targetValue7()`, §19.2). **Exception (S081 P3 G-1):** a voice
+  Morph or the FX Morph writes the value of its last individual edit,
+  captured in `liveRec_morphValue[7]`, because a global Morph change
+  overwrites those stored amounts and the global Morph is never recorded.
 - A second bit (`dirty`) is still needed beside `latch`. On a step that is
   not active, the rule is "write if adjusted since the last write, else clear
   an existing entry". `latch` alone cannot tell those apart. Without
@@ -1058,7 +1069,7 @@ None open for P1. Every item through F-S, plus L1 and L3, is decided (§2).
 
 Looping while recording, meaning L-2 (lift the lockout), L2 (PERF button
 sharing) and L4 (loop-aware placement and echo), is planned separately in
-`S081_P2_LOOP_WHILE_RECORD.md`. Its open questions are listed there.
+`S081_P3_LOOP_WHILE_RECORD.md`. Its open questions are listed there.
 
 ---
 
@@ -1567,7 +1578,7 @@ BAR LEDs; entering PERF restores them from `bh_overlayActive` (as at
 - **P1:** before every `seq_loopEngage()` call, `liveRec_forceOff()` and the
   REC LED off. This replaces the Sequencer-internal call (§3.3-9) and keeps
   the S080 lockout as an interim.
-- **P2** removes the lockout (L-2, `S081_P2_LOOP_WHILE_RECORD.md`).
+- **P3** removes the lockout (L-2, `S081_P3_LOOP_WHILE_RECORD.md`).
 
 ### 19.8 ledHandler
 
@@ -1995,9 +2006,9 @@ loop window starts. It does not change the timing of any step inside a loop.
   and the `len` commits call it.
 - **Where:** schedule A1-5c, A1-7d; plan §5.2 corrected.
 
-### A-22 Looper not locked out by record or erase (decision L-2) — moved to P2
+### A-22 Looper not locked out by record or erase (decision L-2) — moved to P3
 
-Revision 11: this work now lives in `S081_P2_LOOP_WHILE_RECORD.md`. The P1
+Revision 11: this work now lives in `S081_P3_LOOP_WHILE_RECORD.md`. The P1
 schedule is back to the interim lockout:
 
 - B-4: `liveRec_forceOff()` before `seq_loopEngage()`;
@@ -2039,5 +2050,4 @@ The record of the revision 10 decision follows.
 | M-6 | RAM summary: no double-counted staging table; drop counters DEV-only (logging-allocation policy); new items added. Totals: about 428 B added in every build, plus 16 B DEV-only, about 80 B released | RAM summary |
 | M-7 | Dependency order: C and D are independent; both precede E | Dependency order |
 | M-8 | Phase I document list completed from plan §19.14; the nonexistent "MEMORY.md §5.1" reference removed | I-1 |
-| M-9 | (revision 11) Ring semantics made consistent: TIM3 pushes an entry when a step starts; LiveRecord treats a track's next entry as the end of its previous step. Before, C-9a pushed at step start while F-5/E-4 and §19.2 read entries as "step ended" | C-9a, E-4, F-5; plan §19.2 |
-
+| M-9 | (revision 11) Ring semantics made consistent: TIM3 pushes an entry when a step starts; LiveRecord treats a track's next entry as the end of its previous step. Before, C-9a pushed at step start while F-5/E-4 and §19.2 read entries as "step ended". Implemented as specified since P3-0: each entry ends its own step and carries that step's own fired bit and (from P3) the looper jump flag (`S081_P3_IMPLEMENTATION.md` LR-1..LR-5, plan §7) | C-9a, E-4, F-5; plan §19.2 |

@@ -1195,6 +1195,13 @@ should not be disturbed. Include BAR1/SW43 and sequencer chase in the same
 render rules, either by placing chase explicitly in the priority stack or by
 folding it into an existing temporary layer.
 
+**Update (S081 P4):** the pulse and flash layer expiries are now wrap-safe.
+`led_tickHandler()` compares each 16-bit `time_sysTick` deadline by signed
+distance (`led_timeReached()`), so a pulse or flash started just before the
+65.536 s clock wrap lasts its full time instead of being dropped at once
+(a lost pulse) or flickering its phase on every tick (a flash). The same part
+adds the VOICE-mode bar-change SELECT pulse, which rides the pulse layer.
+
 ### Open Engineering Questions
 
 - **Manual roll triggering:** you flagged needing "a smart way of triggering manual rolls" now that rolls are decoupled from pattern length — this needs a concrete UI proposal (which button/hold-gesture initiates a manual roll, and at what rate) before Phase 6's UI work can wire it up.
@@ -2117,6 +2124,14 @@ Records: `079_SESSION_HANDOFF_LOG.md`, `080_SESSION_HANDOFF_LOG.md`.
   chaining (79 conditions, 44 next values, SHIFT+PLAY+SEQ editor); queued
   Scene double-rate flash; compressor alone on the last settings page.
   Hardware: "seems ok so far" (user), follow-up PASS (2026-10-11).
+- **S081 (in progress):** P3 — the PERF looper runs while live record or
+  erase is on (L-2: REC/hold/erase work while looping; any SELECT/VOICE/BAR
+  holds the loop; TRACK keeps its looper functions; loop-aware placement,
+  jump ring entries, PERF Morph cells recorded; post-assessment G-1: the
+  global Morph is never recorded and cannot leak into a recorded voice/FX
+  Morph value, +7 B SRAM1). P4 — the VOICE-mode
+  bar-change SELECT pulse and the wrap-safe pulse/flash expiry. Hardware
+  verification for both parts is pending (user).
 
 ### Open
 

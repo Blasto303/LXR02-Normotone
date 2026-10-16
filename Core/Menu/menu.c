@@ -14190,7 +14190,7 @@ static uint8_t menu_knobClearTarget(uint8_t knobNr, cc_pot_target_t *out)
  *
  * What: in LATCH or OVERDUB, an edit of a cell that resolves to a Pattern
  * target is passed to liveRec_paramIn(), unless:
- *  - the page is PERF, RECORDING, global settings, Load or Save;
+ *  - the page is RECORDING, global settings, Load or Save;
  *  - a Morph view is active (VOICE SHIFT view, STEP Morph view, Effect-page
  *    Morph view);
  *  - the target is a track length;
@@ -14208,6 +14208,11 @@ static uint8_t menu_knobClearTarget(uint8_t knobNr, cc_pot_target_t *out)
  * call. Accessors: menu_parseKnobDelta(), menu_encoderChangeParameter().
  * Affiliates: menu_cellClearTarget(), menuEffects_showMorph(),
  * menu_patternTrackMorphViewActive().
+ * S081 P3 (FQ5): PERF edits are recorded. The PERF Morph cells resolve to
+ * the same targets as the VOICE mix page (1VM..6VM -> Nvm) and the Effect
+ * page (fxm), and commit the values liveRec_targetValue7() reads, so a
+ * Morph is recorded the same way from every page. mrp (master morph) has no
+ * target and is never recorded (FQ7).
  */
 static void menu_liveRecRecordCell(uint8_t subPage, uint8_t position)
 {
@@ -14217,7 +14222,7 @@ static void menu_liveRecRecordCell(uint8_t subPage, uint8_t position)
     if (liveRec_mode() != LIVEREC_MODE_LATCH &&
         liveRec_mode() != LIVEREC_MODE_OVERDUB)
         return;
-    if (menu_activePage == PERFORMANCE_PAGE || menu_activePage == RECORDING_PAGE ||
+    if (menu_activePage == RECORDING_PAGE ||
         menu_activePage == MENU_MIDI_PAGE   || menu_activePage == LOAD_PAGE ||
         menu_activePage == SAVE_PAGE)
         return;
