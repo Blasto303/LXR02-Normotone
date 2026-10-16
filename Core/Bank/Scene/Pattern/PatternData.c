@@ -43,8 +43,8 @@ _Static_assert(PAT_STACK_SIZE > 0u && PAT_STACK_SIZE <= 512u,
                "PAT_STACK_SIZE must fit the 14-bit pool bitmap");
 _Static_assert(sizeof(pat_scene_region_t) ==
                (PAT_STEPS_PER_SCENE * 2u) + (PAT_STACK_SIZE * 32u) +
-               512u + 31u,
-               "pat_scene_region_t size must match the Pattern budget (S080 P2: +1 B loop exclude)");
+               512u + 32u,
+               "pat_scene_region_t size must match the Pattern budget (S081 P2: +1 B auto smooth)");
 
 /*
  * Static lifetime owner for all resident Scene Pattern storage.
@@ -637,12 +637,15 @@ static uint8_t pat_tryAppendAutomation(pat_scene_region_t *r,
  * leaves the old block and address untouched. Affiliates: pat_writeSpecials()
  * and the public automation CRUD functions below.
  */
+/* Trigger policy resolution helper (defined with the raw API below). */
+static uint16_t pat_rawTriggerBits(uint16_t live, uint8_t trigger_mode);
 static uint8_t pat_writeDynamic(uint8_t scene_index, uint8_t track,
                                 uint8_t step, uint8_t new_flags,
                                 const pat_step_specials_t *sp,
                                 const pat_automation_entry_t *autos,
                                 uint8_t auto_count,
-                                uint8_t allow_shrink_in_place)
+                                uint8_t allow_shrink_in_place,
+                                uint8_t trigger_policy)
 {
     pat_scene_region_t *r;
     uint16_t *entry;
@@ -689,7 +692,8 @@ static uint8_t pat_writeDynamic(uint8_t scene_index, uint8_t track,
             uint16_t published;
 
             __asm volatile("cpsid i" ::: "memory");
-            trigger_bits = (uint16_t)(*entry & PAT_ADDR_TRIGGER_BIT);
+            /* D-1a: the publication applies the caller's trigger policy. */
+            trigger_bits = pat_rawTriggerBits(*entry, trigger_policy);
             published = (uint16_t)(trigger_bits | PAT_ADDR_SENTINEL);
             *entry = published;
             __asm volatile("cpsie i" ::: "memory");
@@ -756,7 +760,8 @@ static uint8_t pat_writeDynamic(uint8_t scene_index, uint8_t track,
         uint16_t published;
 
         __asm volatile("cpsid i" ::: "memory");
-        trigger_bits = (uint16_t)(*entry & PAT_ADDR_TRIGGER_BIT);
+        /* D-1a: the publication applies the caller's trigger policy. */
+        trigger_bits = pat_rawTriggerBits(*entry, trigger_policy);
         published = (uint16_t)(trigger_bits | PAT_ADDR_SPECIALS_BIT |
                                new_offset);
         *entry = published;
@@ -801,7 +806,149 @@ static uint8_t pat_writeSpecials(uint8_t scene_index, uint8_t track,
         auto_count = pat_blockReadAutomations(r, offset, autos,
                                               PAT_BLOCK_AUTO_COUNT_MASK);
     return pat_writeDynamic(scene_index, track, step, new_flags, sp, autos,
-                            auto_count, 0u);
+                            auto_count, 0u, PAT_RAW_TRIGGER_KEEP);
+}
+
+/*
+ * Write a recorded step's specials and trigger (S081 D-2a, §8.4, §19.3).
+ *
+ * What: reads the existing specials and automation, applies the record spec
+ * (note, velocity, timing, roll, fill; clears rhythm; keeps the condition or sets
+ * fil), then writes the result with trigger ON. If the result has no specials and
+ * no automation it only sets bit 15 (pat_setStepActive). Why: the old
+ * seq_recordTrigger only set the trigger bit; live recording writes the full step
+ * in one block replacement. Inputs: scene, track, step, spec. Outputs: nonzero on
+ * commit, 0 when allocation fails (old state untouched). Which hit wins when two
+ * land on one step is decided by LiveRecord before submitting (E-1).
+ * Affiliates: pat_writeDynamic (trigger ON), pat_readStepSpecials,
+ * pat_readStepAutomations.
+ */
+uint8_t pat_recordStep(uint8_t scene_index, uint8_t track, uint8_t step,
+                       const pat_record_spec_t *spec)
+{
+    pat_step_specials_t sp;
+    pat_automation_entry_t autos[PAT_BLOCK_AUTO_COUNT_MASK];
+    const pat_scene_region_t *r;
+    const uint16_t *entry;
+    uint16_t offset;
+    uint8_t count = 0u;
+    uint8_t flags;
+
+    if (!spec || !pat_patternValid(scene_index) || !pat_trackValid(track) ||
+        !pat_stepValid(step))
+        return 0u;
+    r = pat_sceneRegion(scene_index);
+    entry = pat_addrPtr(scene_index, track, step);
+    if (!r || !entry)
+        return 0u;
+    sp = pat_readStepSpecials(scene_index, track, step);
+    offset = (uint16_t)(*entry & PAT_ADDR_OFFSET_MASK);
+    if (((*entry & PAT_ADDR_SPECIALS_BIT) != 0u) && pat_poolOffsetValid(offset))
+        count = pat_blockReadAutomations(r, offset, autos,
+                                         PAT_BLOCK_AUTO_COUNT_MASK);
+
+    flags = sp.flags;
+    /* Rhythm is never recorded. */
+    flags &= (uint8_t)~PAT_SPECIAL_RHYTHM_BIT;
+    /* Note: a default note records no note special. */
+    if (spec->noteIsDefault) {
+        flags &= (uint8_t)~PAT_SPECIAL_NOTE_BIT;
+    } else {
+        sp.note = spec->note;
+        flags |= PAT_SPECIAL_NOTE_BIT;
+    }
+    /*
+     * Defaults are stored as "absent" (S081 §8.4, P1B item 15).
+     *
+     * What: velocity 100 and fill 100 are the specials' defaults
+     * (pat_readStepSpecials). They clear their flag bits instead of storing a
+     * byte, exactly as the STEP-page setters do (pat_setStepFill clears at
+     * 100). Why: keeps recorded blocks as small as hand-edited ones, and lets a
+     * plain 100-velocity hit with the default note reach the cheap path
+     * (bit 15 only, no pool block). Roll carry-over compares resolved values,
+     * so an absent fill (100) still matches a stored fill of 100. Affiliates:
+     * pat_readStepSpecials(), seq_rollCarries().
+     */
+    if (spec->velocity == 100u) {
+        flags &= (uint8_t)~PAT_SPECIAL_VEL_BIT;
+    } else {
+        sp.velocity = spec->velocity;
+        flags |= PAT_SPECIAL_VEL_BIT;
+    }
+    /* Micro-timing. */
+    if (spec->timing == 0u) {
+        flags &= (uint8_t)~PAT_SPECIAL_TIMING_BIT;
+    } else {
+        sp.timing = spec->timing;
+        flags |= PAT_SPECIAL_TIMING_BIT;
+    }
+    /* Roll rate + fill. */
+    if (spec->roll == 0u) {
+        flags &= (uint8_t)~(PAT_SPECIAL_ROLL_BIT | PAT_SPECIAL_FILL_BIT);
+    } else {
+        sp.roll = spec->roll;
+        flags |= PAT_SPECIAL_ROLL_BIT;
+        if (spec->fill >= 100u) {
+            flags &= (uint8_t)~PAT_SPECIAL_FILL_BIT;
+        } else {
+            sp.fill = spec->fill;
+            flags |= PAT_SPECIAL_FILL_BIT;
+        }
+    }
+    /* Condition kept; fil overrides it (R10). */
+    if (spec->setFil) {
+        sp.condition = 21u;
+        flags |= PAT_SPECIAL_COND_BIT;
+    }
+    if (flags == 0u && count == 0u) {
+        /* Trigger-only: just set bit 15. */
+        pat_setStepActive(scene_index, track, step, 1u);
+        return 1u;
+    }
+    sp.flags = flags;
+    return pat_writeDynamic(scene_index, track, step, flags, &sp, autos,
+                            count, 0u, PAT_RAW_TRIGGER_ON);
+}
+
+/*
+ * Erase a step's specials while keeping automation (S081 D-3a, §10.2, §19.3).
+ *
+ * What: if automation is present, keeps the condition and removes all other
+ * specials (note, velocity, timing, roll, rhythm, fill). If no automation,
+ * releases the block entirely (trigger KEEP; TIM3 already cleared bit 15). Why:
+ * SEQ-hold erase removes triggers and specials but automation still plays.
+ * Keeping the condition on steps with automation preserves the automation gate.
+ */
+void pat_eraseSpecials(uint8_t scene_index, uint8_t track, uint8_t step)
+{
+    pat_step_specials_t sp;
+    pat_automation_entry_t autos[PAT_BLOCK_AUTO_COUNT_MASK];
+    const pat_scene_region_t *r;
+    const uint16_t *entry;
+    uint16_t offset;
+    uint8_t count = 0u;
+    uint8_t flags;
+
+    if (!pat_patternValid(scene_index) || !pat_trackValid(track) ||
+        !pat_stepValid(step))
+        return;
+    r = pat_sceneRegion(scene_index);
+    entry = pat_addrPtr(scene_index, track, step);
+    if (!r || !entry)
+        return;
+    offset = (uint16_t)(*entry & PAT_ADDR_OFFSET_MASK);
+    if (((*entry & PAT_ADDR_SPECIALS_BIT) != 0u) && pat_poolOffsetValid(offset))
+        count = pat_blockReadAutomations(r, offset, autos,
+                                         PAT_BLOCK_AUTO_COUNT_MASK);
+    if (count == 0u) {
+        pat_rawPublishEmpty(scene_index, track, step, PAT_RAW_TRIGGER_KEEP);
+        return;
+    }
+    sp = pat_readStepSpecials(scene_index, track, step);
+    flags = (uint8_t)(sp.flags & PAT_SPECIAL_COND_BIT);
+    sp.flags = flags;
+    (void)pat_writeDynamic(scene_index, track, step, flags, &sp, autos,
+                           count, 0u, PAT_RAW_TRIGGER_KEEP);
 }
 
 uint8_t pat_trackValid(uint8_t track)
@@ -873,6 +1020,8 @@ void pat_initScene(uint8_t scene_index)
     region->pattern_next = 0u;
     /* S080 P2 Defect 8a: every track starts loopable. */
     region->track_loop_exclude = 0u;
+    /* S081 P2: every track starts with automation ramps off. */
+    region->track_auto_smooth = 0u;
 }
 
 /*
@@ -1161,8 +1310,9 @@ void pat_applyPatternSettingsToMenu(uint8_t scene_index)
 /*
  * Repaint one resident track's v4 parameters in the menu buffer.
  *
- * Inputs: Scene and track. Outputs: length, scale, and shuffle cells mirror
- * the resident region; invalid coordinates leave the menu untouched.
+ * Inputs: Scene and track. Outputs: length, scale, shuffle, play mode,
+ * loopable and asm cells mirror the resident region; invalid coordinates
+ * leave the menu untouched.
  */
 void pat_applyTrackSettingsToMenu(uint8_t scene_index, uint8_t track)
 {
@@ -1177,6 +1327,9 @@ void pat_applyTrackSettingsToMenu(uint8_t scene_index, uint8_t track)
     /* S080 P2 Defect 8a: lop mirror (1 = loopable). */
     parameter_values[PAR_TRACK_LOOPABLE] =
         (uint8_t)((region->track_loop_exclude & (uint8_t)(1u << track)) == 0u);
+    /* S081 P2: asm mirror (1 = automation ramps on). */
+    parameter_values[PAR_TRACK_AUTO_SMOOTH] =
+        (uint8_t)((region->track_auto_smooth >> track) & 1u);
 }
 
 /* Persist one track-length menu edit in the resident Scene region. */
@@ -1269,6 +1422,45 @@ uint8_t pat_trackLoopable(uint8_t scene_index, uint8_t track)
 }
 
 /*
+ * Per-track automation ramp setter/getter (S081 P2, asm).
+ *
+ * What: pat_setTrackAutoSmooth() sets (on = 1) or clears the track's bit in
+ * the resident region and marks the Scene's Pattern dirty only on change;
+ * pat_trackAutoSmooth() reports the bit (0 for invalid coordinates). Why:
+ * the flag is Pattern data persisted in the PAT4 track header and travels
+ * with Pattern copy/clear, exactly like the loopable flag. Inputs: Scene,
+ * track, flag. Outputs: region byte, Pattern AutoSave dirty. Accessors:
+ * menu_cellCommitValue() (asm cell), copyClearService.c. The sequencer reads
+ * the region directly (TIM3). Affiliates:
+ * pat_scene_region_t.track_auto_smooth, seq_rampStepEvent().
+ */
+void pat_setTrackAutoSmooth(uint8_t scene_index, uint8_t track, uint8_t on)
+{
+    pat_scene_region_t *region = pat_sceneRegionMut(scene_index);
+    uint8_t bit;
+    uint8_t next;
+
+    if (!region || !pat_trackValid(track))
+        return;
+    bit = (uint8_t)(1u << track);
+    next = on ? (uint8_t)(region->track_auto_smooth | bit)
+              : (uint8_t)(region->track_auto_smooth & (uint8_t)~bit);
+    if (next == region->track_auto_smooth)
+        return;
+    region->track_auto_smooth = next;
+    pat_markSceneDirty(scene_index);
+}
+
+uint8_t pat_trackAutoSmooth(uint8_t scene_index, uint8_t track)
+{
+    const pat_scene_region_t *region = pat_sceneRegion(scene_index);
+
+    if (!region || !pat_trackValid(track))
+        return 0u;
+    return (uint8_t)((region->track_auto_smooth >> track) & 1u);
+}
+
+/*
  * Return the encoded automation count for one dynamic step block.
  *
  * Inputs: resident Scene/track/step coordinates. Output: the six-bit count
@@ -1326,6 +1518,67 @@ uint8_t pat_readStepAutomations(uint8_t scene_index, uint8_t track,
 }
 
 /*
+ * Find one target's value on one step (S081 P2).
+ *
+ * What: scans one step's automation tail for `target` and returns its 7-bit
+ * value. Same block validation as pat_blockReadAutomations(), without
+ * copying the list. Why: the automation drain pairs each Instrument entry of
+ * step A with the same target on step B (ramp start); copying B's full list
+ * would add a 252-byte stack buffer to the audio-loop drain. Inputs:
+ * resident Scene/track/step, canonical target. Output: nonzero and
+ * *value_out when found; 0 for trigger-only, invalid, malformed, or absent.
+ * Context: foreground. Accessors: seq_rampStartIfPaired(). Affiliates:
+ * pat_readStepAutomations(), pat_blockReadAutomations().
+ */
+uint8_t pat_findStepAutomation(uint8_t scene_index, uint8_t track,
+                               uint8_t step, uint16_t target,
+                               uint8_t *value_out)
+{
+    const pat_scene_region_t *r = pat_sceneRegion(scene_index);
+    const uint16_t *entry = pat_addrPtr(scene_index, track, step);
+    const uint8_t *p;
+    uint16_t offset;
+    uint8_t flags;
+    uint8_t value_count = 0u;
+    uint8_t auto_count;
+    uint8_t idx;
+    uint8_t i;
+
+    if (!r || !entry || !value_out ||
+        ((*entry & PAT_ADDR_SPECIALS_BIT) == 0u))
+        return 0u;
+    offset = (uint16_t)(*entry & PAT_ADDR_OFFSET_MASK);
+    if (!pat_poolOffsetValid(offset))
+        return 0u;
+    p = &r->pool[offset];
+    flags = (uint8_t)(p[2] & PAT_SPECIAL_FLAGS_MASK);
+    /* One special value byte per set flag precedes the automation tail. */
+    if (flags & PAT_SPECIAL_NOTE_BIT)   value_count++;
+    if (flags & PAT_SPECIAL_VEL_BIT)    value_count++;
+    if (flags & PAT_SPECIAL_COND_BIT)   value_count++;
+    if (flags & PAT_SPECIAL_ROLL_BIT)   value_count++;
+    if (flags & PAT_SPECIAL_TIMING_BIT) value_count++;
+    if (flags & PAT_SPECIAL_RHYTHM_BIT) value_count++;
+    if (flags & PAT_SPECIAL_FILL_BIT)   value_count++;
+    auto_count = (uint8_t)(p[1] & PAT_BLOCK_AUTO_COUNT_MASK);
+    if ((uint32_t)offset +
+            ((uint32_t)pat_blockChunks(flags, auto_count) * 4u) >
+        (PAT_STACK_SIZE * 32u))
+        return 0u;
+    idx = (uint8_t)(PAT_BLOCK_HEADER_BYTES + 1u + value_count);
+    for (i = 0u; i < auto_count; i++) {
+        uint16_t packed = (uint16_t)(p[idx] | ((uint16_t)p[idx + 1u] << 8u));
+
+        if ((packed & 0x01FFu) == target) {
+            *value_out = (uint8_t)((packed >> 9u) & 0x7Fu);
+            return 1u;
+        }
+        idx = (uint8_t)(idx + 2u);
+    }
+    return 0u;
+}
+
+/*
  * Add or update one step automation entry.
  *
  * Inputs: resident coordinates, a canonical voice/Scene target ID, and a
@@ -1357,7 +1610,7 @@ uint8_t pat_writeStepAutomation(uint8_t scene_index, uint8_t track,
             autos[i].value = (uint8_t)(value & 0x7Fu);
             sp = pat_readStepSpecials(scene_index, track, step);
             return pat_writeDynamic(scene_index, track, step, sp.flags, &sp,
-                                    autos, count, 0u);
+                                    autos, count, 0u, PAT_RAW_TRIGGER_KEEP);
         }
     }
     if (count >= PAT_BLOCK_AUTO_COUNT_MASK)
@@ -1367,7 +1620,7 @@ uint8_t pat_writeStepAutomation(uint8_t scene_index, uint8_t track,
     count++;
     sp = pat_readStepSpecials(scene_index, track, step);
     return pat_writeDynamic(scene_index, track, step, sp.flags, &sp, autos,
-                            count, 0u);
+                            count, 0u, PAT_RAW_TRIGGER_KEEP);
 }
 
 /*
@@ -1406,7 +1659,7 @@ uint8_t pat_removeStepAutomation(uint8_t scene_index, uint8_t track,
     count--;
     sp = pat_readStepSpecials(scene_index, track, step);
     return pat_writeDynamic(scene_index, track, step, sp.flags, &sp, autos,
-                            count, 1u);
+                            count, 1u, PAT_RAW_TRIGGER_KEEP);
 }
 
 /*
@@ -2056,6 +2309,8 @@ void pat_rawRegionCopyBody(uint8_t src_scene, uint8_t dst_scene)
            sizeof(dst->track_play_mode));
     /* S080 P2 Defect 8a: the loop exclusion travels with a Scene copy. */
     dst->track_loop_exclude = src->track_loop_exclude;
+    /* S081 P2: the automation ramp mode travels with a Scene copy. */
+    dst->track_auto_smooth = src->track_auto_smooth;
     dst->pattern_change_bar = src->pattern_change_bar;
     dst->pattern_next = src->pattern_next;
 }

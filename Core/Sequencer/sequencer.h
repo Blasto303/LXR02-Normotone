@@ -20,6 +20,18 @@ enum Seq_QuantisationEnum
 	QUANT_16,
 	QUANT_32,
 	QUANT_64,
+	/*
+	 * QUANT_TRACK: track-grid quantisation (S081 §5.6, R16).
+	 *
+	 * What: adds QUANT_TRACK = 5 after QUANT_64. Recording snaps to the nearest
+	 * step start of the recorded track's own grid. The looper uses it for per-track
+	 * loop starts (each looped track's loop start is its own current step start).
+	 * Why: the existing quantisation options are all master-clock divisions; trk
+	 * provides a track-relative snap for tracks running at non-standard scales.
+	 * Affiliates: seq_quantisation, seq_setQuantisation, seq_loopEventAnchor,
+	 * quantisationNames.
+	 */
+	QUANT_TRACK,
 };
 
 extern uint8_t seq_activePattern;
@@ -36,7 +48,6 @@ extern uint8_t seq_resetBarOnPatternChange;
  * Affiliates: PatternData mutation paths and S064 Pattern AutoSave.
  */
 extern uint8_t seq_recordActive;
-extern uint8_t seq_eraseActive;
 
 /*
  * Fill-mode flag, written by buttonHandler PERF hold logic (S079 §3.3).
@@ -192,7 +203,16 @@ void seq_realignTrackToMasterClock(uint8_t track);
  */
 void seq_refreshTrackEffectiveParams(void);
 
-void seq_triggerVoice(uint8_t voiceNr, uint8_t vol, uint8_t note);
+/*
+ * Trigger a voice with optional automation reset (S081 §5.8).
+ *
+ * reset = 1 for a step's first trigger (on-time, deferred, roll first hit,
+ * overlay, preview): the pending-reset mask is set so the voice's next audio-
+ * boundary trigger restores Instrument automation to the Morph base and clears
+ * the R12 menu override. reset = 0 for roll retriggers 2+ (F-L). See the
+ * definition in sequencer.c for the full description.
+ */
+void seq_triggerVoice(uint8_t voiceNr, uint8_t vol, uint8_t note, uint8_t reset);
 /*
  * Stopped-transport voice preview.
  *
@@ -283,8 +303,27 @@ void seq_alignActivePatternToScene(uint8_t scene_index);
  * front-panel service without MIDI-CC-style 7-bit expansion; Scene targets
  * remain queued only for the later Scene-target session. Affiliate: main.c
  * calls this before audio rendering.
+ * S081 P2: first ends the ramps of tracks whose next step has applied; each
+ * written Instrument entry of an asm track may start a linear ramp toward the
+ * same target on the predicted next step.
  */
 void seq_drainPendingAutomation(void);
+/*
+ * Automation ramp service (S081 P2, asm).
+ *
+ * What: every call (one per DSP block) ends the ramps of tracks whose next
+ * step has applied; every third call (~2.2 ms) writes each running ramp's
+ * interpolated 7-bit value, when it differs from the last value written,
+ * through the drain's Instrument write path, so
+ * ramp samples are held automation values (binding priority rule). Ramps are
+ * cancelled, value kept, on asm off, live-record latch/erase, an R12 menu
+ * override or an invalid target. Inputs: the ramp table filled by the drain,
+ * TIM3's per-track ramp contexts, the master tick clock. Outputs: runtime
+ * Instrument writes, seq_automation_dirty bits. Context: foreground only.
+ * Client: main.c audio_check_and_render(), right after
+ * seq_drainPendingAutomation().
+ */
+void seq_rampService(void);
 /*
  * Restore transient automation overlays for one visible trigger track.
  *
@@ -293,6 +332,9 @@ void seq_drainPendingAutomation(void);
  * Scene endpoint image immediately before the trigger and their bitmap is
  * cleared. Scene-level targets are intentionally not handled by this API.
  * Client: MidiVoiceControl.c's common trigger path.
+ * S081 P2 (D3): first ends the trigger track's own ramps; parameters still
+ * held by a running ramp of the slot (a mid-step live press, MIDI note, flam
+ * or roll renewal) are neither restored nor un-marked.
  */
 void seq_restoreAutomatedParameters(uint8_t trigger_track);
 /*
@@ -317,6 +359,19 @@ void seq_restoreAutomatedParameters(uint8_t trigger_track);
  */
 uint8_t seq_automationHoldsParameter(uint8_t slot, uint8_t local);
 /*
+ * Set the Instrument menu override for one parameter and clear its held bit
+ * (S081 §5.1, R12).
+ *
+ * What: sets bit `local` in seq_menuOverride[slot] and clears the same bit in
+ * seq_automation_dirty[slot], so the menu edit's endpoint write stands and the
+ * drain skips that parameter's automation until the voice's next trigger.
+ * Inputs: slot 0..5, descriptor-local index. Context: foreground only.
+ * Client: menu_cellCommitValue() INSTRUMENT branch. Affiliates:
+ * seq_restoreAutomatedParameters() (per-trigger clear),
+ * seq_drainPendingAutomation() (skip filter).
+ */
+void seq_menuOverrideSet(uint8_t slot, uint8_t local);
+/*
  * Clear the Scene-target automation dirty bitmap (S076 Rule B).
  *
  * What: zeroes the bitmap that tracks which Scene mod targets were written
@@ -328,6 +383,16 @@ uint8_t seq_automationHoldsParameter(uint8_t slot, uint8_t local);
  * Affiliate: seq_applySceneAutomation().
  */
 void seq_clearSceneAutomationDirty(void);
+/*
+ * Clear one Scene-target automation dirty bit (S081 §5.2).
+ *
+ * What: clears the bit at `index` in the Scene-target dirty mask, so a menu
+ * edit's per-target clear also clears its held bit and the transport restore
+ * cannot revert the edit. Input: bit index (0..31). Client:
+ * menu_cellCommitValue() R12 Scene-setting clears. Affiliates:
+ * seq_clearSceneAutomationDirty() (bulk clear), seq_restoreAllSceneAutomation().
+ */
+void seq_clearSceneAutomationBit(uint8_t index);
 /*
  * Start or stop the sequencer transport.
  *
@@ -348,8 +413,7 @@ uint8_t seq_isRunning(void);
 void seq_armActivePatternReload(void);
 void seq_setMute(uint8_t trackNr, uint8_t isMuted);
 uint8_t seq_isTrackMuted(uint8_t trackNr);
-void seq_setRoll(uint8_t voice, uint8_t onOff);
-void seq_setRollRate(uint8_t rate);
+/* seq_setRoll()/seq_setRollRate() retired in S081 A3-5 (PAR_ROLL). */
 
 /*
  * TIM3-to-foreground FX-sequencer latch (Session 072 step 8; plan §11.1).
@@ -363,24 +427,106 @@ void seq_setRollRate(uint8_t rate);
 #define SEQ_FX_EVENT_RESET 0x40u
 #define SEQ_FX_EVENT_INDEX 0x0Fu
 uint8_t seq_fxTakeEvent(void);
+/* seq_recordTrigger()/seq_setRecordingMode() removed in S081 B-7 (LiveRecord). */
+/* Publish a recorded absolute step for STEP-row LED feedback (S081 B-8c). */
+void seq_markRecordedStep(uint8_t track, uint8_t scene, uint8_t step);
+/* -------------------------------------------------------------------------
+** S081 P1 live-record service API (sequencer side).
+** ------------------------------------------------------------------------- */
+
 /*
- * Effect-overlay owner tracks (Session 072 step 9; plan §9 third rule).
+ * PRIMASK snapshot of a track's timing state (S081 §19.1 item 11, C-8a;
+ * S081 P3 loop fields).
  *
- * EffectsManager publishes one bit per track that owns an Effect Pattern
- * overlay. TIM3 reads the byte to decide whether an advancing track needs an
- * FX step marker in the pending automation queue. It is a single byte store.
+ * Inputs: track 0..6. Outputs: a consistent snapshot of TIM3-mutated state
+ * for LiveRecord's placement math. S081 P3: when the track is looped,
+ * looped = 1 and the loopAnchor, loopStartStep/Accum/PlayState and loopTicks
+ * fields copy its loop anchor tick, snapshot (cursor, accumulator, play
+ * state before the anchor tick's advance) and loop length, so
+ * seq_placeFromSnapshot() can map a shift that crosses a wrap (plan §3.3).
+ * Stack only (+12 B per local).
  */
-void seq_setEffectAutomationTracks(uint8_t mask);
+typedef struct {
+    uint32_t elapsedTick;
+    uint32_t stampUs;
+    uint32_t periodUs;
+    uint32_t nowUs;      /* P1B item 17: capture µs time (same section) */
+    int16_t  stepIndex;
+    uint16_t accumulator;
+    uint16_t interval;
+    uint8_t  length;
+    uint8_t  shuffle;
+    uint8_t  playMode;
+    uint8_t  playState;
+    uint8_t  playedScene;
+    /* S081 P3: loop state at the capture (looped = 0: the rest is unused). */
+    uint8_t  looped;
+    uint8_t  loopStartPlayState;
+    int16_t  loopStartStep;
+    uint16_t loopStartAccum;
+    uint16_t loopTicks;
+    uint32_t loopAnchor;
+} seq_track_time_t;
+
 /*
- * Record a live MIDI/roll event as one quantized fixed-grid trigger bit.
- * Input is the track; output is an on-bit only when recording is active.
- * Note and velocity are not recorded here; they are assigned separately as
- * per-step specials through the step editor. The live address array can carry
- * those future values, but B/B½ records only bit 15.
+ * One step-boundary ring entry (S081 §19.1 item 1; S081 P3).
+ *
+ * step: the step that begins. track: 0..6. fired: that step holds a trigger
+ * and its condition passed (known at its start). jump: the entry comes from a
+ * looper position jump (a wrap that lands mid-step, or a resume), not from a
+ * step advance; the step is a partial replay and its trigger did not fire on
+ * this pass. Producer: seq_recRingPush(). Consumer: liveRec_drainRing(),
+ * which applies a step's own fired and jump flags when that step ends.
  */
-void seq_recordTrigger(uint8_t trackNr);
-void seq_setRecordingMode(uint8_t active);
-void seq_setErasingMode(uint8_t active);
+typedef struct {
+    uint8_t step;
+    uint8_t track;
+    uint8_t fired;
+    uint8_t jump;
+} seq_rec_boundary_t;
+
+/*
+ * One placed live hit (S081 §8.3, P1B item 5, P1C item 6).
+ *
+ * step  landing step index. delay  micro-timing 0..99 from the nominal start.
+ * rel  -1 behind the current step, 0 current, +1 ahead. ahead  whole ticks
+ * from capture to the landed step start when rel > 0. snapQ8  the signed Q8
+ * shift the trk snap added to deltaQ8 (0 without snap): deltaQ8 + snapQ8 is
+ * the snapped hit's offset from the capture. Why snapQ8: a quantised flam
+ * places its grace 1/32 before the SNAPPED main; without it the grace was
+ * placed from the raw hit time under trk. Affiliates: liveRec_placeFlam().
+ */
+typedef struct {
+    uint8_t step;
+    uint8_t delay;
+    int8_t  rel;
+    uint16_t ahead;
+    int16_t  snapQ8;
+} seq_place_t;
+
+void    seq_setRecordTarget(uint8_t track, uint8_t writing);
+void    seq_setAutomationFilter(const uint8_t *latch, const uint8_t *erase,
+                                uint8_t eraseTrack);
+void    seq_setEraseMasks(uint8_t specials, uint8_t full);
+void    seq_suppressStepOnce(uint8_t track, uint8_t step, uint16_t aheadTicks);
+void    seq_setLiveHold(uint8_t track, uint8_t on);
+void    seq_cancelPendingTrigger(uint8_t track, uint8_t step);
+uint8_t seq_takeRecBoundary(seq_rec_boundary_t *out);
+void    seq_captureTrackTime(uint8_t track, seq_track_time_t *out);
+/*
+ * Place a captured hit on a track's step grid (S081 §8.3, P1B item 5;
+ * S081 P3 loop-aware): shifts the live cursor by deltaQ8, or, for a looped
+ * track when the shift crosses a wrap, the loop snapshot by the target's
+ * phase. Returns 0 when the track has not started.
+ */
+uint8_t seq_placeFromSnapshot(uint8_t track, const seq_track_time_t *snap,
+                              int32_t deltaQ8, uint8_t snapToStep,
+                              seq_place_t *out);
+uint32_t seq_quantiseTick(uint32_t tick, uint8_t frac8);
+uint8_t seq_getPlaybackEpoch(void);
+uint8_t seq_getSceneEpoch(void);
+uint8_t seq_getQuantisation(void);
+
 void seq_midiNoteOff(uint8_t chan);
 void seq_sendMidiNoteOn(const uint8_t channel, const uint8_t note, const uint8_t veloc);
 

@@ -123,14 +123,31 @@ typedef struct __attribute__((packed)) {
      * PAT4 writer/readers.
      */
     uint8_t track_loop_exclude;
+    /*
+     * Per-track automation ramp mode (S081 P2, "asm" / Automtn).
+     *
+     * What: bit N set = track N is "on": an Instrument parameter automated on
+     * two consecutively played steps ramps linearly from the first step's
+     * value to the second's; 0 = "off" (the default), every value is applied
+     * as a jump. Why: per-track smooth automation; a Pattern setting, not
+     * automatable or morphable. A zero-filled region and every existing PAT4
+     * file read as "off". Inputs: STEP track page edits, Scene/Pattern loads,
+     * copy/clear. Outputs: seq_rampStepEvent() (TIM3), the ramp service.
+     * Storage: byte 5 of each track's 16-byte PAT4 track header (0/1; the
+     * byte was reserved and zero, so the file version stays 2). RAM: 1 byte
+     * per region (17 B across pat_regions[16] and pat_background_region).
+     * Affiliates: pat_setTrackAutoSmooth()/pat_trackAutoSmooth(),
+     * filesystem.c PAT4 writer/readers.
+     */
+    uint8_t track_auto_smooth;
     uint8_t pattern_change_bar;
     uint8_t pattern_next;
 } pat_scene_region_t;
 
 _Static_assert(sizeof(pat_scene_region_t) ==
                (PAT_STEPS_PER_SCENE * 2u) + (PAT_STACK_SIZE * 32u) +
-               512u + 31u,
-               "pat_scene_region_t size must match the Pattern budget (S080 P2: +1 B loop exclude)");
+               512u + 32u,
+               "pat_scene_region_t size must match the Pattern budget (S081 P2: +1 B auto smooth)");
 
 /*
  * Fixed v4 Pattern file geometry.
@@ -268,7 +285,50 @@ typedef struct {
 #define PAT_AUTOMATION_TARGET_OFF 0x01FFu
 
 pat_step_specials_t pat_readStepSpecials(uint8_t scene_index,
-                                         uint8_t track, uint8_t step);
+                                        uint8_t track, uint8_t step);
+/*
+ * Recorded step spec (S081 D-2b, §8.4).
+ *
+ * What: the fields a live-recorded trigger writes to one step: note, velocity,
+ * micro-timing, roll rate and fill, plus setFil (R10) and noteIsDefault (a `def`
+ * note records no note special). Rhythm is never recorded (cleared). The
+ * condition is kept unless setFil is set.
+ */
+typedef struct {
+    uint8_t note;
+    uint8_t velocity;
+    uint8_t timing;
+    uint8_t roll;
+    uint8_t fill;
+    uint8_t setFil;
+    uint8_t noteIsDefault;
+} pat_record_spec_t;
+
+/*
+ * Write a recorded step's specials and trigger (S081 D-2a, §19.3).
+ *
+ * What: reads the existing specials and automation for the step, applies the
+ * record spec (note, velocity, timing, roll, fill; clears rhythm; keeps the
+ * condition or sets fil), and writes the result with trigger ON. A result with no
+ * specials and no automation only sets bit 15 (pat_setStepActive). Why: the old
+ * seq_recordTrigger only set the trigger bit; live recording writes the full step
+ * in one block replacement. Inputs: scene, track, step, spec. Outputs: nonzero on
+ * commit, 0 when allocation fails (old state untouched). Affiliates:
+ * pat_writeDynamic (trigger ON), pat_readStepSpecials, pat_readStepAutomations.
+ */
+uint8_t pat_recordStep(uint8_t scene_index, uint8_t track, uint8_t step,
+                       const pat_record_spec_t *spec);
+
+/*
+ * Erase a step's specials while keeping automation (S081 D-3a, §10.2).
+ *
+ * What: if automation is present, keeps the condition and removes all other
+ * specials (note, velocity, timing, roll, rhythm, fill). If no automation,
+ * releases the block entirely (trigger KEEP; TIM3 already cleared bit 15). Why:
+ * SEQ-hold erase removes triggers and specials but automation still plays.
+ */
+void pat_eraseSpecials(uint8_t scene_index, uint8_t track, uint8_t step);
+
 
 /*
  * Whole-track and whole-Pattern clear primitives (legacy direct form).
@@ -461,6 +521,15 @@ void pat_setTrackLoopable(uint8_t scene_index, uint8_t track, uint8_t loopable);
 uint8_t pat_trackLoopable(uint8_t scene_index, uint8_t track);
 
 /*
+ * Per-track automation ramp mode (S081 P2): set/clear the asm bit of one
+ * track (marks the Pattern dirty on change); read it (0 when invalid).
+ * Clients: Menu STEP track page (asm cell), copy/clear. The sequencer reads
+ * pat_scene_region_t.track_auto_smooth directly from TIM3.
+ */
+void pat_setTrackAutoSmooth(uint8_t scene_index, uint8_t track, uint8_t on);
+uint8_t pat_trackAutoSmooth(uint8_t scene_index, uint8_t track);
+
+/*
  * Step-automation persistence operations.
  *
  * What: count, decode, add/update, remove, and track-wide-remove automation
@@ -479,6 +548,14 @@ uint8_t pat_stepAutomationCount(uint8_t scene_index, uint8_t track,
 uint8_t pat_readStepAutomations(uint8_t scene_index, uint8_t track,
                                 uint8_t step, pat_automation_entry_t *out,
                                 uint8_t max_count);
+/*
+ * Find one target's 7-bit value on one step without copying the list
+ * (S081 P2 ramp pairing); 0 when absent or invalid. Foreground. Client:
+ * seq_rampStartIfPaired().
+ */
+uint8_t pat_findStepAutomation(uint8_t scene_index, uint8_t track,
+                               uint8_t step, uint16_t target,
+                               uint8_t *value_out);
 uint8_t pat_writeStepAutomation(uint8_t scene_index, uint8_t track,
                                 uint8_t step, uint16_t target, uint8_t value);
 uint8_t pat_removeStepAutomation(uint8_t scene_index, uint8_t track,

@@ -56,7 +56,14 @@ typedef enum {
     PATSVC_OP_SET_FILL,
     PATSVC_OP_CLEAR_TRACK_BARRIER,
     PATSVC_OP_REMOVE_TRACK_TARGET_BARRIER,
-    PATSVC_OP_CLEAR_PATTERN
+    PATSVC_OP_CLEAR_PATTERN,
+    /*
+     * S081 live-record service operations. RECORD_STEP's 16-bit payload is a
+     * record-staging slot index (D-4a/b); ERASE_SPECIALS takes scene/track/step
+     * (D-4c).
+     */
+    PATSVC_OP_RECORD_STEP,
+    PATSVC_OP_ERASE_SPECIALS
 } patSvc_operation_t;
 
 /*
@@ -84,6 +91,46 @@ static uint8_t service_scene;
 static uint8_t service_open;
 static uint8_t service_handover;
 static uint8_t service_replace_pending;
+/*
+ * Record-step staging table and target override (S081 §19.3, D-4a/D-5a).
+ *
+ * record_stage: 4 slots, each a pat_record_spec_t plus its scene/track/step.
+ * The patSvc_recordStep() caller copies the spec into a free slot; the queue
+ * event payload carries the slot index; execution frees it. Why: the queue's
+ * 16-bit payload cannot hold the full record spec. The table is owned by the
+ * service (no LiveRecord dependency). RAM: +34 B.
+ *
+ * service_target_request: the requested recording-target Scene (0xFF = none).
+ * patSvc_desiredScene() returns it, else seq_activePattern; it replaces the
+ * eight direct seq_activePattern comparisons so Pattern writes can target a
+ * track's per-track Scene (S081 §7). RAM: +2 B.
+ */
+#define PATSVC_RECORD_STAGE_COUNT 4u
+typedef struct {
+    uint8_t scene;
+    uint8_t track;
+    uint8_t step;
+    uint8_t used;
+    pat_record_spec_t spec;
+} patSvc_record_stage_t;
+static patSvc_record_stage_t patSvc_recordStage[PATSVC_RECORD_STAGE_COUNT];
+#define PATSVC_NO_TARGET 0xFFu
+static uint8_t service_target_request = PATSVC_NO_TARGET;
+
+/* Desired mutation Scene: the recording target override, else the active one. */
+static uint8_t patSvc_desiredScene(void)
+{
+    return (uint8_t)((service_target_request != PATSVC_NO_TARGET)
+                     ? service_target_request : seq_activePattern);
+}
+
+/* Release a record-staging slot for a dropped RECORD_STEP event (D-4e). */
+static void patSvc_releaseStagedSlot(uint8_t operation, uint16_t payload)
+{
+    if (operation == PATSVC_OP_RECORD_STEP &&
+        payload < PATSVC_RECORD_STAGE_COUNT)
+        patSvc_recordStage[payload].used = 0u;
+}
 /*
  * Exclusive copy/clear claim (S075; one byte, 0xFF means none).
  *
@@ -952,6 +999,22 @@ static uint8_t patSvc_requiredChunks(uint8_t scene, uint8_t operation,
     uint8_t count;
     uint8_t flags;
 
+    /* S081 D-4e: record/erase-specials chunk requirements. */
+    if (operation == PATSVC_OP_RECORD_STEP) {
+        uint8_t slot = (uint8_t)payload;
+
+        if (slot >= PATSVC_RECORD_STAGE_COUNT ||
+            !patSvc_recordStage[slot].used)
+            return 0u;
+        count = pat_stepAutomationCount(scene, track, step);
+        /* Conservative upper bound: every special bit plus the automation. */
+        return patSvc_blockChunksFor(PAT_SPECIAL_FLAGS_MASK, count);
+    }
+    if (operation == PATSVC_OP_ERASE_SPECIALS) {
+        specials = pat_readStepSpecials(scene, track, step);
+        count = pat_stepAutomationCount(scene, track, step);
+        return patSvc_blockChunksFor(specials.flags, count);
+    }
     if (operation == PATSVC_OP_WRITE_AUTOMATION) {
         count = pat_stepAutomationCount(scene, track, step);
         if (count < PAT_BLOCK_AUTO_COUNT_MASK)
@@ -1065,6 +1128,25 @@ static uint8_t patSvc_executeEvent(uint32_t event)
     case PATSVC_OP_CLEAR_PATTERN:
         pat_clearPattern(service_scene);
         return 1u;
+    case PATSVC_OP_RECORD_STEP: {
+        /* S081 D-4b: execute the staged record spec; free the slot on success. */
+        uint8_t slot = (uint8_t)payload;
+        uint8_t r = 0u;
+
+        if (slot < PATSVC_RECORD_STAGE_COUNT && patSvc_recordStage[slot].used) {
+            r = pat_recordStep(patSvc_recordStage[slot].scene,
+                               patSvc_recordStage[slot].track,
+                               patSvc_recordStage[slot].step,
+                               &patSvc_recordStage[slot].spec);
+            if (r)
+                patSvc_recordStage[slot].used = 0u;
+        }
+        return (uint8_t)(r ? 1u : 0u);
+    }
+    case PATSVC_OP_ERASE_SPECIALS:
+        /* S081 D-4c: SEQ-hold erase of specials, automation kept. */
+        pat_eraseSpecials(service_scene, track, step);
+        return 1u;
     default:
         return 0u;
     }
@@ -1166,6 +1248,7 @@ static uint8_t patSvc_drainQueue(void)
         if (required == 0u || free_chunks < required) {
             patternTrace_record(PAT_TRACE_STAGE_CAPACITY_DROP,
                                 (uint8_t)(service_scene & 0x0Fu), event);
+            patSvc_releaseStagedSlot(operation, patSvc_eventPayload(event));
             patSvc_consumeHead();
             return 1u;
         }
@@ -1177,6 +1260,7 @@ static uint8_t patSvc_drainQueue(void)
         }
         patternTrace_record(PAT_TRACE_STAGE_FRAG_DROP,
                             (uint8_t)(service_scene & 0x0Fu), event);
+        patSvc_releaseStagedSlot(operation, patSvc_eventPayload(event));
         patSvc_consumeHead();
     }
     return 1u;
@@ -1200,7 +1284,7 @@ static uint8_t patSvc_submit(uint8_t scene, uint32_t event,
     }
     if (direct_allowed && patSvc_queueCount() == 0u &&
         bulk_op == PATSVC_OP_NONE &&
-        seq_activePattern == service_scene) {
+        patSvc_desiredScene() == service_scene) {
         uint8_t result = patSvc_executeEvent(event);
 
         logical_chunks_used = patSvc_countUsed(patSvc_region(service_scene));
@@ -1281,7 +1365,8 @@ void patSvc_init(void)
     memset((void *)service_queue, 0, sizeof(service_queue));
     service_queue_prod = 0u;
     service_queue_cons = 0u;
-    service_scene = seq_activePattern;
+    service_target_request = PATSVC_NO_TARGET;
+    service_scene = patSvc_desiredScene();
     service_open = 1u;
     service_handover = 0u;
     service_replace_pending = 0u;
@@ -1351,7 +1436,7 @@ void patSvc_finishSceneReplace(uint8_t scene)
     patSvc_clearReservationImage();
     reservation_density_active = 1u;
     patSvc_updateDensityLevel();
-    if (seq_activePattern == service_scene) {
+    if (patSvc_desiredScene() == service_scene) {
         service_handover = 0u;
         service_open = 1u;
     } else {
@@ -1419,7 +1504,7 @@ void patSvc_endExclusive(uint8_t scene)
     /* Every claim may have moved blocks: restart the repair epoch. */
     tier1_scan_cursor = 0u;
     service_exclusive_scene = PATSVC_NO_SCENE;
-    service_open = (uint8_t)(seq_activePattern == service_scene);
+    service_open = (uint8_t)(patSvc_desiredScene() == service_scene);
     service_handover = (uint8_t)(!service_open);
 }
 
@@ -1606,7 +1691,9 @@ uint8_t patSvc_idle(void)
 {
     return (uint8_t)(service_open && service_exclusive_scene == PATSVC_NO_SCENE &&
                      !service_handover &&
-                     seq_activePattern == service_scene &&
+                     /* S081 D-5d: a held target override keeps AutoSave off. */
+                     service_target_request == PATSVC_NO_TARGET &&
+                     patSvc_desiredScene() == service_scene &&
                      patSvc_queueCount() == 0u &&
                      bulk_op == PATSVC_OP_NONE && !reactive_active);
 }
@@ -1758,7 +1845,7 @@ void patSvc_clearTrack(uint8_t scene, uint8_t track)
     event = patSvc_packEvent(PATSVC_OP_CLEAR_TRACK_BARRIER,
                              track, 0u, track);
     if (patSvc_queueCount() == 0u && bulk_op == PATSVC_OP_NONE &&
-        seq_activePattern == service_scene) {
+        patSvc_desiredScene() == service_scene) {
         for (step = 0u; step < NUM_STEPS; step++)
             pat_setStepActive(scene, track, step, 0u);
         pat_clearTrack(scene, track);
@@ -1785,7 +1872,7 @@ void patSvc_clearPattern(uint8_t scene)
         return;
     }
     if (patSvc_queueCount() == 0u && bulk_op == PATSVC_OP_NONE &&
-        seq_activePattern == service_scene) {
+        patSvc_desiredScene() == service_scene) {
         pat_clearPattern(scene);
         logical_chunks_used = 0u;
         tier1_scan_cursor = 0u;
@@ -1818,7 +1905,7 @@ uint8_t patSvc_removeTrackAutomationByTarget(uint8_t scene, uint8_t track,
         return 0u;
     }
     if (patSvc_queueCount() == 0u && bulk_op == PATSVC_OP_NONE &&
-        seq_activePattern == service_scene) {
+        patSvc_desiredScene() == service_scene) {
         uint8_t removed = pat_removeTrackAutomationByTarget(scene, track,
                                                               target);
         logical_chunks_used = patSvc_countUsed(patSvc_region(service_scene));
@@ -1853,6 +1940,111 @@ void patSvc_enqueueErase(uint8_t scene, uint8_t track, uint8_t step)
 }
 
 /*
+ * TIM3-safe erase-specials enqueue (S081 §19.3, D-4d).
+ *
+ * What: modelled on patSvc_enqueueErase(). Packs the scene/track/step into the
+ * queue entry and enqueues PATSVC_OP_ERASE_SPECIALS. Why: TIM3 calls this when a
+ * SEQ-hold erase reaches a step; it cannot mutate pool bytes directly.
+ */
+void patSvc_enqueueEraseSpecials(uint8_t scene, uint8_t track, uint8_t step)
+{
+    if (!patSvc_validStepRequest(scene, track, step, 0u, 0u))
+        return;
+    if (!service_open || service_handover || scene != service_scene) {
+        patSvc_rejectScene(scene,
+                           patSvc_packEvent(PATSVC_OP_ERASE_SPECIALS,
+                                            track, step, 0u));
+        return;
+    }
+    (void)patSvc_enqueue(patSvc_packEvent(PATSVC_OP_ERASE_SPECIALS,
+                                          track, step, 0u));
+}
+
+/*
+ * Record-step submission (S081 §19.3, D-4e).
+ *
+ * What: takes a free staging slot, copies the spec and coordinates, and submits
+ * PATTSVC_OP_RECORD_STEP with the slot index as payload (direct when idle,
+ * queued when busy). Returns 0 when the table is full, the Scene is not the
+ * service target, or admission is closed (the slot is released). The slot is
+ * freed after execution or a counted drop. Affiliates: LiveRecord (E-1),
+ * pat_recordStep(), the staging table (D-4a).
+ */
+uint8_t patSvc_recordStep(uint8_t scene, uint8_t track, uint8_t step,
+                          const pat_record_spec_t *spec)
+{
+    uint8_t slot;
+    uint32_t event;
+
+    if (!spec || !patSvc_validStepRequest(scene, track, step, 0u, 0u))
+        return 0u;
+    if (!service_open || service_handover || scene != service_scene) {
+        patSvc_rejectScene(scene, 0u);
+        return 0u;
+    }
+    for (slot = 0u; slot < PATSVC_RECORD_STAGE_COUNT; slot++) {
+        if (!patSvc_recordStage[slot].used)
+            break;
+    }
+    if (slot >= PATSVC_RECORD_STAGE_COUNT) {
+        patternTrace_record(PAT_TRACE_STAGE_QUEUE_OVERFLOW,
+                            (uint8_t)(scene & 0x0Fu), 0u);
+        return 0u;
+    }
+    patSvc_recordStage[slot].scene = scene;
+    patSvc_recordStage[slot].track = track;
+    patSvc_recordStage[slot].step = step;
+    patSvc_recordStage[slot].spec = *spec;
+    patSvc_recordStage[slot].used = 1u;
+    event = patSvc_packEvent(PATSVC_OP_RECORD_STEP, track, step, slot);
+    if (!patSvc_submit(scene, event, 1u)) {
+        patSvc_recordStage[slot].used = 0u;
+        return 0u;
+    }
+    return 1u;
+}
+
+/*
+ * Target override and replacement queries (S081 §7, §19.3, D-5b).
+ *
+ * requestTarget(scene) records the requested target Scene and returns 1, or
+ * returns 0 while an exclusive claim or filesystem replacement is active or the
+ * Scene is not resident. releaseTarget() drops the request. targetOpen(scene) is
+ * 1 when the service mutates `scene` and admission is open. replacePending() is 1
+ * while a filesystem Pattern replacement is prepared or applied.
+ */
+uint8_t patSvc_requestTarget(uint8_t scene)
+{
+    if (!scene_indexValid(scene))
+        return 0u;
+    if (service_exclusive_scene != PATSVC_NO_SCENE || service_replace_pending)
+        return 0u;
+    if (patSvc_queueCount() != 0u || bulk_op != PATSVC_OP_NONE ||
+        reactive_active)
+        return 0u;
+    service_target_request = scene;
+    return 1u;
+}
+
+void patSvc_releaseTarget(void)
+{
+    service_target_request = PATSVC_NO_TARGET;
+}
+
+uint8_t patSvc_targetOpen(uint8_t scene)
+{
+    return (uint8_t)(service_open && !service_handover &&
+                     service_exclusive_scene == PATSVC_NO_SCENE &&
+                     scene == patSvc_desiredScene() &&
+                     patSvc_desiredScene() == service_scene);
+}
+
+uint8_t patSvc_replacePending(void)
+{
+    return service_replace_pending;
+}
+
+/*
  * Advance one bounded service pass.
  *
  * Priority 0 closes/drains target handover; priority 1 handles reactive
@@ -1866,7 +2058,7 @@ void patSvc_tick(void)
     if (!service_open && !service_handover)
         return;
 
-    if (!service_handover && seq_activePattern != service_scene) {
+    if (!service_handover && patSvc_desiredScene() != service_scene) {
         service_open = 0u;
         service_handover = 1u;
         reactive_active = 0u;
@@ -1901,7 +2093,7 @@ void patSvc_tick(void)
             /* S075: do not reopen/adopt a Scene while copy/clear owns it. */
             return;
         }
-        service_scene = seq_activePattern;
+        service_scene = patSvc_desiredScene();
         logical_chunks_used = patSvc_countUsed(patSvc_region(service_scene));
         tier1_scan_cursor = 0u;
         reactive_scan_cursor = 0u;

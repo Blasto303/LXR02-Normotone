@@ -69,6 +69,25 @@
 
 static uint8_t active_voices=0;	// which voices are currently playing a note
 
+/*
+ * Per-voice pending-reset mask (S081 §5.8, §19.15).
+ *
+ * What: bit N (0..6) is set when voice N's next trigger must restore
+ * Instrument automation to the Morph base and clear the menu override
+ * before the voice fires. Why: voiceControl_noteOff() deletes queued
+ * entries for that voice, so a flag stored inside VoiceTriggerEvent
+ * would be lost on retrigger. A separate mask survives drops: a reset
+ * stays pending until a trigger or end-of-pass consumes it. Inputs:
+ * set by voiceControl_noteOn() (every live/seq first trigger),
+ * voiceControl_resetOnly() (roll renewal with no trigger). Cleared by
+ * voiceControl_processPending() when consumed. Outputs: gates the call
+ * to seq_restoreAutomatedParameters() and the menu-override clear.
+ * Affiliates: seq_triggerVoice() reset argument, main.c audio loop
+ * ordering (voiceControl_processPending -> seq_drainPendingAutomation).
+ * RAM: +1 B SRAM1.
+ */
+static uint8_t voiceControl_pendingReset;
+
 typedef struct {
 	uint8_t voice;
 	uint8_t note;
@@ -135,7 +154,18 @@ static void voiceControl_dropPendingLocked(uint8_t voice)
 	voiceTriggerHead = write;
 }
 
-static uint8_t voiceControl_popPending(VoiceTriggerEvent *event)
+/*
+ * Atomic reset consumption (S081 §5.8, §19.15).
+ *
+ * What: voiceControl_popPending() gains an out-parameter `reset`. Inside its
+ * existing PRIMASK section it copies the event, then tests and clears
+ * voiceControl_pendingReset's bit for ev.voice in the same section. TIM3
+ * sets bits concurrently (seq_triggerVoice() runs in the ISR), so every
+ * read-modify-write of the mask is under PRIMASK, as the ring cursors
+ * already are. Inputs: ring, mask. Outputs: the popped event and its reset
+ * decision.
+ */
+static uint8_t voiceControl_popPending(VoiceTriggerEvent *event, uint8_t *resetOut)
 {
 	uint32_t primask = voiceControl_irqSave();
 
@@ -146,11 +176,28 @@ static uint8_t voiceControl_popPending(VoiceTriggerEvent *event)
 
 	*event = voiceTriggerRing[voiceTriggerTail];
 	voiceTriggerTail = (uint8_t)((voiceTriggerTail + 1u) & VOICE_TRIGGER_RING_MASK);
+	/* Test-and-clear this voice's pending-reset bit in the same PRIMASK
+	** section as the pop so the decision matches the popped event. */
+	*resetOut = (uint8_t)((voiceControl_pendingReset >> event->voice) & 1u);
+	voiceControl_pendingReset &= (uint8_t)~(1u << event->voice);
 	voiceControl_irqRestore(primask);
 	return 1;
 }
 
-static void voiceControl_triggerNow(uint8_t voice, uint8_t note, uint8_t vel)
+/*
+ * Trigger funnel with conditional automation reset (S081 §5.8, §19.15).
+ *
+ * What: preset_applyDeferredSceneSlotForTrigger() first (unchanged), then
+ * seq_restoreAutomatedParameters() only when `reset` is set, then
+ * instrumentManager_triggerTrack(), the sidechain and the LED pulse
+ * (unchanged). Why: only a step's first trigger, a roll renewal or a live
+ * press may restore the Morph base (F-L). Keeping the deferred Scene apply
+ * ahead of the restore preserves the pre-S081 order: the restore reads the
+ * played Scene's morph_interpolation[] after a pending Scene image is
+ * installed. Inputs: voice, note, vel, reset. Outputs: as before.
+ * Affiliates: voiceControl_processPending() (the only caller).
+ */
+static void voiceControl_triggerNow(uint8_t voice, uint8_t note, uint8_t vel, uint8_t reset)
 {
 	/*
 	 * Trigger through the dynamic instrument runtime dispatcher.
@@ -165,9 +212,12 @@ static void voiceControl_triggerNow(uint8_t voice, uint8_t note, uint8_t vel)
 	preset_applyDeferredSceneSlotForTrigger(voice);
 	/*
 	 * Restore any foreground automation overlays before the new voice reads
-	 * them. All MIDI, roll, sequencer, and front-panel previews use this funnel.
+	 * them, but only for a trigger that requests a reset (first trigger of a
+	 * step, a roll renewal, or a live press). Roll retriggers 2+ pass reset=0
+	 * so a step's own automation is not undone by every roll hit (F-L).
 	 */
-	seq_restoreAutomatedParameters(voice);
+	if (reset)
+		seq_restoreAutomatedParameters(voice);
 	instrumentManager_triggerTrack(voice, note, vel);
 
 	/*
@@ -196,6 +246,13 @@ void voiceControl_noteOn(uint8_t voice, uint8_t note, uint8_t vel)
 	active_voices |= (1<<voice);
 
 	voiceControl_enqueueTriggerLocked(voice, note, vel);
+	/*
+	 * Live and sequencer first triggers always request a reset (F12, §5.8).
+	 * The bit is set under the queue's existing PRIMASK so that the enqueue
+	 * and the reset intent are published atomically. Roll retriggers 2+ use
+	 * voiceControl_noteOnNoReset() instead.
+	 */
+	voiceControl_pendingReset |= (uint8_t)(1u << voice);
 	voiceControl_irqRestore(primask);
 	
 	//Send trigger out signal	
@@ -209,6 +266,52 @@ void voiceControl_noteOn(uint8_t voice, uint8_t note, uint8_t vel)
 	}
 	*/
 
+}
+//----------------------------------------------------------------
+/*
+ * Enqueue a voice trigger without requesting an automation reset (S081 §5.8).
+ *
+ * What: identical to voiceControl_noteOn() but does not set the
+ * pending-reset bit. Why: roll retriggers 2+ must not restore the
+ * Morph base or clear the menu override - only the roll's first hit
+ * resets (F-L). Inputs: voice 0..6, note, vel. Outputs: ring entry
+ * enqueued. Affiliates: seq_triggerVoice(..., reset=0) for roll hits,
+ * voiceControl_noteOn() for first triggers.
+ */
+void voiceControl_noteOnNoReset(uint8_t voice, uint8_t note, uint8_t vel)
+{
+	uint32_t primask;
+
+	if (voice >= 7u)
+		return;
+
+	primask = voiceControl_irqSave();
+	active_voices |= (1<<voice);
+	voiceControl_enqueueTriggerLocked(voice, note, vel);
+	voiceControl_irqRestore(primask);
+}
+//----------------------------------------------------------------
+/*
+ * Request an automation reset for a voice with no trigger (S081 §5.8).
+ *
+ * What: sets the pending-reset bit under PRIMASK without enqueuing a
+ * ring entry. Why: a roll carried across steps renews the roll at the
+ * new step boundary. The renewal resets automation (so the new step's
+ * entries apply cleanly) but fires no new first hit. Inputs: voice
+ * 0..6. Outputs: pending-reset bit set; consumed by the next
+ * voiceControl_processPending() pass. Affiliates: seq_rollBegin()
+ * carry path, seq_restoreAutomatedParameters().
+ */
+void voiceControl_resetOnly(uint8_t voice)
+{
+	uint32_t primask;
+
+	if (voice >= 7u)
+		return;
+
+	primask = voiceControl_irqSave();
+	voiceControl_pendingReset |= (uint8_t)(1u << voice);
+	voiceControl_irqRestore(primask);
 }
 //----------------------------------------------------------------
 //----------------------------------------------------------------
@@ -260,8 +363,32 @@ uint8_t voiceControl_isVoicePlaying(uint8_t voice)
 void voiceControl_processPending(void)
 {
 	VoiceTriggerEvent ev;
+	uint8_t reset;
+	uint8_t leftover;
 
-	while (voiceControl_popPending(&ev)) {
-		voiceControl_triggerNow(ev.voice, ev.note, ev.vel);
+	while (voiceControl_popPending(&ev, &reset)) {
+		voiceControl_triggerNow(ev.voice, ev.note, ev.vel, reset);
+	}
+
+	/*
+	 * After the ring is empty, take the remaining reset bits under PRIMASK
+	 * (copy, then store 0) and run the restore for each bit taken: reset-only
+	 * renewals and resets whose trigger entry was dropped by
+	 * voiceControl_noteOff(). All of this precedes
+	 * seq_drainPendingAutomation() (main.c:212-213), so a step's own
+	 * automation still lands after its reset.
+	 */
+	{
+		uint32_t primask = voiceControl_irqSave();
+		leftover = voiceControl_pendingReset;
+		voiceControl_pendingReset = 0u;
+		voiceControl_irqRestore(primask);
+	}
+	while (leftover) {
+		uint8_t voice = 0u;
+		while ((leftover & (uint8_t)(1u << voice)) == 0u)
+			voice++;
+		leftover &= (uint8_t)~(1u << voice);
+		seq_restoreAutomatedParameters(voice);
 	}
 }

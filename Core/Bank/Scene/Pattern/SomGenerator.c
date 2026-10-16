@@ -136,7 +136,7 @@ void som_tick(uint8_t stepNr, uint8_t mutedTracks)
 				{
 					//trigger note
 					uint8_t vol = 64+ (values[i] >> 2);
-					seq_triggerVoice(i,vol,MIDI_DEFAULT_TRIGGER_NOTE);
+					seq_triggerVoice(i,vol,MIDI_DEFAULT_TRIGGER_NOTE, 1);
 				}
 
 			}

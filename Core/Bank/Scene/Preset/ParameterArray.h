@@ -284,6 +284,21 @@ enum ParamEnums
 	 */
 	PAR_TRACK_LOOPABLE,
 
+	/*
+	 * S081 P2: per-track automation ramp mirror (asm).
+	 *
+	 * What: off/on display/edit mirror of the active track's automation ramp
+	 * mode in the viewed Scene's Pattern region (1 = automation on two
+	 * consecutively played steps ramps linearly). Why: the STEP track page
+	 * edits it beside lop. Appended after PAR_TRACK_LOOPABLE so no
+	 * established Global id is renumbered. Inputs:
+	 * pat_applyTrackSettingsToMenu(). Outputs: edits commit through
+	 * menu_cellCommitValue() to pat_setTrackAutoSmooth(); bulk Global apply
+	 * is a no-op for this id. Affiliates: pat_scene_region_t.track_auto_smooth,
+	 * SEQ_PAGE sub-page 0 cell 7.
+	 */
+	PAR_TRACK_AUTO_SMOOTH,
+
 	NUM_PARAMS = 384,
 };
 
@@ -298,6 +313,10 @@ _Static_assert(PAR_BUS_COMP_SIDECHAIN < NUM_PARAMS,
  */
 _Static_assert(PAR_TRACK_LOOPABLE < NUM_PARAMS,
 	"S080 chain/loopable mirrors must fit the fixed flat parameter allocation");
+
+/* S081 P2: the asm mirror also consumes existing parameter_values[] capacity. */
+_Static_assert(PAR_TRACK_AUTO_SMOOTH < NUM_PARAMS,
+	"S081 P2 asm mirror must fit the fixed flat parameter allocation");
 
 #include "stm32f4xx.h"
 

@@ -268,6 +268,27 @@
  */
 #define ENABLE_EUKLID_PAGE 0
 
+/*
+ * LIVEREC_AUTOMATION_FIRST_CHANGE — which value live record writes into a
+ * step (S081 P2 follow-up, user 2026-10-14).
+ *
+ * What: 1 = the value written into step N of the recording track is the
+ * parameter's value at its FIRST change during step N, written at once;
+ * later changes in the same step are not written to it (the knob's resting
+ * value is the menu value, or the next step's first change). A change made
+ * while no step of the recording track is known (transport stopped, or
+ * before the first step after a playhead break) is written at the start of
+ * the next step. 0 = the S081 P1 rule: the value the parameter holds when
+ * step N ends.
+ * Why: a step's automation plays back at the step's start. The P1 rule
+ * recorded the value at the step's end, so every recorded move played back
+ * up to one step early; the first change sits at the beginning of the
+ * step's motion. Both rules write at most one value per step and target.
+ * Affiliates: LiveRecord.c liveRec_paramIn(), liveRec_drainRing(),
+ * liveRec_stepEnd(). No RAM either way.
+ */
+#define LIVEREC_AUTOMATION_FIRST_CHANGE 1
+
 //if 1 the amp EGs will be calculated on a per sample basis
 //takes too much calcuklation time
 //if 0 they are calculated for each dma buffer once, only a smoothing LP will be calculated in the sync loop

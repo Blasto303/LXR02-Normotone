@@ -20,6 +20,7 @@
 #include "ledHandler.h"
 #include "menu.h"
 #include "sequencer.h"
+#include "LiveRecord.h"
 #include "SceneData.h"
 #include "PatternData.h"
 #include "EffectTypes.h"
@@ -581,8 +582,9 @@ uint8_t copyClear_copyPressed(uint8_t shift_held)
     uint32_t refused = 0u;
 
     /* Refusals remain silent; DEV trace records every applicable reason. */
-    if (seq_recordActive)                      refused |= 1u << 0u;
-    if (seq_eraseActive)                       refused |= 1u << 1u;
+    /* COPY stays refused while armed (S081 §19.10, F-N); liveRec_armed()
+    ** replaces the seq_recordActive/seq_eraseActive terms (B-6a/G-5). */
+    if (liveRec_armed())                       refused |= 1u << 0u;
     if (menu_isStorageBusy())                  refused |= 1u << 2u;
     if (menu_loadInstrumentTransactionBusy())  refused |= 1u << 3u;
     if (!cc_modeAllowed(mode))                 refused |= 1u << 4u;

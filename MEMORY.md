@@ -51,8 +51,10 @@ Session 080 in one paragraph:
   `(elapsed−anchor) % L == 0`, loop start = fastest track's current step
   start or last `qnt` boundary (rewind), resume by projection, scene change
   keeps anchors and re-snapshots the incoming Scene, resetting change → anchor
-  0. Sustained by any SELECT / looped VOICE / BAR; VOICE release drops its
-  track; SEQ is always a full change while looping.
+  0. Sustained (S081 P3: until every SELECT / VOICE / BAR is released) by any
+  SELECT / VOICE / BAR; VOICE release drops its track; SEQ is always a full
+  change while looping; live record and live erase run while looping (S081 P3,
+  L-2) and PERF Morph cells are recorded (FQ5).
 - **Scenes:** `scd` (direct, 0..9), `qcd` (queued, 0..17 incl. 5b..9b 12b 15b
   16b), `qac` (`nrm mut mrp res u+r o+r mmr rld r+r`; reload deferred); one
   PC reset `pcr` = `PAR_BAR_RESET_MODE` for direct + chain changes, queued
@@ -162,6 +164,27 @@ end; durable facts belong in `knowledge_files/log_archive/` or
   failures). Every looper publish holds PRIMASK; the wrap runs before the DDA
   advance; `seq_setStepIndexToStart()` rebases (does not end) an engaged loop;
   transport stop ends it. FX/Effects are never looped.
+- **Looper while recording (S081 P3) — binding:** the looper and live record
+  (LATCH or OVERDUB) or live erase run together; engaging, swapping, changing
+  division or releasing the loop never changes the record mode (plan L-2). The
+  loop is held until **every** SELECT, VOICE and BAR button is released or the
+  mode leaves PERF (plan Q1), with or without record; while it is engaged
+  SELECT/BAR/TRACK(=`VOICE`) keep their looper functions — a VOICE press with
+  no SELECT held adds its track, a release drops it, and a VOICE never fires
+  the overlay trigger, toggles a mute or starts an erase gesture (plan Q4,
+  FQ1, FQ2). Live-record boundary-ring entries have **one** producer function,
+  `seq_recRingPush()`: TIM3 for a step advance and for a mid-step loop wrap
+  (the jump flag), the foreground only inside the looper's PRIMASK for a
+  resume. PERF-page Morph cells (`1VM`..`6VM`, `fxm`) are recorded like the
+  same targets on the VOICE and Effect pages (plan FQ5); `mrp` is not (FQ7).
+- **Global Morph is never recorded (user, S081 P3 G-1) — binding:** `mrp`
+  (`PAR_MORPH`) has no recording target and no path into LiveRecord, from
+  the menu or MIDI. A global change writes all six voice Morph amounts and
+  the FX Morph amount (`preset_morphScene()`), so LiveRecord must never write
+  a re-read Morph value: each individual Morph edit (`1VM`..`6VM`/`Nvm`,
+  `fxm`, the Effect page Morph cell) is captured in `liveRec_morphValue[7]`
+  and every dirty Morph write uses it (`liveRec_recordValue7()`). Any new
+  write path or MIDI CC recording must keep this.
 - **One PC reset (S080, user):** `pcr` = `PAR_BAR_RESET_MODE` (key
   `bar_reset_mode`); with it on, **direct and chain-fired** scene changes
   restart tracks and the master clock. **Queued** changes ignore pcr and use
@@ -263,6 +286,13 @@ end; durable facts belong in `knowledge_files/log_archive/` or
   and mono maths may differ (stereo balance laws are centred on 63; mono
   laws use `squareRootLut`), but display and default must match. Do not
   change instrument defaults casually (user).
+- **No backward compatibility, ever (user, standing; restated S081):** stored
+  formats and stored values (PAT4, settings, AutoSave, specials indices) may
+  change meaning freely. Do not offer migration, aliasing or converter
+  options in plans, and do not raise compatibility as a follow-up question.
+- **Wording (user, S081):** stored data are *files* (PAT4 files, settings
+  files, AutoSave records), not "cards". "Card" means only the physical SD
+  card.
 - **No backward compatibility for S075 F2 storage (user):** before testing
   this firmware on an older card, delete `.hcprms1`/`.hcprms2` and other
   temporary records (AutoSave Scene cells 45..50 are not migrated).

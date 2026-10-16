@@ -68,6 +68,7 @@
 #include "endlessPots.h"
 #include "mixer.h"
 #include "PatternStackService.h"
+#include "LiveRecord.h"
 #include "copyClearService.h"
 
 /* -----------------------------------------------------------------------
@@ -198,6 +199,17 @@ void timebase_serviceFrontPanel(void)
      * bounded service step; no new timing or storage state is allocated here.
      * Affiliate: PatternStackService.c.
      */
+    /*
+     * LiveRecord service runs before patSvc_tick (S081 §19.12, B-9a).
+     *
+     * What: calls liveRec_service() immediately before patSvc_tick() in the
+     * 500 Hz foreground pass. Why: LiveRecord's step-end writes and erase ops must
+     * be submitted to the Pattern Stack Service before patSvc_tick() drains the
+     * queue, so idle-direct execution can process them in the same pass. Inputs:
+     * none. Outputs: LiveRecord state serviced, patSvc ops submitted.
+     * Affiliates: patSvc_tick, liveRec_service.
+     */
+    liveRec_service();
     patSvc_tick();
 
     /*

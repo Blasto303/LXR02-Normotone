@@ -348,6 +348,17 @@ only works while sector 6 holds no code.
 - **Session 080 changes:** `.bss` +200 B, `.data` +4 B over S079 (owners in
   the header and §8.2). DEV link `text=556,008`, `data=412`, `bss=427,976`;
   flash payload 556,420 B.
+- **Session 081 changes:** S081 P3 added a +12 B stack frame for
+  `seq_track_time_t` (approved stack-budget increase) and, with its global
+  Morph fix G-1, **+7 B SRAM1** `.bss`: LiveRecord `liveRec_morphValue[7]`
+  (owner LiveRecord, static runtime-only, approved by the user; the section
+  reports +8 B with alignment). S081 P4 adds **+2 B SRAM1** `.data`: ledHandler
+  `led_barPulseTrack` and `led_barPulseBar`, both 0xFF-initialised sentinels
+  (owner ledHandler, static runtime-only, approved by the user); the linker
+  script's `.data` `ALIGN(4)` reports the section as +4 B. DEV link after
+  P4: `text=573,160`, `data=416`, `bss=429,104`; flash payload 573,576 B.
+  After P3 G-1: `text=573,296`, `data=416`, `bss=429,112`; flash payload
+  573,712 B.
 - **Session 079 changes:** `.bss` +160 B (owners in the header). DEV link
   `text=544,072`, `data=408`, `bss=427,776`.
 - **Session 078 changes:** `.bss` +608 B (owners listed in the header and
@@ -516,6 +527,8 @@ byte, including alignment and small variables omitted here.
 | `sequencer.c`: PERF looper (S080) | 67 | `seq_loopActive` (ISR gate), `seq_loopTrackMask`/`Division`/`Modifier`, per track `seq_loopAnchor[7]` (uint32 master tick, 28 B) and the snapshot `seq_loopStartStep[7]` (14 B), `seq_loopStartAccum[7]` (14 B), `seq_loopStartPlayState[7]` (7 B). Runtime only; written under PRIMASK, read by TIM3 (`PATTERN_DYNAMIC_STACK.md` §6.5). |
 | `sequencer.c`: scene change / chain state (S080) | 12 | Pending direct/queued change (index, division, flags, fire flag, 7 B) and chain runtime (bar/repetition counts, previous Scene, `stp` freeze, chain-fire marker, 5 B) (`PATTERN_DYNAMIC_STACK.md` §6.6). |
 | `buttonHandler.c` / `ledHandler.c` / `menu.c`: PERF UI state (S080) | 25 | Looper holds 5 B, BAR overlay runtime 10 B, SHIFT+REC 3 B, release-consume and chain chord 2 B, fast blink 4 B, chain editor Scene 1 B. |
+| `LiveRecord.c`: individual Morph capture (S081 P3 G-1) | 7 | `liveRec_morphValue[7]`: the 7-bit value of the last individual edit of each voice Morph (slots 1..6) and the FX Morph. Every dirty Morph write uses it, so a global Morph change (never recorded) cannot leak into a recorded Morph value. Runtime-only, foreground; written by `liveRec_paramIn()`, read by `liveRec_recordValue7()`. |
+| `ledHandler.c`: VOICE-mode bar pulse (S081 P4) | 2 | `led_barPulseTrack` and `led_barPulseBar` (0xFF = none): the active track and bar last seen by `led_updateVoiceBarPulse()`, so the SELECT LED of a new bar pulses once in VOICE mode. Runtime-only, foreground, written only from the CHASE branch of `led_processSeqLedState()`. Initialised 0xFF, so `.data`, not `.bss`. |
 | `sequencer.c`: per-track timing state (S078) | 76 | ISR-static: `seq_trackAccumulator[7]` (Q8.8, 14 B), `seq_fxAccumulator` (2 B), `seq_fxStepCounter` (4 B), `seq_trackShuffleDelay/Pending/Vel/Note[7]` (28 B), `seq_trackPlayState[7]` (7 B), `seq_effectiveTrackLength/Scale/Shuffle[7]` (21 B, the morphed/automated timing cache). Written by TIM3 and by foreground refresh points (`PATTERN_DYNAMIC_STACK.md` §6.4). |
 | `presetMorphEngine.c`: track step overrides (S078) | 24 | `track_param_override_value[3][7]` + `track_param_override_mask[3]`: runtime-only length/scale/shuffle step-automation overlay. |
 | `InstrumentManager.c`: `lfo_descriptor_targets` | 192 | Twelve descriptor LFO adapters for six slots and two target pairs. |

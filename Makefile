@@ -130,6 +130,7 @@ SRCS = \
 	  Core/Sequencer/sequencer.c \
 	  Core/Sequencer/sequencerTimer.c \
 	  Core/Sequencer/clockSync.c \
+	  Core/Sequencer/LiveRecord.c \
   Core/SampleRom/SampleMemory.c \
   Core/SampleRom/sampleFlash.c \
   Core/Src/startup_stm32f765xx.s

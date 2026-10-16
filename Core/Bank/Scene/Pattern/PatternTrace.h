@@ -49,7 +49,14 @@ typedef enum {
     PAT_TRACE_STAGE_WRONG_SCENE = 'X',
     PAT_TRACE_STAGE_REPAIR_RESERVE = 'V',
     PAT_TRACE_STAGE_REPAIR_RELOC = 'L',
-    PAT_TRACE_STAGE_DIRECT_RETAIN = 'D'
+    PAT_TRACE_STAGE_DIRECT_RETAIN = 'D',
+    /*
+     * W (S081 P1B): a live-record write, clear or capture was dropped. flags =
+     * cause (1 handover/target closed, 2 ownership, 3 staging full, 4 service
+     * rejected, 5 ring full, 6 capacity); value = (track << 8) | step. DEV
+     * builds only, like every PatternTrace record.
+     */
+    PAT_TRACE_STAGE_LIVEREC_DROP = 'W'
 } pat_trace_stage_t;
 
 /* Record one timestamped event. Safe to call from TIM3/foreground context. */

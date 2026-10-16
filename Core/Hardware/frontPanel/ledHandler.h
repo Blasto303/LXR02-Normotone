@@ -122,6 +122,8 @@ void led_clearAll(void);
  * one-shot inversion that returns to original state automatically.
  * led_setBlinkLed() starts/stops persistent blinking until explicitly cleared.
  * led_clearAllBlinkLeds() cancels every blink slot and restores base state.
+ * S081 P4: pulse and flash deadlines are compared by signed 16-bit distance,
+ * so effects started just before the time_sysTick wrap last their full time.
  */
 void led_tickHandler(void);
 void led_pulseLed(uint8_t ledNr);
@@ -198,7 +200,9 @@ void led_updateAutomationStepView(uint8_t track, uint8_t pattern,
  *   LED/menu-aware rendering here in ledHandler.c.
  *
  * Meaning of each bit:
- * - CHASE: chase/current-step LED should move to seq_ledState.chaseStep.
+ * - CHASE: chase/current-step LED should move to seq_ledState.chaseStep;
+ *   the drain also checks the active track's bar for the VOICE-mode bar
+ *   pulse (S081 P4), reading the track live, not from chaseStep.
  * - BEAT: START/STOP beat pulse LED should reflect seq_ledState.beatPulse.
  * - REC_SUB: compatibility dirty bit; SELECT1..8 now identify bars, so the
  *   exported handler is a documented no-op during the bridge.
@@ -212,21 +216,21 @@ void led_updateAutomationStepView(uint8_t track, uint8_t pattern,
  */
 #define SEQ_LED_DIRTY_CHASE    0x01
 #define SEQ_LED_DIRTY_BEAT     0x02
-#define SEQ_LED_DIRTY_REC_SUB  0x04
+/* 0x04 retired in S081 B-8 (the recordSubStep endpoint is removed). */
 #define SEQ_LED_DIRTY_REC_MAIN 0x08
 
 typedef struct {
     /* Bitmask of SEQ_LED_DIRTY_* values. Written by sequencer.c, drained by
      * led_processSeqLedState() in foreground. */
     volatile uint8_t dirty;
-    /* Sub-step index 0..127 for the moving chase light. */
+    /* Sub-step index 0..127 for the moving chase light. Carries no track id;
+     * the S081 P4 bar pulse reads the active track live through
+     * seq_captureTrackTime() instead of this field. */
     volatile uint8_t chaseStep;
     /* 0/1 value for the temporary beat pulse on LED_START_STOP. */
     volatile uint8_t beatPulse;
-    /* Sub-step index 0..127 that was just recorded and may need SELECT LED
-     * refresh if the current UI page is showing that bridge step. */
-    volatile uint8_t recordSubStep;
-    /* Bridge step index 0..127 whose STEP-row LED may need refresh. */
+    /* Absolute step index 0..127 whose STEP-row LED may need refresh (S081
+     * B-8c: the field now carries the absolute step, not step % 16). */
     volatile uint8_t recordMainStep;
 } SeqLedState;
 
@@ -250,17 +254,10 @@ extern SeqLedState seq_ledState;
  */
 /* Move/clear chase feedback for playback step `step` after page/pattern checks. */
 void led_updateCurrentStep(uint8_t step);
-/* Refresh STEP-row record feedback for one recorded bridge step. */
+/* Refresh STEP-row record feedback for one recorded absolute step (S081 B-8c). */
 void led_updateRecordedMainStep(uint8_t activeTrack,
                                 uint8_t shownPattern,
-                                uint8_t subStep);
-/* Compatibility no-op for old SELECT-row record feedback. */
-void led_updateRecordedSubStep(uint8_t activeTrack,
-                               uint8_t shownPattern,
-                               uint8_t step,
-                               uint8_t selectedStepBase,
-                               uint8_t shiftHeld,
-                               uint8_t selectMode);
+                                uint8_t step);
 /* Repaint STEP and SELECT rows from PatternData for one track/pattern view. */
 void led_updatePatternTrack(uint8_t track, uint8_t pattern,
                             uint8_t selectedStepBase);
@@ -279,6 +276,10 @@ void led_notifyPatternChanged(uint8_t playedPattern);
  * seq_isRunning() is zero, the drain clears any retained LED_LAYER_CHASE
  * rather than installing a playback-position inversion on the STEP row.
  * This covers boot, transport stop, and stopped Scene/pattern realignment.
+ * S081 P4: in VOICE mode a CHASE drain that finds the active track in a new
+ * bar pulses that bar's SELECT LED once (single-bar and rnd tracks never; no
+ * pulse on the first step after a start). The bar is read live through
+ * seq_captureTrackTime(), not from chaseStep, which has no track id.
  */
 void led_processSeqLedState(void);
 

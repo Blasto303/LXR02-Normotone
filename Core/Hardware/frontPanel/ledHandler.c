@@ -85,12 +85,15 @@
 /*
  * One-shot pulse slots.
  *
- * led_pulseEndTime stores an absolute time_sysTick deadline for each active
- * pulse slot. led_pulseLedNumber stores the logical LED ID that must be
- * restored when the deadline passes. led_pulsingLeds is the active-slot bitset:
- * bit N set means slot N is in use. led_tickHandler() is the only normal
- * consumer. The arrays are volatile because the tick handler may run from the
- * timer-driven LED service path while foreground code starts effects.
+ * led_pulseEndTime stores the time_sysTick deadline for each active pulse
+ * slot (start + LED_PULSE_TIME_MS, truncated to the 16-bit millisecond
+ * clock). led_pulseLedNumber stores the logical LED ID that must be restored
+ * when the deadline passes. led_pulsingLeds is the active-slot bitset: bit N
+ * set means slot N is in use. led_tickHandler() is the only normal consumer;
+ * it tests the deadline by signed 16-bit distance (S081 P4), so a pulse
+ * started just before the clock wraps lasts its full time. The arrays are
+ * volatile because effects are started and serviced from different call
+ * sites of the main loop.
  */
 static volatile uint16_t led_pulseEndTime[NUM_OF_PULSABLE_LEDS];
 static volatile uint8_t  led_pulseLedNumber[NUM_OF_PULSABLE_LEDS];
@@ -105,6 +108,11 @@ static volatile uint8_t  led_pulsingLeds;
  * flash is active; expiry uses led_renderFromStack(), so it restores the
  * highest remaining layer or the base state that is current at expiry rather
  * than a snapshot taken when the flash began.
+ *
+ * S081 P4: led_flashEndTime and led_flashNextTime are 16-bit time_sysTick
+ * deadlines; led_tickHandler() compares them by signed 16-bit distance, so
+ * a flash near the clock wrap neither ends at once nor steps its phase on
+ * every tick.
  */
 static volatile uint16_t led_flashEndTime[NUM_OF_FLASHABLE_LEDS];
 static volatile uint16_t led_flashNextTime[NUM_OF_FLASHABLE_LEDS];
@@ -954,23 +962,49 @@ uint8_t led_isBlinkLed(uint8_t ledNr)
 }
 
 /*
+ * Has a 16-bit millisecond deadline passed? (S081 P4)
+ *
+ * What: 1 once time_sysTick is past `deadline`, by signed 16-bit distance;
+ * 0 while the deadline is up to 32,767 ms ahead, also across the clock wrap.
+ * Why: time_sysTick wraps every 65.536 s, so a plain `now > deadline`
+ * compare is wrong whenever the deadline has wrapped and the clock has not
+ * (pulses lost, flashes ended or flickering). Matches the plain compare's
+ * "strictly after" meaning, so effect durations are unchanged away from the
+ * wrap. Inputs: deadline. Output: flag. Accessors: led_tickHandler() (pulse
+ * and flash). Affiliates: the fast-blink test in led_tickHandler()
+ * (the same rule, written inline), timebase.h time_sysTick.
+ */
+static uint8_t led_timeReached(uint16_t deadline)
+{
+    return (uint8_t)((int16_t)(uint16_t)(time_sysTick - deadline) > 0);
+}
+
+/*
  * Service time-based LED effects.
  *
- * Why: pulse and blink effects are represented as small slot tables so callers
- * can request visual feedback without blocking. Inputs are implicit global
- * effect state and time_sysTick. Outputs: expired pulse slots clear their
- * layers and render fallback state, while active blink slots toggle at
- * LED_BLINK_TIME_MS intervals unless a higher layer owns the LED.
+ * Why: pulse, flash and blink effects are small slot tables so callers can
+ * request visual feedback without blocking. Inputs are implicit global effect
+ * state and time_sysTick. Outputs: expired pulse slots clear their layers and
+ * render fallback state, flash groups step their phase and expire, active
+ * blink slots toggle at LED_BLINK_TIME_MS intervals unless a higher layer owns
+ * the LED, and the fast blink toggles its phase.
  *
- * Call timing: invoked from the front-panel/timebase service path. It must stay
- * cheap and non-blocking. It does not drain sequencer LED dirty state; that is
- * handled separately by led_processSeqLedState() in the foreground loop.
+ * Deadlines (S081 P4): every deadline is a 16-bit time_sysTick value. Pulse
+ * and flash deadlines are tested with led_timeReached() (signed 16-bit
+ * distance), the same rule the fast blink uses. The former `now > deadline`
+ * test ended a pulse or flash started just before the 65.536 s clock wrap at
+ * once (the pulse was never seen) and made a flash's phase step on every
+ * tick.
+ *
+ * Call timing: the main loop (main.c), between audio render passes. It must
+ * stay cheap and non-blocking. It does not drain sequencer LED dirty state;
+ * that is led_processSeqLedState(), also in the main loop.
  */
 void led_tickHandler(void)
 {
     int i;
     for (i=0;i<NUM_OF_PULSABLE_LEDS;i++) {
-        if ((led_pulsingLeds & (1<<i)) && (time_sysTick > led_pulseEndTime[i])) {
+        if ((led_pulsingLeds & (1<<i)) && led_timeReached(led_pulseEndTime[i])) {
             uint8_t ledNr = led_pulseLedNumber[i];
             uint8_t physLed = led_toPhysicalNumber(ledNr);
             uint8_t index = (physLed == LED_BAR1) ? 40u : physLed;
@@ -982,11 +1016,11 @@ void led_tickHandler(void)
     }
     for (i=0;i<NUM_OF_FLASHABLE_LEDS;i++) {
         if (led_flashingLeds & (1<<i)) {
-            if (time_sysTick > led_flashEndTime[i]) {
+            if (led_timeReached(led_flashEndTime[i])) {
                 led_flashingLeds &= (uint8_t)~(1<<i);
                 led_restoreFlashMask((LedFlashGroup)i, led_flashMask[i]);
                 led_flashMask[i] = 0u;
-            } else if (time_sysTick > led_flashNextTime[i]) {
+            } else if (led_timeReached(led_flashNextTime[i])) {
                 led_flashPhase[i]++;
                 led_flashNextTime[i] = (uint16_t)(led_flashNextTime[i] + LED_FLASH_CYCLE_TIME_MS);
                 led_applyFlashMask((LedFlashGroup)i, led_flashMask[i],
@@ -1338,10 +1372,10 @@ void led_updateCurrentStep(uint8_t step)
  * Refresh the STEP-row LED after a live-recorded note changes pattern data.
  *
  * Inputs: activeTrack is the currently edited Menu voice/track; shownPattern is
- * the pattern slot currently shown by the UI; subStep is the recorded
- * 0..127 bridge step. Output: the corresponding STEP1..16 LED is set from
- * PatternData if the step is inside menu_currentBar. No pattern storage is
- * mutated here.
+ * the pattern slot currently shown by the UI; step is the recorded absolute step
+ * 0..127 (S081 B-8c). Output: the corresponding STEP1..16 LED is set from
+ * PatternData when step is inside menu_currentBar (step / 16 == menu_currentBar).
+ * No pattern storage is mutated here.
  *
  * Common caller: led_processSeqLedState() after sequencer.c marks
  * SEQ_LED_DIRTY_REC_MAIN. Confederates: PatternData owns the step active bit
@@ -1349,13 +1383,13 @@ void led_updateCurrentStep(uint8_t step)
  */
 void led_updateRecordedMainStep(uint8_t activeTrack,
                                 uint8_t shownPattern,
-                                uint8_t subStep)
+                                uint8_t step)
 {
     /* Called after live recording or MIDI recording when one bridge step may
      * have changed. This belongs in ledHandler because it is strictly a physical
      * STEP1..16 presentation update; PatternData owns the active bit queried
      * below. */
-    uint8_t mainStep = (uint8_t)(subStep % NUM_STEPS_PER_BAR);
+    uint8_t mainStep = (uint8_t)(step % NUM_STEPS_PER_BAR);
     uint8_t on = 0;
 
     /* Performance page STEP LEDs select rotation/performance actions rather than
@@ -1364,51 +1398,24 @@ void led_updateRecordedMainStep(uint8_t activeTrack,
         menu_activePage == EFFECT_PAGE ||
         menu_fxVoiceMixOverlayActive())
         return;
-    /* subStep is expected to be 0..127; modulo maps it into STEP1..16. Keep the
-     * guard because seq_ledState is shared state. */
-    if (mainStep >= 16u)
-        return;
-
-    if ((subStep < (uint8_t)(menu_currentBar * NUM_STEPS_PER_BAR)) ||
-        (subStep >= (uint8_t)((menu_currentBar + 1u) * NUM_STEPS_PER_BAR)))
+    /* S081 B-8c: draw only when the absolute step is in the visible bar. */
+    if ((step / NUM_STEPS_PER_BAR) != menu_currentBar)
         return;
 
     /* Query the PatternData owner for the actual bridge step bit. */
     if (pat_trackValid(activeTrack) && pat_patternValid(shownPattern))
-        on = pat_isStepActive(activeTrack, subStep, shownPattern);
+        on = pat_isStepActive(activeTrack, step, shownPattern);
 
     /* STEP1 + mainStep is the physical 16-button row. */
     led_setValue(on, (uint8_t)(LED_STEP1 + mainStep));
 }
 
 /*
- * Ignore SELECT-row record feedback during the 8-bar bridge.
+ * Removed: SEQ_LED_DIRTY_REC_SUB endpoint (S081 §19.8, B-8a/b).
  *
- * Inputs are kept for API stability with sequencer dirty-state callers, but the
- * bridge no longer uses SELECT LEDs to display recorded step data. SELECT1..8
- * identify bars, and led_updateRecordedMainStep() owns STEP-row feedback.
- *
- * Common caller: led_processSeqLedState() after SEQ_LED_DIRTY_REC_SUB. This
- * function deliberately does nothing until the later Scene UI replaces the
- * compatibility dirty bit.
+ * What: led_updateRecordedSubStep() and the recordSubStep field were a
+ * compatibility no-op with no writer. The absolute-step recordMainStep stays.
  */
-void led_updateRecordedSubStep(uint8_t activeTrack,
-                               uint8_t shownPattern,
-                               uint8_t step,
-                               uint8_t selectedStepBase,
-                               uint8_t shiftHeld,
-                               uint8_t selectMode)
-{
-    /* SELECT LEDs now indicate the viewed bar and must not be rewritten by
-     * recording feedback. Preserve the exported helper as a compatibility
-     * endpoint for seq_ledState until the old REC_SUB dirty bit is deleted. */
-    (void)activeTrack;
-    (void)shownPattern;
-    (void)step;
-    (void)selectedStepBase;
-    (void)shiftHeld;
-    (void)selectMode;
-}
 
 /*
  * Repaint sequencer LEDs for one visible track/pattern.
@@ -1587,6 +1594,80 @@ static void led_updateSelectBarChaselight(void)
     }
 }
 
+static uint8_t led_barPulseTrack = 0xFFu;
+static uint8_t led_barPulseBar   = 0xFFu;
+
+/*
+ * VOICE-mode bar pulse state (S081 P4).
+ *
+ * What: the track and bar (0..7) last seen by led_updateVoiceBarPulse();
+ * 0xFF = none (transport stopped, cursor not started, or never seen). Why:
+ * the pulse fires when the active track's bar differs from the bar of the
+ * last step seen on the SAME track; remembering in every mode keeps the
+ * baseline current, so entering VOICE mode or changing the active voice never
+ * pulses by itself. Writers/readers: led_updateVoiceBarPulse() only.
+ * Lifetime: static, runtime-only. RAM: 2 B SRAM1 (approved, plan Q4).
+ * Affiliates: led_processSeqLedState() (CHASE branch).
+ */
+
+/*
+ * Pulse the SELECT LED of a new bar in VOICE mode (S081 P4).
+ *
+ * What: reads the active track's live step, effective length and play mode
+ * (seq_captureTrackTime(), one PRIMASK copy) and, when its bar (step / 16)
+ * differs from the bar last seen on the same track, pulses SELECT(bar + 1)
+ * once with led_pulseLed(): a 50 ms inversion on the pulse layer that never
+ * changes the SELECT row's base state, so the VOICE sub-page indicator keeps
+ * working (spec 2). No pulse when:
+ *  - the mode is not VOICE (STEP has its own bar chaselight; PERF never shows
+ *    the bar);
+ *  - the effective length is 16 or less (a single bar; also when a Morph or
+ *    length automation shortens the track);
+ *  - the play mode is rnd (3);
+ *  - the bar is the one being left (pip boundary repeat, a wrap within one
+ *    bar, a loop back to the same bar);
+ *  - the active voice changed since the last call (re-baselined instead);
+ *  - the transport is stopped: the bar is forgotten, so the first step after
+ *    a start never pulses (plan Q2).
+ * A jump into another bar (realign, looper resume, per-track Scene or length
+ * change) pulses once like any bar change (plan Q3). The track and bar are
+ * remembered in every mode.
+ * Why: why not seq_ledState.chaseStep: it carries no track id, so a voice
+ * change between the TIM3 write and this drain would compare two tracks and
+ * pulse falsely. Inputs: menu_getActiveVoice(), seq_isRunning(), the
+ * snapshot, buttonHandler_getMode(). Outputs: at most one led_pulseLed();
+ * led_barPulseTrack/Bar. Context: foreground (main-loop drain). Accessors:
+ * led_processSeqLedState() (CHASE branch, every mode). Affiliates:
+ * led_pulseLed(), led_tickHandler() (expiry), led_setActiveSelectButton()
+ * (the base state it must not disturb), led_updateSelectBarChaselight()
+ * (STEP-mode counterpart).
+ */
+static void led_updateVoiceBarPulse(void)
+{
+    seq_track_time_t snap;
+    uint8_t track = menu_getActiveVoice();
+    uint8_t bar;
+
+    if (!seq_isRunning() || track >= NUM_TRACKS) {
+        led_barPulseTrack = 0xFFu;
+        led_barPulseBar = 0xFFu;
+        return;
+    }
+    seq_captureTrackTime(track, &snap);
+    bar = (snap.stepIndex < 0)
+        ? 0xFFu : (uint8_t)((uint8_t)snap.stepIndex / NUM_STEPS_PER_BAR);
+    if (bar < NUM_BARS &&
+        track == led_barPulseTrack &&
+        led_barPulseBar != 0xFFu &&
+        bar != led_barPulseBar &&
+        snap.length > NUM_STEPS_PER_BAR &&
+        snap.playMode != 3u &&                    /* 3 = rnd */
+        buttonHandler_getMode() == SELECT_MODE_VOICE)
+        led_pulseLed((uint8_t)(LED_PART_SELECT1 + bar));
+    led_barPulseTrack = track;
+    led_barPulseBar = bar;
+}
+
 /*
  * Notify the front-panel layer that playback has switched patterns.
  *
@@ -1643,6 +1724,9 @@ void led_notifyPatternChanged(uint8_t playedPattern)
  * timing and physical UI. Common caller: main loop after front-panel services.
  * Invariant: a CHASE event is rendered only while seq_isRunning() is nonzero;
  * when transport is stopped, the event clears the retained CHASE layer.
+ * S081 P4: the CHASE branch also runs led_updateVoiceBarPulse(), which
+ * pulses the SELECT LED of a new bar in VOICE mode and keeps its baseline
+ * current in every mode.
  */
 void led_processSeqLedState(void)
 {
@@ -1740,6 +1824,20 @@ void led_processSeqLedState(void)
          */
         if (buttonHandler_getMode() == SELECT_MODE_STEP)
             led_updateSelectBarChaselight();
+
+        /*
+         * VOICE-mode bar pulse (S081 P4).
+         *
+         * What: one pulse of the new bar's SELECT LED when the active
+         * track's bar changes in VOICE mode; in every other mode the call
+         * only keeps the remembered track/bar current, and with the
+         * transport stopped (the CHASE dirty at stop) it forgets them. Why:
+         * the CHASE dirty bit fires at every step advance, at playhead jumps
+         * and at stop, exactly when the bar can change. Inputs/outputs: see
+         * led_updateVoiceBarPulse(). Affiliates: led_updateVoiceBarPulse(),
+         * led_updateSelectBarChaselight() (STEP mode, above).
+         */
+        led_updateVoiceBarPulse();
     }
 
     /* Recorded step: update STEP1..16 for the visible bar unless performance
