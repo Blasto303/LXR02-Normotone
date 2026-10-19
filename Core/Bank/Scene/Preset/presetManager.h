@@ -187,6 +187,12 @@ uint8_t preset_loadSceneForScenes(uint16_t presetNr, uint16_t scene_mask);
  */
 #define PRESET_BANK_LOAD_BOOT     0x01u
 #define PRESET_BANK_LOAD_REPLACE  0x02u
+/*
+ * Progressive runtime Bank load (S082 P3): loaded children become available
+ * one by one; equals FS_BANK_FLAG_PROGRESSIVE. Set only by the background
+ * load for an unlocked load.
+ */
+#define PRESET_BANK_LOAD_PROGRESSIVE 0x10u
 uint8_t preset_loadBank(uint16_t presetNr, uint16_t act_mask,
                         uint16_t empty_mask, uint8_t flags);
 uint8_t preset_saveBank(uint16_t presetNr, uint16_t act_mask,
@@ -234,6 +240,13 @@ uint8_t preset_buildBackgroundScene(uint8_t rebuild_in_place,
 uint8_t preset_requestBackgroundBankLoad(uint16_t slot, uint16_t act_mask,
                                          uint16_t empty_mask, uint8_t origin);
 uint8_t preset_backgroundBankLoadRunning(void);
+/*
+ * Unlocked: phase 5 of a progressive load, the panel is free (S082 P3).
+ * Locked: running and not unlocked (S082 P1 R7 drop applies).
+ * Accessors: ButtonHandler, Menu, LED owner.
+ */
+uint8_t preset_backgroundBankLoadUnlocked(void);
+uint8_t preset_backgroundBankLoadLocked(void);
 void preset_tickBackgroundBankLoad(void);
 /*
  * Background Bank load result codes (S082 P1 D34).

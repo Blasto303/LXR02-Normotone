@@ -1361,8 +1361,9 @@ static void buttonHandler_setRemoveStep(uint8_t ledNr, uint8_t seqButtonPressed)
      * removes. Keeping the name avoids unrelated call-site churn during the
      * FrontPanelParser removal.
      */
-    /* S081 H-2b (Q13): silently refuse STEP toggles while T != A. */
-    if (liveRec_activePatternLocked())
+    /* S081 H-2b (Q13): silently refuse STEP toggles while T != A.
+     * S082 P3 D45: also while the viewed Scene is still being loaded. */
+    if (liveRec_activePatternLocked() || menu_viewedSceneLoadPending())
         return;
     uint8_t trackNr;
     uint8_t patternNr;
@@ -1423,7 +1424,8 @@ static void buttonHandler_perfRefreshHeldSceneLeds(void);
  * instrument apply armed, perf_voiceActionOccurred set so the subsequent VOICE
  * release does not toggle mute, and the double-click window cancelled. HiHat
  * link: tracks 5 and 6 always switch together inside seq_setTrackPlayedScene()
- * and share slot 5. Validation: the Scene must be resident (bank_scenePresent).
+ * and share slot 5. Validation: the Scene must be available (resident, and
+ * not pending in a background Bank load, S082 P3).
  * Affiliates: seq_setTrackPlayedScene(), seq_realignTrackToMasterClock(),
  * preset_startSingleVoiceApply().
  */
@@ -1431,8 +1433,9 @@ static void buttonHandler_perfVoiceHeldSeqPressed(uint8_t seqButtonPressed)
 {
     uint8_t track;
 
+    /* S082 P3 D52: per-track moves only to available Scenes (manual change). */
     if (seqButtonPressed >= SCENE_COUNT || seqButtonPressed >= 16u ||
-        !bank_scenePresent(seqButtonPressed))
+        !bank_sceneAvailable(seqButtonPressed))
         return;
 
     for (track = 0u; track < NUM_TRACKS; track++) {
@@ -1477,8 +1480,9 @@ static void buttonHandler_perfScenePressed(uint8_t seqButtonPressed)
     uint8_t isDouble = (uint8_t)(!dblclick_armed &&
                                  dblclick_button == seqButtonPressed);
 
+    /* S082 P3 D52: Scene and view changes only to available Scenes. */
     if (seqButtonPressed >= SCENE_COUNT || seqButtonPressed >= 16u ||
-        !bank_scenePresent(seqButtonPressed))
+        !bank_sceneAvailable(seqButtonPressed))
         return;
 
     if (parameter_values[PAR_FOLLOW]) {
@@ -1696,8 +1700,11 @@ static void buttonHandler_seqButtonPressed(uint8_t seqButtonPressed)
                 (void)menu_chainMenuOpen(seqButtonPressed);
                 break;
             }
+            /* S082 P3 D52: queue only an available Scene; availability only
+             * grows during a load, so the target is still valid when the
+             * change fires. */
             if (seqButtonPressed < SCENE_COUNT &&
-                bank_scenePresent(seqButtonPressed)) {
+                bank_sceneAvailable(seqButtonPressed)) {
                 seq_queueSceneChange(seqButtonPressed,
                                      parameter_values[PAR_SCENE_QUEUE_DIV]);
             }
@@ -1888,19 +1895,20 @@ static void handleModeButtons(uint8_t mode)
         return;
     }
     /*
-     * A running background Bank load owns the panel (S082 P1 R7, D7).
+     * A locked background Bank load owns the panel (S082 P1 R7, D7;
+     * S082 P3 D38, D40).
      *
-     * What: every MODE press is dropped while
-     * preset_backgroundBankLoadRunning(): no latch closes, no looper
-     * release, no mode/LED change, no page switch, and nothing is queued.
-     * Why: the UI stays on Load:[Bank] until the load ends and then stays
-     * there (D7); a queued exit would fire right after the load, and an
-     * applied one would leave the page under a running load.
-     * Inputs: preset_backgroundBankLoadRunning(). Outputs: none.
+     * What: every MODE press is dropped while the load is locked (phases 1-4
+     * and 6, or a load requested stopped). Once it is unlocked MODE works
+     * normally; Menu shows the frozen Load:[Bank] screen for Load/Save.
+     * Why: the UI stays on Load:[Bank] until the load ends (D7); a queued exit
+     * would fire right after the load, and an applied one would leave the page
+     * under a running load.
+     * Inputs: preset_backgroundBankLoadLocked(). Outputs: none.
      * Accessors: MODE button presses.
-     * Affiliates: menu_switchPage() backstop (c), preset_tickBackgroundBankLoad().
+     * Affiliates: menu_switchPage() backstop, preset_tickBackgroundBankLoad().
      */
-    if (preset_backgroundBankLoadRunning())
+    if (preset_backgroundBankLoadLocked())
         return;
     {
         uint8_t next;
@@ -2335,9 +2343,9 @@ static void buttonHandler_partButtonReleased(uint8_t partNr)
  */
 static void buttonHandler_shiftRecMenuEnter(void)
 {
-    /* SHIFT+REC is dropped while a background Bank load owns the panel
-     * (S082 P1 R7); nothing is saved or switched. */
-    if (preset_backgroundBankLoadRunning())
+    /* SHIFT+REC is dropped while a locked background Bank load owns the
+     * panel (S082 P1 R7); an unlocked load allows it (S082 P3 W3). */
+    if (preset_backgroundBankLoadLocked())
         return;
     bh_shiftRecSavedPage = menu_getActivePage();
     bh_shiftRecSavedSubPg = menu_getSubPage();

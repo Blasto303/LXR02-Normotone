@@ -558,6 +558,7 @@ uint8_t effects_storeValue7(uint8_t scene_index, uint8_t local,
  * Effect type differs, protecting local descriptor/lane indices until the
  * layout gate and revalidation have repaired every mask. Inactive edits reach
  * only their origin, matching VOICE editing. Foreground-only; no SRAM.
+ * Affiliates: bank_loadUnavailableMask().
  */
 static uint32_t effects_fanoutMask(uint8_t scene_index, uint8_t match_type)
 {
@@ -576,6 +577,13 @@ static uint32_t effects_fanoutMask(uint8_t scene_index, uint8_t match_type)
         mask |= (uint32_t)bank_sceneMaskVoiceEdit();
     else
         mask |= (uint32_t)bank_sceneMaskVoiceEditForScene(scene_index);
+    /*
+     * S082 P3 D44: no Effect fan-out into a Scene a running background Bank
+     * load has not finished (pending, in progress or emptied); zero mask
+     * outside a load. Affiliates: bank_loadUnavailableMask(),
+     * bank_editTargetMask().
+     */
+    mask &= ~(uint32_t)bank_loadUnavailableMask();
     if (!match_type)
         return mask;
     for (s = 0u; s < SCENE_COUNT; s++) {

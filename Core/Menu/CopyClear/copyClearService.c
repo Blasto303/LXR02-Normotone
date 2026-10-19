@@ -17,6 +17,7 @@
 #include "clearOps.h"
 #include "PatternData.h"
 #include "SceneData.h"
+#include "BankData.h"
 #include "PatternStackService.h"
 #include "filesystem.h"
 #include "Autosave.h"
@@ -193,6 +194,21 @@ static uint8_t ccSvc_ensureScratch(void)
 {
     if (ccSvc_buf)
         return 1u;
+    /*
+     * Hold the name loan while a Load/Save command runs (S082 P3 D53).
+     *
+     * What: no borrow while menu_isLoadSaveCommandActive(), which covers a
+     * background Bank load from OK (or the MIDI UI take-over) to its final
+     * index restore. Why: the facade is busy for the whole load, and right
+     * after it the frozen screen's final Bank index restore reuses the same
+     * 9 kB array; a borrow in between would corrupt one or the other. A job
+     * in its name phase waits; its content is already committed.
+     * Inputs: menu_isLoadSaveCommandActive(). Outputs: 0 (not ready).
+     * Affiliates: ccSvc_namesReady(),
+     * menu_requestLoadCommandFinalIndexRestore().
+     */
+    if (menu_isLoadSaveCommandActive())
+        return 0u;
     ccSvc_buf = filesystem_borrowNameCacheScratch();
     if (!ccSvc_buf)
         return 0u;
@@ -1595,6 +1611,42 @@ static void ccSvc_traceOpFinish(void) { }
 #endif
 
 /*
+ * Does a job touch a Scene the background load has not finished?
+ * (S082 P3 D41)
+ *
+ * What: nonzero when the job's destination Scene, or for a paste the copy
+ * source Scene, is a resident Scene still unavailable in BankData. Scene 17
+ * (index 16) is never pending; its own rules stay (D11, CC_DROP_SCENE17).
+ * Fan-out members are filtered separately by bank_sceneFanoutMask32().
+ * Why: a pending or in-progress Scene is about to be replaced (content and
+ * Pattern region); an emptied one is empty. Copy/clear stays open during the
+ * load (D41), so the collision is resolved by dropping that job silently.
+ * Availability only grows during a load, so a job that passes once stays
+ * valid.
+ * Inputs: job, copyClear_source(), bank_loadUnavailableMask().
+ * Outputs: boolean.
+ * Accessors: ccSvc_tick() before each engine call.
+ * Affiliates: AUTOSAVE_TRACE_CC_DROP_LOAD_PENDING, bank_sceneFanoutMask().
+ */
+static uint8_t ccSvc_jobLoadPending(const cc_job_t *job)
+{
+    uint16_t pending = bank_loadUnavailableMask();
+    const cc_source_t *src;
+
+    if (pending == 0u)
+        return 0u;
+    if (job->scene < 16u && (pending & (uint16_t)(1u << job->scene)) != 0u)
+        return 1u;
+    if ((job->op & CC_JOB_CLASS_MASK) == CC_JOB_PASTE) {
+        src = copyClear_source();
+        if (src && src->scene < 16u &&
+            (pending & (uint16_t)(1u << src->scene)) != 0u)
+            return 1u;
+    }
+    return 0u;
+}
+
+/*
  * One bounded service step (500 Hz, foreground). Non-overlapping Pattern
  * work starts without a scratch wait; while an older filesystem writer is
  * busy, the governor gates complete engine calls to 0.1% average CPU.
@@ -1625,8 +1677,19 @@ void ccSvc_tick(void)
         const cc_job_t *job = &ccSvc_queue[ccSvc_head];
         uint8_t slot = ccSvc_head;
 
-        r = ((job->op & CC_JOB_CLASS_MASK) == CC_JOB_PASTE)
-                ? ccCopy_runJob(job) : ccClear_runJob(job);
+        /*
+         * S082 P3 D41: drop a job whose Scene the background load has not
+         * finished; the ordinary DROP tail restores early triggers and frees
+         * the slot. Affiliates: ccSvc_jobLoadPending().
+         */
+        if (ccSvc_jobLoadPending(job)) {
+            ccSvc_traceDropReason(AUTOSAVE_TRACE_CC_DROP_LOAD_PENDING,
+                                  job->kind);
+            r = CC_RUN_DROP;
+        } else {
+            r = ((job->op & CC_JOB_CLASS_MASK) == CC_JOB_PASTE)
+                    ? ccCopy_runJob(job) : ccClear_runJob(job);
+        }
         ccSvc_chargeTrickle(t0);
         CC_TRACE_SAT16(ccSvc_traceState.job_ticks);
 #if DEV_MODE_LOGGING
@@ -1685,6 +1748,14 @@ void ccSvc_tick(void)
             ccSvc_nameRetry = 0u;
             return;
         }
+        /*
+         * S082 P3 D53: never give up on the names because of a Load/Save
+         * command (a background Bank load lasts far longer than
+         * CC_NAME_RETRY_TICKS); the retry budget counts only while no
+         * command holds the card.
+         */
+        if (menu_isLoadSaveCommandActive())
+            return;
         if (++ccSvc_nameRetry < CC_NAME_RETRY_TICKS)
             return;
 #if DEV_MODE_LOGGING

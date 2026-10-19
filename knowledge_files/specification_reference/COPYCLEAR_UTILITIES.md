@@ -1010,6 +1010,7 @@ bar, 3 track, 4 Scene, 5 FX step), 11..14 Scene, 15..17 track (7 = none),
 | 6 | `NO_SCRATCH` (retired in S077; no producer remains) | — |
 | 7 | `BAD_SELECTION` (dispatch default) | selection |
 | 8 | `BAD_GEOMETRY` (paste count 0) | kind |
+| 10 | `LOAD_PENDING` (the job's Scene is not yet available in a background Bank load, S082 P3) | kind |
 
 ### 15.4 Anomaly codes (`ANOMALY` bits 0..7); each one is a bug report
 
@@ -1304,3 +1305,20 @@ Decision tags in comments (all recorded in `075_SESSION_HANDOFF_LOG.md`):
   copy/clear jobs are dropped by every Bank load (Menu and MIDI), because
   phase 2 of `preset_tickBackgroundBankLoad()` waits for card idle, which
   includes the running job (S082 P1 D12, R6).
+
+## S082 P3 — copy/clear while an unlocked load runs
+
+* `copyClear_copyPressed()` refuses on `menu_isStorageBusy()` only when
+  `menu_backgroundLoadReleasesPanel()` is false, so an unlocked background
+  Bank load does not lock the copy/clear session out on ordinary pages.
+* Each queued job is gated when it runs: `ccSvc_jobLoadPending()` drops a job
+  whose destination (or paste source) Scene is still unavailable, with
+  `AUTOSAVE_TRACE_CC_DROP_LOAD_PENDING` (10). Availability only grows, so a
+  job that passes the gate stays valid. Fan-out members are filtered by
+  `bank_sceneFanoutMask32()`.
+* The name phase waits for the Load/Save command to end:
+  `ccSvc_ensureScratch()` will not borrow the 9 kB buffer while
+  `menu_isLoadSaveCommandActive()`, and `ccSvc_nameRetry` does not advance in
+  that window. A job's content commits first; names publish after the load,
+  so the Bank's own HCNAMES write cannot overwrite them (D53). While the
+  facade is busy the existing 0.1 % trickle governor still applies.

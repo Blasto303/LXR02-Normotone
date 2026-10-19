@@ -4,9 +4,16 @@ Where every byte of the STM32F765VIH6's on-chip storage goes: program flash,
 sample flash, ITCM, DTCM, SRAM1 and SRAM2. It also records the rules for
 changing any of it.
 
-- **Current as of:** Session 082 P2 (2026-10-19), `dev-ph6-midi`. DEV link:
-  `text=595,968`, `data=420`, `bss=430,920`; flash payload 596,388 B of
-  753,664 B (**headroom 157,276 B**), after the S082 P2 audio/load fixes.
+- **Current as of:** Session 082 P3 (2026-10-19), `dev-ph6-midi`. DEV link:
+  `text=598,120`, `data=420`, `bss=430,928`; flash payload 598,540 B of
+  753,664 B (**headroom 155,124 B**), after the S082 P3 work-while-loading
+  changes.
+- **S082 P3 changes:** +4 B approved SRAM1 (D47): BankData
+  `bank_load_unavailable_mask` 2 B, `ledHandler.c` `led_fastBlinkLed[]`
+  +1 B (1 → 2 slots), `menu.c` `menu_bgLoadAvailCount` 1 B. The measured DEV
+  BSS grew by 8 B because the new bytes changed section alignment; no page or
+  pool was enlarged. `PM_BG_UNLOCKED` is spare bit 3 of `pm_bg_phase`, and
+  the frozen-screen Bank name reuses `op_bank_display_name`; both add no RAM.
 - **S082 P2 changes:** no production SRAM growth. `filesystem.c`
   `fs_stall_poll_uncounted` is 1 B inside `DEV_STALL_DETECTION` builds only
   (idle-time Bank-load ticks stay invisible to the poll-count stall
@@ -29,7 +36,8 @@ changing any of it.
   `seq_pendingChainFire`); `buttonHandler.c` looper holds 5 B, overlay
   runtime 10 B (`bh_overlayActive`, voice mask, track, note, velocity,
   count, interval 2 B, next 2 B), SHIFT+REC 3 B, `bh_shiftReleaseConsume`,
-  `bh_chainPlayArmed`; `ledHandler.c` fast blink 4 B (`led_fastBlinkLed`,
+  `bh_chainPlayArmed`; `ledHandler.c` fast blink 5 B (two `led_fastBlinkLed`
+  slots since S082 P3, `led_fastBlinkPhase`,
   `led_fastBlinkPhase`, `led_fastBlinkNext`); `menu.c`
   `menu_chainMenuScene` 1 B; `scenes` +64 B (16 × 4 B chain settings,
   26,496 B); `pat_regions` +16 B and `pat_background_region` +1 B
@@ -536,7 +544,7 @@ byte, including alignment and small variables omitted here.
 | `sequencer.c`: pending automation + dirty bits | 560 | 128 four-byte pending records (512 B) and six per-voice 64-bit dirty maps (48 B). |
 | `sequencer.c`: PERF looper (S080) | 67 | `seq_loopActive` (ISR gate), `seq_loopTrackMask`/`Division`/`Modifier`, per track `seq_loopAnchor[7]` (uint32 master tick, 28 B) and the snapshot `seq_loopStartStep[7]` (14 B), `seq_loopStartAccum[7]` (14 B), `seq_loopStartPlayState[7]` (7 B). Runtime only; written under PRIMASK, read by TIM3 (`PATTERN_DYNAMIC_STACK.md` §6.5). |
 | `sequencer.c`: scene change / chain state (S080) | 12 | Pending direct/queued change (index, division, flags, fire flag, 7 B) and chain runtime (bar/repetition counts, previous Scene, `stp` freeze, chain-fire marker, 5 B) (`PATTERN_DYNAMIC_STACK.md` §6.6). |
-| `buttonHandler.c` / `ledHandler.c` / `menu.c`: PERF UI state (S080) | 25 | Looper holds 5 B, BAR overlay runtime 10 B, SHIFT+REC 3 B, release-consume and chain chord 2 B, fast blink 4 B, chain editor Scene 1 B. |
+| `buttonHandler.c` / `ledHandler.c` / `menu.c`: PERF UI state (S080) | 26 | Looper holds 5 B, BAR overlay runtime 10 B, SHIFT+REC 3 B, release-consume and chain chord 2 B, fast blink 5 B (second slot S082 P3), chain editor Scene 1 B. |
 | `LiveRecord.c`: individual Morph capture (S081 P3 G-1) | 7 | `liveRec_morphValue[7]`: the 7-bit value of the last individual edit of each voice Morph (slots 1..6) and the FX Morph. Every dirty Morph write uses it, so a global Morph change (never recorded) cannot leak into a recorded Morph value. Runtime-only, foreground; written by `liveRec_paramIn()`, read by `liveRec_recordValue7()`. |
 | `ledHandler.c`: VOICE-mode bar pulse (S081 P4) | 2 | `led_barPulseTrack` and `led_barPulseBar` (0xFF = none): the active track and bar last seen by `led_updateVoiceBarPulse()`, so the SELECT LED of a new bar pulses once in VOICE mode. Runtime-only, foreground, written only from the CHASE branch of `led_processSeqLedState()`. Initialised 0xFF, so `.data`, not `.bss`. |
 | `sequencer.c`: per-track timing state (S078) | 76 | ISR-static: `seq_trackAccumulator[7]` (Q8.8, 14 B), `seq_fxAccumulator` (2 B), `seq_fxStepCounter` (4 B), `seq_trackShuffleDelay/Pending/Vel/Note[7]` (28 B), `seq_trackPlayState[7]` (7 B), `seq_effectiveTrackLength/Scale/Shuffle[7]` (21 B, the morphed/automated timing cache). Written by TIM3 and by foreground refresh points (`PATTERN_DYNAMIC_STACK.md` §6.4). |
@@ -704,9 +712,13 @@ approved.
 | filesystem | `op_bank_child_content_mask` | 2 | operation | preview content |
 | filesystem | `op_bank_scene_empty_mask` | 2 | operation | Load empty / Save removal |
 | filesystem | `op_bank_save_written_mask` | 2 | operation | Merge Save edit-mask rule |
-| filesystem | `op_bank_flags` | 1 | operation | BOOT / REPLACE |
+| filesystem | `op_bank_flags` | 1 | operation | BOOT / REPLACE / PROGRESSIVE |
 | filesystem | `fs_autosave_yield` | 1 | permanent | AutoSave drain gate |
 | Preset | `pm_bg_phase` | 1 | permanent | background Bank Load phase/flags |
+| Preset | `PM_BG_UNLOCKED` | 0 | permanent | spare bit 3 of `pm_bg_phase` |
+| BankData | `bank_load_unavailable_mask` | 2 | permanent | Scenes a background load has not finished |
+| LED | `led_fastBlinkLed[2]` | +1 | permanent | second fast-blink slot (Bank load mode LED) |
+| Menu | `menu_bgLoadAvailCount` | 1 | permanent | SEQ LED fill repaint trigger |
 | PatternData | Scene 17 Pattern region | 0 | reused | `pat_background_region` |
 
 The 16 B outside Scene 17 are within the acknowledged S082 total (~13 B

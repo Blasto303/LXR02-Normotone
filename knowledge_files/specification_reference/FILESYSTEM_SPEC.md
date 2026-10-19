@@ -924,6 +924,25 @@ Bank Load/Save LEDs use pattern content (active trigger steps), not presence.
 The Menu selection is 16 bits with a default of all 16, and the Bank page's
 COPY button toggles Merge (tap) or shows the other side (hold).
 
+**Progressive Bank Load (S082 P3).** The background loader passes
+`FS_BANK_FLAG_PROGRESSIVE` (0x10, equal to
+`PRESET_BANK_LOAD_PROGRESSIVE`). On acceptance,
+`bank_beginLoadAvailability(act | empty)` marks the affected resident Scenes
+unavailable in BankData. Phase 17/98 first calls
+`bank_mergeVoiceEditMasksAfterLoad()` with the new Bank's entries, so a child
+that lands is usable and fans out at once; failed children are stripped from
+every entry at the end instead of re-running the merge. Phase 20 calls
+`bank_noteLoadChildDone()` for each successful child: that sets the child's
+present bit immediately, clears its unavailable bit and revalidates layouts
+among the Scenes now available. The final present-mask commit keeps the live
+mask for a progressive load and only clears the emptied Scenes (so a mid-load
+`clear scene` stays cleared); non-progressive loads keep the original outcome
+formula. `filesystem_bankLoadDisplayName()` exposes the name captured at
+request for the frozen Load:[Bank] screen, and `NN.` progress is displayed
+1-based (`cursor + 1`) for Bank Load and Bank Save. See
+`BANK_PRESET_ARCHITECTURE.md` for the availability rule and
+`S082_P3_WORK_WHILE_BG_LOAD.md` for the panel behavior.
+
 Pre-S082 behavior (historical):
 
 - Boot scans `Bank/` and loads BankData's restored slot (default 000) before

@@ -1233,3 +1233,13 @@ are written after the first whole-Scene change releases Scene 17. `settings.cfg`
 is not AutoSave and keeps writing (D24). The new HCNAMES Scene-row source tokens
 `bNNN` and `x` are carried in the AutoSave source fields as ordinary uint16_t
 register values.
+
+S082 P3 (work while a background Bank load runs): the load's
+`fs_autosave_yield` still holds every drain until `preset_bgEnd()`. A
+progressive load marks the present-mask Bank field and the edit-mask fields as
+each child lands (`bank_noteLoadChildDone()`, the early edit-mask merge and the
+`bank_stripFailedFromVoiceEditMasks()` correction); those marks accumulate in
+the dirty mask and are captured after the load, exactly like edits made during
+the unlocked window. The end-of-load present commit marks the field only when
+the final mask actually changed. No AutoSave writer starts mid-load, and the
+HCNAMES publication exception above is unchanged.

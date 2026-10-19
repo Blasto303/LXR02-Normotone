@@ -1443,6 +1443,29 @@ static uint8_t op_bank_flags = 0u;
  */
 #define FS_BANK_FLAG_PREVIEW_CANCEL  0x08u
 /*
+ * Progressive Bank Load (S082 P3 W4, D44).
+ *
+ * What: set by Preset for an unlocked background Bank load. The request
+ * starts a BankData availability session; each completed child sets its
+ * present bit at once; the new Bank's edit masks are merged before the first
+ * child; the end commit keeps the live present mask and only removes failed
+ * children from the edit masks.
+ * Why: the user may play, edit and select loaded Scenes while later children
+ * load; the old all-at-the-end commit would hide them until completion and
+ * overwrite edits made during the load.
+ * Inputs: filesystem_requestLoadBank() flags (PRESET_BANK_LOAD_PROGRESSIVE).
+ * Outputs: the progressive branches of Bank Load phases 17, 98, 20 and the
+ * metadata commit. Lifetime: op_bank_flags, cleared by filesystem_start().
+ * Affiliates: bank_beginLoadAvailability(), bank_noteLoadChildDone(),
+ * bank_stripFailedFromVoiceEditMasks(), preset_tickBackgroundBankLoad().
+ */
+#define FS_BANK_FLAG_PROGRESSIVE     0x10u
+_Static_assert(FS_BANK_FLAG_PROGRESSIVE == PRESET_BANK_LOAD_PROGRESSIVE,
+               "Preset passes Bank Load flags straight through");
+_Static_assert(FS_BANK_FLAG_BOOT == PRESET_BANK_LOAD_BOOT &&
+               FS_BANK_FLAG_REPLACE == PRESET_BANK_LOAD_REPLACE,
+               "Preset passes Bank Load flags straight through");
+/*
  * AutoSave drain yield for a background Bank Load (+1 B SRAM1, S082 C7/C9).
  *
  * What: one persistent flag. While set, both AutoSave schedulers decline new
@@ -14165,6 +14188,34 @@ static void filesystem_bankEmptyScenes(uint16_t mask)
     }
 }
 
+/*
+ * Merge the new Bank's edit masks before the first child (S082 P3 D44).
+ *
+ * What: for a progressive load, applies bank_mergeVoiceEditMasksAfterLoad()
+ * with the request's load and empty sets as soon as bankset.bcg is parsed and
+ * the empties are done, i.e. at the transition into the first child.
+ * Why: a child that completes is usable at once; its fan-out must follow the
+ * new Bank's entry, not the old one. Entries naming Scenes that are still
+ * pending are harmless: fan-out and edit targets exclude unavailable Scenes,
+ * and bank_noteLoadChildDone() revalidates layouts as each child lands.
+ * Failed children are removed at the end (bank_stripFailedFromVoiceEditMasks()).
+ * Inputs: op_bankset_state entries and seen mask, op_bank_scene_load_mask,
+ * op_bank_scene_empty_mask, op_bank_flags.
+ * Outputs: BankData edit-mask entries (AutoSave fields marked; drain held).
+ * Accessors: Bank Load phases 17 and 98 at their "first child" exits.
+ * Affiliates: the metadata commit (F2.5), FS_BANK_FLAG_PROGRESSIVE.
+ */
+static void filesystem_bankLoadMergeEditMasksEarly(void)
+{
+    if ((op_bank_flags & FS_BANK_FLAG_PROGRESSIVE) == 0u)
+        return;
+    bank_mergeVoiceEditMasksAfterLoad(
+        op_bankset_state.scene_mask_voice_edit,
+        op_bankset_state.seen_scene_mask_voice_edit,
+        op_bank_scene_load_mask,
+        op_bank_scene_empty_mask);
+}
+
 #if DEV_STALL_DETECTION
 static uint8_t op_bank_load_entry_stall_last_phase = 0u;
 static uint32_t op_bank_load_entry_stall_ticks = 0u;
@@ -14843,6 +14894,7 @@ static void filesystem_loadBankDirectory_tick(void)
             filesystem_finish(FS_STATUS_ERROR);
             return;
         }
+        filesystem_bankLoadMergeEditMasksEarly();
         op_bank_child_cursor = child_slot;
         /*
          * The first selected child's display name is already cached from the
@@ -14950,6 +15002,7 @@ static void filesystem_loadBankDirectory_tick(void)
             filesystem_finish(FS_STATUS_ERROR);
             return;
         }
+        filesystem_bankLoadMergeEditMasksEarly();
         op_bank_child_cursor = child_slot;
         op_phase = 27u;
         return;
@@ -14995,6 +15048,19 @@ static void filesystem_loadBankDirectory_tick(void)
                 (uint16_t)(op_bank_scene_failed_mask |
                           (uint16_t)(1u << op_bank_child_cursor));
             filesystem_makeNamedErrorCode("BKKit", op_phase);
+        } else if (op_bank_flags & FS_BANK_FLAG_PROGRESSIVE) {
+            /*
+             * Publish the completed child at once (S082 P3 W4, D44).
+             *
+             * What: the child's settings, Kit, Pattern and Effect are
+             * committed and its directory is closed; BankData sets its
+             * present bit, makes it available and revalidates layouts among
+             * available Scenes. Why: the user may select it, fan out to it
+             * and see it fill in PERF before the last child (W4).
+             * Inputs: op_bank_child_cursor. Outputs: BankData state.
+             * Affiliates: bank_noteLoadChildDone(), Menu PERF fill observer.
+             */
+            bank_noteLoadChildDone(op_bank_child_cursor);
         }
         for (child_slot = (uint8_t)(op_bank_child_cursor + 1u);
              child_slot < STORAGE_BANK_SCENE_MAX_SLOTS;
@@ -15044,23 +15110,35 @@ static void filesystem_loadBankDirectory_tick(void)
             filesystem_stageKeptSceneSources(kept_mask, old_bank_source);
         }
         /*
-         * Resident availability after the load is exactly what the outcome left.
+         * Resident availability after the load (S082 B3; S082 P3 progressive).
          *
-         * What: Scenes outside the load and empty sets keep their bit; loaded
-         * children set theirs (failed children excepted); emptied Scenes clear
-         * theirs, except the active Scene, which always stays present (S17).
-         * Inputs: load/empty/failed masks, active (home) Scene.
-         * Outputs: BankData present mask, with an explicit AutoSave mark.
-         * Affiliates: bank_setScenePresentMask(), autosave_markBankFieldDirty().
+         * What: non-progressive loads keep the existing outcome formula.
+         * A progressive load already set each loaded child's present bit as
+         * it completed; it now only clears the emptied Scenes, keeping
+         * whatever the user did to loaded or kept Scenes during the load
+         * (a mid-load `clear scene` removed a bit that must stay removed).
+         * Failed children keep their old bit, exactly as before. The active
+         * Scene always stays present (S17).
+         * Inputs: load/empty/failed masks, live present mask, active Scene,
+         * FS_BANK_FLAG_PROGRESSIVE. Outputs: BankData present mask, with an
+         * explicit AutoSave mark.
+         * Affiliates: bank_setScenePresentMask(), bank_noteLoadChildDone(),
+         * autosave_markBankFieldDirty().
          */
         {
-            uint16_t present = (uint16_t)(
-                (bank_scenePresentMask() &
-                 (uint16_t)~(op_bank_scene_load_mask |
-                             op_bank_scene_empty_mask)) |
-                (op_bank_scene_load_mask &
-                 (uint16_t)~op_bank_scene_failed_mask));
+            uint16_t present;
             uint8_t active = scene_getActiveIndex();
+
+            if (op_bank_flags & FS_BANK_FLAG_PROGRESSIVE)
+                present = (uint16_t)(bank_scenePresentMask() &
+                                     (uint16_t)~op_bank_scene_empty_mask);
+            else
+                present = (uint16_t)(
+                    (bank_scenePresentMask() &
+                     (uint16_t)~(op_bank_scene_load_mask |
+                                 op_bank_scene_empty_mask)) |
+                    (op_bank_scene_load_mask &
+                     (uint16_t)~op_bank_scene_failed_mask));
             if (active < 16u)
                 present = (uint16_t)(present | (uint16_t)(1u << active));
             if (!bank_setScenePresentMask(present))
@@ -15074,11 +15152,26 @@ static void filesystem_loadBankDirectory_tick(void)
                 op_bank_scene_load_mask);
         if (op_bank_flags & FS_BANK_FLAG_BOOT)
             bank_selectActiveSceneForEditMask(op_bank_active_scene);
-        bank_mergeVoiceEditMasksAfterLoad(
-            op_bankset_state.scene_mask_voice_edit,
-            op_bankset_state.seen_scene_mask_voice_edit,
-            op_bank_scene_load_mask,
-            op_bank_scene_empty_mask);
+        /*
+         * Edit masks at the end of the load (S082 B3; S082 P3).
+         *
+         * What: a progressive load merged the new Bank's entries before its
+         * first child; it now only removes failed children. Other loads run
+         * the full merge here as before.
+         * Why: re-merging would overwrite edit-mask changes made while the
+         * panel was unlocked. Inputs: op_bankset_state, outcome masks, flags.
+         * Outputs: BankData entries. Affiliates:
+         * filesystem_bankLoadMergeEditMasksEarly(),
+         * bank_stripFailedFromVoiceEditMasks().
+         */
+        if (op_bank_flags & FS_BANK_FLAG_PROGRESSIVE)
+            bank_stripFailedFromVoiceEditMasks(op_bank_scene_failed_mask);
+        else
+            bank_mergeVoiceEditMasksAfterLoad(
+                op_bankset_state.scene_mask_voice_edit,
+                op_bankset_state.seen_scene_mask_voice_edit,
+                op_bank_scene_load_mask,
+                op_bank_scene_empty_mask);
         bank_setRestoreBankSlot(op_slot);
         filesystem_markSettingsDirty();
         bank_setHasResidentBank(1u);
@@ -27293,6 +27386,23 @@ uint8_t filesystem_bankChildCursor(void)
     return 0xFFu;
 }
 
+/*
+ * Display name of the Bank being loaded (S082 P3 W2, D49).
+ *
+ * What: the eight-character name captured by filesystem_requestLoadBank()
+ * (op_bank_display_name). Why: the frozen Load:[Bank] screen is re-entered
+ * after the user left Load/Save, which cleared the browser cache that
+ * normally supplies the name; the captured copy is stable until the next
+ * Bank operation, and no other operation can start during the load.
+ * Inputs: none. Outputs: pointer to 8 characters (NUL at [8]).
+ * Accessors: menu_repaintLoadSavePage() for an unlocked background load.
+ * Affiliates: filesystem_bankSlotName(), filesystem_requestLoadBank().
+ */
+const char *filesystem_bankLoadDisplayName(void)
+{
+    return op_bank_display_name;
+}
+
 void filesystem_ack(void)
 {
     if (status == FS_STATUS_DONE || status == FS_STATUS_ERROR) {
@@ -31609,7 +31719,8 @@ bool filesystem_requestLoadBank(uint16_t slot,
      *
      * What: validates and starts a Bank Load with explicit act/empty masks and
      * flags. Why: S082 outcome table; an all-empty Replace is a valid request.
-     * Inputs: slot, masks, flags, callback. Outputs: accepted/refused; op masks.
+     * Inputs: slot, masks, flags, callback; flags may carry
+     * FS_BANK_FLAG_PROGRESSIVE (S082 P3). Outputs: accepted/refused; op masks.
      * Accessors: preset_loadBank(). Affiliates:
      * filesystem_loadBankDirectory_tick() phases 17/20/98.
      */
@@ -31657,6 +31768,20 @@ bool filesystem_requestLoadBank(uint16_t slot,
     op_scene_load_scene_mask = valid_act;
     op_bank_scene_empty_mask = (uint16_t)(valid_empty & (uint16_t)~valid_act);
     op_bank_flags = (uint8_t)(flags | (valid_empty ? FS_BANK_FLAG_REPLACE : 0u));
+    /*
+     * Start the load-availability session before any child phase
+     * (S082 P3 D44).
+     *
+     * What: a progressive load marks its load and empty sets unavailable now.
+     * Why: Preset unlocks the panel as soon as this request is accepted; a
+     * Scene about to be replaced must be excluded from that first moment.
+     * Inputs: FS_BANK_FLAG_PROGRESSIVE, validated masks.
+     * Outputs: BankData unavailable mask.
+     * Affiliates: bank_beginLoadAvailability(), on_bank_load_complete().
+     */
+    if (op_bank_flags & FS_BANK_FLAG_PROGRESSIVE)
+        bank_beginLoadAvailability(
+            (uint16_t)(op_bank_scene_load_mask | op_bank_scene_empty_mask));
     /*
      * Keep the root Bank display key intact while repair reads its cache row.
      *

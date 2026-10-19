@@ -286,6 +286,32 @@ static void menu_finishLoadSaveCommand(void)
     menu_resetSaveParametersEx(1u);
 }
 
+/*
+ * End an unlocked background Bank load's command off Load/Save
+ * (S082 P3 §5.10).
+ *
+ * What: releases no-playback storage (if S058 owned it), clears
+ * menu_loadSaveCommandActive and menu_storageBusy, and nothing else: no
+ * Load/Save cursor reset, no editModeActive change, no Load LED reset, no
+ * repaint of the Load/Save page.
+ * Why: menu_finishLoadSaveCommand() resets Load/Save state through
+ * menu_resetSaveParametersEx(), which sets editModeActive and repaints; on
+ * another page that would corrupt the page the user is working on. The next
+ * Load/Save entry is a fresh entry and resets everything itself.
+ * Inputs: menu_loadSaveCommandActive. Outputs: command and busy flags.
+ * Accessors: PRESET_OP_BANK_LOAD completion and its failure branch,
+ * menu_backgroundBankLoadAbort().
+ * Affiliates: menu_finishLoadSaveCommand(), menu_endNoPlaybackStorage().
+ */
+static void menu_finishBackgroundLoadCommandOffPage(void)
+{
+    if (!menu_loadSaveCommandActive)
+        return;
+    menu_endNoPlaybackStorage();
+    menu_loadSaveCommandActive = 0u;
+    menu_storageBusy = 0u;
+}
+
 static void menu_paintLoadSaveConfirmation(uint8_t overwrite,
                                            uint8_t selected)
 {
@@ -301,28 +327,23 @@ static void menu_paintLoadSaveConfirmation(uint8_t overwrite,
     if (menu_loadSaveCommandActive) {
         uint8_t child = filesystem_bankChildCursor();
 
-        if (child != 0xFFu && child < 100u) {
+        if (child != 0xFFu && child < 99u) {
             /*
-             * Show Bank child progress instead of static "...".
+             * Show Bank child progress as the 1-based Scene number
+             * (S082 P3 D51).
              *
-             * Inputs: filesystem_bankChildCursor() returns the zero-based
-             * Bank-local Scene slot (0..15) currently being processed by
-             * a Bank Save or Bank Load. Output: the three-character command
-             * surface shows the two-digit child number plus a trailing dot
-             * (e.g. "05."), giving the user visible proof that the multi-
-             * child operation is progressing — the number advances as each
-             * child completes. Why: a 16-scene Bank operation can take
-             * 30-120+ seconds on a slow SD card; the former static "..."
-             * was indistinguishable from a frozen operation, causing users
-             * to hard-reboot mid-save and corrupt Bank data. Affiliates:
-             * filesystem_bankChildCursor(),
-             * filesystem_saveBankDirectory_tick(),
-             * filesystem_loadBankDirectory_tick().
+             * What: `NN.` shows child + 1 (01..16), the Scene number the user
+             * sees on the SEQ row; it is read live, so a return to the frozen
+             * Load:[Bank] screen shows the current child. Why: user-facing
+             * numbers are 1-based; the former zero-based slot read one behind
+             * the filling LED. Bank Load and Bank Save share the indicator.
+             * Inputs: filesystem_bankChildCursor(). Outputs: cells 13-15.
+             * Affiliates: menu_refreshBankChildProgress().
              */
-            editDisplayBuffer[1][13] =
-                (char)('0' + (child / 10u));
-            editDisplayBuffer[1][14] =
-                (char)('0' + (child % 10u));
+            uint8_t shown = (uint8_t)(child + 1u);
+
+            editDisplayBuffer[1][13] = (char)('0' + (shown / 10u));
+            editDisplayBuffer[1][14] = (char)('0' + (shown % 10u));
             editDisplayBuffer[1][15] = '.';
         } else {
             memcpy(&editDisplayBuffer[1][13], "...", 3u);
@@ -1981,6 +2002,7 @@ static void menu_instrumentLoadCopyTypeLabel(char *dest);
 static void menu_instrumentLoadRefreshBaseType(uint8_t preserve_selected_type);
 static void menu_instrumentLoadStepType(int8_t inc);
 static void menu_refreshLoadSceneLeds(void);
+static void menu_refreshBackgroundLoadSceneLeds(void);
 static void menu_resetLoadSaveSceneSelection(void);
 static uint8_t menu_paramIsMorphAmount(uint16_t paramNr);
 static uint8_t menu_isLoadSaveSelectionCurrent(void);
@@ -2956,6 +2978,66 @@ void menu_copyClearMenuClosed(void)
 uint8_t menu_isStorageBusy(void)
 {
     return menu_storageBusy;
+}
+
+/*
+ * Panel free during a background Bank load (S082 P3 W2, W3).
+ *
+ * What: nonzero when the running background Bank load is unlocked and the
+ * panel is not on Load/Save. Why: the accepted command keeps
+ * menu_storageBusy set and Preset reports LOAD_IN_PROGRESS for the whole
+ * load; every storage gate that guards ordinary pages (encoder, pots, page
+ * switch, knob repaint, widgets, STEP overlay, copy/clear) must ignore them
+ * there, while Load/Save itself stays frozen (W2).
+ * Inputs: preset_backgroundBankLoadUnlocked(), menu_activePage.
+ * Outputs: boolean.
+ * Accessors: Menu storage gates, copyClear_copyPressed().
+ * Affiliates: menu_storageBusy, preset_getStatus(),
+ * menu_bankLoadFrozenPageActive().
+ */
+uint8_t menu_backgroundLoadReleasesPanel(void)
+{
+    return (uint8_t)(preset_backgroundBankLoadUnlocked() &&
+                     menu_activePage != LOAD_PAGE &&
+                     menu_activePage != SAVE_PAGE);
+}
+
+/*
+ * Frozen Load:[Bank] screen shown (S082 P3 W2, D49).
+ *
+ * What: nonzero while the load is unlocked and the panel is on Load/Save,
+ * which then shows only the Bank Load screen. Why: its SEQ LEDs follow PERF,
+ * including the per-beat refresh. Inputs: as above. Outputs: boolean.
+ * Accessors: led per-beat refresh, menu_refreshLoadSceneLeds().
+ * Affiliates: menu_enterFrozenBankLoadPage().
+ */
+uint8_t menu_bankLoadFrozenPageActive(void)
+{
+    return (uint8_t)(preset_backgroundBankLoadUnlocked() &&
+                     menu_activePage == LOAD_PAGE);
+}
+
+/*
+ * Viewed Scene not yet available during a Bank load (S082 P3 D45).
+ *
+ * What: nonzero when the viewed Pattern is a resident Scene the running load
+ * has not finished. Why: with PAR_FOLLOW off the view can stay on the home
+ * Scene the load is replacing; a STEP or track-setting edit there would be
+ * overwritten or race the Pattern replacement, so it is dropped silently,
+ * like the S081 H-2 refusal. Zero outside a load.
+ * Inputs: menu_getViewedPattern(), bank_loadUnavailableMask().
+ * Outputs: boolean.
+ * Accessors: menu_parseEncoder(), menu_parseKnobDelta() (SEQ_PAGE),
+ * ButtonHandler STEP toggle.
+ * Affiliates: liveRec_activePatternLocked().
+ */
+uint8_t menu_viewedSceneLoadPending(void)
+{
+    uint8_t viewed = menu_getViewedPattern();
+
+    return (uint8_t)(viewed < 16u &&
+                     (bank_loadUnavailableMask() &
+                      (uint16_t)(1u << viewed)) != 0u);
 }
 
 /*
@@ -4321,7 +4403,11 @@ static void sa_applyTrackMarkers(void)
  */
 void menu_enterStepTrackAutomationOverlay(uint8_t voiceNr)
 {
-    if (voiceNr >= NUM_TRACKS || menu_storageBusy)
+    /* S082 P3: an unlocked background Bank load keeps menu_storageBusy set
+     * but frees every page except Load/Save
+     * (menu_backgroundLoadReleasesPanel()). */
+    if (voiceNr >= NUM_TRACKS ||
+        (menu_storageBusy && !menu_backgroundLoadReleasesPanel()))
         return;
 
     menu_setActiveVoice(voiceNr);
@@ -8874,8 +8960,9 @@ static void menu_chainLoadMirrors(uint8_t scene_index)
 
 uint8_t menu_chainMenuOpen(uint8_t scene_index)
 {
+    /* S082 P3: chain editor only for available Scenes. */
     if (scene_index >= SCENE_COUNT || scene_index >= 16u ||
-        !bank_scenePresent(scene_index))
+        !bank_sceneAvailable(scene_index))
         return 0u;
     menu_chainMenuScene = scene_index;
     menu_chainLoadMirrors(scene_index);
@@ -8889,8 +8976,9 @@ uint8_t menu_chainMenuOpen(uint8_t scene_index)
 
 void menu_chainMenuView(uint8_t scene_index)
 {
+    /* S082 P3: chain editor only for available Scenes. */
     if (menu_chainMenuScene >= 16u || scene_index >= SCENE_COUNT ||
-        scene_index >= 16u || !bank_scenePresent(scene_index))
+        scene_index >= 16u || !bank_sceneAvailable(scene_index))
         return;
     menu_chainMenuScene = scene_index;
     menu_chainLoadMirrors(scene_index);
@@ -9040,8 +9128,11 @@ void menu_perfModeSceneButtonPressed(uint8_t scene_index)
 
 static void menu_perfSceneChangeExecute(uint8_t scene_index, uint8_t restart)
 {
+    /* S082 P3 D52: only an available Scene; a direct, deferred or queued
+     * change to a Scene the load has not finished is dropped (including one
+     * armed before a direct load). */
     if (scene_index >= SCENE_COUNT || scene_index >= 16u ||
-        !bank_scenePresent(scene_index)) {
+        !bank_sceneAvailable(scene_index)) {
         return;
     }
     scene_selectActive(scene_index);
@@ -9191,25 +9282,37 @@ void menu_serviceDeferredSceneChange(void)
 }
 
 /*
- * Owner of the queued-scene fast blink (S080 P2 Defect 10).
+ * Owner of both fast-blink slots (S080 P2 Defect 10; S082 P3 W1).
  *
- * What: in PERF mode, fast-blinks the SEQ LED of the queued Scene; otherwise
- * (no queue, queue fired, transport stopped, or another mode owns the SEQ
- * row) clears it. Why: re-deriving from sequencer state on every tick covers
- * every way a queue can start, change or end without call sites in each path.
- * Inputs: seq_queuedSceneTarget(), buttonHandler_getMode(). Outputs:
- * led_setFastBlinkLed() on change only. Accessors:
- * menu_serviceDeferredSceneChange(). Affiliates: LED_LAYER_FAST.
+ * What: slot QUEUED_SCENE fast-blinks the queued Scene's SEQ LED in PERF;
+ * slot BANK_LOAD fast-blinks the Load/Save mode LED (LED_MODE4) while an
+ * unlocked background Bank load runs and the panel is not in Load/Save mode.
+ * Both clear when their condition ends.
+ * Why: re-deriving from state on every tick covers every way a queue, a mode
+ * change or a load can start or end without call sites in each path; in
+ * Load/Save mode the frozen screen shows the load, so the mode LED stays as
+ * led_setMode2() set it.
+ * Inputs: seq_queuedSceneTarget(), buttonHandler_getMode(),
+ * preset_backgroundBankLoadUnlocked().
+ * Outputs: led_setFastBlinkSlot() on change only.
+ * Accessors: menu_serviceDeferredSceneChange() (every buttonHandler_tick()).
+ * Affiliates: LED_LAYER_FAST, LED_FAST_SLOT_*.
  */
 static void menu_syncQueuedSceneLed(void)
 {
     uint8_t target = seq_queuedSceneTarget();
+    uint8_t mode = buttonHandler_getMode();
     uint8_t want = 0xFFu;
+    uint8_t want_load = 0xFFu;
 
-    if (buttonHandler_getMode() == SELECT_MODE_PERF && target < 16u)
+    if (mode == SELECT_MODE_PERF && target < 16u)
         want = (uint8_t)(LED_SEQ1 + target);
-    if (led_getFastBlinkLed() != want)
-        led_setFastBlinkLed(want);
+    if (led_getFastBlinkSlot(LED_FAST_SLOT_QUEUED_SCENE) != want)
+        led_setFastBlinkSlot(LED_FAST_SLOT_QUEUED_SCENE, want);
+    if (preset_backgroundBankLoadUnlocked() && mode != SELECT_MODE_LOAD_SAVE)
+        want_load = LED_MODE4;
+    if (led_getFastBlinkSlot(LED_FAST_SLOT_BANK_LOAD) != want_load)
+        led_setFastBlinkSlot(LED_FAST_SLOT_BANK_LOAD, want_load);
 }
 
 void menu_refreshVoiceHeldSceneLeds(void)
@@ -9255,7 +9358,9 @@ uint8_t menu_voiceHeldSceneButtonPressed(uint8_t scene_index)
      */
     if (scene_index >= SCENE_COUNT || scene_index >= 16u)
         return 0u;
-    if (!bank_scenePresent(scene_index))
+    /* S082 P3 D44: a Scene not yet loaded cannot join the edit mask (its
+     * layout is the old content's). */
+    if (!bank_sceneAvailable(scene_index))
         return 1u;
     if (!bank_sceneInVoiceEditMask(scene_index) &&
         !scene_editLayoutMatches(scene_getActiveIndex(), scene_index))
@@ -9269,13 +9374,13 @@ uint8_t menu_voiceHeldSceneButtonPressed(uint8_t scene_index)
 
 static uint16_t menu_residentPresentSceneMask(void)
 {
-    uint16_t mask = bank_scenePresentMask();
+    uint16_t mask = bank_sceneAvailableMask();
     uint8_t home_scene;
 
     /*
      * Return the resident Scene availability mask used by Load/Save.
      *
-     * Inputs: BankData's present mask. Output: a nonzero 16-bit mask when at
+     * Inputs: BankData's availability mask. Output: a nonzero 16-bit mask when at
      * least one resident Scene is available. The fallback to the active Scene
      * keeps root/default boot usable before a Bank has supplied an explicit
      * child-present map.
@@ -9284,9 +9389,18 @@ static uint16_t menu_residentPresentSceneMask(void)
      * The mask is 16-bit and cannot hold bit 16; using the home Scene keeps
      * the one-Scene default valid for Kit/Scene/Pattern operations that never
      * target Scene 17 (S082 P1 D18).
+     *
+     * S082 P3 W4, D42: the mask is BankData's availability: during a
+     * background Bank load, Scenes not yet loaded (and emptied ones) drop
+     * out, loaded children appear as each completes and kept Scenes stay.
+     * PERF, the frozen Load:[Bank] screen and the VOICE-held LEDs therefore
+     * fill left to right. No home-Scene fallback while a load is pending: an
+     * all-pending Replace must show nothing. Outside a load availability is
+     * presence, so nothing changes.
      */
     home_scene = scene_backgroundHomeIndex();
-    if (mask == 0u && home_scene < SCENE_COUNT)
+    if (mask == 0u && bank_loadUnavailableMask() == 0u &&
+        home_scene < SCENE_COUNT)
         mask = (uint16_t)(1u << home_scene);
     return mask;
 }
@@ -9518,6 +9632,21 @@ static void menu_refreshLoadSceneLeds(void)
      */
     if (menu_activePage != LOAD_PAGE && menu_activePage != SAVE_PAGE)
         return;
+    /*
+     * Frozen Load:[Bank] screen: SEQ LEDs as PERF (S082 P3 D49).
+     *
+     * What: during an unlocked background load the page shows the PERF Scene
+     * row (loaded and kept Scenes with content lit, pending ones dark, the
+     * fill growing left to right). Why: the user's choice; the selection view
+     * is meaningless while the command runs. Inputs: unlocked state.
+     * Outputs: SEQ LEDs via menu_refreshPerfSceneLeds().
+     * Affiliates: menu_bankLoadFrozenPageActive(),
+     * menu_residentPresentSceneMask().
+     */
+    if (menu_bankLoadFrozenPageActive()) {
+        menu_refreshPerfSceneLeds();
+        return;
+    }
     for (scene_index = 0u; scene_index < 16u; scene_index++) {
         led_setBlinkLed((uint8_t)(LED_SEQ1 + scene_index), 0u);
         led_setValue(0u, (uint8_t)(LED_SEQ1 + scene_index));
@@ -10281,6 +10410,14 @@ void menu_backgroundBankLoadAbort(void)
 {
     if (!menu_loadSaveCommandActive)
         return;
+    /*
+     * S082 P3: aborts come from phases 2-4 and 6, all locked, so the panel is
+     * on Load/Save; should one arrive elsewhere, end the command quietly.
+     */
+    if (menu_activePage != LOAD_PAGE && menu_activePage != SAVE_PAGE) {
+        menu_finishBackgroundLoadCommandOffPage();
+        return;
+    }
     menu_finishLoadSaveCommand();
     if (menu_activePage == LOAD_PAGE && !menu_instrumentLoadActive &&
         menu_saveOptions.what == SAVE_TYPE_BANK)
@@ -11784,9 +11921,10 @@ static void menu_refreshBankChildProgress(void)
     }
 
     child = filesystem_bankChildCursor();
-    if (child == 0xFFu || child >= 100u)
+    if (child == 0xFFu || child >= 99u)
         return;
-
+    /* S082 P3 D51: compare against the 1-based digits the paint writes. */
+    child = (uint8_t)(child + 1u);
     tens = (char)('0' + (child / 10u));
     ones = (char)('0' + (child % 10u));
     if (currentDisplayBuffer[1][13] == tens &&
@@ -11796,6 +11934,49 @@ static void menu_refreshBankChildProgress(void)
     }
 
     menu_repaint();
+}
+
+/*
+ * SEQ LED repaint trigger for the background load fill (S082 P3 W4, D49).
+ *
+ * What: menu_bgLoadAvailCount holds the number of available Scenes last
+ * painted during an unlocked load (0xFF = none). When the count changes, the
+ * Scene row is repainted: PERF mode through menu_refreshPerfSceneLeds(), the
+ * frozen Load:[Bank] screen through menu_refreshLoadSceneLeds(). When the
+ * load stops being unlocked, one final repaint restores the normal rules.
+ * Why: children complete inside filesystem_tick(), independent of beats and
+ * of input; with the transport stopped there is no per-beat refresh at all.
+ * During a load availability only grows, so a count is a sufficient change
+ * test.
+ * Inputs: preset_backgroundBankLoadUnlocked(), bank_sceneAvailableMask(),
+ * buttonHandler_getMode(), menu_activePage.
+ * Outputs: SEQ LEDs; menu_bgLoadAvailCount.
+ * SRAM: 1 B, SRAM1 static, owner Menu (approved 2026-10-19, S082 P3 D47).
+ * Accessors: menu_pollPresetStatus() (every pass, before early returns).
+ * Affiliates: bank_noteLoadChildDone(), menu_residentPresentSceneMask().
+ */
+static uint8_t menu_bgLoadAvailCount = 0xFFu;
+
+static void menu_refreshBackgroundLoadSceneLeds(void)
+{
+    uint8_t count = 0xFFu;
+
+    if (preset_backgroundBankLoadUnlocked()) {
+        uint16_t avail = bank_sceneAvailableMask();
+
+        count = 0u;
+        while (avail != 0u) {
+            avail = (uint16_t)(avail & (uint16_t)(avail - 1u));
+            count++;
+        }
+    }
+    if (count == menu_bgLoadAvailCount)
+        return;
+    menu_bgLoadAvailCount = count;
+    if (buttonHandler_getMode() == SELECT_MODE_PERF)
+        menu_refreshPerfSceneLeds();
+    else if (menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE)
+        menu_refreshLoadSceneLeds();
 }
 
 /* -----------------------------------------------------------------------
@@ -12156,8 +12337,15 @@ static void menu_repaintLoadSavePage(void)
          */
         if (menu_activePage == LOAD_PAGE && menu_saveOptions.what < SAVE_TYPE_GLO) {
             if (menu_saveOptions.what == SAVE_TYPE_BANK) {
-                displayName = filesystem_bankSlotName(
-                    menu_currentPresetNr[SAVE_TYPE_BANK]);
+                /*
+                 * S082 P3 W2: the frozen Load:[Bank] screen shows the name
+                 * captured with the request; the browser cache was cleared
+                 * when the user left Load/Save mid-load.
+                 */
+                displayName = menu_bankLoadFrozenPageActive()
+                    ? filesystem_bankLoadDisplayName()
+                    : filesystem_bankSlotName(
+                          menu_currentPresetNr[SAVE_TYPE_BANK]);
             } else if (menu_saveOptions.what == SAVE_TYPE_SCENE) {
                 displayName = filesystem_sceneSlotName(
                     menu_currentPresetNr[SAVE_TYPE_SCENE]);
@@ -14797,7 +14985,10 @@ void menu_parseEncoder(int8_t inc, uint8_t button)
     uint8_t oldPage = menu_activePage;
     uint8_t oldIndex = menuIndex;
 
-    if (menu_storageBusy || preset_getStatus() != PRESET_IDLE) {
+    /* S082 P3: an unlocked background Bank load blocks only Load/Save; other
+     * pages take the encoder (menu_backgroundLoadReleasesPanel()). */
+    if ((menu_storageBusy || preset_getStatus() != PRESET_IDLE) &&
+        !menu_backgroundLoadReleasesPanel()) {
         uint8_t allow_load_number_scroll = (uint8_t)(
             inc != 0 &&
             button == lastEncoderButton &&
@@ -14828,8 +15019,10 @@ void menu_parseEncoder(int8_t inc, uint8_t button)
         }
     }
 
-    /* S081 H-2a (Q13): silent refusal of STEP edits of A while T != A. */
-    if (liveRec_activePatternLocked() && menu_activePage == SEQ_PAGE) {
+    /* S081 H-2a (Q13): silent refusal of STEP edits of A while T != A.
+     * S082 P3 D45: also while the viewed Scene is still being loaded. */
+    if ((liveRec_activePatternLocked() || menu_viewedSceneLoadPending()) &&
+        menu_activePage == SEQ_PAGE) {
         lastEncoderButton = button;
         return;
     }
@@ -15340,7 +15533,8 @@ static void menu_liveRecRecordCell(uint8_t subPage, uint8_t position)
 
 void menu_parseKnobDelta(uint8_t knobNr, int8_t delta)
 {
-    if (menu_storageBusy) return;
+    /* S082 P3: pots stay locked only on Load/Save during an unlocked load. */
+    if (menu_storageBusy && !menu_backgroundLoadReleasesPanel()) return;
 
     /*
      * Q13 silent refusal while T != A (S081 §7.5, H-2a).
@@ -15349,7 +15543,9 @@ void menu_parseKnobDelta(uint8_t knobNr, int8_t delta)
      * STEP-page edit of A is refused before the display or value changes. No
      * message. Why: editing A's Pattern while recording into T would conflict.
      */
-    if (liveRec_activePatternLocked() && menu_activePage == SEQ_PAGE)
+    /* S082 P3 D45: also while the viewed Scene is being loaded. */
+    if ((liveRec_activePatternLocked() || menu_viewedSceneLoadPending()) &&
+        menu_activePage == SEQ_PAGE)
         return;
 
     /*
@@ -15537,7 +15733,10 @@ void menu_parseKnobDelta(uint8_t knobNr, int8_t delta)
 ** same iteration produce one repaint. */
 void menu_serviceKnobRepaint(void)
 {
-    if (menu_storageBusy)
+    /* S082 P3: an unlocked background Bank load keeps menu_storageBusy set
+     * but frees every page except Load/Save
+     * (menu_backgroundLoadReleasesPanel()). */
+    if (menu_storageBusy && !menu_backgroundLoadReleasesPanel())
         return;
 
     /*
@@ -15611,7 +15810,10 @@ void menu_serviceRuntimeWidgets(void)
     uint16_t now = time_sysTick;
     uint8_t sample;
 
-    if (menu_storageBusy)
+    /* S082 P3: an unlocked background Bank load keeps menu_storageBusy set
+     * but frees every page except Load/Save
+     * (menu_backgroundLoadReleasesPanel()). */
+    if (menu_storageBusy && !menu_backgroundLoadReleasesPanel())
         return;
 
     /*
@@ -15840,6 +16042,12 @@ void menu_pollPresetStatus(void)
      * menu_refreshBankChildProgress(), filesystem_tick(), and screensaver exit.
      */
     menu_refreshBankChildProgress();
+    /*
+     * Repaint the Scene row as background load children land (S082 P3 W4).
+     * Before any worker below can return early; cheap when nothing changed.
+     * Affiliates: menu_refreshBackgroundLoadSceneLeds().
+     */
+    menu_refreshBackgroundLoadSceneLeds();
 
     /*
      * Give a queued physical Load/Save exit priority over new browser work.
@@ -16031,6 +16239,20 @@ void menu_pollPresetStatus(void)
          * File/Dir test ops keep their detailed result branch below.
          */
         if (menu_loadSaveCommandActive) {
+            /*
+             * S082 P3 D46: a failed unlocked background Bank load that ends
+             * off Load/Save finishes quietly: no Load/Save reset, no repaint
+             * of another page, no error overlay. Playback stays where it is.
+             * Affiliates: menu_finishBackgroundLoadCommandOffPage().
+             */
+            if (preset_getCompletedOp() == PRESET_OP_BANK_LOAD &&
+                preset_backgroundBankLoadUnlocked() &&
+                menu_activePage != LOAD_PAGE &&
+                menu_activePage != SAVE_PAGE) {
+                menu_finishBackgroundLoadCommandOffPage();
+                preset_ackStatus();
+                return;
+            }
             filesystem_clearNameCache();
             menu_finishLoadSaveCommand();
         } else if (menu_storageBusy &&
@@ -16237,13 +16459,24 @@ void menu_pollPresetStatus(void)
          * Affiliates: menu_startSoundApply(),
          * menu_requestLoadCommandFinalIndexRestore(),
          * autosave_markResidentBankDirty(), bank_revalidateVoiceEditMasks().
+         *
+         * S082 P3 §5.10: an unlocked load never re-applies: the active Scene
+         * is Scene 17, a kept Scene, or a loaded child the user switched to
+         * after it completed (its activation already applied the loaded data);
+         * a second activation would be audible. Off Load/Save the command
+         * ends quietly (no Load/Save reset or repaint, no failure overlay,
+         * D46); on the frozen screen it ends exactly as before (D7).
+         * Inputs: + preset_backgroundBankLoadUnlocked(), menu_activePage.
+         * Affiliates: + menu_finishBackgroundLoadCommandOffPage().
          */
         uint16_t replaced;
         uint8_t active;
         uint8_t active_replaced;
+        uint8_t unlocked = preset_backgroundBankLoadUnlocked();
+        uint8_t on_page = (uint8_t)(menu_activePage == LOAD_PAGE ||
+                                    menu_activePage == SAVE_PAGE);
 
-        if ((menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
-            !menu_isLoadSaveSelectionCurrent()) {
+        if (on_page && !menu_isLoadSaveSelectionCurrent()) {
             retrySelectionAfterAck = 1;
             retrySelectionLoadKit = 0;
             break;
@@ -16252,7 +16485,7 @@ void menu_pollPresetStatus(void)
         replaced = (uint16_t)(filesystem_lastBankLoadSceneMask() |
                               filesystem_lastBankLoadEmptyMask());
         active = scene_getActiveIndex();
-        active_replaced = (uint8_t)(active < 16u &&
+        active_replaced = (uint8_t)(!unlocked && active < 16u &&
                                     (replaced & (uint16_t)(1u << active)));
 
         bank_revalidateVoiceEditMasks();
@@ -16261,24 +16494,25 @@ void menu_pollPresetStatus(void)
             autosave_markResidentBankDirty();
 
         if (active_replaced) {
-            uint8_t reset_save =
-                (uint8_t)(menu_activePage == LOAD_PAGE ||
-                          menu_activePage == SAVE_PAGE);
+            uint8_t reset_save = on_page;
             menu_startSoundApply(1u, reset_save, 1u, 0u, 1u, 0u, 1u, 0u,
                                  FS_STALE_WARNING_NONE);
         } else {
             preset_ackStatus();
             if (!menu_requestLoadCommandFinalIndexRestore()) {
-                if (menu_loadSaveCommandActive)
-                    menu_finishLoadSaveCommand();
-                else {
+                if (menu_loadSaveCommandActive) {
+                    if (unlocked && !on_page)
+                        menu_finishBackgroundLoadCommandOffPage();
+                    else
+                        menu_finishLoadSaveCommand();
+                } else {
                     menu_storageBusy = 0u;
                     menu_resetSaveParameters();
                     menu_repaintAll();
                 }
             }
         }
-        if (preset_bankLoadFailedSceneMask() != 0u)
+        if (preset_bankLoadFailedSceneMask() != 0u && (!unlocked || on_page))
             menu_showFilesystemErrorOverlay();
         break;
     }
@@ -16887,6 +17121,40 @@ void menu_resetActiveParameter(void)
         menuIndex &= (uint8_t)(~MASK_PARAMETER);
 }
 
+/*
+ * Enter the frozen Load:[Bank] screen during an unlocked load
+ * (S082 P3 W2, D49).
+ *
+ * What: shows the Bank Load page exactly as the background load presents it:
+ * top-level Bank type with the bracketed type field (`Load:[Bank    ]`), the
+ * loading slot, the captured Bank name and the live `NN.` progress; SEQ LEDs
+ * as PERF. Nothing is requested, reset or reloaded.
+ * Why: the normal Load entry resets the Load/Save state and posts a browser
+ * request, which would change the screen and fight the busy card. The
+ * command is still active, so every Load/Save input stays dropped by the
+ * existing gates (no cursor, no encoder, no pots, no SEQ, no COPY).
+ * Inputs: preset_getRequestSlot() (the loading Bank slot).
+ * Outputs: menu_activePage = LOAD_PAGE and the Bank Load state; Scene LEDs.
+ * Accessors: menu_switchPage(LOAD_PAGE) while
+ * preset_backgroundBankLoadUnlocked().
+ * Affiliates: menu_loadSaveEnterTopAt() (the state it mirrors),
+ * filesystem_bankLoadDisplayName(), menu_refreshLoadSceneLeds().
+ */
+static void menu_enterFrozenBankLoadPage(void)
+{
+    menu_activePage = LOAD_PAGE;
+    menu_instrumentLoadActive = 0u;
+    menu_instrumentSaveMode = 0u;
+    menu_saveOptions.what = SAVE_TYPE_BANK;
+    menu_saveOptions.state = SAVE_STATE_EDIT_TYPE;
+    editModeActive = 1u;
+    menu_currentPresetNr[SAVE_TYPE_BANK] = preset_getRequestSlot();
+    menu_bankUiFlags = 0u;
+    led_setValue(0u, LED_COPY);
+    lockPotentiometerFetch();
+    menu_refreshLoadSceneLeds();
+}
+
 /* -----------------------------------------------------------------------
 ** menu_switchPage — exact port (sequencer/LED calls stubbed where needed)
 ** ----------------------------------------------------------------------- */
@@ -16897,22 +17165,27 @@ void menu_switchPage(uint8_t pageNr)
     uint8_t was_voice_page = menu_isVoicePage(menu_activePage);
 
     /*
-     * Backstop: no page switch while a background Bank load runs
-     * (S082 P1 R7).
+     * Background Bank load gates (S082 P1 R7; S082 P3 W2, D38).
      *
-     * What: a page request is dropped (not queued in
-     * menu_pendingPageSwitch) while preset_backgroundBankLoadRunning().
-     * Why: ButtonHandler drops MODE and SHIFT+REC at the source (a, b); this
-     * catches any other caller. The load's own switches
-     * (menu_chainMenuClose() and menu_switchPage(LOAD_PAGE) in
-     * menu_backgroundBankLoadUiBegin()) run in phase 0 before the phase is
-     * set, so they are not affected.
-     * Inputs: preset_backgroundBankLoadRunning(). Outputs: none.
-     * Affiliates: handleModeButtons(), menu_backgroundBankLoadUiBegin().
+     * What: while the load is locked (phases 1-4, 6, stopped loads) every
+     * page request is dropped, as in P1. While it is unlocked, page switches
+     * run immediately and are never queued; a Load/Save request while the
+     * frozen Load:[Bank] screen is already shown does nothing (no Load/Save
+     * toggle, D49).
+     * Why: the P3 panel is free except for Load/Save itself; the queued-exit
+     * mechanism below exists for short Load/Save transactions and would hold
+     * every page change until the end of the load.
+     * Inputs: preset_backgroundBankLoadLocked()/Unlocked(), pageNr,
+     * menu_activePage. Outputs: none (drop) or fall through.
+     * Affiliates: handleModeButtons(), menu_enterFrozenBankLoadPage().
      */
-    if (preset_backgroundBankLoadRunning())
+    if (preset_backgroundBankLoadLocked())
         return;
-    if (menu_storageBusy || preset_getStatus() != PRESET_IDLE) {
+    if (preset_backgroundBankLoadUnlocked() && pageNr == LOAD_PAGE &&
+        menu_activePage == LOAD_PAGE)
+        return;
+    if ((menu_storageBusy || preset_getStatus() != PRESET_IDLE) &&
+        !preset_backgroundBankLoadUnlocked()) {
         /*
          * Retain every genuine physical exit requested during busy work.
          * Inputs: a requested page while Load/Save owns a filesystem/apply
@@ -17167,6 +17440,11 @@ void menu_switchPage(uint8_t pageNr)
 
     case LOAD_PAGE:
         menu_setVoiceModeShowMorph(0u);
+        /* S082 P3 W2: during an unlocked load only the frozen Bank screen. */
+        if (preset_backgroundBankLoadUnlocked()) {
+            menu_enterFrozenBankLoadPage();
+            break;
+        }
         if (menu_activePage == LOAD_PAGE) {
             menu_activePage = SAVE_PAGE;
             menu_instrumentLoadActive = 0u;
@@ -17313,8 +17591,11 @@ void menu_switchPage(uint8_t pageNr)
      * type's data at the moment of entry, which boot's own synchronous
      * pre-audio index population does not leave behind on the very first
      * navigation into Load/Save. See S054_BANK_NAME_ENTRY_FIX.md.
+     *
+     * S082 P3: an unlocked background load keeps menu_storageBusy set for its
+     * whole run; the destination page (or the frozen screen) must still paint.
      */
-    if (!menu_storageBusy)
+    if (!menu_storageBusy || preset_backgroundBankLoadUnlocked())
         menu_repaintAll();
 }
 

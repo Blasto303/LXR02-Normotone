@@ -42,7 +42,7 @@ MIDI CC0 (S083).
 | D4 | **Sound identical.** When all tracks fit, Scene 17 must sound exactly like what was playing. |
 | D5 | **Switch instantly.** Playback moves seamlessly to Scene 17 as soon as the copy completes. |
 | D6 | **Then load.** The Bank loads, replacing Scenes 1–16. |
-| D7 | **UI.** From MIDI, the UI locks and switches to Load/Save → Bank showing the loading slot, exactly as if the user had selected it and pressed OK. From the Menu it is the normal OK. Afterwards the UI unlocks on Load/Save exactly as after a normal Bank Load, and **stays there**. |
+| D7 | **UI.** From MIDI, the UI locks and switches to Load/Save → Bank showing the loading slot, exactly as if the user had selected it and pressed OK. From the Menu it is the normal OK. Afterwards the UI unlocks on Load/Save exactly as after a normal Bank Load, and **stays there**. *Amended by S082 P3 (D40, §5): after phase 5 the user may leave Load/Save; the "stays there" completion applies only when the user is on Load/Save at completion.* |
 | D8 | **PERF shows no Scene selected** while Scene 17 is active. |
 | D9 | **Scene 17 is a normal Scene in every way**, except: (a) once left, it can never be selected again; (b) it has no chain: it always loops itself, and any chain conditions are discarded at the copy. |
 | D10 | **Released only by a Scene change.** Per-track changes do not release it, even if all seven tracks have been moved to other Scenes: Scene 17 still owns the Effect (and the other Scene-level state) that is sounding. Any whole-Scene change (SEQ press, MIDI PC, queued change) releases it. |
@@ -73,7 +73,7 @@ MIDI CC0 (S083).
 | D35 | **Live record at the switch (recommendation accepted 2026-10-18).** The switch keeps the current take going with no reset, so recording carries on into 17 seamlessly. Amends D16 ("as with a Scene change while recording"). |
 | D36 | **Nothing loads into Scene 17 (user, 2026-10-18; schedule R1).** Every load while on 17 (Kit, KitMrp, Scene, Pattern, Instrument, InstrumentMrp, the `kit` row) goes to the **home Scene**, the Scene that was active when 17 was built. That is the SEQ the Load page shows as its destination. Saves from 17 (D29) and copy/clear pastes into 17 (D18) stay allowed. Amends D18. |
 | D37 | **AutoSave dropped at once (user, 2026-10-18; schedule R6).** A Bank load does not wait for an in-flight AutoSave drain; it aborts it (torn, stale record). The only exception is an HCNAMES register publication already under way, which finishes so that `/.hcnames` cannot be lost. Replace discards the dirty state on every path; Merge keeps it (D1, D25). Amends §4.1 step 2 and the §7 "D1 AutoSave yield" note. |
-| D38 | **Panel input during a load is dropped (user, 2026-10-18; schedule R7).** While a Bank load runs, MODE, SHIFT+REC, VOICE entry and page switches are dropped, not queued. Nothing happens after the load; the UI stays on Load:[Bank] (D7). |
+| D38 | **Panel input during a load is dropped (user, 2026-10-18; schedule R7).** While a Bank load runs, MODE, SHIFT+REC, VOICE entry and page switches are dropped, not queued. Nothing happens after the load; the UI stays on Load:[Bank] (D7). *Amended by S082 P3 (D40, §5): this holds for phases 1–4 and 6 and for a stopped load; an unlocked phase-5 load frees the panel.* |
 | D39 | **MIDI load closes everything (user, 2026-10-18; schedule R8).** A MIDI Bank load closes every latched menu and session and shows the Bank Load screen exactly as if it had been entered by hand. |
 
 ---

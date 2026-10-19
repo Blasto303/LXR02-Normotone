@@ -221,6 +221,22 @@ must not allocate those rings, cursors, or timing records.
   use the full-queue idle window (200 µs, `BG_LOAD_IDLE_FS_BUDGET_US`), and the
   DEV poll-count stall observers ignore those ticks. See
   `S082_P2_IMPLEMENTATION.md` §10.
+* **S082 P3 implemented (2026-10-19, built, not hardware-tested):** a
+  background Bank load now unlocks the panel at phase 5 when it runs on Scene
+  17 or as a running-transport direct load;
+  `preset_backgroundBankLoadUnlocked()/Locked()` split the P1 lock. BankData
+  owns the 2 B `bank_load_unavailable_mask` availability session
+  (`bank_beginLoadAvailability`/`bank_noteLoadChildDone`/
+  `bank_endLoadAvailability`): selection, fan-out, copy/clear and LEDs use
+  availability, persistence keeps presence. The load is posted with
+  `FS_BANK_FLAG_PROGRESSIVE`, merges the new edit masks before the first child,
+  sets each child's present bit as it completes, and strips only failed
+  children at the end. The Load/Save page becomes a frozen Bank screen with
+  live 1-based `NN.` progress and PERF-style SEQ LEDs; `LED_MODE4` fast-blinks
+  elsewhere (second fast-blink slot). Chains do not evaluate during a load;
+  copy/clear jobs on pending Scenes drop with `LOAD_PENDING` and their names
+  publish after the command. DEV link `text=598,120`, `data=420`,
+  `bss=430,928`; image 598,540 B. See `S082_P3_IMPLEMENTATION.md` §13.
 
 This section is for short carryover points only. Flush or rewrite it at session
 end; durable facts belong in `knowledge_files/log_archive/` or

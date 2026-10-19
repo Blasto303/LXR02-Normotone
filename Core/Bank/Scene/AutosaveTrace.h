@@ -590,6 +590,8 @@ typedef enum {
 #define AUTOSAVE_TRACE_CC_DROP_BAD_SELECTION    7u
 #define AUTOSAVE_TRACE_CC_DROP_BAD_GEOMETRY     8u
 #define AUTOSAVE_TRACE_CC_DROP_SCENE17          9u
+/* S082 P3 D41: the job's Scene is still being loaded by a background Bank load. */
+#define AUTOSAVE_TRACE_CC_DROP_LOAD_PENDING    10u
 
 #define AUTOSAVE_TRACE_CC_ANOM_GROW_UNPLACEABLE      1u
 #define AUTOSAVE_TRACE_CC_ANOM_SWAP_RETURN_ABANDONED 2u

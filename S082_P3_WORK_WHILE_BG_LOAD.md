@@ -218,6 +218,10 @@ whenever the command is active, in scope and the transport is stopped.
 - **Exit work deferred:** the resident-name session end (`end_resident_name_session`, `menu.c:16999`) posts an HCNAMES flush that needs the facade. It is **deferred to the load's completion**, not dropped.
 - **Returning:** shows §5.3. Leaving and returning any number of times is allowed.
 
+**Implemented as:** no deferral is needed. The page exit only invalidates the
+name scratch and clears the browser cache, and the HCNAMES flush is already a
+background write that waits for an idle card (schedule §0.6 b).
+
 ### 5.5 What runs during an unlocked load (W3, D41)
 
 Nothing is locked out at the menu level except Load/Save itself (W2).
@@ -238,6 +242,10 @@ Nothing is queued to run after the load.
 | Any Load or Save (Kit, KitMrp, Scene, Pattern, Instrument, InstrumentMrp, Bank, Globals, Samples, the `kit` row) | **Not reachable**: Load/Save is frozen (W2). |
 | Global page items that start a card or Preset operation | **Dropped** (§7.6 audit). Plain Global parameter edits run; `settings.cfg` writes wait for the facade (D24). |
 | MIDI PC, MIDI Bank Change, other non-RT/note/CC MIDI | **Dropped** (D13, D33 unchanged). |
+
+**Implemented as:** D48 was already satisfied:
+`menu_loadSaveCommandInNoPlaybackScope()` returns 0 off Load/Save, so leaving
+the page ends the codec suspension with no code change (schedule §0.6 c).
 
 ### 5.6 PERF Scene LEDs and Scene changes (W4, D42, D43)
 
@@ -365,6 +373,12 @@ fixes the sites.
 
 ### 7.2 Done mask and edit masks — filesystem, BankData
 
+**Implemented as:** the availability state lives in BankData as a 2 B
+*unavailable* mask (`bank_load_unavailable_mask`), not as a filesystem done
+mask; a completed child sets its present bit immediately and clears its
+unavailable bit. This is the schedule's §0.6 a decision. `filesystem.c` keeps
+no new per-operation mask.
+
 | Site | Change |
 |------|--------|
 | `filesystem.c` op scratch (beside `op_bank_child_cursor`, 1410) | ADD `op_bank_done_mask` (2 B, D47). Cleared at Bank Load start; the child's bit is set when the loop leaves a child without failure (`filesystem.c:14990-15000`). |
@@ -437,6 +451,15 @@ release, and the MIDI drop/defer rules.
    The ordering in §5.8 must leave the copied names on the card.
 7. **Early edit-mask merge on boot.** Moving the merge before the first child also changes boot loads. Confirm the boot path does not read the old entries between phase 98 and the end.
 
+**Resolved by the implementation dive (schedule §0.6):** item 1 — every Preset
+or filesystem request reachable while unlocked comes from a Load/Save-family
+path, which stays frozen; Instrument/Effect `typ` and the SOM generator are
+runtime-only. Item 3 — the frozen screen reads the request's captured name and
+slot, not the browser cache. Item 4 — the frozen entry sets
+`menu_saveOptions.what`/`menu_currentPresetNr[]` from the request, so the
+completion's selection check takes the normal path. The boot load keeps its
+non-progressive merge at the end (the early merge is progressive-only).
+
 ---
 
 ## 8. Resources (D47, approved 2026-10-19)
@@ -451,6 +474,12 @@ release, and the MIDI drop/defer rules.
 
 Total 4 B. Record the measured sizes in `STORAGE_SRAM_MANIFEST.md` at
 implementation. Anything larger needs a new acknowledgement.
+
+**Implemented as (2026-10-19):** the 2 B mask is BankData's
+`bank_load_unavailable_mask`, not `op_bank_done_mask` (schedule §0.6 a).
+Measured symbols: mask 2 B, `led_fastBlinkLed[2]` 2 B (+1 B), Menu
+`menu_bgLoadAvailCount` 1 B; linked DEV BSS grew 430,920 → 430,928 B
+(alignment). `PM_BG_UNLOCKED` uses spare bit 3 of `pm_bg_phase`.
 
 ---
 

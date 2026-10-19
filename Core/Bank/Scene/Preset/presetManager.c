@@ -95,8 +95,9 @@ static uint16_t                  pm_bank_load_failed_scene_mask = 0u;
  *
  * What: low nibble = phase (0 idle / start a pending MIDI request, 1 decide,
  * 2 quiesce, 3 build or rebuild and switch, 4 post the load, 5 wait for
- * completion, 6 MIDI origin: wait for the Load:[Bank] preview); flags = MIDI
- * origin, Replace, Scene 17 needed, dirty mask discarded.
+ * completion, 6 MIDI origin: wait for the Load:[Bank] preview); flags =
+ * unlocked (bit 3), MIDI origin, Replace, Scene 17 needed, dirty mask
+ * discarded.
  * Why: the request is accepted immediately and advanced one
  * bounded step per menu_pollPresetStatus() pass; the slot and outcome masks
  * reuse pm_request_slot and pm_kit_request_scene_mask, and the empty mask is
@@ -109,7 +110,21 @@ static uint16_t                  pm_bank_load_failed_scene_mask = 0u;
  * seq_moveTracksToBackgroundScene().
  */
 static uint8_t                   pm_bg_phase = 0u;
-#define PM_BG_PHASE_MASK      0x0Fu
+#define PM_BG_PHASE_MASK      0x07u
+/*
+ * The load is unlocked for the panel (S082 P3 W3, W4, D40).
+ *
+ * What: set on entry to phase 5 when the Bank Load was posted progressively
+ * (Scene 17 load, or a direct load with the transport running); cleared with
+ * every other flag by preset_bgEnd(). Phase values are 0-6, so bit 3 was
+ * unused under the former 0x0F mask.
+ * Why: Menu, ButtonHandler and the LED owner need one test for "the user may
+ * work while this load finishes"; phases 1-4 and 6, and stopped loads, keep
+ * the S082 P1 lock (D38).
+ * Inputs: phase 4 acceptance. Outputs: preset_backgroundBankLoadUnlocked().
+ * Affiliates: PRESET_BANK_LOAD_PROGRESSIVE, preset_backgroundBankLoadLocked().
+ */
+#define PM_BG_UNLOCKED        0x08u
 #define PM_BG_ORIGIN_MIDI     0x10u
 #define PM_BG_REPLACE         0x20u
 /*
@@ -650,6 +665,19 @@ static void on_bank_load_complete(void)
 {
     uint16_t completed_scene_mask;
     uint8_t scene_index;
+
+    /*
+     * End the availability session before Menu sees the completion
+     * (S082 P3 D44).
+     *
+     * What: availability returns to the present mask, which the filesystem
+     * has just committed (success) or left as the children set it (failure).
+     * Why: Menu's completion repaints PERF and finishes the command from the
+     * final state; a stale unavailable bit would keep a Scene dark.
+     * Inputs: none. Outputs: BankData session closed.
+     * Affiliates: bank_endLoadAvailability(), filesystem metadata commit.
+     */
+    bank_endLoadAvailability();
 
     /*
      * Complete one root Bank load.
@@ -3226,7 +3254,9 @@ uint8_t preset_loadBank(uint16_t presetNr, uint16_t act_mask,
      *
      * Inputs: root Bank library slot, act_mask (Scenes loaded from child),
      * empty_mask (Scenes emptied by Replace), flags (PRESET_BANK_LOAD_BOOT for
-     * the boot path). Output: nonzero when filesystem accepts the Bank load.
+     * the boot path, REPLACE for a stated runtime Replace and PROGRESSIVE for
+     * an unlocked load, S082 P3). Output: nonzero when filesystem accepts the
+     * Bank load.
      */
     filesystem_ack();
     pm_status = PRESET_LOAD_IN_PROGRESS;
@@ -3683,6 +3713,30 @@ uint8_t preset_backgroundBankLoadRunning(void)
 }
 
 /*
+ * Panel state of a background Bank load (S082 P3 D38, D40).
+ *
+ * What: Unlocked = phase 5 of a progressive load (the user may leave
+ * Load/Save and work). Locked = any other running phase, or a stopped load
+ * (the S082 P1 R7 panel drop still applies).
+ * Why: the P1 gates dropped every panel action while a load ran; P3 keeps
+ * that only for the locked part.
+ * Inputs: pm_bg_phase. Outputs: boolean; single-byte read, ISR-safe.
+ * Accessors: ButtonHandler MODE/SHIFT+REC, menu_switchPage(), Menu storage
+ * gates, frozen Load:[Bank] screen, completion, the LED owner.
+ * Affiliates: PM_BG_UNLOCKED, preset_backgroundBankLoadRunning().
+ */
+uint8_t preset_backgroundBankLoadUnlocked(void)
+{
+    return (uint8_t)((pm_bg_phase & PM_BG_UNLOCKED) != 0u);
+}
+
+uint8_t preset_backgroundBankLoadLocked(void)
+{
+    return (uint8_t)(preset_backgroundBankLoadRunning() &&
+                     !preset_backgroundBankLoadUnlocked());
+}
+
+/*
  * Read and clear the last background Bank load result (S082 P1 D34).
  *
  * What: returns pm_bg_result and resets it to NONE.
@@ -3747,13 +3801,20 @@ static uint8_t preset_bgWaitExpired(void)
  * Inputs: failed, pm_bg_phase. Outputs: pm_bg_phase, pm_bg_pending_slot,
  * pm_bg_result, yield, Menu command state.
  * Accessors: preset_tickBackgroundBankLoad().
- * Affiliates: filesystem_setAutosaveYield(), menu_backgroundBankLoadAbort().
+ * Affiliates: filesystem_setAutosaveYield(), menu_backgroundBankLoadAbort(),
+ * bank_endLoadAvailability().
  */
 static void preset_bgEnd(uint8_t failed)
 {
     uint8_t midi = (uint8_t)((pm_bg_phase & PM_BG_ORIGIN_MIDI) != 0u);
 
     filesystem_setAutosaveYield(0u);
+    /*
+     * Close any availability session (S082 P3). What: idempotent backstop
+     * for every exit, including failures before the filesystem accepted the
+     * request. Affiliates: bank_endLoadAvailability(), on_bank_load_complete().
+     */
+    bank_endLoadAvailability();
     pm_bg_phase = 0u;
     pm_bg_pending_slot = PM_BG_PENDING_NONE;
     if (failed) {
@@ -3905,27 +3966,43 @@ void preset_tickBackgroundBankLoad(void)
         menu_refreshPerfSceneLeds();
         preset_bgSetPhase(4u);
         return; }
-    case 4u:
+    case 4u: {
         /*
          * Post the ordinary two-mask Bank Load; wait while the card is busy
-         * (P1-5).
+         * (P1-5). Decide the unlock (S082 P3 D40).
          *
-         * What: a refusal while the facade is BUSY (for example a
-         * settings.cfg write, D24) is retried next pass, for at most
-         * PM_BG_WAIT_LIMIT_MS (A8); a refusal on an idle facade is a real
-         * failure. Either failure releases the yield, records FAILED and ends
-         * the command. On failure while on Scene 17 playback stays on 17
-         * (§4.5).
+         * What: a refusal while the facade is BUSY is retried next pass, for
+         * at most PM_BG_WAIT_LIMIT_MS (A8); a refusal on an idle facade is a
+         * real failure. The load is progressive, and the panel unlocks at
+         * phase 5, when Scene 17 carries playback, or when the transport runs
+         * and no played Scene is replaced (a direct D25/D31 load). A load
+         * requested stopped keeps the P1 lock: it replaces the active Scene in
+         * place and runs fast with the codec suspended.
+         * Why: the unlock must start exactly when the filesystem has accepted
+         * the request and BankData has marked the affected Scenes unavailable,
+         * never earlier.
+         * Inputs: act/empty, PM_BG_NEEDED, seq_isRunning(),
+         * preset_backgroundScene17Needed().
+         * Outputs: phase 5 (+ PM_BG_UNLOCKED), or failure.
+         * Affiliates: preset_loadBank(), FS_BANK_FLAG_PROGRESSIVE.
          */
-        if (preset_loadBank(pm_request_slot, act, empty,
-                            (uint8_t)((pm_bg_phase & PM_BG_REPLACE)
-                                          ? PRESET_BANK_LOAD_REPLACE : 0u))) {
+        uint8_t progressive = (uint8_t)(
+            (pm_bg_phase & PM_BG_NEEDED) != 0u ||
+            (seq_isRunning() &&
+             !preset_backgroundScene17Needed((uint16_t)(act | empty))));
+        uint8_t flags = (uint8_t)(
+            ((pm_bg_phase & PM_BG_REPLACE) ? PRESET_BANK_LOAD_REPLACE : 0u) |
+            (progressive ? PRESET_BANK_LOAD_PROGRESSIVE : 0u));
+
+        if (preset_loadBank(pm_request_slot, act, empty, flags)) {
             preset_bgSetPhase(5u);
+            if (progressive)
+                pm_bg_phase |= PM_BG_UNLOCKED;
         } else if (filesystem_status() != FS_STATUS_BUSY ||
                    preset_bgWaitExpired()) {
             preset_bgEnd(1u);
         }
-        return;
+        return; }
     case 5u:
         if (pm_status == PRESET_IDLE)
             preset_bgEnd(0u);

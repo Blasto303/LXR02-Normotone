@@ -138,11 +138,31 @@ Scene storage; it is a singleton module.
 |-------|------|---------|
 | `bank_display_name[9]` | char[9] | 8-char display name + NUL, from HCNAMES row 0 |
 | `bank_scene_present_mask` | uint16_t | Which of 16 Scenes are populated |
+| `bank_load_unavailable_mask` | uint16_t | Scenes a running background Bank load has not finished (S082 P3) |
 | `bank_scene_mask_voice_edit[16]` | uint16_t[16] | Per-Scene fan-out mask for VOICE-page and Scene-settings edits |
 | `bank_active_scene_slot` | uint8_t | Currently active Scene index (0..15) |
 | `bank_has_resident_bank` | uint8_t | Whether a Bank is loaded |
 | `bank_restore_slot` | uint16_t | SD library slot for `settings.cfg` persistence |
 | SD-clean authority | ~16 bytes | Session-scoped, never serialized |
+
+### Load availability (S082 P3)
+
+`bank_load_unavailable_mask` is zero outside a load. A progressive background
+Bank Load marks its load and empty sets at request acceptance
+(`bank_beginLoadAvailability()`); each completed child sets its own present
+bit, clears its unavailable bit and revalidates layouts among the Scenes now
+available (`bank_noteLoadChildDone()`); every exit clears the mask
+(`bank_endLoadAvailability()`, called by the Preset completion and as the
+`preset_bgEnd()` backstop).
+
+The resulting availability rule is **selection, fan-out, copy/clear and LED
+presence use `bank_sceneAvailableMask()`; persistence (AutoSave, Bank Save and
+the end-of-load present commit) keeps using `bank_scenePresentMask()`**. The
+helpers are `bank_sceneAvailable()`, `bank_loadUnavailableMask()`,
+`bank_sceneFanoutMask()` and `bank_editTargetMask()`; EffectsManager's
+`effects_fanoutMask()` masks the same unavailable bits. While Scene 17 is
+active the edit target remains Scene 17 alone. Outside a load availability is
+exactly presence, so every changed test reduces to its pre-P3 form.
 
 ### Voice-Edit Fan-Out Mask (Per-Scene, Session 071)
 
@@ -821,6 +841,10 @@ S082 active Scene and edit masks:
   resident presence. A Merge Load re-marks the whole resident Bank for
   AutoSave; a Merge Save reads the slot's existing manifest to keep untouched
   children mutually exclusive.
+* A progressive Load sets each child's present bit as it completes and merges
+  the new Bank's edit entries before the first child; its final commit keeps
+  the live present mask and only strips failed children from the entries, so
+  user edits made while the panel was unlocked survive.
 * Voice edit masks stay mutually exclusive after a partial operation. A
   loaded/written Scene takes its source/RAM entry restricted to the acted set
   plus itself; an emptied/removed Scene resets to self and is removed from

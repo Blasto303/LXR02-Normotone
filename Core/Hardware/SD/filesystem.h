@@ -650,6 +650,11 @@ void        filesystem_backgroundBudgetDeny(uint8_t work_class);
  * filesystem_saveBankDirectory_tick(), filesystem_loadBankDirectory_tick().
  */
 uint8_t filesystem_bankChildCursor(void);
+/*
+ * Name of the Bank being loaded, captured at request (S082 P3 W2).
+ * Accessors: the frozen Load:[Bank] screen.
+ */
+const char *filesystem_bankLoadDisplayName(void);
 
 /*
  * Queue keyed settings persistence without taking filesystem ownership.

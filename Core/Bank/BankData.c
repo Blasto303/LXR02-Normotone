@@ -19,6 +19,29 @@ static uint16_t bank_scene_mask_present;
  * Autosave/bankset writers serialize the same per-Scene layout.
  */
 static uint16_t bank_scene_mask_voice_edit[BANK_SCENE_SLOT_COUNT];
+/*
+ * Scenes a running background Bank load has not finished (S082 P3 D44).
+ *
+ * What: bit N set = resident Scene N belongs to the load's load or empty set
+ * and is not yet complete: pending, in progress, emptied, or a requested child
+ * that never loads. A completed child's bit clears; every remaining bit clears
+ * at the end of the load. Zero outside a load.
+ * Why: the present mask and the edit masks describe the old Bank until the
+ * last child commits, but the panel is unlocked from the first child (W4). A
+ * Scene being replaced must never be played, viewed for editing, fanned out
+ * to or copied into; a loaded Scene must be usable at once. BankData is the
+ * one module every reader (Menu, Sequencer, copy/clear, EffectsManager)
+ * already includes.
+ * Inputs: bank_beginLoadAvailability(), bank_noteLoadChildDone(),
+ * bank_endLoadAvailability().
+ * Outputs: bank_sceneAvailable(), bank_sceneAvailableMask(),
+ * bank_loadUnavailableMask(), filters in bank_editTargetMask() and
+ * bank_sceneFanoutMask().
+ * SRAM: 2 B, SRAM1 static, owner BankData (approved 2026-10-19, S082 P3 D47).
+ * Affiliates: filesystem_requestLoadBank(), Bank Load phase 20,
+ * on_bank_load_complete(), preset_bgEnd().
+ */
+static uint16_t bank_load_unavailable_mask;
 static uint8_t bank_active_scene_slot;
 static uint8_t bank_has_resident_bank;
 /*
@@ -257,6 +280,99 @@ uint8_t bank_scenePresent(uint8_t scene_index)
                      0u);
 }
 
+/*
+ * Start a load-availability session (S082 P3 D44, W4).
+ *
+ * What: marks every Scene of the accepted load's load and empty sets as
+ * unavailable. Why: from the moment the filesystem accepts a progressive
+ * Bank load the panel can act; a Scene about to be replaced must already be
+ * excluded, before any child phase runs. Inputs: scope_mask = act | empty.
+ * Outputs: bank_load_unavailable_mask. No AutoSave mark (not a Bank field).
+ * Accessors: filesystem_requestLoadBank() for FS_BANK_FLAG_PROGRESSIVE.
+ * Affiliates: bank_noteLoadChildDone(), bank_endLoadAvailability().
+ */
+void bank_beginLoadAvailability(uint16_t scope_mask)
+{
+    bank_load_unavailable_mask = bank_normalizeSceneMask(scope_mask);
+}
+
+/*
+ * Publish one completed Bank child (S082 P3 D44, W4).
+ *
+ * What: for a Scene still unavailable in this session, sets its present bit,
+ * clears its unavailable bit, then revalidates the edit masks among the
+ * Scenes now available. Why: the child's settings, Kit, Pattern and Effect
+ * are complete; the Scene must be selectable, lit in PERF and a fan-out
+ * member immediately, and its new edit-mask entry (merged before the first
+ * child, F3) must not link Scenes whose layouts differ. Revalidating only
+ * among available Scenes keeps the links to pending Scenes, whose old content
+ * would otherwise strip them. The present bit is set early on purpose: it is
+ * exactly what the end-of-load commit sets, and a Bank load that fails later
+ * still leaves the loaded content present.
+ * Inputs: scene 0..15. Outputs: present mask (AutoSave field marked; the
+ * drain is held by the load's yield), unavailable mask, edit-mask entries.
+ * Accessors: filesystem Bank Load phase 20 (success, progressive loads only).
+ * Affiliates: bank_revalidateVoiceEditMasksIn(), bank_setScenePresentMask().
+ */
+void bank_noteLoadChildDone(uint8_t scene)
+{
+    uint16_t bit = bank_sceneBit(scene);
+
+    if (bit == 0u || (bank_load_unavailable_mask & bit) == 0u)
+        return;
+    (void)bank_setScenePresentMask((uint16_t)(bank_scene_mask_present | bit));
+    bank_load_unavailable_mask =
+        (uint16_t)(bank_load_unavailable_mask & (uint16_t)~bit);
+    bank_revalidateVoiceEditMasksIn(bank_sceneAvailableMask());
+}
+
+/*
+ * End the load-availability session (S082 P3).
+ *
+ * What: clears the unavailable mask; availability equals presence again.
+ * Why: called once the filesystem has committed the final present mask, or
+ * on any failure; idempotent so every exit can call it.
+ * Inputs: none. Outputs: bank_load_unavailable_mask = 0.
+ * Accessors: on_bank_load_complete(), preset_bgEnd().
+ * Affiliates: bank_beginLoadAvailability().
+ */
+void bank_endLoadAvailability(void)
+{
+    bank_load_unavailable_mask = 0u;
+}
+
+/*
+ * Read the load-availability state (S082 P3).
+ *
+ * What: bank_loadUnavailableMask() is the raw unavailable set (0 outside a
+ * load); bank_sceneAvailableMask() is present & ~unavailable;
+ * bank_sceneAvailable() tests one Scene (0 for index 16 and above).
+ * Why: user-facing selection, fan-out, copy/clear and LEDs use availability;
+ * persistence (AutoSave, Bank Save, the end-of-load commit) keeps using the
+ * present mask. Outside a load both are identical.
+ * Inputs: present and unavailable masks. Outputs: masks or boolean.
+ * Accessors: Menu Scene LEDs and Scene changes, ButtonHandler PERF presses,
+ * copy/clear job gate, EffectsManager fan-out, bank_editTargetMask(),
+ * bank_sceneFanoutMask().
+ * Affiliates: bank_scenePresent(), bank_scenePresentMask().
+ */
+uint16_t bank_loadUnavailableMask(void)
+{
+    return bank_load_unavailable_mask;
+}
+
+uint16_t bank_sceneAvailableMask(void)
+{
+    return (uint16_t)(bank_scene_mask_present &
+                      (uint16_t)~bank_load_unavailable_mask);
+}
+
+uint8_t bank_sceneAvailable(uint8_t scene_index)
+{
+    return (uint8_t)((bank_sceneAvailableMask() &
+                      bank_sceneBit(scene_index)) != 0u);
+}
+
 void bank_setActiveSceneSlot(uint8_t slot)
 {
     uint8_t normalized_slot;
@@ -427,15 +543,23 @@ void bank_toggleSceneMaskVoiceEdit(uint8_t scene_index)
 }
 
 /*
- * Revalidate every directional VOICE edit-mask entry after layout changes.
+ * Revalidate directional VOICE edit-mask entries within a Scene scope
+ * (F5 repair; S082 P3 scope).
  *
- * Inputs: resident Scene Effect/Instrument types. Output: mismatched member
- * bits are removed and changed owner entries pass through the indexed setter,
- * preserving the active-bit invariant and marking the Bank mask field. This
- * is the shared F5 repair for load completion and Effect type-change paths;
- * it runs in foreground context and uses no extra storage.
+ * What: for every owner in scope, drops each member bit in scope whose
+ * layout no longer matches the owner; members and owners outside scope are
+ * untouched. Changed entries pass through the indexed setter (active-bit
+ * invariant, Bank mask field marked on change).
+ * Why: load completion and Effect type changes revalidate everything
+ * (scope 0xFFFF). During a progressive Bank load only the available Scenes
+ * hold final content; revalidating against pending Scenes would remove links
+ * that are valid once those Scenes load (S082 P3 D44).
+ * Inputs: scope mask; resident Effect/Instrument types.
+ * Outputs: edit-mask entries. Foreground only; no storage.
+ * Accessors: bank_revalidateVoiceEditMasks() (full), bank_noteLoadChildDone().
+ * Affiliates: scene_editLayoutMatches(), bank_setSceneMaskVoiceEditForScene().
  */
-void bank_revalidateVoiceEditMasks(void)
+void bank_revalidateVoiceEditMasksIn(uint16_t scope)
 {
     uint8_t owner;
 
@@ -444,10 +568,13 @@ void bank_revalidateVoiceEditMasks(void)
         uint16_t kept = mask;
         uint8_t member;
 
+        if ((scope & bank_sceneBit(owner)) == 0u)
+            continue;
         for (member = 0u; member < BANK_SCENE_SLOT_COUNT; member++) {
             uint16_t bit = bank_sceneBit(member);
 
-            if (member == owner || (mask & bit) == 0u)
+            if (member == owner || (mask & bit) == 0u ||
+                (scope & bit) == 0u)
                 continue;
             if (!scene_editLayoutMatches(owner, member))
                 kept = (uint16_t)(kept & (uint16_t)~bit);
@@ -457,12 +584,21 @@ void bank_revalidateVoiceEditMasks(void)
     }
 }
 
+/* Full-scope wrapper of bank_revalidateVoiceEditMasksIn(). */
+void bank_revalidateVoiceEditMasks(void)
+{
+    bank_revalidateVoiceEditMasksIn(0xFFFFu);
+}
+
 /*
  * Edit-mask helpers for copy/clear (S075, spec §4.4, §4.5, §5).
  *
  * Contract in BankData.h. bank_sceneFanoutMask() reads the Scene's own
  * directional entry (the active Scene through the self-repairing getter) and
- * keeps the Scene itself plus every present member whose layout matches.
+ * keeps the Scene itself plus every available member whose layout matches
+ * (S082 P3 D44: members must be present and not pending in a running
+ * background Bank load, so a paste, clear or edit never reaches a Scene the
+ * load is about to replace; outside a load this equals the present test).
  * bank_exchangeVoiceEditMask() applies the spec §4.4 formula to the source
  * entry and stores it as the destination entry. bank_resetVoiceEditMaskToSelf()
  * stores bit(scene). Both writers use the indexed setter (normalize, active
@@ -484,7 +620,7 @@ uint16_t bank_sceneFanoutMask(uint8_t scene)
         uint16_t bit = bank_sceneBit(member);
 
         if (member == scene || (mask & bit) == 0u ||
-            !bank_scenePresent(member) ||
+            !bank_sceneAvailable(member) ||
             !scene_editLayoutMatches(scene, member))
             continue;
         out = (uint16_t)(out | bit);
@@ -494,9 +630,26 @@ uint16_t bank_sceneFanoutMask(uint8_t scene)
 
 uint32_t bank_editTargetMask(void)
 {
+    /*
+     * Edit targets, limited to available Scenes during a load
+     * (S082 C4; S082 P3 D44).
+     *
+     * What: Scene 17 alone while it is active; otherwise the active Scene's
+     * edit-mask entry without the Scenes a running background Bank load has
+     * not finished. Why: the entry is applied raw by every Menu commit loop;
+     * during a load it can name pending Scenes (old content about to be
+     * replaced) or emptied ones. Outside a load the unavailable mask is 0 and
+     * the result is the existing entry.
+     * Inputs: active Scene, active entry, bank_load_unavailable_mask.
+     * Outputs: 32-bit target mask.
+     * Accessors: menu_cellCommitValue(), menu_commitBusCompParam(), PAR_MORPH
+     * and voice Morph commits, other Menu fan-out loops.
+     * Affiliates: bank_sceneMaskVoiceEdit(), bank_loadUnavailableMask().
+     */
     return (scene_getActiveIndex() == SCENE_BACKGROUND_INDEX)
         ? (1ul << SCENE_BACKGROUND_INDEX)
-        : (uint32_t)bank_sceneMaskVoiceEdit();
+        : (uint32_t)(uint16_t)(bank_sceneMaskVoiceEdit() &
+                               (uint16_t)~bank_load_unavailable_mask);
 }
 
 uint32_t bank_sceneFanoutMask32(uint8_t scene)
@@ -579,6 +732,39 @@ void bank_mergeVoiceEditMasksAfterLoad(const uint16_t *source_entries,
                 (bank_scene_mask_voice_edit[n] & (uint16_t)~replaced) | bit);
         }
         bank_setSceneMaskVoiceEditForScene(n, entry);
+    }
+}
+
+/*
+ * Remove failed Bank children from every edit-mask entry (S082 P3).
+ *
+ * What: every entry loses the failed Scenes' bits (keeping its own bit); a
+ * failed Scene's own entry becomes itself only.
+ * Why: a progressive Bank load merges the new Bank's edit masks before the
+ * first child (so loaded children fan out correctly at once); the end of the
+ * load must then only correct the children that failed. Re-running the full
+ * merge would overwrite edit-mask changes the user made during the load.
+ * Inputs: failed_mask (op_bank_scene_failed_mask).
+ * Outputs: entries through bank_setSceneMaskVoiceEditForScene().
+ * Accessors: filesystem Bank Load metadata commit (progressive loads).
+ * Affiliates: bank_mergeVoiceEditMasksAfterLoad(), FS_BANK_FLAG_PROGRESSIVE.
+ */
+void bank_stripFailedFromVoiceEditMasks(uint16_t failed_mask)
+{
+    uint8_t n;
+
+    failed_mask = bank_normalizeSceneMask(failed_mask);
+    if (failed_mask == 0u)
+        return;
+    for (n = 0u; n < BANK_SCENE_SLOT_COUNT; n++) {
+        uint16_t bit = bank_sceneBit(n);
+        uint16_t entry = (failed_mask & bit)
+            ? bit
+            : (uint16_t)((bank_scene_mask_voice_edit[n] &
+                          (uint16_t)~failed_mask) | bit);
+
+        if (entry != bank_scene_mask_voice_edit[n])
+            bank_setSceneMaskVoiceEditForScene(n, entry);
     }
 }
 

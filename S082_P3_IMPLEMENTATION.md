@@ -1881,3 +1881,230 @@ The spec §11 list (1–15) is the hardware script. In addition:
 
 *(To be filled in by the implementer: per step, the date, the build numbers
 and any deviation from this schedule.)*
+
+### 2026-10-19 — S1 BankData availability — DONE
+
+- Baseline `make all` before any edit: `text=595,968`, `data=420`,
+  `bss=430,920`; flash 596,388 / 753,664 B (headroom 157,276 B).
+- Added the static 2 B `bank_load_unavailable_mask` and the availability API
+  (`bank_beginLoadAvailability`, `bank_noteLoadChildDone`,
+  `bank_endLoadAvailability`, `bank_loadUnavailableMask`,
+  `bank_sceneAvailableMask`, `bank_sceneAvailable`).
+- Split `bank_revalidateVoiceEditMasks()` into the scoped
+  `bank_revalidateVoiceEditMasksIn()` plus the full-scope wrapper; the loop
+  now skips owners and members outside the scope.
+- `bank_sceneFanoutMask()` filters on availability;
+  `bank_editTargetMask()` masks out unavailable Scenes; added
+  `bank_stripFailedFromVoiceEditMasks()`.
+- Header declarations and contract text updated.
+- Build after S1: unchanged linked sizes (the new code has no caller yet, so
+  LTO/gc dropped both text and the 2 B mask). No new warnings.
+
+### 2026-10-19 — S2 filesystem progressive Bank Load — DONE
+
+- Added `FS_BANK_FLAG_PROGRESSIVE` (0x10) plus compile-time equality checks
+  against `PRESET_BANK_LOAD_BOOT/REPLACE/PROGRESSIVE` (the Preset progressive
+  define was added in this step so the checks exist from the start).
+- `filesystem_requestLoadBank()` starts the availability session with
+  `act | empty`; phases 17 and 98 call the new
+  `filesystem_bankLoadMergeEditMasksEarly()` before the first child; phase 20
+  publishes each successful child through `bank_noteLoadChildDone()`.
+- The post-children commit keeps the live present mask for a progressive load
+  (clearing only emptied Scenes) and strips failed children from the edit masks
+  instead of re-running the full merge. Non-progressive paths are unchanged.
+- Added `filesystem_bankLoadDisplayName()` and its header declaration.
+- Build after S2: `text=596,168`, `data=420`, `bss=430,920` (mask still
+  optimised out until callers reached it; no new warnings).
+
+### 2026-10-19 — S3 Preset unlocked flag — DONE
+
+- `PM_BG_PHASE_MASK` is now 0x07 with `PM_BG_UNLOCKED` = bit 3;
+  `PRESET_BANK_LOAD_PROGRESSIVE` added to the header.
+- Phase 4 posts `PRESET_BANK_LOAD_PROGRESSIVE` for a Scene 17 load or a
+  running-transport direct load, then sets `PM_BG_UNLOCKED` on phase 5.
+- Added `preset_backgroundBankLoadUnlocked()`/`Locked()`;
+  `preset_bgEnd()` clears the BankData session as a backstop and
+  `on_bank_load_complete()` ends it before Menu sees completion.
+- Build after S3: `text=596,416`, `data=420`, `bss=430,920`.
+
+### 2026-10-19 — S4 two-slot fast blink — DONE
+
+- `led_fastBlinkLed[2]` with `LED_FAST_SLOT_QUEUED_SCENE` and
+  `LED_FAST_SLOT_BANK_LOAD`, one shared phase/deadline. Added
+  `led_setFastBlinkSlot()`/`led_getFastBlinkSlot()`; `led_clearAll()` clears
+  both slots; the tick renders both.
+- The per-beat PERF refresh now also runs when
+  `menu_bankLoadFrozenPageActive()`.
+- Removed the old single-LED API; its only caller was Menu.
+- Build: included in the S5 result (ledHandler alone had a missing Menu
+  declaration until S5 landed).
+
+### 2026-10-19 — S5 Menu — DONE
+
+- Added `menu_backgroundLoadReleasesPanel()`, `menu_bankLoadFrozenPageActive()`,
+  `menu_viewedSceneLoadPending()` and their header declarations.
+- Added `menu_finishBackgroundLoadCommandOffPage()`; the Bank Load completion
+  suppresses re-activation for unlocked loads and finishes silently off-page;
+  the failure branch does the same (no overlay off-page); abort is defensive.
+- Frozen Load:[Bank] entry (`menu_enterFrozenBankLoadPage()`), the
+  `menu_switchPage()` gates, and the final repaint guard.
+- `NN.` progress is 1-based in both paint and change detection (D51); the
+  frozen page reads the captured Bank name.
+- Storage gates: encoder, pots, knob repaint, runtime widgets, STEP track
+  overlay. SEQ/Scene changes and chain editor use availability; PERF/Load
+  Scene LEDs use availability.
+- Fill observer `menu_refreshBackgroundLoadSceneLeds()` (+1 B
+  `menu_bgLoadAvailCount`) runs before any Menu worker early return.
+- `menu_syncQueuedSceneLed()` owns both fast-blink slots, including the
+  Load/Save mode LED (W1).
+- Build after S5: `text=597,464`, `data=420`, `bss=430,928`.
+
+### 2026-10-19 — S6 ButtonHandler — DONE
+
+- MODE and SHIFT+REC drop only while `preset_backgroundBankLoadLocked()`.
+- PERF Scene/view presses, VOICE+SEQ per-track moves and SHIFT+SEQ queue use
+  `bank_sceneAvailable()`; the STEP toggle also refuses while
+  `menu_viewedSceneLoadPending()`.
+
+### 2026-10-19 — S7 Sequencer chains — DONE
+
+- `seq_chainServiceTick()` still advances bar/repetition counters but returns
+  before `seq_chainEvaluate()` while `preset_backgroundBankLoadRunning()`
+  (one-byte ISR-safe read).
+
+### 2026-10-19 — S8 Copy/clear — DONE
+
+- COPY no longer refuses on `menu_isStorageBusy()` when
+  `menu_backgroundLoadReleasesPanel()` is set.
+- Added `ccSvc_jobLoadPending()`; a pending destination or paste source drops
+  the job at run time with new reason `LOAD_PENDING` (10).
+- The name loan waits while `menu_isLoadSaveCommandActive()` and the name
+  retry counter does not advance in that window (D53).
+- `AutosaveTrace.h` and `tools/decode_devlogs.py` updated; the decoder's
+  `fs_internal_op_t` table also gained the missing
+  `FS_INTERNAL_OP_UPDATE_HCNAMES_COPY`, which restores `0x2b =
+  FS_INTERNAL_OP_SCAN_BANK_SCENES` (the P2-5 open item).
+
+### 2026-10-19 — S9 EffectsManager — DONE
+
+- `effects_fanoutMask()` masks out `bank_loadUnavailableMask()` after the
+  edit entry is ORed in; zero outside a load.
+
+### 2026-10-19 — S10 Documentation — DONE
+
+- Updated this spec (§5.4, §5.5, §7.2, §7.6, §8), `S082_P1_LOAD_SAVE.md`
+  (D7/D38), `STORAGE_SRAM_MANIFEST.md`, `FILESYSTEM_SPEC.md`,
+  `BANK_PRESET_ARCHITECTURE.md`, `COPYCLEAR_UTILITIES.md` and `AUTOSAVE.md`.
+
+### Final build and deviations
+
+- `make all`: `text=598,120`, `data=420`, `bss=430,928`; flash 598,540 /
+  753,664 B (headroom 155,124 B); DTCM statics 4,472 B; ITCM 4,168 B.
+- `make img`: `build/LXRV2_lxr02.img` (598,540 B) written OK.
+- No new compiler warnings; only the existing unused-function set in
+  `filesystem.c` and the toolchain's `_close/_lseek/_read/_write` notices.
+- A final `make clean && make all && make img` reproduced the same sizes
+  (`text=598,120`, `data=420`, `bss=430,928`; image 598,540 B). The 20 build
+  warnings are all pre-existing (EuklidGenerator, PatternData packed member,
+  asyncfatfs, USB, SplashAnimation, filesystem unused functions, libc linker
+  notices, LTO serial note).
+- **Deviation 1:** the 2 B state is BankData's unavailable mask, per schedule
+  §0.6 a (the spec's filesystem done mask was not added).
+- **Deviation 2:** linked BSS grew 8 B rather than 4 B because the new bytes
+  changed section alignment; the approved objects total 4 B (nm sizes: 2, 2,
+  1 with `led_fastBlinkLed` +1 over its former 1 B).
+- **Deviation 3:** one ambiguous patch context initially put the
+  `menu_switchPage()` repaint guard in `menu_residentNameScratchFlushComplete()`
+  and the encoder gate in `menu_instrumentLoadRequestSelection()`; both were
+  corrected before the final build, so the landed diff matches the schedule.
+
+---
+
+## 14. Post-implementation assessment (2026-10-19)
+
+*Code review of the working tree against this schedule and
+`S082_P3_WORK_WHILE_BG_LOAD.md`. Read-only: no code was changed by this
+assessment. Hardware has not been run.*
+
+### 14.1 Verdict
+
+**The implementation matches the schedule. No defect blocks a hardware test.**
+- Every S1–S10 item is present at its anchor, with the scheduled logic and comment blocks.
+- Outside a load, every changed test reduces to the old one, because the unavailable mask is 0.
+- Two low-severity issues and one observation are listed in §14.3. Neither affects data, audio or the load itself.
+
+### 14.2 What was checked
+
+| Step | Result |
+|------|--------|
+| **Build** | `make all` is up to date at `text=598,120`, `data=420`, `bss=430,928`; flash 598,540 / 753,664 B (headroom 155,124 B), as logged. No new warnings. |
+| **S1 BankData** | `bank_load_unavailable_mask` (`BankData.c:44`) and the availability API (`:294-373`) are as scheduled. `bank_normalizeSceneMask()` only strips bits above 15, so neither the session nor the failed strip can gain bits. `bank_revalidateVoiceEditMasksIn()` (`:562`) skips owners and members outside the scope; the full wrapper uses 0xFFFF. `bank_sceneFanoutMask()` (`:625`) uses availability, `bank_editTargetMask()` (`:650-652`) masks pending Scenes, and `bank_stripFailedFromVoiceEditMasks()` (`:752`) makes a failed child's entry itself only. |
+| **S2 filesystem** | Flag 0x10 with the three `_Static_assert`s (`filesystem.c:1462-1467`). The session starts in `filesystem_requestLoadBank()` (`:31782`), synchronously with Preset's acceptance, so there is no window in which the panel is unlocked but a pending Scene still reads as available. The early merge is at both first-child exits (`:14897`, `:15005`); `bank_noteLoadChildDone()` runs only on the successful close of phase 20 (`:15051-15063`). The progressive present formula and failed-only strip are at `:15132`, `:15167`. |
+| **S3 Preset** | `PM_BG_PHASE_MASK` is 0x07 and phase 6 still fits. `preset_bgSetPhase()` keeps bit 3. The unlock rule in phase 4 (`presetManager.c:3990`) is as scheduled. The session ends in `on_bank_load_complete()` (`:680`) before Menu sees the completion, and in `preset_bgEnd()` (`:3817`). `PM_BG_UNLOCKED` is still set when Menu dispatches `PRESET_OP_BANK_LOAD` (phase 5 waits for `PRESET_IDLE`, which the dispatch's ack produces), so the completion sees the correct state. |
+| **S4 LED** | Two slots sharing a phase (`ledHandler.c:210`, `920-963`, `1076-1085`). A new slot joins a running phase rather than restarting it. `led_clearAll()` resets both slots and the owner re-asserts them next tick. The frozen screen gets the per-beat refresh (`:1815`). The old API is removed and no caller remains. |
+| **S5 Menu** | All 22 items are at their anchors. Spot-checked in full: the quiet finish (`menu.c:305`); the 1-based paint and change test (`:304-330`, `:11923-11929`); frozen entry (`:17143`); `menu_switchPage()` gates (`:17182-17188`), `case LOAD_PAGE` (`:17444`) and final repaint (`:17598`); completion (`:16465-16525`); failure branch (`:16239-16253`); abort (`:10410-10418`); LED owner (`:9302-9316`). The fill observer runs before any early return (`:16050`). The S058 scope needs no change (schedule §0.6 c). |
+| **S6 ButtonHandler** | MODE and SHIFT+REC drop only while locked (`buttonHandler.c:1911`, `2348`). The STEP toggle refuses a pending viewed Scene (`:1366`). Per-track moves, Scene/view presses and SHIFT+SEQ use availability (`:1438`, `1485`, `1707`). |
+| **S7 Sequencer** | Counters advance; evaluation is skipped while a load runs (`sequencer.c:5719`). |
+| **S8 copy/clear** | The COPY gate (`copyClearSession.c:591`), job gate (`copyClearService.c:1631`, `1685`), loan hold (`:210`) and retry freeze (`:1757`) are present. `ccSvc_ensureScratch()` is the only borrow path (callers `copyOps.c:684-961`, service `:1743`). Phase 2 of the load waits for `ccSvc_busy()`, so no loan can be outstanding when a load starts. Trace reason 10 and the decoder are updated, and the decoder op table now restores `0x2b` (closes P2-5's decoder item). |
+| **S9 EffectsManager** | `effects_fanoutMask()` masks pending Scenes after the entry and before the type filter (`EffectsManager.c:586`); the Scene 17 early return comes first. |
+| **S10 docs** | The spec carries "Implemented as" notes (§5.4, D48, §7.2, §7.6, §8). D7 and D38 in `S082_P1_LOAD_SAVE.md` point to P3. The manifest header, S082 table and §8.2 row are updated, and each reference spec has its P3 paragraph. |
+| **Deviation 3** | Confirmed reverted: neither `menu_residentNameScratchFlushComplete()` (`menu.c:7188-7248`) nor `menu_instrumentLoadRequestSelection()` (`:8547-8608`) contains a P3 condition. |
+| **Deviation 2** | Accepted. The approved objects total 4 B; the extra 4 B of linked BSS is section alignment. |
+
+**Interactions checked by reading the code:**
+- **Leaving Load/Save mid-load.**
+  - `filesystem_cancelScanBankScenes()` acts only while a preview scan runs (`filesystem.c:32141`), so it cannot set a flag on the running Bank Load.
+  - The name-cache clear cannot disturb the load: its HCNAMES rows stream from the dedicated mirror (`filesystem.c:15426-15433`, `case 85`).
+- **Copy/clear names against the Bank's HCNAMES write** (schedule §7.6 item 6). The ordering holds:
+  - a loaded child's identity rows are set at its own commit (`filesystem.c:13151-13166`), before the child becomes available to copy into;
+  - the end of the load sets only the Bank row and the kept Scenes' sources (`:15108`, `14140-14162`);
+  - a copy records only a row remap and clears the destination's refreshed flag; the names resolve when the copy publishes, after the command ends.
+
+  The copied name therefore lands last. Confirm on hardware (§14.4 item 7).
+- **Pattern service.** The loader's `patSvc_prepareSceneReplace()` waits only when the child being loaded is the service Scene. A switched-to Scene is always available, so it can never be that child. With `PAR_FOLLOW` off and the view on the home Scene, edits there are dropped (D45), so the service queue the loader waits for stays empty.
+
+### 14.3 Findings
+
+| Id | Severity | Finding | Recommendation |
+|----|----------|---------|----------------|
+| A1 | Low | **Queued action parts run for a target the executor then drops.** `menu_serviceDeferredSceneChange()` calls `menu_applyQueuedSceneAction(scene)` (`menu.c:9271`) before `menu_perfSceneChangeExecute()` applies the availability test (`:9133-9137`). A SHIFT+SEQ queue armed **before a direct (Merge, transport running) load**, whose target the load then replaces, still clears all mutes (`mut`) and writes Morph 0 into the pending Scene (`mrp`), although no change happens. The Morph write is overwritten when the child loads; the mute reset is audible. The Scene 17 path is unaffected (`seq_switchToBackgroundScene()` clears pending changes). New queues during the load are already gated at the press. | In the `isQueue` branch, skip the whole action when `!bank_sceneAvailable(scene)`: one test before `menu_applyQueuedSceneAction()`. |
+| A2 | Low (cosmetic) | **A second Load/Save press on the frozen screen clears its blinks.** `handleModeButtons()` runs `led_clearAllBlinkLeds()` (`buttonHandler.c:1975`) before `menu_switchPage(LOAD_PAGE)`, which then returns at the frozen re-press guard (`menu.c:17184`) without repainting. The PERF-style blinks (active Scene while stopped, viewed Scene with `PAR_FOLLOW` off) are lost until the next beat refresh or child completion. With the transport stopped that can be several seconds. | In the re-press guard, call `menu_refreshLoadSceneLeds()` before returning. |
+| A3 | Observation | **SHIFT+REC opened from Load/Save mode shows no W1 blink.** The mode stays `SELECT_MODE_LOAD_SAVE` while the recording settings page is shown, so the owner (`menu.c:9312`) keeps `LED_MODE4` steady even though the load screen is not visible. This matches W1 literally ("not in Load/Save mode"). | Leave as is, unless the user wants the blink keyed to the page (`menu_activePage != LOAD_PAGE`) rather than the mode. |
+
+No defect was found in S1–S4, S6–S9 or the docs.
+
+### 14.4 Hardware test priorities
+
+Run the spec §11 script (1–15) and schedule §12. In particular:
+
+1. **Replace on 17 with audio running; leave Load/Save at once.** Check:
+   - MODE4 fast-blinks;
+   - pots, encoder and Morph work on Voice, Effect and PERF;
+   - no audible change at any child commit;
+   - `audioCodec_underrunCount` is unchanged.
+2. **PERF fill and switching.** Check:
+   - pending Scenes are dark and fill in order;
+   - switch 17 → loaded A → loaded B → back to A;
+   - no second activation at completion (listen; trace `menu_startSoundApply`);
+   - AutoSave stays idle until the end.
+3. **Fan-out with links.** Check:
+   - a link between two loaded children made mid-load survives completion;
+   - a mismatched-layout link is stripped as the second Scene lands;
+   - no edit reaches a pending Scene.
+4. **Frozen screen.** Check:
+   - leave and return several times, with `NN.` reading `01.`–`16.`;
+   - completion while on it gives D7, the final index restore, and the overlay on a child failure;
+   - completion elsewhere gives no overlay and no repaint of the current page.
+5. **Queued and chain changes.** Check:
+   - SHIFT+SEQ to a loaded Scene with both fast LEDs;
+   - chains frozen during the load and resuming afterwards;
+   - A1 (a queue armed before a direct load into a replaced Scene).
+6. **`PAR_FOLLOW` off:** STEP edits on the home Scene are dropped until it loads.
+7. **Copy/clear mid-load.** Check:
+   - a clear on a loaded Scene;
+   - an overlapping paste before and after leaving 17;
+   - a Kit copy into a loaded Scene, with its names published after the load and correct after a reboot;
+   - a job on a pending Scene shows `LOAD_PENDING` in the DEV trace.
+8. **Stopped load:** the P1 lock is unchanged and chains do not fire.
+9. **MIDI CC0 load:** the D39 take-over, then the unlock at phase 5.
+10. **Card pulled mid-load on another page:** the command ends quietly, playback stays, and loaded Scenes stay present.

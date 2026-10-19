@@ -650,6 +650,16 @@ void menu_copyClearMenuChanged(void);
 void menu_copyClearMenuClosed(void);
 uint8_t menu_isStorageBusy(void);
 /*
+ * Background Bank load panel state (S082 P3).
+ * menu_backgroundLoadReleasesPanel(): unlocked load and not on Load/Save.
+ * menu_bankLoadFrozenPageActive(): unlocked load on the frozen Load:[Bank].
+ * menu_viewedSceneLoadPending(): the viewed Scene is not yet loaded.
+ * Accessors: copyClearSession.c, ledHandler.c, buttonHandler.c.
+ */
+uint8_t menu_backgroundLoadReleasesPanel(void);
+uint8_t menu_bankLoadFrozenPageActive(void);
+uint8_t menu_viewedSceneLoadPending(void);
+/*
  * STEP front-page half navigation.
  *
  * Why: repeated VOICE presses in STEP mode should toggle between track settings

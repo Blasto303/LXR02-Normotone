@@ -5684,13 +5684,19 @@ static void seq_chainEvaluate(uint8_t at_bar, uint8_t at_rep)
 }
 
 /*
- * Per-tick chain boundary service (S080 G7).
+ * Per-tick chain boundary service (S080 G7; S082 P3 D50, D52).
  *
  * What: on each master tick after the first, detects bar and repetition
- * boundaries, advances the counters, and evaluates the chain unless a direct,
+ * boundaries and advances the counters; evaluates the chain unless a direct,
  * queued or chain change is already pending (a manual or queued switch
- * cancels conditional changes, plan §4.5). Inputs: seq_elapsedPpqTicks,
- * pending flags. Outputs: counters, seq_chainEvaluate(). Context: TIM3 ISR via
+ * cancels conditional changes, plan §4.5), or a background Bank load runs.
+ * Why: counters keep running during a load (D50); evaluation is suspended
+ * because a chain target (`sNN`, `nxt`, `prv`, random range) could resolve
+ * differently depending on which children have loaded (D52). After the load
+ * the next boundary evaluates with the counts as they stand.
+ * Inputs: seq_elapsedPpqTicks, pending flags,
+ * preset_backgroundBankLoadRunning() (one-byte read, ISR-safe).
+ * Outputs: counters, seq_chainEvaluate(). Context: TIM3 ISR via
  * seq_processSchedulerTick().
  */
 static void seq_chainServiceTick(void)
@@ -5709,6 +5715,8 @@ static void seq_chainServiceTick(void)
 	if (at_rep && seq_chainRepCount < 255u)
 		seq_chainRepCount++;
 	if (seq_pendingSceneChange || seq_pendingSceneQueue || seq_sceneFireFlag)
+		return;
+	if (preset_backgroundBankLoadRunning())
 		return;
 	seq_chainEvaluate(at_bar, at_rep);
 }
