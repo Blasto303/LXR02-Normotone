@@ -295,6 +295,25 @@ void seq_selectActivePattern(uint8_t pattern);
  */
 void seq_alignActivePatternToScene(uint8_t scene_index);
 /*
+ * Move playback to Scene 17 without a sound change (S082 P1 D5, D16).
+ *
+ * What: points the active, pending and every per-track Scene at index 16
+ * under PRIMASK, re-snapshots the looper and cancels pending Scene changes.
+ * It deliberately does not realign positions, reset rolls/conditions/epochs,
+ * send a program change or force note-offs.
+ * Inputs: a built Scene 17. Outputs: playback reads Scene 17.
+ * Accessors: preset_requestBackgroundBankLoad() tick.
+ * Affiliates: seq_selectActivePattern(), seq_loopRefreshSceneSnapshots().
+ */
+void seq_switchToBackgroundScene(void);
+/*
+ * Move selected tracks onto Scene 17 without a sound change (S082 P1 D31).
+ * Inputs: track_mask (bit t = track t). Outputs: those tracks play index 16;
+ * seq_perTrackActive recomputed; pending Scene changes cancelled.
+ * Accessors: preset_tickBackgroundBankLoad() phase 3 (rebuild in place).
+ */
+void seq_moveTracksToBackgroundScene(uint8_t track_mask);
+/*
  * Drain TIM3-published voice automation in foreground context.
  *
  * Inputs: the bounded pending queue written by seq_advanceTrackStep(), whose

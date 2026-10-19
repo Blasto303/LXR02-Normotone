@@ -1836,6 +1836,56 @@ storage_status_t storage_banksetParseLine(storage_bankset_t *state, const char *
     }
     return STORAGE_STATUS_OK;
 }
+/*
+ * Parse one bankset line without overwriting protected per-Scene entries (S082).
+ *
+ * What: delegates to storage_banksetParseLine() after saving and restoring
+ * protected scene_mask_voice_edit entries and the active_scene field. A bit
+ * set in `protect` keeps that Scene's mask and seen bit unchanged; the
+ * active_scene field is always kept.
+ * Why: Merge Bank Save reads the slot's old manifest into the same staging
+ * that already holds the written Scenes' entries (no second buffer).
+ * Inputs: state, line, protect mask (bit N → Scene N is protected).
+ * Outputs: parse status; untouched entries + seen bits for protected Scenes.
+ * Accessors: Bank Save phase 62.
+ * Affiliates: storage_banksetParseLine().
+ */
+storage_status_t storage_banksetParseLineMasked(storage_bankset_t *state,
+                                                const char *line,
+                                                uint16_t protect)
+{
+    uint8_t saved_active;
+    uint8_t saved_seen_active;
+    uint16_t saved_masks[BANK_SCENE_SLOT_COUNT];
+    uint16_t saved_seen;
+    uint8_t i;
+    storage_status_t st;
+
+    if (!state || !line) return STORAGE_STATUS_BAD_VALUE;
+
+    saved_active      = state->active_scene;
+    saved_seen_active = state->seen_active_scene;
+    saved_seen        = state->seen_scene_mask_voice_edit;
+    for (i = 0u; i < BANK_SCENE_SLOT_COUNT; i++) {
+        if (protect & (uint16_t)(1u << i))
+            saved_masks[i] = state->scene_mask_voice_edit[i];
+    }
+
+    st = storage_banksetParseLine(state, line);
+
+    state->active_scene      = saved_active;
+    state->seen_active_scene = saved_seen_active;
+    for (i = 0u; i < BANK_SCENE_SLOT_COUNT; i++) {
+        if (protect & (uint16_t)(1u << i)) {
+            state->scene_mask_voice_edit[i] = saved_masks[i];
+            state->seen_scene_mask_voice_edit =
+                (uint16_t)((state->seen_scene_mask_voice_edit & ~(1u << i)) |
+                           (saved_seen & (1u << i)));
+        }
+    }
+
+    return st;
+}
 storage_status_t storage_banksetFinalize(const storage_bankset_t *state)
 { return (!state || !state->seen_format || !state->seen_version) ? STORAGE_STATUS_MISSING_REQUIRED : STORAGE_STATUS_OK; }
 uint8_t storage_formatBanksetLine(char *dst,uint16_t capacity,const storage_bankset_t *state,uint16_t line_index)

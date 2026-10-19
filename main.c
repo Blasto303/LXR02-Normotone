@@ -222,6 +222,45 @@ static void audio_check_and_render(void)
     }
 }
 
+/*
+ * Give a background Bank load the idle time between audio renders
+ * (S082 P2 fix 3).
+ *
+ * What: while a background Bank load runs and the filesystem facade is BUSY,
+ * runs extra (stall-uncounted) filesystem steps as long as both render slots
+ * are full, for at most BG_LOAD_IDLE_FS_BUDGET_US per call. It returns at once
+ * when a render slot frees, the facade leaves BUSY, the load ends, or the
+ * budget is spent.
+ * Why: with audio playing (Scene 17), one filesystem step per main-loop pass
+ * makes each Bank child take about a second; the full-queue window is
+ * otherwise spent spinning through the loop. Rendering keeps priority: the
+ * queue is tested before every step, so a render is delayed by at most one
+ * bounded filesystem step, the same bound the main loop already relies on.
+ * Limited to background Bank loads so no other workflow's timing changes. It
+ * is foreground scheduling only; no DSP work is skipped (DSP CPU policy).
+ * Inputs: preset_backgroundBankLoadRunning(), filesystem_status(),
+ * audioCodec_isSuspended(), audioCodec_queueFreeSlots(), TIM2 microseconds.
+ * Outputs: filesystem progress; completion callbacks may run, as in the
+ * regular tick.
+ * Accessors: the main loop, once per pass after the regular filesystem_tick().
+ * Affiliates: filesystem_tickUncounted(), audio_check_and_render(),
+ * BG_LOAD_IDLE_FS_BUDGET_US, preset_tickBackgroundBankLoad().
+ */
+static void main_serviceBackgroundLoadIdle(void)
+{
+    uint32_t start;
+
+    if (!preset_backgroundBankLoadRunning() || audioCodec_isSuspended())
+        return;
+    start = timebase_tim2Now();
+    while (filesystem_status() == FS_STATUS_BUSY &&
+           audioCodec_queueFreeSlots() == 0u &&
+           timebase_tim2Delta(timebase_tim2Now(), start) <
+               BG_LOAD_IDLE_FS_BUDGET_US) {
+        filesystem_tickUncounted();
+    }
+}
+
 static void midi_service(void)
 {
 	uint8_t budget = 8;
@@ -1043,7 +1082,8 @@ int main(void)
                      * Why: silently entering the fallback ladder here would
                      * hide the retained BANKLOAD/BIDXLOAD diagnostic code.
                      */
-                    if (!preset_loadBank(boot_bank_slot, 0xffffu))
+                    if (!preset_loadBank(boot_bank_slot, 0xffffu, 0u,
+                                        PRESET_BANK_LOAD_BOOT))
                         goto boot_filesystem_failure;
                     /*
                      * The canonical Bank Load fallback path was used.
@@ -1447,6 +1487,13 @@ boot_filesystem_done:
         // tick the SD read async
         filesystem_tick();
         audio_check_and_render();
+        /*
+         * Background Bank load: use the full-queue idle window for extra
+         * filesystem steps (S082 P2 fix 3); returns at once otherwise. The
+         * loop returns to its render check at the top of the next pass, so a
+         * slot that freed during the window is served promptly.
+         */
+        main_serviceBackgroundLoadIdle();
     }
 }
 

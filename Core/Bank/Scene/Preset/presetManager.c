@@ -49,7 +49,9 @@
 #include "Autosave.h"
 #include "AutosaveTrace.h"
 #include "EffectsManager.h"
+#include "copyClearService.h"
 #include "mixer.h"
+#include "timebase.h"
 #include "valueShaper.h"
 #include <string.h>
 #include <stdint.h>
@@ -88,6 +90,94 @@ static volatile instrument_type_t pm_instrument_request_type = INSTRUMENT_TYPE_U
 static volatile uint16_t         pm_instrument_request_index = 0u;
 static volatile uint16_t         pm_kit_request_scene_mask = 0u;
 static uint16_t                  pm_bank_load_failed_scene_mask = 0u;
+/*
+ * Background Bank Load orchestration state (+1 B SRAM1, S082 C7).
+ *
+ * What: low nibble = phase (0 idle / start a pending MIDI request, 1 decide,
+ * 2 quiesce, 3 build or rebuild and switch, 4 post the load, 5 wait for
+ * completion, 6 MIDI origin: wait for the Load:[Bank] preview); flags = MIDI
+ * origin, Replace, Scene 17 needed, dirty mask discarded.
+ * Why: the request is accepted immediately and advanced one
+ * bounded step per menu_pollPresetStatus() pass; the slot and outcome masks
+ * reuse pm_request_slot and pm_kit_request_scene_mask, and the empty mask is
+ * derived from Replace (empty = ~act) exactly as the Menu computed it.
+ * Inputs: preset_requestBackgroundBankLoad().
+ * Outputs: preset_tickBackgroundBankLoad(), preset_backgroundBankLoadRunning().
+ * Lifetime: static. Owner: presetManager.c.
+ * Affiliates: ccSvc_dropQueued(), filesystem_setAutosaveYield(),
+ * preset_buildBackgroundScene(), seq_switchToBackgroundScene(),
+ * seq_moveTracksToBackgroundScene().
+ */
+static uint8_t                   pm_bg_phase = 0u;
+#define PM_BG_PHASE_MASK      0x0Fu
+#define PM_BG_ORIGIN_MIDI     0x10u
+#define PM_BG_REPLACE         0x20u
+/*
+ * Scene 17 is needed for this request (S082 review F1).
+ *
+ * What: set by phase 1 when the transport runs and a played Scene is loaded or
+ * emptied (or a track already plays Scene 17). Clear means "load directly":
+ * no copy/clear drop, no AutoSave yield or discard, no Scene 17 build/switch.
+ * Why: phase 3 used to build and switch to Scene 17 on every request, so even
+ * a stopped Bank Load (D14) or a Merge that kept every played Scene (D25)
+ * ended on Scene 17 with AutoSave suspended, changing the user's Scene
+ * against S9/S25.
+ * Accessors: preset_tickBackgroundBankLoad() phases 1 and 3.
+ */
+#define PM_BG_NEEDED          0x40u
+#define PM_BG_DISCARDED       0x80u
+#define PM_BG_PHASE_MIDI_UI   6u
+
+/*
+ * Pending MIDI Bank load request (S082 P1 D33).
+ *
+ * What: the Bank slot of the latest MIDI request not yet started, or
+ * PM_BG_PENDING_NONE. Why: a MIDI request that arrives while Preset, the
+ * filesystem facade or a Menu command is busy is deferred, latest wins, and
+ * started by phase 0 once everything is idle; a request while a Bank load is
+ * in flight is dropped instead (D13). A Menu Bank OK discards it (R5).
+ * Inputs: preset_requestBackgroundBankLoad() (MIDI origin).
+ * Outputs: preset_tickBackgroundBankLoad() phase 0.
+ *
+ * Second use while a load is in flight (S082 P1 assessment A8): from phase 1
+ * to the return to phase 0 no request can be pending, because a MIDI request
+ * during a load is dropped (D13) and a Menu request is refused. The register
+ * then holds the time_sysTick at which the current bounded wait (phase 2, 4
+ * or 6) began. Every return to phase 0 restores PM_BG_PENDING_NONE.
+ * SRAM: 2 B, SRAM1 static (.data, initialiser 0xFFFF), owner Preset (accepted
+ * 2026-10-18, S082 P1 §6); the second use adds no storage.
+ * Affiliates: menu_backgroundBankLoadUiIdle(), menu_backgroundBankLoadUiBegin(),
+ * preset_bgSetPhase(), preset_bgWaitExpired().
+ */
+#define PM_BG_PENDING_NONE    0xFFFFu
+static uint16_t                  pm_bg_pending_slot = PM_BG_PENDING_NONE;
+
+/*
+ * Longest bounded wait of a background Bank load (S082 P1 assessment A8).
+ *
+ * What: 20 s of time_sysTick for each of phase 2 (copy/clear job, AutoSave
+ * close-down, HCNAMES publication, facade idle), phase 4 (card busy before the
+ * Bank Load is accepted) and phase 6 (MIDI Bank index and child preview).
+ * Why: while a load runs every panel exit is dropped (R7), so a wait that never
+ * ends would leave Load:[Bank] locked until a power cycle. The limit is far
+ * above the slowest legitimate wait (a full HCNAMES rewrite or a 16-child
+ * preview on a slow card) and fits the 16-bit tick (65 s wrap).
+ * Accessors: preset_bgWaitExpired().
+ */
+#define PM_BG_WAIT_LIMIT_MS   20000u
+
+/*
+ * Result of the last background Bank load (S082 P1 D34).
+ *
+ * What: PRESET_BG_RESULT_NONE / _DONE / _FAILED in the low bits, plus
+ * PRESET_BG_RESULT_MIDI when the load had MIDI origin. Why: the origin must
+ * learn completion or failure (S083 sends CC0 TX from it); pm_bg_phase has
+ * no free bit. Inputs: on_bank_load_complete() (phase 5), every failure
+ * path of the tick, phase 6 refusal. Outputs:
+ * preset_takeBackgroundBankLoadResult() (read and clear).
+ * SRAM: 1 B, SRAM1 static, owner Preset (accepted 2026-10-18, S082 P1 §6).
+ */
+static uint8_t                   pm_bg_result = PRESET_BG_RESULT_NONE;
 
 static void preset_markRequestedScenesPresentOnSuccessfulLoad(void)
 {
@@ -606,6 +696,22 @@ static void on_bank_load_complete(void)
         bank_publishSdCleanAuthority(bank_restoreBankSlot(),
                                      completed_scene_mask);
     }
+    /*
+     * Record the background load's result for its origin (S082 P1 D34).
+     *
+     * What: when this completion belongs to a background request (phase 5),
+     * DONE or FAILED from the terminal filesystem status, with the MIDI
+     * flag when the request had MIDI origin. Child failures inside a DONE
+     * load still show the normal overlay and count as DONE. The boot load
+     * (no background phase) records nothing.
+     * Inputs: pm_bg_phase, filesystem_status(). Outputs: pm_bg_result.
+     * Affiliates: preset_takeBackgroundBankLoadResult().
+     */
+    if ((pm_bg_phase & PM_BG_PHASE_MASK) == 5u)
+        pm_bg_result = (uint8_t)(
+            ((filesystem_status() == FS_STATUS_DONE)
+                 ? PRESET_BG_RESULT_DONE : PRESET_BG_RESULT_FAILED) |
+            ((pm_bg_phase & PM_BG_ORIGIN_MIDI) ? PRESET_BG_RESULT_MIDI : 0u));
     preset_completeFilesystemOp(PRESET_OP_BANK_LOAD);
 }
 
@@ -2803,6 +2909,20 @@ uint8_t preset_loadInstrumentTemp(uint8_t destination_scene,
                                   instrument_type_t type)
 {
     /*
+     * Nothing loads into Scene 17 (S082 P1 R1, D36).
+     *
+     * What: a destination Scene outside the resident range (index 16) is
+     * refused before any Preset or filesystem state changes.
+     * Why: this loader takes a Scene index, and scene_get(16) is valid while
+     * Scene 17 exists, so a stray caller could otherwise write into 17 (and a
+     * 16-bit 1u << 16 destination mask would be undefined). The Menu passes
+     * the home Scene (menu_instrumentEntryScene()); this is the backstop.
+     * Inputs: destination_scene. Outputs: 0 (refused) for index >= SCENE_COUNT.
+     * Affiliates: menu_instrumentEntryScene(), scene_backgroundHomeIndex().
+     */
+    if (destination_scene >= SCENE_COUNT)
+        return 0u;
+    /*
      * Route the direct `kit` row through the normal Instrument apply path.
      *
      * Inputs: the exact temporary-file Scene/voice/type context retained by
@@ -2829,6 +2949,20 @@ uint8_t preset_loadInstrumentMorphTemp(uint8_t destination_scene,
                                        uint8_t destination_slot,
                                        instrument_type_t type)
 {
+    /*
+     * Nothing loads into Scene 17 (S082 P1 R1, D36).
+     *
+     * What: a destination Scene outside the resident range (index 16) is
+     * refused before any Preset or filesystem state changes.
+     * Why: this loader takes a Scene index, and scene_get(16) is valid while
+     * Scene 17 exists, so a stray caller could otherwise write into 17 (and a
+     * 16-bit 1u << 16 destination mask would be undefined). The Menu passes
+     * the home Scene (menu_instrumentEntryScene()); this is the backstop.
+     * Inputs: destination_scene. Outputs: 0 (refused) for index >= SCENE_COUNT.
+     * Affiliates: menu_instrumentEntryScene(), scene_backgroundHomeIndex().
+     */
+    if (destination_scene >= SCENE_COUNT)
+        return 0u;
     /*
      * Load the hidden Morph-only InstrumentMrp baseline.
      *
@@ -2901,16 +3035,34 @@ uint8_t preset_loadDrumset(uint16_t presetNr, uint8_t isMorph)
 {
     fs_file_type_t type = isMorph ? FS_FILE_MORPH : FS_FILE_KIT;
     fs_completion_cb_t cb = isMorph ? on_morph_load_complete : on_kit_load_complete;
+    uint8_t target_scene = scene_backgroundHomeIndex();
 
     filesystem_ack();
     pm_status = PRESET_LOAD_IN_PROGRESS;
     pm_completed_op = PRESET_OP_NONE;
     pm_request_slot = presetNr;
     pm_request_type = isMorph ? PRESET_REQUEST_LEGACY_MORPH : SAVE_TYPE_KIT;
-    pm_kit_request_scene_mask = (uint16_t)(1u << scene_getActiveIndex());
+    /*
+     * Kit Load destination on Scene 17 (S082 C3).
+     *
+     * What: the legacy Kit Load mask names the playing Scene's home Scene
+     * while Scene 17 is active, because a 16-bit mask cannot hold bit 16 and
+     * Kit Load never targets Scene 17 (S082 P1 D18).
+     * Why: scene_getActiveIndex() returns 16 during a background Bank load;
+     * shifting 1u by 16 and truncating to uint16_t would silently produce an
+     * empty request.
+     * Inputs: Scene 17 state and its captured home Scene.
+     * Outputs: pm_kit_request_scene_mask and the filesystem request mask.
+     * Accessors: Menu's legacy Kit Load path.
+     * Affiliates: scene_backgroundHomeIndex(),
+     * filesystem_requestLoadKitForScenes().
+     */
+    if (target_scene >= SCENE_COUNT)
+        target_scene = 0u;
+    pm_kit_request_scene_mask = (uint16_t)(1u << target_scene);
     if ((!isMorph && filesystem_requestLoadKitForScenes(
                          presetNr,
-                         (uint16_t)(1u << scene_getActiveIndex()), cb)) ||
+                         (uint16_t)(1u << target_scene), cb)) ||
         (isMorph && filesystem_requestLoad(type, presetNr, cb)))
         return 1;
     pm_status = PRESET_IDLE;
@@ -3066,65 +3218,57 @@ uint8_t preset_saveScene(uint16_t presetNr, uint8_t source_scene)
     return 0u;
 }
 
-uint8_t preset_loadBank(uint16_t presetNr, uint16_t scene_mask)
+uint8_t preset_loadBank(uint16_t presetNr, uint16_t act_mask,
+                        uint16_t empty_mask, uint8_t flags)
 {
     /*
-     * Post an explicit root Bank Load request.
+     * Post a root Bank Load with explicit act/empty masks (S082 B3).
      *
-     * Inputs: root Bank library slot and destination resident Scene mask.
-     * Output: nonzero when filesystem accepts the Bank container load. A
-     * successful completion may still have no Scene child; callers inspect
-     * preset_completedBankLoadedScene() before deciding whether to apply sound
-     * or start fallback.
+     * Inputs: root Bank library slot, act_mask (Scenes loaded from child),
+     * empty_mask (Scenes emptied by Replace), flags (PRESET_BANK_LOAD_BOOT for
+     * the boot path). Output: nonzero when filesystem accepts the Bank load.
      */
     filesystem_ack();
     pm_status = PRESET_LOAD_IN_PROGRESS;
     pm_completed_op = PRESET_OP_NONE;
     pm_request_slot = presetNr;
     pm_request_type = SAVE_TYPE_BANK;
-    pm_kit_request_scene_mask = scene_mask;
-    if (filesystem_requestLoadBank(presetNr, scene_mask,
-                                   on_bank_load_complete))
+    pm_kit_request_scene_mask = act_mask;
+    if (filesystem_requestLoadBank(presetNr, act_mask, empty_mask,
+                                   flags, on_bank_load_complete))
         return 1u;
     pm_status = PRESET_IDLE;
     return 0u;
 }
 
-uint8_t preset_saveBank(uint16_t presetNr, uint16_t scene_mask,
-                        uint8_t force_save)
+uint8_t preset_saveBank(uint16_t presetNr, uint16_t act_mask,
+                        uint16_t empty_mask)
 {
-    uint8_t source_scene = scene_getActiveIndex();
+    uint8_t source_scene = scene_backgroundHomeIndex();
 
     /*
-     * Post a multi-Scene Bank Save.
+     * Post a multi-Scene Bank Save with explicit act/empty masks (S082 B3).
      *
-     * Inputs: root Bank slot, edited preset_currentName as the Bank directory
-     * name, the caller-selected resident Scene mask, and force_save. Output:
-     * filesystem writes bankset.bcg and one Bank-local child folder per
-     * selected bit (or fewer when Option 2 skips card-clean children and
-     * force_save is zero). source_scene remains the active Scene for
-     * compatibility validation, but the mask determines the actual child set.
+     * Inputs: root Bank slot, act_mask (resident Scenes written to their child),
+     * empty_mask (children removed from the slot). Output: filesystem writes
+     * bankset.bcg and one Bank-local child folder per act_mask bit.
+     *
+     * S082 C3/D20: while Scene 17 is active the manifest's active Scene is its
+     * captured home Scene. Scene 17 has no Bank number and is never saved as
+     * the active Scene.
      */
     filesystem_ack();
     pm_status = PRESET_LOAD_IN_PROGRESS;
     pm_completed_op = PRESET_OP_NONE;
     pm_request_slot = presetNr;
     pm_request_type = SAVE_TYPE_BANK;
-    /*
-     * Retain the Bank Save child selection through durable completion.
-     *
-     * Input: caller-selected resident mask already bounded by the 16-bit API.
-     * Output: on_bank_save_complete() can assign provenance only to children
-     * actually included in the successful save. Why: filesystem owns its own
-     * scratch copy, which Preset must not inspect after a later request.
-     * Affiliate: pm_kit_request_scene_mask's existing immutable-mask role.
-     */
-    pm_kit_request_scene_mask = scene_mask;
+    pm_kit_request_scene_mask = act_mask;
     if (filesystem_requestSaveBank(presetNr,
                                    source_scene,
                                    preset_currentName,
-                                   scene_mask,
-                                   force_save,
+                                   act_mask,
+                                   empty_mask,
+                                   0u,
                                    on_bank_save_complete)) {
         return 1u;
     }
@@ -3140,6 +3284,683 @@ uint8_t preset_completedBankLoadedScene(void)
 uint16_t preset_bankLoadFailedSceneMask(void)
 {
     return pm_bank_load_failed_scene_mask;
+}
+
+/*
+ * Count the pool chunks one source track needs in Scene 17 (S082 C5).
+ *
+ * What: reads every step block of the track and sums its encoded size in
+ * four-byte chunks. Why: the per-track build must decide whether the whole
+ * track fits before publishing any of it (D3). Inputs: source Scene/track.
+ * Outputs: required chunks. Accessors: preset_copyBackgroundTrack().
+ * Affiliates: pat_rawReadBlock(), pat_rawBlockBytes().
+ */
+static uint16_t preset_backgroundTrackChunks(uint8_t src_scene, uint8_t track)
+{
+    uint8_t block[PAT_RAW_BLOCK_MAX];
+    uint16_t entry;
+    uint16_t chunks = 0u;
+    uint8_t step;
+
+    for (step = 0u; step < NUM_STEPS; step++) {
+        uint8_t bytes = pat_rawReadBlock(src_scene, track, step, block,
+                                         &entry);
+
+        chunks = (uint16_t)(chunks + (uint16_t)(bytes / 4u));
+    }
+    return chunks;
+}
+
+/*
+ * Empty one Scene 17 track before a rebuild copies into it (S082 P1 D30).
+ *
+ * What: publishes every step of the track empty (trigger off), which frees
+ * its old blocks in the background region.
+ * Why: a rebuild candidate's old Scene 17 blocks must neither count against
+ * the fit check nor be played when the track does not fit (D30: it is left
+ * empty).
+ * Inputs: track 0..6. Outputs: Scene 17 track empty, pool chunks freed.
+ * Context: foreground; the track plays a resident Scene, not 16, so the ISR
+ * does not read these entries.
+ * Accessors: preset_buildBackgroundScene() (rebuild only).
+ * Affiliates: pat_rawPublishEmpty(), pat_rawFreeChunks().
+ */
+static void preset_clearBackgroundTrack(uint8_t track)
+{
+    uint8_t step;
+
+    for (step = 0u; step < NUM_STEPS; step++)
+        pat_rawPublishEmpty(SCENE_BACKGROUND_INDEX, track, step,
+                            PAT_RAW_TRIGGER_OFF);
+}
+
+/*
+ * Copy one source track's Pattern data into Scene 17 (S082 C5).
+ *
+ * What: copies the track's step blocks and block-less triggers, then the
+ * track parameters, MIDI assignment and Morph endpoints. A track whose blocks
+ * do not fit in the background region's free pool is left empty (D3); a
+ * placement failure during publication publishes every step empty again so a
+ * failed track never keeps a partial copy.
+ * Why: Scene 17 must sound exactly like the per-track mix that is playing
+ * (D4), without the shared source region. Inputs: track and its played Scene.
+ * Outputs: 1 when the track is copied, 0 when it is left empty.
+ * Accessors: preset_buildBackgroundScene().
+ * Affiliates: pat_rawReadBlock(), pat_rawPlace(), pat_rawPublishEmpty(),
+ * pat_rawFreeChunks(), scene_get(), scene_getConst().
+ */
+static uint8_t preset_copyBackgroundTrack(uint8_t track, uint8_t src_scene)
+{
+    uint8_t block[PAT_RAW_BLOCK_MAX];
+    uint16_t entry;
+    uint8_t step;
+    uint8_t clear_step;
+    uint8_t bytes;
+    uint16_t needed;
+    const pat_scene_region_t *src = pat_sceneRegion(src_scene);
+    pat_scene_region_t *dst = pat_sceneRegionMut(SCENE_BACKGROUND_INDEX);
+    scene_t *dst_scene = scene_get(SCENE_BACKGROUND_INDEX);
+    const scene_t *src_scene_data = scene_getConst(src_scene);
+    uint8_t bit = (uint8_t)(1u << track);
+
+    if (!src || !dst || !dst_scene || !src_scene_data)
+        return 0u;
+    needed = preset_backgroundTrackChunks(src_scene, track);
+    if (needed > pat_rawFreeChunks(SCENE_BACKGROUND_INDEX))
+        return 0u;
+    for (step = 0u; step < NUM_STEPS; step++) {
+        bytes = pat_rawReadBlock(src_scene, track, step, block, &entry);
+        if (bytes != 0u) {
+            uint8_t trigger = (uint8_t)((entry & PAT_ADDR_TRIGGER_BIT)
+                                            ? PAT_RAW_TRIGGER_ON
+                                            : PAT_RAW_TRIGGER_OFF);
+
+            if (!pat_rawPlace(SCENE_BACKGROUND_INDEX, track, step, block,
+                              trigger)) {
+                for (clear_step = 0u; clear_step < NUM_STEPS; clear_step++)
+                    pat_rawPublishEmpty(SCENE_BACKGROUND_INDEX, track,
+                                        clear_step,
+                                        PAT_RAW_TRIGGER_OFF);
+                return 0u;
+            }
+        } else if ((entry & PAT_ADDR_TRIGGER_BIT) != 0u) {
+            pat_rawPublishEmpty(SCENE_BACKGROUND_INDEX, track, step,
+                                PAT_RAW_TRIGGER_ON);
+        }
+    }
+    dst->track_length[track] = src->track_length[track];
+    dst->track_scale[track] = src->track_scale[track];
+    dst->track_shuffle[track] = src->track_shuffle[track];
+    dst->track_play_mode[track] = src->track_play_mode[track];
+    dst->track_loop_exclude = (uint8_t)((dst->track_loop_exclude & ~bit) |
+                                        (src->track_loop_exclude & bit));
+    dst->track_auto_smooth = (uint8_t)((dst->track_auto_smooth & ~bit) |
+                                       (src->track_auto_smooth & bit));
+    dst_scene->settings.midi_channel[track] =
+        src_scene_data->settings.midi_channel[track];
+    dst_scene->settings.midi_note[track] =
+        src_scene_data->settings.midi_note[track];
+    dst_scene->settings.track_morph_length[track] =
+        src_scene_data->settings.track_morph_length[track];
+    dst_scene->settings.track_morph_scale[track] =
+        src_scene_data->settings.track_morph_scale[track];
+    dst_scene->settings.track_morph_shuffle[track] =
+        src_scene_data->settings.track_morph_shuffle[track];
+    return 1u;
+}
+
+/*
+ * Copy one voice slot's Scene data and its captured Instrument name (D29)
+ * into Scene 17 (S082 C5).
+ *
+ * What: copies the Instrument image, voice Morph amount, audio routing, FX
+ * send endpoints, fader mode and (for the shared slot 6) the Kit-level
+ * generated decay endpoints from the played Scene.
+ * Why: a per-track Scene 17 must reproduce each slot's voice exactly (D4).
+ * Inputs: destination slot, source Scene, source slot.
+ * Outputs: Scene 17's slot data updated.
+ * Accessors: preset_buildBackgroundScene().
+ * Affiliates: scene_get(), scene_getConst(),
+ * filesystem_backgroundNameCaptureInstrument().
+ */
+static void preset_copyBackgroundSlot(uint8_t dst_slot, uint8_t src_scene,
+                                      uint8_t src_slot)
+{
+    scene_t *dst = scene_get(SCENE_BACKGROUND_INDEX);
+    const scene_t *src = scene_getConst(src_scene);
+
+    if (!dst || !src || dst_slot >= INSTRUMENT_SLOT_COUNT ||
+        src_slot >= INSTRUMENT_SLOT_COUNT)
+        return;
+    dst->kit.instruments[dst_slot] = src->kit.instruments[src_slot];
+    dst->settings.voice_morph_amount[dst_slot] =
+        src->settings.voice_morph_amount[src_slot];
+    dst->settings.audio_out[dst_slot] = src->settings.audio_out[src_slot];
+    dst->settings.fx_send_amount[dst_slot] =
+        src->settings.fx_send_amount[src_slot];
+    dst->settings.fx_send_morph[dst_slot] =
+        src->settings.fx_send_morph[src_slot];
+    dst->settings.fader_setting[dst_slot] =
+        src->settings.fader_setting[src_slot];
+    if (dst_slot == INSTRUMENT_SLOT_COUNT - 1u) {
+        dst->kit.settings.slot6_track7_amp_envelope_decay =
+            src->kit.settings.slot6_track7_amp_envelope_decay;
+        dst->kit.settings.slot6_track7_morph_amp_envelope_decay =
+            src->kit.settings.slot6_track7_morph_amp_envelope_decay;
+    }
+    /*
+     * The slot's name follows its data (S082 P1 D29).
+     *
+     * What: the captured Instrument name of dst_slot is copied from the same
+     * resident Scene and slot as the image. Why: per-track playback mixes
+     * slots from several Scenes (D2); the name must match the voice.
+     * Inputs: dst_slot, src_scene, src_slot. Outputs: one capture row.
+     * Affiliates: filesystem_backgroundNameCaptureInstrument().
+     */
+    filesystem_backgroundNameCaptureInstrument(dst_slot, src_scene, src_slot);
+}
+
+static uint8_t preset_backgroundCandidateTracks(uint16_t replaced);
+
+/*
+ * Build, or rebuild in place, Scene 17 from what is playing
+ * (S082 P1 D2-D4, D9, D19, D29-D31).
+ *
+ * What: fresh build: copies the active Scene's Scene-level state (settings
+ * without chain, Effect, FX sequence, bus compressor, Morph) and all its
+ * captured names, then either the whole Pattern region (no per-track
+ * overrides) or, per track in T1..T7 order, the track and its voice slot from
+ * the track's played Scene. Rebuild in place: only the tracks whose played
+ * resident Scene the load replaces are emptied and then copied; Scene 17's
+ * Scene-level state and every other track stay. A track that does not fit is
+ * left empty and later tracks are still tried (D3, D30). T6/T7's shared slot
+ * follows T6 when T6 fits.
+ * Why: Scene 17 must sound exactly like what is playing (D4), so the switch
+ * changes only the read address (C6); a rebuild must not disturb tracks the
+ * load does not touch (D31).
+ * Inputs: rebuild_in_place, replaced_mask (act | empty), active Scene,
+ * seq_perTrackPattern[], resident Scenes, pool capacity, HCNAMES mirror.
+ * Outputs: scene_background, pat_background_region, the name capture;
+ * returns the mask of tracks copied.
+ * Context: foreground, before the switch or the per-track move; no written
+ * track is read by the ISR yet.
+ * Accessors: preset_tickBackgroundBankLoad() phase 3.
+ * Affiliates: preset_backgroundCandidateTracks(), preset_clearBackgroundTrack(),
+ * preset_copyBackgroundTrack(), preset_copyBackgroundSlot(),
+ * pat_snapshotScene(), filesystem_backgroundNamesCaptureScene(),
+ * scene_backgroundBegin().
+ */
+uint8_t preset_buildBackgroundScene(uint8_t rebuild_in_place,
+                                    uint16_t replaced_mask)
+{
+    uint8_t active = scene_getActiveIndex();
+    uint8_t copied = 0u;
+    uint8_t track;
+    uint8_t candidates;
+    scene_t *dst;
+    const scene_t *src;
+
+    if (active >= SCENE_COUNT)
+        active = scene_backgroundHomeIndex();
+    if (active >= SCENE_COUNT)
+        return 0u;
+    if (!scene_backgroundExists())
+        rebuild_in_place = 0u;
+    if (!rebuild_in_place)
+        scene_backgroundBegin(active);
+    dst = scene_get(SCENE_BACKGROUND_INDEX);
+    src = scene_getConst(active);
+    if (!dst || !src) {
+        if (!rebuild_in_place)
+            scene_backgroundRelease();
+        return 0u;
+    }
+    if (!rebuild_in_place) {
+        *dst = *src;
+        /*
+         * D9b: Scene 17 has no chain of its own. A chain evaluated while a
+         * background load runs must never fire a queued Scene change.
+         */
+        dst->settings.chain_condition[0] = 0u;
+        dst->settings.chain_condition[1] = 0u;
+        dst->settings.chain_next[0] = 0u;
+        dst->settings.chain_next[1] = 0u;
+        filesystem_backgroundNamesCaptureScene(active);
+        if (!seq_perTrackActive) {
+            pat_snapshotScene(active);
+            return 0x7Fu;
+        }
+        pat_rawRegionReset(SCENE_BACKGROUND_INDEX);
+    }
+    candidates = rebuild_in_place
+        ? preset_backgroundCandidateTracks(replaced_mask) : 0x7Fu;
+    for (track = 0u; track < NUM_TRACKS; track++) {
+        uint8_t src_scene = seq_perTrackPattern[track];
+        uint8_t bit = (uint8_t)(1u << track);
+
+        if ((candidates & bit) == 0u)
+            continue;                   /* D31: not affected by this load */
+        if (src_scene >= SCENE_COUNT)
+            src_scene = active;         /* fresh build only (no track on 16) */
+        if (rebuild_in_place)
+            preset_clearBackgroundTrack(track);  /* D30: free, then fit */
+        if (!preset_copyBackgroundTrack(track, src_scene))
+            continue;
+        copied = (uint8_t)(copied | bit);
+        if (track < INSTRUMENT_SLOT_COUNT - 1u) {
+            preset_copyBackgroundSlot(track, src_scene, track);
+        } else if (track == INSTRUMENT_SLOT_COUNT - 1u) {
+            preset_copyBackgroundSlot(track, src_scene, track);
+        } else if ((copied & (uint8_t)(1u <<
+                                       (INSTRUMENT_SLOT_COUNT - 1u))) == 0u) {
+            preset_copyBackgroundSlot((uint8_t)(INSTRUMENT_SLOT_COUNT - 1u),
+                                      src_scene,
+                                      (uint8_t)(INSTRUMENT_SLOT_COUNT - 1u));
+        }
+    }
+    if (!rebuild_in_place) {
+        pat_scene_region_t *dst_region =
+            pat_sceneRegionMut(SCENE_BACKGROUND_INDEX);
+        const pat_scene_region_t *src_region = pat_sceneRegion(active);
+
+        if (dst_region && src_region) {
+            dst_region->pattern_change_bar = src_region->pattern_change_bar;
+            dst_region->pattern_next = src_region->pattern_next;
+        }
+    }
+    return copied;
+}
+
+/*
+ * Tracks whose played resident Scene a Bank load replaces (S082 P1 D31).
+ *
+ * What: bit t is set when track t plays a resident Scene (0..15) that is in
+ * the load's replaced mask (act | empty).
+ * Why: one rule for "a played Scene is replaced" (D25) and for which tracks a
+ * rebuild in place copies into Scene 17 (D31). Tracks on Scene 17 and tracks
+ * on unaffected resident Scenes are never candidates.
+ * Inputs: replaced mask, seq_perTrackPattern[]. Outputs: 7-bit track mask.
+ * Accessors: preset_backgroundScene17Needed(), preset_buildBackgroundScene(),
+ * preset_tickBackgroundBankLoad() phase 3.
+ * Affiliates: seq_perTrackPattern[], SCENE_COUNT.
+ */
+static uint8_t preset_backgroundCandidateTracks(uint16_t replaced)
+{
+    uint8_t track;
+    uint8_t mask = 0u;
+
+    for (track = 0u; track < NUM_TRACKS; track++) {
+        uint8_t played = seq_perTrackPattern[track];
+
+        if (played < SCENE_COUNT &&
+            (replaced & (uint16_t)(1u << played)) != 0u)
+            mask = (uint8_t)(mask | (uint8_t)(1u << track));
+    }
+    return mask;
+}
+
+/*
+ * Decide whether a Bank load needs Scene 17 (S082 P1 D2-D5, D14, D25, D31).
+ *
+ * What: Scene 17 is needed when the transport runs and the load replaces or
+ * empties the active resident Scene or any track's played resident Scene.
+ * While Scene 17 is already active it is needed only when a track still on a
+ * resident Scene would lose that Scene (rebuild in place); otherwise the load
+ * runs directly and Scene 17 is unchanged (D31).
+ * Why: a played Scene's content must not disappear under the transport; a
+ * load that touches only unplayed Scenes runs directly. The former
+ * "Scene 17 is active -> always rebuild" pulled every track onto 17 (D31).
+ * Inputs: replaced = act | empty, seq_isRunning(), active Scene,
+ * seq_perTrackPattern[]. Output: 1 = build or rebuild, 0 = direct load.
+ * Accessors: preset_tickBackgroundBankLoad() phase 1.
+ * Affiliates: preset_backgroundCandidateTracks().
+ */
+static uint8_t preset_backgroundScene17Needed(uint16_t replaced)
+{
+    uint8_t active;
+
+    if (!seq_isRunning())
+        return 0u;
+    active = scene_getActiveIndex();
+    if (active < SCENE_COUNT &&
+        (replaced & (uint16_t)(1u << active)) != 0u)
+        return 1u;
+    return (uint8_t)(preset_backgroundCandidateTracks(replaced) != 0u);
+}
+
+/*
+ * Request a Bank load that keeps playing (S082 P1 §4, D1-D35).
+ *
+ * What: Menu origin: refused when the slot does not exist in the resident
+ * Bank index (§4.1) or Preset is busy; otherwise accepted at once and advanced
+ * by the tick. MIDI origin: dropped while a Bank load is in flight (D13);
+ * otherwise held as the one pending request (latest wins, D33), which phase 0
+ * starts when Preset, the facade and the Menu are idle, by entering
+ * Load:[Bank] exactly as an OK would (D7, D32). A Menu request discards a
+ * pending MIDI one (R5). The mode is stated by Menu (Merge flag); MIDI is
+ * always Replace with all 16 (Q15).
+ * Why: a Bank change must not interrupt what is playing (D1-D5); MIDI CC0
+ * (S083) must reach the same path; a missing slot must be refused before any
+ * Scene 17 work.
+ * Inputs: slot, act/empty masks (Menu), origin | PRESET_BANK_REQUEST_MERGE.
+ * Outputs: accepted (1) / refused or dropped (0); pm_bg_phase or
+ * pm_bg_pending_slot.
+ * Accessors: Menu Bank OK (`menu.c:14090`), S083 MIDI CC0.
+ * Affiliates: preset_tickBackgroundBankLoad(), filesystem_bankSlotExists(),
+ * menu_backgroundBankLoadUiBegin(), preset_backgroundBankLoadRunning().
+ */
+uint8_t preset_requestBackgroundBankLoad(uint16_t slot, uint16_t act_mask,
+                                         uint16_t empty_mask, uint8_t origin)
+{
+    uint8_t merge;
+
+    merge = (uint8_t)((origin & PRESET_BANK_REQUEST_MERGE) != 0u);
+    origin = (uint8_t)(origin & (uint8_t)~PRESET_BANK_REQUEST_MERGE);
+    if ((pm_bg_phase & PM_BG_PHASE_MASK) != 0u)
+        return 0u;                  /* D13/D33: drop while a load is in flight */
+    if (origin == PRESET_BANK_ORIGIN_MIDI) {
+        if (slot >= STORAGE_BANK_MAX_SLOTS)
+            return 0u;
+        pm_bg_pending_slot = slot;  /* D33: latest wins; phase 0 starts it */
+        return 1u;
+    }
+    if (pm_status != PRESET_IDLE)
+        return 0u;
+    if (!filesystem_bankSlotExists(slot))
+        return 0u;                  /* §4.1: never build Scene 17 for nothing */
+    pm_bg_pending_slot = PM_BG_PENDING_NONE;     /* R5 */
+    pm_request_slot = slot;
+    pm_kit_request_scene_mask = act_mask;
+    (void)empty_mask;
+    pm_bg_result = PRESET_BG_RESULT_NONE;
+    pm_bg_phase = (uint8_t)(1u | (merge ? 0u : PM_BG_REPLACE));
+    return 1u;
+}
+
+uint8_t preset_backgroundBankLoadRunning(void)
+{
+    return (uint8_t)((pm_bg_phase & PM_BG_PHASE_MASK) != 0u);
+}
+
+/*
+ * Read and clear the last background Bank load result (S082 P1 D34).
+ *
+ * What: returns pm_bg_result and resets it to NONE.
+ * Why: the origin of a load needs one completion signal; a read-and-clear
+ * byte lets S083 send exactly one CC0 reply per load.
+ * Inputs: pm_bg_result. Outputs: PRESET_BG_RESULT_* (| _MIDI).
+ * Accessors: S083 MIDI service.
+ * Affiliates: on_bank_load_complete(), preset_tickBackgroundBankLoad().
+ */
+uint8_t preset_takeBackgroundBankLoadResult(void)
+{
+    uint8_t result = pm_bg_result;
+
+    pm_bg_result = PRESET_BG_RESULT_NONE;
+    return result;
+}
+
+/*
+ * Enter a background-load phase and stamp a bounded wait (S082 P1 A8).
+ *
+ * What: replaces the phase nibble, keeping the flag bits; entering a waiting
+ * phase (2, 4 or 6) records time_sysTick in pm_bg_pending_slot, which holds
+ * no request while a load is in flight (see its declaration).
+ * Why: one place starts every wait clock, so no wait can run unbounded.
+ * Inputs: phase. Outputs: pm_bg_phase, wait start.
+ * Accessors: preset_tickBackgroundBankLoad().
+ * Affiliates: preset_bgWaitExpired(), PM_BG_WAIT_LIMIT_MS.
+ */
+static void preset_bgSetPhase(uint8_t phase)
+{
+    pm_bg_phase = (uint8_t)((pm_bg_phase & (uint8_t)~PM_BG_PHASE_MASK) |
+                            (phase & PM_BG_PHASE_MASK));
+    if (phase == 2u || phase == 4u || phase == PM_BG_PHASE_MIDI_UI)
+        pm_bg_pending_slot = time_sysTick;
+}
+
+/*
+ * Report whether the current bounded wait has run out (S082 P1 A8).
+ *
+ * What: nonzero once PM_BG_WAIT_LIMIT_MS have passed since the waiting phase
+ * was entered (wrap-safe 16-bit subtraction).
+ * Inputs: time_sysTick, pm_bg_pending_slot (wait start).
+ * Outputs: boolean. Accessors: phases 2, 4 and 6 of the tick.
+ * Affiliates: preset_bgSetPhase(), preset_bgEnd().
+ */
+static uint8_t preset_bgWaitExpired(void)
+{
+    return (uint8_t)((uint16_t)(time_sysTick - pm_bg_pending_slot) >=
+                     PM_BG_WAIT_LIMIT_MS);
+}
+
+/*
+ * End a background Bank load (S082 P1 D34, A8).
+ *
+ * What: releases the AutoSave yield, returns to phase 0, restores the pending
+ * register to PM_BG_PENDING_NONE and, for a failure, records FAILED (with the
+ * MIDI flag for MIDI origin) and ends the accepted Load/Save command.
+ * Why: every exit (completion, refusal, failure, timeout) must leave the same
+ * clean state: no yield, no stale wait stamp mistaken for a pending slot, and
+ * no command stuck on `...`. A failure after the Scene 17 switch keeps
+ * playback on 17 (§4.5).
+ * Inputs: failed, pm_bg_phase. Outputs: pm_bg_phase, pm_bg_pending_slot,
+ * pm_bg_result, yield, Menu command state.
+ * Accessors: preset_tickBackgroundBankLoad().
+ * Affiliates: filesystem_setAutosaveYield(), menu_backgroundBankLoadAbort().
+ */
+static void preset_bgEnd(uint8_t failed)
+{
+    uint8_t midi = (uint8_t)((pm_bg_phase & PM_BG_ORIGIN_MIDI) != 0u);
+
+    filesystem_setAutosaveYield(0u);
+    pm_bg_phase = 0u;
+    pm_bg_pending_slot = PM_BG_PENDING_NONE;
+    if (failed) {
+        pm_bg_result = (uint8_t)(PRESET_BG_RESULT_FAILED |
+                                 (midi ? PRESET_BG_RESULT_MIDI : 0u));
+        menu_backgroundBankLoadAbort();
+    }
+}
+
+/*
+ * Advance the background Bank Load one bounded phase per poll pass
+ * (S082 P1 §4, D1-D39).
+ *
+ * What: phase 0 starts a pending MIDI request when everything is idle; phases
+ * 1-5 are: decide whether Scene 17 is needed; drop queued copy/clear work and
+ * abort AutoSave, wait for the facade and pattern snapshot; build/rebuild and
+ * switch/move (Scene 17 only); load the Bank; wait for completion. Phase 6
+ * (MIDI origin): wait for the Load:[Bank] preview, then act as OK. Each of
+ * the waits in phases 2, 4 and 6 is bounded by PM_BG_WAIT_LIMIT_MS; on expiry
+ * the load ends FAILED (A8). The result is recorded for
+ * preset_takeBackgroundBankLoadResult().
+ * Inputs: pm_bg_phase, pm_request_slot, pm_kit_request_scene_mask.
+ * Outputs: Scene 17 state or a direct load; preset status; pm_bg_result.
+ * Accessors: menu_pollPresetStatus().
+ * Affiliates: all preset_background* and preset_bg* helpers, ccSvc_busy(),
+ * filesystem_status(), filesystem_patternSnapshotInUse(),
+ * menu_backgroundBankLoadUiIdle(), menu_backgroundBankLoadUiPoll(),
+ * menu_backgroundNamesChanged(), seq_moveTracksToBackgroundScene(),
+ * preset_backgroundCandidateTracks().
+ */
+void preset_tickBackgroundBankLoad(void)
+{
+    uint8_t phase = (uint8_t)(pm_bg_phase & PM_BG_PHASE_MASK);
+    uint16_t act = pm_kit_request_scene_mask;
+    uint16_t empty = (pm_bg_phase & PM_BG_REPLACE)
+        ? (uint16_t)~act : 0u;
+
+    /*
+     * Start a deferred MIDI request once everything is idle (D33, D7, D32).
+     *
+     * What: with no load in flight, a pending MIDI slot is started when
+     * Preset, the facade and the Menu are idle: the UI is taken to
+     * Load:[Bank] at that slot (abandoning any Menu state) and phase 6 waits
+     * for its preview, exactly as a user would before OK.
+     * Inputs: pm_bg_pending_slot, menu_backgroundBankLoadUiIdle().
+     * Outputs: phase 6 with MIDI origin and Replace; pending cleared (the
+     * register then holds the phase 6 wait start).
+     */
+    if (phase == 0u) {
+        if (pm_bg_pending_slot == PM_BG_PENDING_NONE ||
+            pm_status != PRESET_IDLE || !menu_backgroundBankLoadUiIdle())
+            return;
+        pm_request_slot = pm_bg_pending_slot;
+        pm_bg_pending_slot = PM_BG_PENDING_NONE;
+        pm_bg_result = PRESET_BG_RESULT_NONE;
+        menu_backgroundBankLoadUiBegin(pm_request_slot);
+        pm_bg_phase = (uint8_t)(PM_BG_ORIGIN_MIDI | PM_BG_REPLACE);
+        preset_bgSetPhase(PM_BG_PHASE_MIDI_UI);
+        return;
+    }
+
+    switch (phase) {
+    case 1u: {
+        uint16_t replaced = (uint16_t)(act | empty);
+
+        /*
+         * Decide Scene 17 once (D2-D5, D14, D25, D31). Every request then
+         * drops background work (phase 2: D12 copy/clear, D1/R6 AutoSave
+         * aborted, card idle); only a Scene 17 request builds.
+         */
+        if (preset_backgroundScene17Needed(replaced))
+            pm_bg_phase |= PM_BG_NEEDED;
+        preset_bgSetPhase(2u);
+        return; }
+    case 2u:
+        if ((pm_bg_phase & PM_BG_DISCARDED) == 0u) {
+            ccSvc_dropQueued();
+            filesystem_setAutosaveYield(1u);
+        }
+        if (ccSvc_busy() || filesystem_status() == FS_STATUS_BUSY ||
+            filesystem_patternSnapshotInUse()) {
+            /* A8: nothing has been built yet; a timeout just fails. */
+            if (preset_bgWaitExpired())
+                preset_bgEnd(1u);
+            return;
+        }
+        /*
+         * Drop the outgoing Bank's pending AutoSave state (D1, D25, R6).
+         *
+         * What: the facade is idle (any drain aborted and closed), so a
+         * Replace discards the dirty mask on every path, with or without
+         * Scene 17; a Merge keeps it and Menu re-marks the whole Bank after
+         * the load. Then build (Scene 17 needed) or load directly.
+         */
+        if ((pm_bg_phase & PM_BG_DISCARDED) == 0u) {
+            if ((pm_bg_phase & PM_BG_REPLACE) != 0u)
+                autosave_discardDirtyMask();
+            pm_bg_phase |= PM_BG_DISCARDED;
+        }
+        preset_bgSetPhase((pm_bg_phase & PM_BG_NEEDED) ? 3u : 4u);
+        return;
+    case 3u: {
+        /*
+         * Build and switch, or rebuild and move only the affected tracks
+         * (D2-D5, D19, D27-D31).
+         *
+         * What: fresh build: build Scene 17 and switch every track to it;
+         * the view follows only with PAR_FOLLOW on (D27). Rebuild in place:
+         * copy the candidate tracks and move only them (D31); the active
+         * Scene is already 17 and the view is never moved (D28). Either way
+         * the Menu drops any stale Scene 17 name scratch (D29).
+         */
+        uint16_t replaced = (uint16_t)(act | empty);
+        uint8_t rebuild = scene_backgroundExists();
+
+        if (!preset_buildBackgroundScene(rebuild, replaced) &&
+            !scene_backgroundExists()) {
+            preset_bgEnd(1u);
+            return;
+        }
+        if (rebuild) {
+            seq_moveTracksToBackgroundScene(
+                preset_backgroundCandidateTracks(replaced));
+        } else {
+            seq_switchToBackgroundScene();
+            (void)scene_selectActive(SCENE_BACKGROUND_INDEX);
+            /*
+             * The sounding Effect follows playback onto Scene 17
+             * (S082 P2 fix 1).
+             *
+             * What: retargets EffectsManager's per-block source from the home
+             * Scene to Scene 17 without touching the running Effect; a type
+             * mismatch (never expected: 17 is a copy of the active Scene)
+             * falls back to the full activation.
+             * Why: the Bank load is about to overwrite the home Scene's Effect
+             * record; the Effect must keep reading the identical copy, or it
+             * changes level and parameters mid-load (S082_P1 D4).
+             * Inputs: Scene 17 built and active. Outputs: effects_state source.
+             * Affiliates: effects_rebindSourceScene(), effects_activateScene(),
+             * preset_buildBackgroundScene().
+             */
+            if (!effects_rebindSourceScene(SCENE_BACKGROUND_INDEX))
+                effects_activateScene(SCENE_BACKGROUND_INDEX);
+            menu_setPlayedPattern(SCENE_BACKGROUND_INDEX);
+            if (parameter_values[PAR_FOLLOW])
+                menu_setShownPattern(SCENE_BACKGROUND_INDEX);
+        }
+        menu_backgroundNamesChanged();
+        menu_refreshPerfSceneLeds();
+        preset_bgSetPhase(4u);
+        return; }
+    case 4u:
+        /*
+         * Post the ordinary two-mask Bank Load; wait while the card is busy
+         * (P1-5).
+         *
+         * What: a refusal while the facade is BUSY (for example a
+         * settings.cfg write, D24) is retried next pass, for at most
+         * PM_BG_WAIT_LIMIT_MS (A8); a refusal on an idle facade is a real
+         * failure. Either failure releases the yield, records FAILED and ends
+         * the command. On failure while on Scene 17 playback stays on 17
+         * (§4.5).
+         */
+        if (preset_loadBank(pm_request_slot, act, empty,
+                            (uint8_t)((pm_bg_phase & PM_BG_REPLACE)
+                                          ? PRESET_BANK_LOAD_REPLACE : 0u))) {
+            preset_bgSetPhase(5u);
+        } else if (filesystem_status() != FS_STATUS_BUSY ||
+                   preset_bgWaitExpired()) {
+            preset_bgEnd(1u);
+        }
+        return;
+    case 5u:
+        if (pm_status == PRESET_IDLE)
+            preset_bgEnd(0u);
+        return;
+    case PM_BG_PHASE_MIDI_UI: {
+        /*
+         * MIDI origin: wait for the Load:[Bank] preview, then act as OK
+         * (D7, §4.1, Q15).
+         *
+         * What: the Menu reports WAIT while the Bank index or child preview
+         * runs; READY with the Replace/all-16 masks it would compute on OK;
+         * REFUSED when the slot is missing (the page shows it as Menu would)
+         * or the preview failed. READY continues at phase 1; REFUSED, or a
+         * WAIT longer than PM_BG_WAIT_LIMIT_MS (A8), ends the command with a
+         * FAILED result.
+         */
+        uint16_t a = 0u, e = 0u;
+        uint8_t ui = menu_backgroundBankLoadUiPoll(pm_request_slot, &a, &e);
+
+        if (ui == MENU_BG_UI_WAIT) {
+            if (preset_bgWaitExpired())
+                preset_bgEnd(1u);
+            return;
+        }
+        if (ui == MENU_BG_UI_REFUSED) {
+            preset_bgEnd(1u);
+            return;
+        }
+        pm_kit_request_scene_mask = a;
+        preset_bgSetPhase(1u);
+        return; }
+    default:
+        preset_bgEnd(0u);
+        return;
+    }
 }
 
 uint8_t preset_loadFirstAvailableSceneOrKit(void)
@@ -3242,6 +4063,20 @@ uint8_t preset_loadInstrument(uint8_t destination_scene,
                               instrument_type_t type,
                               uint16_t browser_index)
 {
+    /*
+     * Nothing loads into Scene 17 (S082 P1 R1, D36).
+     *
+     * What: a destination Scene outside the resident range (index 16) is
+     * refused before any Preset or filesystem state changes.
+     * Why: this loader takes a Scene index, and scene_get(16) is valid while
+     * Scene 17 exists, so a stray caller could otherwise write into 17 (and a
+     * 16-bit 1u << 16 destination mask would be undefined). The Menu passes
+     * the home Scene (menu_instrumentEntryScene()); this is the backstop.
+     * Inputs: destination_scene. Outputs: 0 (refused) for index >= SCENE_COUNT.
+     * Affiliates: menu_instrumentEntryScene(), scene_backgroundHomeIndex().
+     */
+    if (destination_scene >= SCENE_COUNT)
+        return 0u;
     return preset_loadInstrumentForScenes((uint16_t)(1u << destination_scene),
                                           destination_slot,
                                           type,
@@ -3364,7 +4199,22 @@ uint8_t preset_loadInstrumentMorph(uint8_t destination_scene,
                                    instrument_type_t type,
                                    uint16_t browser_index)
 {
-    const kit_instrument_slot_t *destination =
+    const kit_instrument_slot_t *destination;
+    /*
+     * Nothing loads into Scene 17 (S082 P1 R1, D36).
+     *
+     * What: a destination Scene outside the resident range (index 16) is
+     * refused before any Preset or filesystem state changes.
+     * Why: this loader takes a Scene index, and scene_get(16) is valid while
+     * Scene 17 exists, so a stray caller could otherwise write into 17 (and a
+     * 16-bit 1u << 16 destination mask would be undefined). The Menu passes
+     * the home Scene (menu_instrumentEntryScene()); this is the backstop.
+     * Inputs: destination_scene. Outputs: 0 (refused) for index >= SCENE_COUNT.
+     * Affiliates: menu_instrumentEntryScene(), scene_backgroundHomeIndex().
+     */
+    if (destination_scene >= SCENE_COUNT)
+        return 0u;
+    destination =
         scene_instrumentSlotConst(destination_scene, destination_slot);
 
     /*

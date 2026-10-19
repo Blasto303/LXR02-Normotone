@@ -178,6 +178,22 @@ quiet window scheduling, and shared background CPU budget):
   `fs_autosave_page_suppressed` set while suspended, so its first drain
   afterwards uses the 250 ms continuation deadline. Dirty marks are made at
   every change and are written afterwards.
+- Bank load drain abort (Session 082 P1 R6, D1): every Bank load (Menu and
+  MIDI) sets `fs_autosave_yield`, which now also aborts an in-flight scalar
+  or Pattern drain at its next tick through its error close-down.
+  **Scalar drain:** every phase except the HCNAMES publication (70–77) and
+  the error close-down itself (40–46) routes through
+  `filesystem_autosaveWriterFinishError()`. **Pattern drain:** phases 0–1
+  (no handle) finish ERROR at once; phases 3–8 (streaming) jump to the
+  close at phase 9 with ERROR status; phase 2 (open pending) waits for its
+  callback. Phases 9–10 (closing) and the HCNAMES Pattern follow-on are
+  never cut (an abort between the live remove and temp rename would lose
+  `/.hcnames`). After abort the writer's five-second retry re-arms, but the
+  yield and the Scene 17 gate prevent it from running until the load is
+  over. A Replace discards the dirty mask on every path (D25); a Merge keeps
+  it and re-marks the whole Bank. Recovery writes may leave both A/B files
+  invalid — accepted because the old Bank's records are ignored after the
+  load anyway (identity mismatch, D21).
 - exact-length validation by a one-byte end-of-file probe in both scalar
   validators, silent self-repair of a torn record by the next drain, `V`
   trace bits 4..5, and a progress-aware drain stall observer (Session 074);
@@ -295,19 +311,21 @@ starting at 13. The source field is absorbed from previously reserved
 parameter/tail bytes, so every containing section remains the same size.
 
 The Bank `scene_present_mask` occupies payload bytes 10..11 (absolute record
-offsets 3930..3931) and is the effective resident Scene availability union.
-Bank Load preserves existing resident bits and ORs in its effective
-selected-child mask; an equal-value completion explicitly re-marks those two
-bytes so a successful load refreshes the hidden record even when the
-change-aware BankData setter is a no-op. The logging-only `B` trace stage
-witnesses the resident mask at Bank Load commit and at the drain's first-byte
-capture; it uses the existing eight-byte trace ring and adds no production RAM.
+offsets 3930..3931) and is the effective resident Scene availability set.
+Since S082 a Bank Load assigns it: Scenes outside the act/empty masks keep
+their bit, loaded children set theirs, and emptied Scenes clear theirs except
+the active Scene, which always stays present (S17). An equal-value completion
+explicitly re-marks those two bytes so a successful load refreshes the hidden
+record even when the change-aware BankData setter is a no-op. The logging-only
+`B` trace stage witnesses the resident mask at Bank Load commit and at the
+drain's first-byte capture; it uses the existing eight-byte trace ring and adds
+no production RAM.
 
 
-`Save:[Bank]` preserves the resident present mask by OR-ing in its selected
-child subset. A partial save therefore cannot shrink the live Bank solely
-because unsaved resident Scenes were outside the save mask. This Session 057
-fix is a prerequisite for correct whole-Bank AutoSave publication.
+`Save:[Bank]` never changes the resident present mask. It writes or removes
+children according to its act/empty masks and leaves resident presence exactly
+as it was, so a partial save cannot shrink the live Bank. This Session 057
+rule is unchanged.
 
 The relative Effect region is projected without copying the retained C record:
 
@@ -1201,3 +1219,17 @@ editing the source files: check exact record sizes, header/commit fields,
 CRC32C, generation selection, dirty masks, and trace records independently. A
 broader human-readable development-log converter is deferred until AutoSave
 behavior and every logging format are complete.
+
+S082 Merge semantics: a Merge Load acts only on selected Scenes with pattern
+content and leaves every other resident Scene as it was. Only Scenes that were
+actually loaded or emptied lose their pending dirty state; after the load the
+whole resident Bank is explicitly re-marked because the mixed Bank now sits
+under the source Bank's identity. A Merge Save writes only selected Scenes with
+content and leaves the slot's other children untouched.
+
+Scene 17 (background Bank Load): AutoSave is suspended while Scene 17 exists
+`scene_backgroundExists()`; dirty marks for Scenes 1..16 keep accumulating and
+are written after the first whole-Scene change releases Scene 17. `settings.cfg`
+is not AutoSave and keeps writing (D24). The new HCNAMES Scene-row source tokens
+`bNNN` and `x` are carried in the AutoSave source fields as ordinary uint16_t
+register values.

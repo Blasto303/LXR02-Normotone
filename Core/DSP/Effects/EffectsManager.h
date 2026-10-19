@@ -470,6 +470,16 @@ uint8_t effects_registryCheckResult(void);
 /* Runtime lifecycle and resolution API. */
 void effects_init(void);
 void effects_activateScene(uint8_t scene_index);
+/*
+ * Retarget the running Effect to an identical copy of its source Scene
+ * (S082 P2 fix 1).
+ * What: changes only the Scene whose Effect record the per-block service
+ * reads; no runtime, sequence, automation or LFO state changes.
+ * Inputs: scene_index. Outputs: 1 retargeted, 0 refused (no record or a
+ * different type).
+ * Accessors: preset_tickBackgroundBankLoad() phase 3.
+ */
+uint8_t effects_rebindSourceScene(uint8_t scene_index);
 uint8_t effects_changeType(uint8_t scene_index, effect_type_id_t type);
 void effects_service(void);
 void effects_process(effect_io_t *io);

@@ -595,6 +595,9 @@ void storage_makeSavedEffectDisplayFilename(char *dst,
 void storage_banksetInit(storage_bankset_t *state);
 storage_status_t storage_banksetParseLine(storage_bankset_t *state,
                                           const char *line);
+storage_status_t storage_banksetParseLineMasked(storage_bankset_t *state,
+                                                const char *line,
+                                                uint16_t protect);
 storage_status_t storage_banksetFinalize(const storage_bankset_t *state);
 uint8_t storage_formatBanksetLine(char *dst,
                                   uint16_t capacity,

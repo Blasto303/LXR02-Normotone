@@ -492,6 +492,20 @@ uint16_t bank_sceneFanoutMask(uint8_t scene)
     return out;
 }
 
+uint32_t bank_editTargetMask(void)
+{
+    return (scene_getActiveIndex() == SCENE_BACKGROUND_INDEX)
+        ? (1ul << SCENE_BACKGROUND_INDEX)
+        : (uint32_t)bank_sceneMaskVoiceEdit();
+}
+
+uint32_t bank_sceneFanoutMask32(uint8_t scene)
+{
+    if (scene == SCENE_BACKGROUND_INDEX)
+        return 1ul << SCENE_BACKGROUND_INDEX;
+    return (uint32_t)bank_sceneFanoutMask(scene);
+}
+
 void bank_exchangeVoiceEditMask(uint8_t src, uint8_t dst)
 {
     uint16_t m;
@@ -518,6 +532,54 @@ void bank_resetVoiceEditMaskToSelf(uint8_t scene)
     if (scene >= BANK_SCENE_SLOT_COUNT)
         return;
     bank_setSceneMaskVoiceEditForScene(scene, bank_sceneBit(scene));
+}
+
+/*
+ * Mutually exclusive VOICE edit masks after a partial Bank operation (S082 B3).
+ *
+ * What: bank_mergeVoiceEditEntry() restricts one entry to a set of Scenes that
+ * still match it, plus the Scene itself. After a Bank Load, loaded Scenes take
+ * their source entry restricted to the loaded set, emptied Scenes are reset to
+ * self, and kept Scenes drop every loaded or emptied Scene. The same rule
+ * serves Replace (no kept Scenes) and Merge.
+ * Why: Scenes in one edit mask must stay equal in parameters and FX; a partial
+ * load or save breaks that equality between the two sides.
+ * Inputs: source entries + seen bits (Load), loaded/emptied masks.
+ * Outputs: per-Scene entries via bank_setSceneMaskVoiceEditForScene().
+ * Accessors: filesystem Bank Load phase 20 / empty branch; Bank Save request
+ * and phase 64 (entry helper only).
+ * Affiliates: bank_revalidateVoiceEditMasks(), bank_sceneFanoutMask().
+ */
+uint16_t bank_mergeVoiceEditEntry(uint16_t entry, uint16_t keep_mask,
+                                  uint8_t scene)
+{
+    return (uint16_t)((entry & keep_mask) | bank_sceneBit(scene));
+}
+
+void bank_mergeVoiceEditMasksAfterLoad(const uint16_t *source_entries,
+                                       uint16_t source_seen,
+                                       uint16_t loaded_mask,
+                                       uint16_t emptied_mask)
+{
+    uint8_t n;
+    uint16_t replaced = (uint16_t)(loaded_mask | emptied_mask);
+
+    for (n = 0u; n < BANK_SCENE_SLOT_COUNT; n++) {
+        uint16_t bit = bank_sceneBit(n);
+        uint16_t entry;
+
+        if (loaded_mask & bit) {
+            entry = (source_seen & bit)
+                ? source_entries[n] : bit;
+            entry = (uint16_t)((entry & loaded_mask) | bit);
+        } else if (emptied_mask & bit) {
+            entry = bit;
+        } else {
+            entry = (uint16_t)(
+                (bank_scene_mask_voice_edit[n] & (uint16_t)~replaced) | bit);
+        }
+        bank_setSceneMaskVoiceEditForScene(n, entry);
+    }
 }
 
 void bank_setHasResidentBank(uint8_t present)

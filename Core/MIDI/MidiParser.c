@@ -1782,8 +1782,36 @@ void midiParser_processRealtimeEvents(void)
 
 
 //-----------------------------------------------------------
-/** Parse incoming midi messages and invoke corresponding action
+/*
+ * MIDI that may act while a Bank load is in flight (S082 P1 D13, D33).
+ *
+ * What: accepts system realtime (0xF8-0xFF), note on/off, and control change
+ * except a Bank Change (CC0 / CC32). Everything else is rejected: program
+ * change, pitch bend, polyphonic and channel pressure, MTC quarter frame,
+ * song position/select and the other system common messages.
+ * Why: D33 drops non-realtime/note/CC input during a load, and D13 drops a
+ * Bank Change and program change, which would otherwise start a second load
+ * or a Scene change into Scenes that are being written. Clock and transport
+ * keep playback in sync; notes and CCs keep the performance playing.
+ * Inputs: msg (status, data1). Outputs: 1 = act on it, 0 = drop.
+ * Accessors: midiParser_parseMidiMessage().
+ * Affiliates: preset_backgroundBankLoadRunning(), MidiRealtime (the realtime
+ * queue path is not filtered).
  */
+static uint8_t midiParser_acceptedDuringBankLoad(MidiMsg msg)
+{
+    uint8_t type = (uint8_t)(msg.status & 0xF0u);
+
+    if (msg.status >= 0xF8u)
+        return 1u;
+    if (type == NOTE_ON || type == NOTE_OFF)
+        return 1u;
+    if (type == MIDI_CC)
+        return (uint8_t)(msg.data1 != CC_BANK_CHANGE &&
+                         msg.data1 != CC_BANK_SELECT_LSB);
+    return 0u;
+}
+
 void midiParser_parseMidiMessage(MidiMsg msg)
 {
 	// route message if needed
@@ -1806,10 +1834,16 @@ void midiParser_parseMidiMessage(MidiMsg msg)
 	}
 
 	if(msg.bits.sysxbyte)
-		return; // no further action needed. we don't interpret sysex data right now
-
-	// --AS FILT filter messages here. Filter inline below to be more optimal
-	// we are interested in the low nibble since we are Rx here
+		return;
+	/*
+	 * Drop non-realtime/note/CC input while a Bank load is in flight
+	 * (S082 P1 D13, D33). Thru routing above is unaffected (R4); only
+	 * Helicase's own interpretation is suppressed. A pending, unstarted MIDI
+	 * Bank request does not count as in flight.
+	 */
+	if (preset_backgroundBankLoadRunning() &&
+	    !midiParser_acceptedDuringBankLoad(msg))
+		return;
 
 
 	if((msg.status & 0xF0) == 0XF0) {

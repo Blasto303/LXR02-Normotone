@@ -123,6 +123,10 @@ STAGE_ENUM = {
     "H": "AUTOSAVE_TRACE_STAGE_BUDGET_REPORT",
     # c: S075 Phase 6 copy/clear lifecycle and risk witness.
     "c": "AUTOSAVE_TRACE_STAGE_COPY_CLEAR",
+    # b: S082 Bank child preview completion with presence and content masks.
+    "b": "AUTOSAVE_TRACE_STAGE_BANK_PREVIEW",
+    # h: S082 review F5 HCNAMES provenance and Load/Save pot-drop evidence.
+    "h": "AUTOSAVE_TRACE_STAGE_HCNAMES_PROVENANCE",
 }
 
 STAGE_PRODUCER = {
@@ -160,6 +164,8 @@ STAGE_PRODUCER = {
     "Z": "autosave_maskHasDirty() DEV population audit",
     "H": "filesystem_backgroundBudgetRefill()",
     "c": "Core/Menu/CopyClear/* and filesystem suspension/loan witnesses",
+    "b": "filesystem_scanBankScenes_tick() probe completion",
+    "h": "filesystem HCNAMES register / Menu Load/Save (S082 review F5)",
 }
 
 # AUTOSAVE_TRACE_PHASE_STALL_SITE_* (AutosaveTrace.h). Session 057 widened the
@@ -178,6 +184,7 @@ PHASE_STALL_SITES = {
     7: "Bank Load entry (filesystem_loadBankDirectory_tick)",
     8: "settings write (filesystem_saveGlobals_tick)",
     9: "flush finish (filesystem_flushFinish_tick)",
+    10: "Bank child preview (filesystem_scanBankScenes_tick)",
 }
 
 PHASE_STALL_BEHAVIOUR = {
@@ -194,6 +201,7 @@ PHASE_STALL_BEHAVIOUR = {
     7: "abort (FS_STATUS_ERROR)",
     8: "abort (FS_STATUS_ERROR)",
     9: "abort (FS_STATUS_ERROR)",
+    10: "abort: preview finishes with error BkPv after 20,000 polls (S082 review F4)",
 }
 
 SAVE_LIFECYCLE_TYPES = {0: "Kit", 1: "Scene", 2: "Bank", 3: "Instrument"}
@@ -547,7 +555,8 @@ CC_EVENTS = {
 CC_KINDS = {1: "step", 2: "bar", 3: "track", 4: "scene", 5: "fx-step"}
 CC_DROP = {0: "none", 1: "NO_ROOM", 2: "EVACUATE_FAILED",
            3: "ADVANCED_LIMIT", 4: "FX_TYPE_MISMATCH", 5: "NO_SOURCE",
-           6: "NO_SCRATCH", 7: "BAD_SELECTION", 8: "BAD_GEOMETRY"}
+           6: "NO_SCRATCH", 7: "BAD_SELECTION", 8: "BAD_GEOMETRY",
+           9: "SCENE17"}
 CC_ANOMALY = {1: "GROW_UNPLACEABLE", 2: "SWAP_RETURN_ABANDONED",
               3: "SWAP_OCCUPIED", 4: "REGION_REWRITE_GREW",
               5: "CLAIM_OTHER_SCENE", 6: "TEARDOWN_CLAIM_HELD",
@@ -918,7 +927,22 @@ def trace_record_text(index: int, stage: int, flags: int, tick: int,
         case3 = bool(flags & 0x02)
         case2 = bool(flags & 0x04)
         summary = bool(flags & 0x80)
-        if summary:
+        if flags == 0x08:
+            reasons = {1: "unresolvable source", 2: "folder not entered",
+                       3: "sceneset.scg not opened",
+                       4: "sceneset.scg parse/finalize",
+                       5: "kitset.kcg parse/finalize",
+                       6: "Instrument member file", 7: "Scene storage missing",
+                       9: "other loader"}
+            raw = value & 0xFFFF
+            reason = (value >> 16) & 0xFF
+            sub = (value >> 24) & 0xFF
+            detail = (f"{enum_name} via filesystem_bootReaderEvaluateScene(): "
+                      f"case3 detail, raw source word=0x{raw:04x} "
+                      f"(value=0x{raw & 0x1FFF:04x}, R={(raw >> 13) & 1}, "
+                      f"dirty={(raw >> 15) & 1}), reason={reason} "
+                      f"({reasons.get(reason, 'unknown')}), sub={sub}")
+        elif summary:
             detail = (f"{enum_name} via {producer}: reader summary, "
                       f"case2_scene_mask=0x{value & 0xFFFF:04x}, "
                       f"case3_scene_mask=0x{(value >> 16) & 0xFFFF:04x}")
@@ -930,6 +954,38 @@ def trace_record_text(index: int, stage: int, flags: int, tick: int,
                       f"hcnames row {row}, source=0x{source:04x}")
     elif ch == "c":
         detail = f"{enum_name} via {producer}: {cc_record_text(flags, value)}"
+    elif ch == "b":
+        present = value & 0xFFFF
+        content = (value >> 16) & 0xFFFF
+        detail = (f"{enum_name} via {producer}: "
+                  f"present=0x{present:04x} ({bin(present).count('1')} children) "
+                  f"content=0x{content:04x} ({bin(content).count('1')} with triggers), "
+                  f"elapsed~{flags * 64} ms" + (" (saturated)" if flags == 255 else ""))
+    elif ch == "h":
+        if flags == 0x01:
+            detail = (f"{enum_name}: REFRESHED_RESET count={value & 0xFF} "
+                      f"first_row={(value >> 8) & 0xFF} op={(value >> 16) & 0xFF} "
+                      f"phase={(value >> 24) & 0xFF}")
+        elif flags == 0x02:
+            detail = (f"{enum_name}: WRITE_UNKNOWN_REFRESHED row={value & 0xFFFF} "
+                      f"op={(value >> 16) & 0xFF} phase={(value >> 24) & 0xFF}")
+        elif flags == 0x03:
+            src = (value >> 16) & 0x1FFF
+            detail = (f"{enum_name}: KIT_SOURCE_STAGED row={value & 0xFFFF} "
+                      f"(Scene{(value & 0xFFFF) - 17}) source=0x{src:04x}")
+        elif flags == 0x04:
+            detail = (f"{enum_name}: REFRESH_ON_UNKNOWN row={value & 0xFFFF} "
+                      f"op={(value >> 16) & 0xFF} phase={(value >> 24) & 0xFF}")
+        elif flags == 0x05:
+            detail = (f"{enum_name}: KIT_LOAD_CONTEXT what={value & 0xFF} "
+                      f"page={(value >> 8) & 0xFF} "
+                      f"request_mask=0x{(value >> 16) & 0xFFFF:04x}")
+        elif flags == 0x06:
+            detail = (f"{enum_name}: POT_DROPPED knob={value & 0xFF} "
+                      f"what={(value >> 8) & 0xFF} page={(value >> 16) & 0xFF} "
+                      f"storageBusy={(value >> 24) & 0xFF}")
+        else:
+            detail = f"{enum_name}: unknown event 0x{flags:02x}"
     else:
         detail = f"{enum_name}: no decoder for this stage"
 

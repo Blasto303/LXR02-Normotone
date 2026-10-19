@@ -101,8 +101,41 @@ uint16_t bank_sceneMaskVoiceEditForScene(uint8_t scene_index);
  * Clients: copyOps.c, clearOps.c. Foreground only; no SRAM.
  */
 uint16_t bank_sceneFanoutMask(uint8_t scene);
+/*
+ * Edit fan-out targets including Scene 17 (bit 16).
+ *
+ * What: 32-bit Scene masks for edit and copy/clear fan-out. While the active
+ * (viewed/edited) Scene is Scene 17 the target set is Scene 17 alone; for
+ * resident Scenes it is the existing 16-bit entry, unchanged.
+ * Why: Scene 17's edit mask is itself only (D15) and a 16-bit mask cannot
+ * name it; without this, edits on 17 would fan out to the home Scene's group
+ * or write nothing.
+ * Inputs: active Scene, per-Scene entries. Outputs: uint32_t masks.
+ * Accessors: Menu commit loops, EffectsManager edit API, copy/clear jobs.
+ * Affiliates: bank_sceneMaskVoiceEdit(), bank_sceneFanoutMask(),
+ * scene_backgroundExists(). Foreground only; no SRAM.
+ */
+uint32_t bank_editTargetMask(void);
+uint32_t bank_sceneFanoutMask32(uint8_t scene);
 void bank_exchangeVoiceEditMask(uint8_t src, uint8_t dst);
 void bank_resetVoiceEditMaskToSelf(uint8_t scene);
+/*
+ * Mutually exclusive VOICE edit masks after a partial Bank operation (S082 B3).
+ *
+ * bank_mergeVoiceEditEntry(): restricts one entry to a set of Scenes that
+ * still match it, plus the Scene itself.
+ * bank_mergeVoiceEditMasksAfterLoad(): loaded Scenes take their source entry
+ * restricted to the loaded set, emptied Scenes are reset to self, kept Scenes
+ * drop every loaded or emptied Scene.
+ * Accessors: filesystem Bank Load phase 20, Bank Save request and phase 64.
+ * Affiliates: bank_revalidateVoiceEditMasks(), bank_sceneFanoutMask().
+ */
+uint16_t bank_mergeVoiceEditEntry(uint16_t entry, uint16_t keep_mask,
+                                  uint8_t scene);
+void bank_mergeVoiceEditMasksAfterLoad(const uint16_t *source_entries,
+                                       uint16_t source_seen,
+                                       uint16_t loaded_mask,
+                                       uint16_t emptied_mask);
 void bank_setHasResidentBank(uint8_t present);
 uint8_t bank_hasResidentBank(void);
 

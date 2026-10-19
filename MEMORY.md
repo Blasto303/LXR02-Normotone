@@ -146,7 +146,81 @@ must not allocate those rings, cursors, or timing records.
   against the worst-case Scene; the user accounts for it on the `cpu`
   widget. Do not generalise this exception to anything else.
 
+## Load/Save Slot Scrolling Policy (user, repeated 2026-10-19) — binding
+
+- **Scrolling a slot number (encoder or endless pot) must never block or lag.**
+  Every slot change runs, in this order and each asynchronously:
+  1. **number** updates immediately;
+  2. **name** loads (it may be blank briefly);
+  3. **LED array** loads after the name.
+- **The next turn disposes whatever is still running, in the same order.**
+  It increments the number, blanks the name, cancels the LED load, and
+  restarts the name load. Name and LEDs may be blank for a moment until the
+  item settles. No stage may hold the input gate (`menu_storageBusy`) while
+  the user scrolls.
+- **Bank is the case that keeps breaking**, because its LED array is a card
+  scan (the child preview: up to 16 child folders plus PAT4 reads). Since
+  2026-10-19:
+  - the Bank name comes from the resident Bank index;
+  - the preview never takes `menu_storageBusy`;
+  - each new selection cancels it (`filesystem_cancelScanBankScenes()`,
+    called from `menu_requestCurrentLoadSaveSelection()`,
+    `menu_requestBankChildPreview()` and the Load/Save exit);
+  - the cancelled scan unwinds at a callback-free phase and finishes ERROR;
+  - the latest slot is served by the deferred retry.
+- **Bank OK stays gated** by a valid preview of the shown slot (Load). On
+  Save, OK cancels a running preview and needs a second press.
+- **Why:** the user has had to restate this rule several times; Scene and
+  Kit scrolling already behave this way.
+- **How to apply:** any new per-slot work (preview, probe, name read) must
+  follow it; check the encoder gate (`menu_parseEncoder()`) and the pot gate
+  (`menu_handleLoadSaveKnobDelta()`) for the page.
+
 ## Volatile Notes
+
+**Session 082 (in progress) — Load/Save cleanup and Scene 17 invariants:**
+
+* Load/Save pot deltas on every page coalesce through `menu_knobs_dirty`;
+  `menu_serviceKnobRepaint()` routes LOAD_PAGE/SAVE_PAGE to `menu_repaint()`
+  at most every 20 ms. Do not reintroduce `menu_repaintAll()` per pot delta or
+  the BAR handler's full frame; only real layout changes (page/type entry and
+  command start/finish) repaint everything.
+* Bank Load/Save use explicit act/empty masks. Replace acts on all 16 Scenes;
+  Merge acts only on selected Scenes with pattern content. The active and
+  viewed Scene never change because of a load or save.
+* Scene 17 is an exact copy of what is playing while a background Bank Load
+  runs. It is editable, never AutoSaved, has no MIDI PC and no PERF LED. Only
+  a whole-Scene change releases it; per-track moves do not. The first
+  whole-Scene change lets AutoSave and the shared Pattern snapshot region
+  resume.
+* **Scene 17 P1 invariants (2026-10-19):** the 90 B name capture
+  (`fs_background_name`) holds Scene 17's identity names; rebuild in place
+  (`preset_backgroundCandidateTracks(replaced)`) moves only tracks whose
+  played Scene is replaced; MIDI Bank load requests are deferred when busy
+  and dropped during an active load (D33); `midiParser_acceptedDuringBankLoad()`
+  drops everything except realtime, note and CC (not CC0/CC32); panel gates
+  suppress MODE, SHIFT+REC, VOICE entry and page switches during a load (R7);
+  nothing loads into Scene 17 — every load targets the home Scene (R1);
+  in-flight AutoSave drains are aborted at their next tick (R6, except
+  HCNAMES publication).
+* AutoSave is suspended while `scene_backgroundExists()`; `settings.cfg` and
+  MIDI Learn lines still write. Overlapping copy/clear pastes are refused
+  while 17 exists (shared background region ownership).
+* Card preparation after this change: delete `/.hcnames`, `.hcnamtmp`, and
+  both `.hcprms1`/`.hcprms2` records so the new Scene-row tokens (`bNNN`, `x`)
+  and the assignment-based present mask are regenerated. Old Bank bankset
+  manifests remain readable.
+* **S082 P2 fixes (2026-10-19, built, not hardware-tested):** (1) the running
+  Effect follows playback onto Scene 17 through
+  `effects_rebindSourceScene()` — it changes only the cached Scene index, so
+  the per-block service keeps reading an identical record while the home
+  Scene is overwritten; (2) a whole-Scene AutoSave mark is one contiguous mask
+  range with one `LOAD_MARK` witness, not per-byte `D` records — the drain
+  drops ownerless reserved bits, and `autosave_markKitDirty()` keeps its
+  per-byte form; (3) `filesystem_tickUncounted()` lets a background Bank load
+  use the full-queue idle window (200 µs, `BG_LOAD_IDLE_FS_BUDGET_US`), and the
+  DEV poll-count stall observers ignore those ticks. See
+  `S082_P2_IMPLEMENTATION.md` §10.
 
 This section is for short carryover points only. Flush or rewrite it at session
 end; durable facts belong in `knowledge_files/log_archive/` or
@@ -607,9 +681,9 @@ SceneData source array. Runtime holds 90 bytes of active identity: one Bank,
   payload/HCNAMES, publishes the completed result, applies the active Scene
   through the shared runtime worker, then reloads the unchanged selected
   `.hcindex` read-only as the accepted command's final step. Load:Bank entry
-  must also preview the highlighted Bank's children and hold input until its
-  destination mask is valid; a resident Bank index alone is not selection
-  readiness.
+  must also preview the highlighted Bank's children before OK is accepted (a
+  resident Bank index alone is not selection readiness), but the preview must
+  **not** hold input: see the Load/Save Slot Scrolling Policy (2026-10-19).
 - Accepted OK/OW requests alone own `menu_loadSaveCommandActive`: render `...`,
   suppress every cursor, and retain input locking until true terminal work
   finishes. Preparatory index/preview work may use `menu_storageBusy` without
@@ -1790,9 +1864,12 @@ sequencerTimer_init(); // TIM3 4kHz sequencer owner — AFTER audioCodec_init()
 - Native recursive tree delete was reimplemented on 2026-08-19. Card-fixture
   and hardware acceptance remain pending; do not claim power-loss atomicity or
   reintroduce `old*`/temporary promotion as a workaround.
-- **Known bug — runtime Bank Load can switch the playing Scene.** Defer the
-  request-time active-Scene preservation change until Bank Load/Save is
-  otherwise stable. Boot must retain its saved-default-Scene behavior.
+**Closed in S082 — runtime Bank Load no longer switches the playing Scene.**
+A runtime load never applies `bankset.bcg` `active_scene` and never calls
+`seq_alignActivePatternToScene()` / `menu_setShownPattern()`; only the boot
+load keeps that behavior. If playback runs and a played Scene would be
+replaced, the Menu/MIDI request builds Scene 17 and switches to it
+seamlessly first. See S082_P1 D25-D27 and the Scene 17 invariants below.
 - **Deferred tooling — developer-log converter.** When AutoSave is complete
   and logging formats are stable, add a read-only `/tools/` script that turns
   copied `SD_CARD/` development outputs into dated project-root
@@ -1953,8 +2030,9 @@ sequencerTimer_init(); // TIM3 4kHz sequencer owner — AFTER audioCodec_init()
   confirmed the initial active Scene's Snare controls and both reported LFO
   destinations now work without a Scene/target round trip.
 - Top-level Load:Bank chains Bank index completion into its child preview and
-  gates input until the destination mask is resident, fixing unchanged-slot
-  zero-mask rejection.
+  gates **OK** (not scrolling) until the destination mask is resident, fixing
+  unchanged-slot zero-mask rejection. Superseded input gating: Load/Save Slot
+  Scrolling Policy (2026-10-19).
 - Root Scene/Bank Load finishes HCNAMES, preserves the completed Bank result,
   applies DSP, and reloads the unchanged root index read-only last. Save alone
   owns physical numbered-root scan/index rebuild.

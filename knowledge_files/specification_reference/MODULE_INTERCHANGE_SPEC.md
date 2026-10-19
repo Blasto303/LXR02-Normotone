@@ -108,6 +108,19 @@ that name below; engine timing in `PATTERN_DYNAMIC_STACK.md` §6.5/§6.6):
 - the LED fast-blink layer (`led_setFastBlinkLed()`, `led_getFastBlinkLed()`,
   `led_isBlinkLed()`); removed `led_initPerformanceLeds()`.
 
+and the Session 082 P1 additions (background Bank Load invariants, Scene 17
+identity):
+
+- `preset_requestBackgroundBankLoad()` MIDI origin, deferred/drop lifecycle,
+  `preset_takeBackgroundBankLoadResult()`, `preset_backgroundCandidateTracks()`;
+- `seq_moveTracksToBackgroundScene(track_mask)` (rebuild-in-place);
+- `buttonHandler_enterLoadSaveForBackgroundLoad()` and the R7 panel gates
+  (MODE, SHIFT+REC, VOICE, page switch suppressed during a load);
+- MIDI drop filter `midiParser_acceptedDuringBankLoad()`, `CC_BANK_SELECT_LSB`;
+- name capture `filesystem_backgroundNameCapture()` /
+  `filesystem_backgroundNameRead()` / `filesystem_backgroundNameSet()` /
+  `filesystem_backgroundNameCaptureInstrument()`.
+
 The DSP internals behind these APIs are described in
 `INSTRUMENTS_DSP_REFERENCE.md` and `EFFECTS_MIXER_DSP_REFERENCE.md`.
 Historical migrations belong in session logs; this document states which live
@@ -739,6 +752,8 @@ dispatch to owners.
 | STEP held steps + TRACK (S078) | In `handleVoiceButton()`'s STEP arm, `buttonHandler_seqHeldMask() != 0` calls `menu_enterStepTrackAutomationOverlay(voiceNr)` and returns before the ordinary half toggle. | Menu |
 | PERF looper / overlay / SHIFT+REC / chain chord (S080) | See "PERF performance surface". Hold state `bh_loopSelectHeldMask`, `bh_loopLastSelectButton`, `bh_loopTrackMask` (mask returned by the sequencer), `bh_loopBarModifier`, `bh_loopBarHeld` (event-order BAR holds); helpers `buttonHandler_loopCheckDisengage()`, `buttonHandler_loopForceRelease()`; overlay `bh_overlayActive` + 1 ms repeat slot (`bh_overlayInterval/Next/Count`, serviced in `buttonHandler_tick()`); latches `bh_shiftRecMenuActive`, `bh_shiftReleaseConsume`, `bh_chainPlayArmed`. | Sequencer, Menu, ledHandler |
 | `buttonHandler_loopSelectLed()` | S080: SELECT index (0..7) of the looper division while the looper is held or engaged, else 0xFF. | `menu_syncPerfSelectLed()` |
+| `buttonHandler_enterLoadSaveForBackgroundLoad()` | S082 P1 D7/D32: put the front panel into Load/Save for a MIDI-origin Bank load. Closes latched surfaces (PERF looper, SHIFT+REC, overlay, chain chord), ends an open copy/clear session, sets mode LEDs. Menu performs the page change. | `menu_backgroundBankLoadUiBegin()` |
+| Background load panel gates (S082 P1 R7) | While `preset_backgroundBankLoadRunning()`, MODE presses, SHIFT+REC entry and VOICE button entry are suppressed (mode LEDs unchanged). `menu_switchPage()` is also gated. After the load completes, all buttons act normally. | handleModeButtons, buttonHandler_shiftRecMenuEnter, menu_switchPage, menu_loadInstrumentVoicePressed |
 | `buttonHandler_clearAllMutes()` | S080: clear the VOICE mute mirror; repaint the VOICE row only when it shows mutes. | `menu_applyQueuedSceneAction()` |
 | `handleModeButtons()` | The only writer of `selectButtonMode`. With SHIFT held a MODE button selects `(mode + 4) & 7` (SHIFT+VOICE = VOICE Morph latch), so SHIFT-derived view state set in the old mode must not rely on the SHIFT release (it runs in the new mode). | buttonHandler |
 | Effect-page SHIFT+TRACK voice-mix overlay (S075 F2) | After the type's TRACK hook declines, SHIFT+TRACK in FX mode selects the track and calls `menu_fxVoiceMixOverlayBegin()`; `buttonHandler_fxVoiceMixTrackMask` (1 B) holds the TRACKs keeping it up. While the mask is nonzero every TRACK press joins it and moves the overlay to that track; **no TRACK press mutes**. The last release calls `menu_fxVoiceMixOverlayEnd()` (release consumed before copy/clear routing). SHIFT under the overlay switches the voice Morph view; default SELECT navigation is skipped (type SELECT hooks still run); overflow clears the mask and ends the overlay. | Menu, ledHandler |
@@ -787,7 +802,7 @@ edit dispatch, and post-load operation follow-up.
 | `menu_voiceHeldSceneButtonPressed(scene)` | VOICE-held SEQ mask toggle. Turning a Scene **on** requires `scene_editLayoutMatches(active, scene)` (same Effect type and six Instrument types); a mismatch is consumed silently. Turning off is always allowed (Session 072 step 10). | buttonHandler |
 | `menu_startSoundApply()` / `menu_startInstrumentApply()` (internal) | Post-load apply funnels. Both call `bank_revalidateVoiceEditMasks()` after the retained commit; the empty-Bank branch of Bank Load does too. | `menu_pollPresetStatus()` |
 | `menu_loadInstrumentVoicePressed(voice)` / `menu_loadInstrumentExit()` | Enter/select or leave nested Instrument Load/Save. Entry establishes the combined Kit/Instrument HCNAMES identity session; normal Instrument Load also writes the current voice to `.hctmp.<ext>`. Voice/exit boundaries invalidate that temporary session. | buttonHandler Load/Save VOICE gestures |
-| `menu_loadSceneButtonPressed(scene)` | Consume Load/Save-context SEQ presses as Kit target toggles, Instrument Load one-Scene selection, or Instrument Save source-Scene selection. | buttonHandler SEQ press/release routing |
+| `menu_loadSceneButtonPressed(scene)` | Consume Load/Save-context SEQ presses as Kit target toggles, Instrument Load one-Scene selection, or Instrument Save source-Scene selection. On Load:[Bank] and Save:[Bank] every one of the 16 buttons toggles, including unlit Scenes, and all-deselected is legal (S082). While Bank COPY is held a SEQ press is consumed with no change. | buttonHandler SEQ press/release routing |
 | `menu_loadInstrumentTransactionBusy()` | Report read/save-plus-commit Instrument transaction ownership. Accepted request coordinates remain immutable; number-only scrolling may coalesce the newest pool row, while Scene/voice/type/mode changes are boundaries rather than retargeting. | buttonHandler/Menu gates |
 | `menu_paramUsesMorphView(paramNr)` / `menu_getParameterDisplayValue(paramNr)` / `menu_getParameterEditPtr(paramNr)` | Legacy display/edit helpers for static parameter IDs. Descriptor-backed VOICE cells use the internal dynamic cell resolver instead. | Menu repaint, encoder edits, endless-pot edits |
 | `menu_showStepTrackSettingsFirstHalf()` / `menu_toggleStepTrackSettingsHalf()` | Select STEP front-page first half or toggle to the second half where per-track shuffle lives. | buttonHandler STEP-mode voice/track buttons |
@@ -950,6 +965,7 @@ Sequencer no longer exposes `seq_patternSet`, `seq_tmpPattern`, or
 | `seq_restoreAllSceneAutomation()` | Walk `seq_scene_automation_dirty` (uint32_t) bitmap and restore each dirty Scene target from its retained SceneData getter. Clears morph step overrides, slot6 decay step state, and audio routing. Called from `seq_setStepIndexToStart()` (Session 070). | Sequencer transport restart |
 | `seq_clearSceneAutomationDirty()` | Clear the `seq_scene_automation_dirty` bitmap. Rule B: called from `seq_selectActivePattern()` and `seq_alignActivePatternToScene()` so a Scene activation starts with a clean overlay state. (S076 P1) | Sequencer Scene activation paths |
 | `seq_midiNoteOff(chan)` / `seq_sendMidiNoteOn(channel, note, veloc)` | MIDI note output ownership. | MidiParser, Sequencer |
+| `seq_moveTracksToBackgroundScene(track_mask)` | S082 P1 E4.6: under PRIMASK, move selected tracks (7-bit mask) to play from Scene 17's Pattern region; recompute `seq_perTrackActive[]` and refresh snapshots. Used by `preset_buildBackgroundScene()` rebuild-in-place path (D19/D31). | presetManager |
 | `seq_offsetTrackStepIndexForRotation(trackNr, oldRot, newRot, len)` | Narrow runtime hook for live rotation compensation. | PatternData only |
 
 ### Shared StepScale contract
@@ -1007,7 +1023,10 @@ prefixes remain `preset_*` for the mechanical move.
 | `preset_saveInstrument(scene, slot, display_name)` | Post one root Instrument Save request from a resident Scene/voice slot. The display stem is captured at request acceptance and filesystem writes `Instrument/<stem.ext>`. | Instrument Save nested Save-page OK |
 | `preset_saveInstrumentMorph(scene, slot, display_name)` | Post one root InstrumentMrp Save request. The writer uses the normal Instrument schema but writes the current interpolated values into both endpoint sections and does not rename resident source metadata. | Instrument Save `<Type>Mrp` OK |
 | `preset_loadSceneForScenes(presetNr, scene_mask)` / `preset_saveScene(presetNr, source_scene)` | Load/save root Scene library folders through the non-Pattern Scene stage and direct Pattern phase. | Load/Save Scene |
-| `preset_loadBank(presetNr, scene_mask)` / `preset_saveBank(presetNr, scene_mask, force_save)` | Load/save root Bank folders with a 16-bit local-Scene mask. Load validates bankset.bcg v2, preserves unselected resident Scenes/HCNAMES rows, can report a valid empty Bank, and publishes Session 058 card-clean authority for the completed effective child mask; a child proven invalid by content (not I/O abort) is excluded from the load rather than failing the whole operation (Session 057). Save deletes and rewrites only each selected child in place, skipping Option 2 card-verified clean children unless `force_save` is set; non-selected children are left untouched (Session 057; previously a total-tree delete/recreate that destroyed every child regardless of selection). | Load/Save Bank, boot |
+| `preset_loadBank(slot, act_mask, empty_mask, flags)` / `preset_saveBank(slot, act_mask, empty_mask)` | S082 two-mask Bank operations. Load: act_mask Scenes are loaded exactly, empty_mask Scenes are reset to the shared empty Scene (Replace); Merge passes empty_mask = 0 and untouched Scenes stay as they are. A runtime load never changes the active or viewed Scene; only the boot flag applies the manifest active_scene. Save: act_mask children are written exactly, empty_mask children are deleted from the slot, others untouched; a Save never changes resident presence or edit masks. | Load/Save Bank, boot, S083 MIDI |
+| `preset_requestBackgroundBankLoad(slot, act_mask, empty_mask, origin)` / `preset_tickBackgroundBankLoad()` | S082 P1 background Bank Load. If a running transport plays a Scene the operation replaces, it drops queued copy/clear work, yields AutoSave (which aborts an in-flight drain, R6), builds and switches to Scene 17 seamlessly, then posts the ordinary two-mask load. Otherwise it loads directly. MIDI origin also enters Load:[Bank]. Ticked from `menu_pollPresetStatus()`. Scene 17 invariants: D28 no return (the user cannot navigate back to it); R1 nothing loads into Scene 17 — every load targets the home Scene (`scene_backgroundHomeIndex()`); D29/R2 Saves from 17 use the name capture and suppress HCNAMES publication; D19/D31 rebuild in place copies only tracks whose resident Scene is replaced (`preset_backgroundCandidateTracks(replaced)`). | Menu Bank OK, S083 MIDI CC0 |
+| `preset_takeBackgroundBankLoadResult()` | S082 P1 D34: return the one-shot result byte and clear it. Bits 0..1: `PRESET_BG_RESULT_DONE` (1), `PRESET_BG_RESULT_FAILED` (2), `PRESET_BG_RESULT_CODE` (3). Bit 7 (`PRESET_BG_RESULT_MIDI` 0x80) set when the load originated from MIDI. Returns `PRESET_BG_RESULT_NONE` (0) when no result is pending. | Menu `on_bank_load_complete` polling |
+| `preset_backgroundCandidateTracks(replaced)` | S082 P1 D19/D31: given the replaced Scene mask, return a 7-bit track mask of tracks whose currently played resident Scene is in the replaced set. Only those tracks are rebuilt into Scene 17. | `preset_buildBackgroundScene()` |
 | `preset_bankLoadFailedSceneMask()` (Session 057) | Read `pm_bank_load_failed_scene_mask`, populated from `filesystem_lastBankLoadFailedSceneMask()` in `on_bank_load_complete()`. Nonzero after an otherwise-successful (`FS_STATUS_DONE`) Bank Load means Menu still needs to show the filesystem error overlay once for the excluded child(ren). | Menu `PRESET_OP_BANK_LOAD` success path (both the empty-Bank fallback and normal sound-apply branches) |
 | `preset_loadFirstAvailableSceneOrKit()` | Fallback after absent/empty Bank: lowest root Scene, then lowest root Kit, then defaults. | boot, Bank Load completion |
 | `preset_sendDrumsetParameters()` | Synchronous pre-audio clear plus six-slot tagged reset/routing/descriptor-image apply. It intentionally leaves target installation to the exact ordinary Scene worker started after audio initialization. | Menu boot/load path |
@@ -1346,6 +1365,21 @@ Key API/data:
 - `NOTE_ON`, `NOTE_OFF`, `MIDI_CC`, `MIDI_CC2`, `PROG_CHANGE`,
   realtime/system status constants
 - Sound CC enums used by `midiParser_ccHandler()`
+- `CC_BANK_SELECT_LSB` (0x20): S082 P1 — identifies CC 32 so the drop filter
+  can reject Bank Select LSB along with CC 0 during a background load.
+
+S082 P1 MIDI drop filter (`midiParser_acceptedDuringBankLoad()`):
+while `preset_backgroundBankLoadRunning()` returns nonzero, only realtime
+messages (0xF8–0xFF), Note On, Note Off, and CC (except CC 0 and CC 32) are
+accepted. Program Change, Pitch Bend, Aftertouch, SysEx and the Bank Select
+CCs are silently dropped. MIDI Thru still forwards everything regardless.
+Deferred MIDI Bank load requests: `preset_requestBackgroundBankLoad()` with
+MIDI origin stores a pending slot if a load is already running; the pending
+slot is picked up by tick phase 0 after the previous load completes, and
+only the latest deferred request survives (D33).
+`preset_takeBackgroundBankLoadResult()` returns a one-shot result byte: bits
+0..1 encode DONE/FAILED/CODE, and bit 7 (`PRESET_BG_RESULT_MIDI`) flags
+MIDI origin so the caller can distinguish Menu from MIDI completion.
 - `NO_AUTOMATION`
 
 ## Core/MIDI/MidiVoiceControl
@@ -1706,3 +1740,53 @@ Removed from live API surface:
 
 Historical logs may still mention these names. In current code, they should
 only appear in comments, documentation, or old session logs.
+## S082 Load/Save UI, name editing and instrument type change
+
+Bank page:
+
+* The 16-bit Scene selection defaults to 0xFFFF on both Load:[Bank] and
+  Save:[Bank]. Every SEQ button toggles; the last selected bit may be cleared.
+* Replace (default) acts on all 16 Scenes. Merge (COPY tap) acts only on
+  selected Scenes with pattern content.
+* COPY tap/hold uses the common 200 ms threshold: a tap toggles Merge, a hold
+  shows the other view (Load: resident RAM; Save: the selected slot). SEQ and
+  OK are consumed while COPY is held; encoder slot moves stay allowed and
+  refresh the held view. LED_COPY mirrors Merge. COPY on any other Load/Save
+  type remains refused.
+* Labels: Load Replace ok, Load Merge mr; Save Replace ok/OW, Save Merge
+  ok/MR.
+* The SEQ matrix lights pattern content (active trigger steps), never bare
+  presence; no blinks on either Bank page.
+* Selection retention: Load keeps it after a completed Load until the source
+  or page changes; Save keeps it across slot moves and resets after a
+  completed Save. A page/type/mode exit resets both Merge flags.
+
+Name editing:
+
+* Load/Save pots 2-4 raise the coalesced knob-repaint flag instead of
+  repainting the whole frame per detent. `menu_serviceKnobRepaint()` routes
+  Load/Save pages through `menu_repaint()` at most every 20 ms, so only changed
+  characters are sent. Pot behaviour itself is unchanged.
+* BAR2 moves the cursor right and keeps every character; at the last cell it is
+  consumed and changes nothing. BAR1 backspace is unchanged.
+
+Nested Instrument Load:
+
+* A normal type step to a type different from the destination slot's resident
+  type shows `chg` plus row 000's name. A click on the lower row or a positive
+  turn commits row 000 of that type; a negative turn does nothing.
+* After the commit the row becomes a numbered pool row and the old `kit`
+  snapshot is invalidated. Stepping back to the old type shows `chg` again.
+* Stepping away and back before committing restores `kit` with its snapshot.
+  Multi-Scene destinations hide a type unless every selected Scene can take it.
+  InstrumentMrp never shows `chg`.
+
+Scene 17:
+
+* While a background Bank Load runs, playback reads Scene 17, an exact copy of
+  the active Scene's Scene-level state and each track's played Scene. It is
+  editable and never AutoSaved; its voice edit mask is itself only.
+* PERF shows no selected Scene (17 has no number and no PC). A copy/clear
+  destination may be 17; an overlapping paste is refused while 17 exists.
+* The first whole-Scene change releases 17; per-track Scene moves do not.
+  AutoSave and the shared Pattern snapshot region return after the release.

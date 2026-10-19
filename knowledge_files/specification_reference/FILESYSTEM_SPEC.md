@@ -251,8 +251,11 @@ Implemented through Session 064:
   (default 000) before root Scene/root Kit fallback. Empty Bank folders are
   valid and complete Bank selection before fallback.
 - Bank-local Scene folders use two digits, `00..15`, not root-library
-  three-digit numbering. Bank Save writes every child selected by its 16-bit
-  save mask and Bank Load iterates every requested/present local child.
+  three-digit numbering. Bank Save writes or removes every child named by its
+  act/empty masks, and Bank Load iterates every requested/present local child.
+  Both pages now use Replace (act on all 16 Scenes as they are) or Merge (act
+  only on selected Scenes with pattern content); see the S082 Bank outcome
+  table below.
 - Scene/Bank Pattern files are exact binary PAT4 images. Version 1 placeholders
   and legacy v2/v3 text remain accepted for import only; current saves never
   emit them.
@@ -495,7 +498,10 @@ backward compatible with every pre-Session-060 file. The fixed row class
 supplies the namespace for a numeric slot. The 161-by-`uint16_t`
 filesystem-owned source register follows Instrument -> Kit -> Scene -> Bank
 until it finds a direct
-source or reaches ordinary boot fallback. A legacy name-only line remains
+source or reaches ordinary boot fallback. S082 adds two Scene-row-only source
+tokens: bNNN (this row's child NN of root Bank NNN) and x (intentionally
+empty). The boot reader treats x as an empty Scene with no notice and resolves
+bNNN through Bank/NNN/<row index>. A legacy name-only line remains
 readable as unknown; malformed extended records fail the read rather than
 silently inheriting. The name cache remains space-padded and NUL-terminated.
 
@@ -895,7 +901,30 @@ scene_mask_voice_edit=0x0001
 the file. The Bank name is never stored in `bankset.bcg`; it comes only from
 the `Bank/NNN <bank name>/` directory.
 
-Current behavior:
+Current behavior (S082):
+
+Bank Load takes explicit act/empty masks. Replace (the default) acts on all
+16 Scenes: a selected Scene with a child is loaded exactly as it is, and every
+other Scene is emptied (settings, Effect and Kit defaults, Pattern reset,
+present bit off except for the active Scene). Merge acts only on selected
+Scenes with pattern content and leaves every other Scene unchanged. A child
+that vanished after the preview is emptied by Replace and kept by Merge. The
+runtime path never applies the manifest active_scene and never realigns the
+active or viewed Scene; only the boot load (BOOT flag) does.
+
+Bank Save takes act/empty masks too. A selected present resident Scene is
+written exactly as it is; an empty-mask child is deleted from the slot; Scenes
+in neither mask are untouched. A Save never changes the resident present mask.
+A Merge Save reads the slot's existing bankset.bcg so untouched children drop
+every written Scene from their voice-edit entry. A Replace Save writes a
+present Scene with only default content as a full default child, and the
+active Scene always stays present (S17).
+
+Bank Load/Save LEDs use pattern content (active trigger steps), not presence.
+The Menu selection is 16 bits with a default of all 16, and the Bank page's
+COPY button toggles Merge (tap) or shows the other side (hold).
+
+Pre-S082 behavior (historical):
 
 - Boot scans `Bank/` and loads BankData's restored slot (default 000) before
   root Scene/root Kit fallback.
@@ -2185,6 +2214,24 @@ Implemented:
   family boundary. Morph saves preserve resident identity. Scene and Bank
   operations own their targeted/full-register HCNAMES transaction as part of
   their completion chain.
+
+Session 082 P1 — Scene 17 name capture and Saves from Scene 17:
+
+- **Name capture** (`fs_background_name[10][9]`): at Scene 17 build time,
+  `filesystem_backgroundNameCapture()` fills 10 rows (Scene, Kit, six
+  Instruments, Pattern, Effect) with the identity names for the tracks that
+  entered Scene 17. `filesystem_backgroundNameCaptureInstrument()` fills
+  one Instrument row during `preset_copyBackgroundSlot()`.
+  `filesystem_backgroundNameRead()` returns the captured name for a given
+  category and slot, used by Menu prefill when the active Scene is 16.
+- **Saves from Scene 17** (scene index 16): Kit, Scene, Instrument and
+  Pattern Save set `op_scene_load_scene_mask` to zero (the ternary
+  `(scene < SCENE_COUNT) ? (1u << scene) : 0u`) so no HCNAMES row is
+  published for the 17th Scene. Instead, the captured name is installed as
+  the display name via `filesystem_backgroundNameSet()` before the HCNAMES
+  update begins. After a Save completes, the capture row for that category
+  is updated so the next prefill shows the saved name. KitMrp and
+  InstrumentMrp Saves from 17 do not rename (same as resident Scenes).
 
 Still future:
 

@@ -454,6 +454,19 @@ uint8_t     filesystem_autosaveTraceFlushBlocking(void);
  */
 void        filesystem_setAutosaveEnabled(uint8_t enabled);
 /*
+ * Suspend or resume AutoSave drain admission for a background Bank Load
+ * (S082 C7, D1).
+ *
+ * What: one persistent flag that makes the scalar and Pattern AutoSave
+ * schedulers decline new drains; an in-flight drain still reaches its next
+ * safe boundary. Why: the Bank is about to be replaced and a record written
+ * now would be torn. Inputs: nonzero = suspend, zero = resume.
+ * Outputs: scheduler gate state. Accessors: preset background Bank Load.
+ * Affiliates: filesystem_autosaveWriterSchedule_tick(),
+ * filesystem_autosavePatternDrainSchedule_tick().
+ */
+void        filesystem_setAutosaveYield(uint8_t yield);
+/*
  * Read the normalized in-memory AutoSave policy without touching storage.
  *
  * Input: none. Output: zero when hidden-record reads/writes are disabled and
@@ -561,6 +574,13 @@ uint8_t     filesystem_createLibraryIndexBlocking(fs_library_index_kind_t kind);
  * callers. Affiliate: Autosave.c and PatternStackService.c.
  */
 void        filesystem_tick(void);
+/*
+ * One extra filesystem step that the DEV stall observers do not count
+ * (S082 P2 fix 3).
+ * Inputs: none. Outputs: one filesystem_tick() step.
+ * Accessors: main.c idle-time servicing during a background Bank load.
+ */
+void        filesystem_tickUncounted(void);
 fs_status_t filesystem_status(void);
 const char *filesystem_errorCode(void);
 void        filesystem_ack(void);
@@ -770,7 +790,9 @@ bool filesystem_requestLoadPatternForScenes(uint16_t slot,
  * flexible declared Instrument/LFO payload mapping.
  */
 bool filesystem_requestLoadBank(uint16_t slot,
-                                uint16_t scene_mask,
+                                uint16_t act_mask,
+                                uint16_t empty_mask,
+                                uint8_t flags,
                                 fs_completion_cb_t cb);
 /*
  * Scan one root Bank's Bank-local Scene children.
@@ -784,6 +806,20 @@ bool filesystem_requestLoadBank(uint16_t slot,
  */
 bool filesystem_requestScanBankScenes(uint16_t slot, fs_completion_cb_t cb);
 uint16_t filesystem_bankChildSceneMask(void);
+/* Content mask (present ∩ trigger steps) of the last Bank child preview;
+ * same staleness rule as filesystem_bankChildSceneMask(). */
+uint16_t filesystem_bankChildContentMask(void);
+/*
+ * Bank child preview scan state and disposal (Bank slot scroll).
+ *
+ * filesystem_scanBankScenesRunning(): nonzero while a preview scan owns the
+ * facade. filesystem_cancelScanBankScenes(): asks a running scan to stop at
+ * its next phase with no callback outstanding; it closes its handles, returns
+ * to root and finishes ERROR (never a valid preview). No-op when none runs.
+ * Accessors: Menu Bank slot, type and page changes; Bank Save OK; MIDI poll.
+ */
+uint8_t filesystem_scanBankScenesRunning(void);
+void filesystem_cancelScanBankScenes(void);
 /*
  * Save one root Bank directory from resident Scene memory.
  *
@@ -797,6 +833,7 @@ bool filesystem_requestSaveBank(uint16_t slot,
                                 uint8_t source_scene,
                                 const char display_name[8],
                                 uint16_t bank_scene_save_mask,
+                                uint16_t empty_mask,
                                 uint8_t force_save,
                                 fs_completion_cb_t cb);
 bool filesystem_requestSave(fs_file_type_t type, uint16_t slot, fs_completion_cb_t cb);
@@ -868,6 +905,26 @@ enum {
  * formatter. Affiliates: Pattern AutoSave drain, boot reader, and HCNAMES.
  */
 #define FS_RESIDENT_SOURCE_PATTERN_AUTOSAVE  0x1ffcu
+/*
+ * Scene-row provenance tokens added in S082 (no compatibility, S13).
+ *
+ * BANK_CHILD_BASE + NNN (`bNNN` on card): this Scene's content came from child
+ * NN of root Bank NNN, which is not the Bank in row 0 — written for Scenes a
+ * Merge Load kept, and for resident Scenes a Bank Save did not write.
+ * EMPTY (`x` on card): the Scene was intentionally emptied by a Replace Bank
+ * Load (or is non-present at a Replace Bank Save); boot treats it as an empty
+ * Scene with no notice.
+ * Both are valid only on Scene rows 1..16. The values sit inside the 13-bit
+ * value field, above the direct-slot range (0..999) and below the existing
+ * specials (0x1ffc..0x1fff), so the REFRESHED (0x2000) and DIRTY (0x8000)
+ * flags are untouched.
+ * Affiliates: filesystem_residentSourceValid(), _parseResidentSourceToken(),
+ * _formatResidentNameLine(), _resolveResidentSource(), the boot reader,
+ * AutoSave source fields (carried as plain uint16_t values).
+ */
+#define FS_RESIDENT_SOURCE_BANK_CHILD_BASE   0x1000u
+#define FS_RESIDENT_SOURCE_BANK_CHILD_END    0x13E8u
+#define FS_RESIDENT_SOURCE_EMPTY             0x1ffbu
 #define FS_RESIDENT_SOURCE_REFRESHED_FLAG    0x2000u
 #define FS_RESIDENT_SOURCE_DIRTY_FLAG        0x8000u
 #define FS_RESIDENT_SOURCE_VALUE_MASK        0x1fffu
@@ -941,6 +998,7 @@ bool filesystem_requestUpdateResidentInstrumentNames(
  * Borrow the selected eight-cell Instrument name after either request above.
  * The pointer is valid only while HCNAMES owns the shared cache; copy it before
  * requesting a typed `.hcindex`. Blank/invalid rows return `Empty   `.
+ * Index 16 (Scene 17, while it exists) returns the S082 P1 D29 captured name.
  */
 const char *filesystem_residentInstrumentName(uint8_t scene_index,
                                               uint8_t instrument_slot);
@@ -971,6 +1029,7 @@ bool filesystem_requestUpdateResidentKitNames(uint16_t scene_mask,
  * The pointer is valid only while HCNAMES owns the shared cache; callers must
  * copy it before requesting `/Kit/.hcindex`. Blank/invalid rows return
  * `Empty   `.
+ * Index 16 (Scene 17, while it exists) returns the S082 P1 D29 captured name.
  */
 const char *filesystem_residentKitName(uint8_t scene_index);
 /*
@@ -1025,10 +1084,64 @@ typedef enum {
 uint16_t filesystem_identityRow(fs_identity_row_class_t cls, uint8_t scene,
                                 uint8_t slot);
 bool filesystem_requestCopyResidentNames(fs_completion_cb_t cb);
-/* Borrow the requested Scene row while HCNAMES owns the shared cache. */
+/* Borrow the requested Scene row while HCNAMES owns the shared cache.
+ * Index 16 (Scene 17, while it exists) returns the S082 P1 D29 captured name. */
 const char *filesystem_residentSceneName(uint8_t scene_index);
-/* Borrow the appended Pattern row for one resident Scene. */
+/* Borrow the appended Pattern row for one resident Scene.
+ * Index 16 (Scene 17, while it exists) returns the S082 P1 D29 captured name. */
 const char *filesystem_residentPatternName(uint8_t scene_index);
+
+/*
+ * Scene 17 captured-name rows (S082 P1 D29).
+ *
+ * What: indices into the 10-row Scene 17 name capture: Scene, Kit, six
+ * Instruments, Pattern, Effect.
+ * Inputs/Outputs: row ids for filesystem_backgroundName*().
+ * Accessors: Preset build (E4), filesystem save paths (E3), resident-name
+ * readers for index 16 (E1.5).
+ */
+enum {
+    FS_BACKGROUND_NAME_SCENE = 0u,
+    FS_BACKGROUND_NAME_KIT,
+    FS_BACKGROUND_NAME_INSTRUMENT_0,
+    FS_BACKGROUND_NAME_PATTERN = FS_BACKGROUND_NAME_INSTRUMENT_0 + 6u,
+    FS_BACKGROUND_NAME_EFFECT,
+    FS_BACKGROUND_NAME_ROW_COUNT
+};
+
+/*
+ * Capture every Scene-level name of one resident Scene into Scene 17.
+ *
+ * What: copies the Scene, Kit, six Instrument, Pattern and Effect rows of
+ * src_scene from the HCNAMES mirror into the Scene 17 capture.
+ * Inputs: resident Scene 0..15. Outputs: capture rows 0..9.
+ * Accessors: preset_buildBackgroundScene() (fresh build).
+ */
+void filesystem_backgroundNamesCaptureScene(uint8_t src_scene);
+
+/*
+ * Capture one Instrument name into a Scene 17 slot.
+ *
+ * What: copies the Instrument row (src_scene, src_slot) into capture row
+ * FS_BACKGROUND_NAME_INSTRUMENT_0 + dst_slot.
+ * Inputs: Scene 17 slot 0..5, resident source Scene and slot.
+ * Outputs: one capture row.
+ * Accessors: preset_copyBackgroundSlot() (per-track build and rebuild).
+ */
+void filesystem_backgroundNameCaptureInstrument(uint8_t dst_slot,
+                                                uint8_t src_scene,
+                                                uint8_t src_slot);
+
+/*
+ * Replace one Scene 17 captured name.
+ *
+ * What: writes eight display cells into one capture row.
+ * Inputs: row (FS_BACKGROUND_NAME_*), eight-cell name (NULL blanks it).
+ * Outputs: one capture row.
+ * Accessors: Kit, Instrument, Scene and Pattern Save from Scene 17 (E3).
+ */
+void filesystem_backgroundNameSet(uint8_t row, const char *name);
+
 /*
  * Load or repair one registered Instrument type's browser index.
  *
@@ -1313,6 +1426,7 @@ uint16_t    filesystem_lastBankLoadSceneMask(void);
  * signals Menu to show the existing filesystem error overlay after an
  * otherwise-successful FS_STATUS_DONE Bank Load. */
 uint16_t    filesystem_lastBankLoadFailedSceneMask(void);
+uint16_t    filesystem_lastBankLoadEmptyMask(void);
 /*
  * Query whether a root Instrument save target already exists.
  *

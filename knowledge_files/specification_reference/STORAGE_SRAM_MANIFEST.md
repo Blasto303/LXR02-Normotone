@@ -4,11 +4,21 @@ Where every byte of the STM32F765VIH6's on-chip storage goes: program flash,
 sample flash, ITCM, DTCM, SRAM1 and SRAM2. It also records the rules for
 changing any of it.
 
-- **Current as of:** Session 080 close (2026-10-11), `dev-ph6-cleanup`,
-  code at `4869a98`. DEV link:
-  `text=556,008`, `data=412`, `bss=427,976`; flash payload 556,420 B of
-  753,664 B (**headroom 197,244 B**). Production (`DEV_MODE_LOGGING=0`) was
-  last measured at S075 F1 and needs a rebuild.
+- **Current as of:** Session 082 P2 (2026-10-19), `dev-ph6-midi`. DEV link:
+  `text=595,968`, `data=420`, `bss=430,920`; flash payload 596,388 B of
+  753,664 B (**headroom 157,276 B**), after the S082 P2 audio/load fixes.
+- **S082 P2 changes:** no production SRAM growth. `filesystem.c`
+  `fs_stall_poll_uncounted` is 1 B inside `DEV_STALL_DETECTION` builds only
+  (idle-time Bank-load ticks stay invisible to the poll-count stall
+  observers). The measured DEV BSS is unchanged from S082 P1 because the byte
+  filled existing alignment padding. F1 and F2 add no static storage.
+- **S082 P1 changes:** +93 B SRAM1 from S082 P0: 91 B BSS (`filesystem.c`
+  `fs_background_name` 90 B, the 10 × 9 B name capture for Scene 17 identity
+  names, §8.2; `presetManager.c` `pm_bg_result` 1 B, one-shot result
+  register) and 2 B `.data` (`presetManager.c` `pm_bg_pending_slot`, deferred
+  MIDI Bank load slot, initialiser `0xFFFF`, which also adds 2 B of flash
+  initialiser). While a load is in flight `pm_bg_pending_slot` doubles as the
+  bounded-wait start tick (S082 P1 assessment A8), with no further storage.
 - **S080 changes:** +200 B BSS (+4 B data) from S079 (PERF performance
   surface, `080_SESSION_HANDOFF_LOG.md` §8). Owners: `sequencer.c` looper
   state 67 B (`seq_loopActive`, mask/division/modifier 3 B,
@@ -581,7 +591,8 @@ AutoSave drain's observer is 5 B: `op_autosave_drain_last_phase` (u8),
 `op_autosave_drain_stall_ticks` (u16) and `op_autosave_drain_last_progress`
 (u16). That is the same total as its pre-S074 `u8` + `u32`. The S073
 special-tag self-check (`instrumentManager_specialTagSelfCheck()`) uses no
-RAM.
+RAM. S082 P2 adds `fs_stall_poll_uncounted` (1 B) to the same conditional
+class; it is set only inside `filesystem_tickUncounted()`.
 
 Configuration at S073 close: `DEV_MODE_LOGGING=1`, `DEV_MODE_DIAGNOSTIC=0`,
 `DEV_LOGGING_IWDG=0`, `DEV_STALL_DETECTION=1`,
@@ -676,3 +687,28 @@ not describe it in detail.
   `pat_background_region`); `.bss` +200 B, `.data` +4 B. DEV link
   `text=556,008`, `data=412`, `bss=427,976`; payload 556,420 B (headroom
   197,244 B).
+## S082 Load/Save and Scene 17 allocations
+
+All values are SRAM1 static storage. The Scene 17 allocation was approved
+2026-10-17; the remaining items were approved in S082 S6/S15/S25 and the
+user's 2026-10-18 statement that every expansion quoted in the plan is
+approved.
+
+| Owner | Object | Bytes | Lifetime | Purpose |
+| --- | --- | ---: | --- | --- |
+| SceneData | `scene_background` | 1,656 | permanent | Scene 17 record |
+| SceneData | `scene_backgroundFlags` + `scene_backgroundHome` | 2 | permanent | exists / home Scene |
+| Menu | `menu_bankPreviewContentMask` | 2 | permanent | Bank child content mask |
+| Menu | `menu_bankUiFlags` | 1 | permanent | Merge, COPY held/peek |
+| ButtonHandler | `bh_bankCopyPressTick` | 2 | permanent | COPY tap/hold |
+| filesystem | `op_bank_child_content_mask` | 2 | operation | preview content |
+| filesystem | `op_bank_scene_empty_mask` | 2 | operation | Load empty / Save removal |
+| filesystem | `op_bank_save_written_mask` | 2 | operation | Merge Save edit-mask rule |
+| filesystem | `op_bank_flags` | 1 | operation | BOOT / REPLACE |
+| filesystem | `fs_autosave_yield` | 1 | permanent | AutoSave drain gate |
+| Preset | `pm_bg_phase` | 1 | permanent | background Bank Load phase/flags |
+| PatternData | Scene 17 Pattern region | 0 | reused | `pat_background_region` |
+
+The 16 B outside Scene 17 are within the acknowledged S082 total (~13 B
+S6/S15 plus the plan's 2-3 B acknowledgement). `preset_buildBackgroundScene()`
+uses one 136-byte stack block buffer; no new large stack frame is added.

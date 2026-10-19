@@ -168,6 +168,8 @@ static volatile struct {
 /* S081 G-5: SHIFT/CLEAR hold state for the live-erase chord. */
 static uint8_t bh_shiftHeld;
 static uint8_t bh_clearHeld;
+/* Press tick of a Bank-page COPY (+2 B SRAM1, S082 B2.13). */
+static uint16_t bh_bankCopyPressTick;
 
 /*
  * Buttons holding a live-erase gesture (S081 §10.2, P1C items 10/16).
@@ -1253,6 +1255,18 @@ void buttonHandler_tick(void)
     }
 
     /*
+     * COPY hold promotion for Bank pages (S082 P0, B2.13d).
+     *
+     * What: promotes a held Bank-page COPY to the other view at the common
+     * hold threshold. Why: S1 tap/hold split. Inputs: press tick, Menu armed
+     * state. Outputs: the Menu peek. Affiliates: BUTTON_TIMEOUT,
+     * menu_bankCopyHoldReached().
+     */
+    if (menu_bankCopyArmed() &&
+        (uint16_t)(time_sysTick - bh_bankCopyPressTick) >= BUTTON_TIMEOUT)
+        menu_bankCopyHoldReached();
+
+    /*
      * Foreground long-press poll using the wrapping 16-bit millisecond clock.
      *
      * What: checks whether the hold timer deadline has elapsed, then verifies
@@ -1816,6 +1830,49 @@ static void buttonHandler_seqButtonReleased(uint8_t seqButtonPressed)
 static void buttonHandler_shiftRecMenuEnter(void);
 static void buttonHandler_shiftRecMenuExit(void);
 
+/*
+ * Close every latched front-panel surface before a mode change (S080 P2,
+ * S081, S082 P1 D7/D32).
+ *
+ * What: closes the SHIFT+REC overlay (restoring its saved page only when
+ * restore_page is set), closes the chain editor, ends held live-erase
+ * gestures, and releases the looper when the mode leaves PERF.
+ * Why: one implementation for the MODE press and the MIDI-origin Bank load,
+ * which must leave the panel exactly as a MODE press would (D7); the MIDI
+ * path does not restore the SHIFT+REC page (R8) because the Bank entry
+ * follows at once.
+ * Inputs: restore_page, leaving_perf. Outputs: latches closed, looper and
+ * erase holds released.
+ * Accessors: handleModeButtons(), buttonHandler_enterLoadSaveForBackgroundLoad().
+ * Affiliates: buttonHandler_shiftRecMenuExit(), menu_chainMenuClose(),
+ * liveRec_eraseReleaseHeld(), buttonHandler_loopForceRelease().
+ */
+static void buttonHandler_closeLatchedSurfaces(uint8_t restore_page,
+                                               uint8_t leaving_perf)
+{
+    if (bh_shiftRecMenuActive) {
+        if (restore_page) {
+            buttonHandler_shiftRecMenuExit();
+        } else {
+            bh_shiftRecMenuActive = 0u;
+            led_setBlinkLed(LED_REC, 0u);
+            led_setValue((uint8_t)(liveRec_mode() == LIVEREC_MODE_LATCH),
+                         LED_REC);
+            led_setValue(buttonHandler_getShift(), LED_SHIFT);
+        }
+    }
+    if (menu_chainMenuIsOpen())
+        menu_chainMenuClose();
+    if (liveRec_mode() == LIVEREC_MODE_ERASE) {
+        liveRec_eraseReleaseHeld();
+        bh_eraseSeqMask = 0u;
+        bh_eraseFxSeqMask = 0u;
+        bh_eraseVoiceMask = 0u;
+    }
+    if (leaving_perf)
+        buttonHandler_loopForceRelease();
+}
+
 static void handleModeButtons(uint8_t mode)
 {
     if (menu_loadInstrumentTransactionBusy()) {
@@ -1831,40 +1888,21 @@ static void handleModeButtons(uint8_t mode)
         return;
     }
     /*
-     * S080 P2: a MODE press ends latched PERF surfaces first.
+     * A running background Bank load owns the panel (S082 P1 R7, D7).
      *
-     * What: closes the SHIFT+REC settings menu and the chain editor, and, when
-     * the mode is about to leave PERF, releases the looper (tracks resume where
-     * they would have been) and clears the looper hold state. Why: both menus
-     * keep page state that a mode switch would otherwise strand (a later REC
-     * press would "restore" a stale page), and the SELECT/BAR rows change
-     * meaning outside PERF, so their release edges would never reach the
-     * looper. Inputs: bh_shiftRecMenuActive, menu_chainMenuIsOpen(), current
-     * and requested mode. Outputs: menus closed; looper released.
-     * Affiliates: buttonHandler_shiftRecMenuExit(), menu_chainMenuClose(),
-     * buttonHandler_loopForceRelease() (Step 9).
+     * What: every MODE press is dropped while
+     * preset_backgroundBankLoadRunning(): no latch closes, no looper
+     * release, no mode/LED change, no page switch, and nothing is queued.
+     * Why: the UI stays on Load:[Bank] until the load ends and then stays
+     * there (D7); a queued exit would fire right after the load, and an
+     * applied one would leave the page under a running load.
+     * Inputs: preset_backgroundBankLoadRunning(). Outputs: none.
+     * Accessors: MODE button presses.
+     * Affiliates: menu_switchPage() backstop (c), preset_tickBackgroundBankLoad().
      */
-    if (bh_shiftRecMenuActive)
-        buttonHandler_shiftRecMenuExit();
-    if (menu_chainMenuIsOpen())
-        menu_chainMenuClose();
-    /*
-     * A mode change ends held erase gestures (S081 §10.1, P1B item 8).
-     *
-     * What: SEQ and TRACK buttons change meaning with the mode, so their held
-     * erase gestures stop at a MODE press; erase itself (SHIFT/CLEAR) and the
-     * knob-erase targets stay enabled. Affiliates: liveRec_eraseReleaseHeld().
-     */
-    if (liveRec_mode() == LIVEREC_MODE_ERASE) {
-        liveRec_eraseReleaseHeld();
-        /* The BC-3 masks are cleared with them, so the old buttons' later
-         * releases are consumed as no-ops (P1C item 10). */
-        bh_eraseSeqMask = 0u;
-        bh_eraseFxSeqMask = 0u;
-        bh_eraseVoiceMask = 0u;
-    }
+    if (preset_backgroundBankLoadRunning())
+        return;
     {
-        /* Same mode arithmetic as below; SHIFT+MODE1 stays in VOICE. */
         uint8_t next;
 
         if (buttonHandler_getShift() && mode == SELECT_MODE_VOICE)
@@ -1873,9 +1911,10 @@ static void handleModeButtons(uint8_t mode)
             next = (uint8_t)((mode + 4u) & 0x07u);
         else
             next = (uint8_t)(mode & 0x07u);
-        if (bh_state.selectButtonMode == SELECT_MODE_PERF &&
-            next != SELECT_MODE_PERF)
-            buttonHandler_loopForceRelease();
+        buttonHandler_closeLatchedSurfaces(
+            1u,
+            (uint8_t)(bh_state.selectButtonMode == SELECT_MODE_PERF &&
+                      next != SELECT_MODE_PERF));
     }
     if (!buttonHandler_getShift() &&
         mode == SELECT_MODE_LOAD_SAVE &&
@@ -2296,6 +2335,10 @@ static void buttonHandler_partButtonReleased(uint8_t partNr)
  */
 static void buttonHandler_shiftRecMenuEnter(void)
 {
+    /* SHIFT+REC is dropped while a background Bank load owns the panel
+     * (S082 P1 R7); nothing is saved or switched. */
+    if (preset_backgroundBankLoadRunning())
+        return;
     bh_shiftRecSavedPage = menu_getActivePage();
     bh_shiftRecSavedSubPg = menu_getSubPage();
     menu_switchPage(RECORDING_PAGE);
@@ -2321,11 +2364,41 @@ static void buttonHandler_shiftRecMenuExit(void)
     menu_switchPage(bh_shiftRecSavedPage);
     menu_switchSubPage(bh_shiftRecSavedSubPg);
     menu_resetActiveParameter();
-    /* REC returns to its record state; SHIFT reflects whether it is held. */
     led_setBlinkLed(LED_REC, 0u);
     led_setValue((uint8_t)(liveRec_mode() == LIVEREC_MODE_LATCH), LED_REC);
     led_setValue(buttonHandler_getShift(), LED_SHIFT);
     menu_repaintAll();
+}
+
+/*
+ * Put the front panel into Load/Save for a MIDI-origin Bank load
+ * (S082 P1 D7, D32).
+ *
+ * What: closes every latched surface without restoring the SHIFT+REC page
+ * (R8), ends an open COPY/CLEAR session (nothing is applied), cancels the
+ * double-click window, leaves Morph voice mode, and sets the Load/Save mode
+ * with its mode LEDs; BAR LEDs go dark (non-PERF rule). The Menu page change
+ * is Menu's (menu_backgroundBankLoadUiBegin()).
+ * Why: a MIDI Bank load takes the UI exactly as if the user had pressed MODE
+ * to Load/Save and OK (D7), abandoning any Menu state (D32).
+ * Inputs: bh_state, latch flags, copy/clear session.
+ * Outputs: bh_state.selectButtonMode = SELECT_MODE_LOAD_SAVE; LEDs.
+ * Accessors: menu_backgroundBankLoadUiBegin().
+ * Affiliates: buttonHandler_closeLatchedSurfaces(), copyClear_copyReleased(),
+ * dblclick_cancel(), buttonHandler_setMorphVoiceMode().
+ */
+void buttonHandler_enterLoadSaveForBackgroundLoad(void)
+{
+    buttonHandler_closeLatchedSurfaces(
+        0u, (uint8_t)(bh_state.selectButtonMode == SELECT_MODE_PERF));
+    copyClear_copyReleased();
+    dblclick_cancel();
+    buttonHandler_setMorphVoiceMode(0u);
+    bh_state.selectButtonMode = SELECT_MODE_LOAD_SAVE;
+    led_clearAllBlinkLeds();
+    led_setMode2(SELECT_MODE_LOAD_SAVE);
+    led_setValue(0u, LED_BAR1);
+    led_setValue(0u, LED_BAR2);
 }
 
 static void handleVoiceButton(uint8_t voiceNr)
@@ -2850,6 +2923,11 @@ static void processPress(uint8_t buttonNr)
         break;
 
     case BUT_COPY:
+        if (bh_state.selectButtonMode == SELECT_MODE_LOAD_SAVE &&
+            menu_bankCopyPressed()) {
+            bh_bankCopyPressTick = time_sysTick;
+            break;
+        }
         /*
          * SHIFT + copy/clear while recording and running keeps its erase
          * meaning. Every other press arms a copy operation, or a clear
@@ -2920,8 +2998,9 @@ static void processPress(uint8_t buttonNr)
     case BUT_BAR2:
         led_setValue(1, LED_BAR2);
         /*
-         * See BAR1 above. BAR2 is insert-space-forward in Load/Save character
-         * entry and ordinary next-bar selection everywhere else.
+         * See BAR1 above. BAR2 is cursor-forward (keeps characters) in
+         * Load/Save character entry and ordinary next-bar selection everywhere
+         * else.
          */
         if (menu_loadSaveBarButtonPressed(1u))
             break;
@@ -3068,6 +3147,11 @@ static void processPress(uint8_t buttonNr)
 static void processRelease(uint8_t buttonNr)
 {
     if (buttonNr == BUT_COPY) {
+        if (bh_bankCopyPressTick) {
+            menu_bankCopyReleased();
+            bh_bankCopyPressTick = 0u;
+            return;
+        }
         /*
          * COPY release (S081 G-5): ends the live-erase chord when SHIFT is no
          * longer held, otherwise the ordinary copy/clear release runs.
@@ -3484,6 +3568,9 @@ void buttonHandler_processEvents(void)
          * Copy/Clear source/row ledger cannot remain half armed.
          */
         (void)copyClear_eventOverflow();
+        /* a lost COPY release must not leave the Bank page held */
+        menu_bankCopyForceRelease();
+        bh_bankCopyPressTick = 0u;
         buttonHandler_voiceSceneSeqPressedMask = 0u;
         buttonHandler_loadSceneSeqPressedMask = 0u;
         /* S075 F2-F: a lost TRACK release must not strand the overlay. */

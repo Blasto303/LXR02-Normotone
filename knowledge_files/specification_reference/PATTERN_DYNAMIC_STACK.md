@@ -75,10 +75,11 @@ file repair itself exactly as designed (§9).
 **Session 077 changed this area in two ways:**
 
 - **`pat_background_region`** (§1): the standalone `pat_autosave_snapshot` is
-  now `pat_background_region`, an identical-type 10,519 B region outside
-  `pat_regions[]`. It serves the AutoSave snapshot, the copy/clear overlap
-  paste pool (`pat_backgroundPoolMut()`), and future Bank Load staging. These
-  three uses must never run concurrently. The copy/clear overlap path now
+now `pat_background_region`, an identical-type region outside
+`pat_regions[]`. It serves the AutoSave snapshot, the copy/clear overlap
+paste pool (`pat_backgroundPoolMut()`), and, since S082, Scene 17 (the
+background Scene of a running Bank Load). These uses must never run
+concurrently. The copy/clear overlap path
   waits on `filesystem_patternSnapshotInUse()` instead of borrowing name-buffer
   space, and the paste source table is a static `uint16_t[128]` in
   `copyClearService.c` instead of being stored in the name buffer.
@@ -183,17 +184,17 @@ public operations so mutation tracking cannot be bypassed.
 
 One additional `pat_background_region` is exactly 10,527 bytes (S077; it
 replaces the former standalone `pat_autosave_snapshot` at identical size, and
-grew with the region type in S078 and S080). It
-is not a playable Scene: every Scene-indexed bound (scene_indexValid(),
-pat_patternValid(), the sequencer, the UI, PERF and Bank) stays at
-`SCENE_COUNT` (16), and it is reached only through its accessors. It serves
-three purposes that must never run concurrently: the immutable source for an
-in-flight Pattern AutoSave write (`pat_snapshotScene()` /
-`pat_autosaveSnapshot()`), the copy/clear scratch pool for an overlapping
-paste (`pat_backgroundPoolMut()`; the pool is a full PAT_STACK_SIZE * 32
-bytes, so it always fits what the source pool could hold), and future Bank
-Load staging. There is no snapshot per Scene and no PAT4-sized filesystem
-stage.
+grew with the region type in S078 and S080). It serves four purposes that
+must never run concurrently: the immutable source for an in-flight Pattern
+AutoSave write (`pat_snapshotScene()` / `pat_autosaveSnapshot()`), the
+copy/clear scratch pool for an overlapping paste
+(`pat_backgroundPoolMut()`; the pool is a full PAT_STACK_SIZE * 32 bytes, so
+it always fits what the source pool could hold), Scene 17 of a running Bank
+Load, and the whole-region fast path of `preset_buildBackgroundScene()`.
+Scene 17 is addressed only through `pat_regionFor(16)`;
+`scene_indexValid()` stays 0..15, while `pat_patternValid(16)` is true only
+while Scene 17 exists. AutoSave and an overlapping paste are gated off while
+Scene 17 owns the region.
 
 ## 2. Address encoding
 

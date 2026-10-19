@@ -463,6 +463,13 @@ void menu_loadInstrumentExit(void);
  */
 uint8_t menu_loadSceneButtonPressed(uint8_t scene_index);
 void    menu_perfModeSceneButtonPressed(uint8_t scene_index);
+/* Bank page COPY: tap toggles Merge, hold shows the other view (S082 B2.12).
+ * Inputs: ButtonHandler edges. Outputs: menu_bankUiFlags, LEDs, label. */
+uint8_t menu_bankCopyPressed(void);
+void    menu_bankCopyHoldReached(void);
+void    menu_bankCopyReleased(void);
+void    menu_bankCopyForceRelease(void);
+uint8_t menu_bankCopyArmed(void);
 /*
  * Run a deferred/queued scene change when the sequencer raises its fire flag
  * (S080 F8/F9). Input: none. Output: the pending change is executed (queue
@@ -711,6 +718,48 @@ void menu_parseKnobDelta(uint8_t knobNr, int8_t delta);
 void menu_notifyExternalParamChanged(uint16_t paramNr);
 void menu_serviceKnobRepaint(void);  /* call from main loop after RV1-4 read loop */
 void menu_pollPresetStatus(void);   /* call from main loop — handles async SD completion */
+/*
+ * Enter Load:[Bank] for a MIDI-origin background Bank Load (S082 C10, D7).
+ *
+ * What: switches to LOAD_PAGE with SAVE_TYPE_BANK, selects the requested
+ * slot, shows Replace with all 16 Scenes selected and the ellipsis busy
+ * state, and closes latched menus the way MODE does.
+ * Inputs: Bank slot. Outputs: the same UI state an accepted Bank OK leaves.
+ * Accessors: preset_requestBackgroundBankLoad() (MIDI origin).
+ * Affiliates: menu_beginLoadSaveCommand(), menu_chainMenuClose().
+ */
+/*
+ * Enter Load:[Bank] for a MIDI-origin background Bank load (S082 P1 D7, D32).
+ * Closes latched surfaces, ends copy/clear, enters Load:[Bank] at the slot,
+ * command active; precondition menu_backgroundBankLoadUiIdle().
+ */
+void menu_backgroundBankLoadUiBegin(uint16_t slot);
+/*
+ * Abort an accepted background Bank Load UI command (S082 C7).
+ *
+ * What: runs the ordinary Load/Save command-finish cleanup only when a
+ * command is active. Why: phase 4 can be refused after OK entered the busy
+ * state, and no Preset completion would clear it.
+ * Inputs: none. Outputs: normal cursor/input restored.
+ * Accessors: preset_tickBackgroundBankLoad().
+ * Affiliates: menu_finishLoadSaveCommand().
+ */
+void menu_backgroundBankLoadAbort(void);
+/*
+ * MIDI-origin Bank load UI hooks (S082 P1 D7, D29, D33).
+ * menu_backgroundBankLoadUiIdle(): nonzero when a deferred MIDI request may
+ * take the UI. menu_backgroundBankLoadUiPoll(): WAIT / READY (masks filled) /
+ * REFUSED for the Load:[Bank] preview of slot.
+ * menu_backgroundNamesChanged(): drop Menu name scratch keyed to Scene 17.
+ * Accessors: preset_tickBackgroundBankLoad().
+ */
+#define MENU_BG_UI_WAIT     0u
+#define MENU_BG_UI_READY    1u
+#define MENU_BG_UI_REFUSED  2u
+uint8_t menu_backgroundBankLoadUiIdle(void);
+uint8_t menu_backgroundBankLoadUiPoll(uint16_t slot, uint16_t *act_mask,
+                                      uint16_t *empty_mask);
+void    menu_backgroundNamesChanged(void);
 void menu_parseGlobalParam(uint16_t paramNr, uint8_t value);
 void menu_sendAllParameters(void);
 /*

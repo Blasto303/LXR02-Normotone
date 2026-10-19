@@ -109,6 +109,14 @@ int8_t buttonHandler_voiceIndex(uint8_t buttonNr);
 
 uint8_t buttonHandler_getMode(void);
 uint8_t buttonHandler_getShift(void);
+/*
+ * Put the front panel into Load/Save for a MIDI-origin Bank load
+ * (S082 P1 D7, D32).
+ * Inputs: none. Outputs: latches closed, copy/clear session ended,
+ * Load/Save mode and LEDs. Menu performs the page change.
+ * Accessors: menu_backgroundBankLoadUiBegin().
+ */
+void buttonHandler_enterLoadSaveForBackgroundLoad(void);
 int8_t  buttonHandler_getArmedAutomationStep(void);
 void    buttonHandler_setRunStopState(uint8_t running);
 void    buttonHandler_showMuteLEDs(void);

@@ -2139,6 +2139,21 @@ void seq_selectActivePattern(uint8_t pattern)
 		seq_loopRefreshSceneSnapshots();
 		__set_PRIMASK(primask);
 	}
+	/*
+	 * Release Scene 17 on the first whole-Scene change (S082 C8, D9a, D10).
+	 *
+	 * What: once every track points at a resident Scene, Scene 17's storage
+	 * becomes invalid and can never be selected again; AutoSave and overlap
+	 * paste return because their Scene 17 gates fall away.
+	 * Why: Scene 17 owns the sounding Effect and Scene-level state until a
+	 * whole-Scene change replaces them; per-track moves never release it.
+	 * Inputs: new Scene p < 16 and an existing Scene 17.
+	 * Outputs: scene_backgroundRelease().
+	 * Accessors: seq_selectActivePattern() (SEQ press, MIDI PC, queued/chain).
+	 * Affiliates: scene_backgroundRelease(), pat_regionFor(), the C9 gates.
+	 */
+	if (pattern < SCENE_COUNT && scene_backgroundExists())
+		scene_backgroundRelease();
 	led_notifyPatternChanged(seq_activePattern);
 	seq_sendProgChg(seq_activePattern);
 	voiceControl_noteOff(0xFF);
@@ -2248,6 +2263,96 @@ void seq_alignActivePatternToScene(uint8_t scene_index)
 	 * Same rationale as seq_selectActivePattern() — see Change 15.
 	 */
 	seq_clearSceneAutomationDirty();
+}
+
+/*
+ * Move playback to Scene 17 without a sound change (D5, D16).
+ *
+ * What: points the active, pending and every per-track Scene at index 16 in
+ * one PRIMASK section and re-snapshots the looper for the new Scene, keeping
+ * step positions, DDA accumulators, rolls, conditions, epochs and looper
+ * anchors; cancels pending direct/queued Scene changes. No program change,
+ * note-off or LED notify is sent (Scene 17 has no number).
+ * Why: Scene 17 is an exact copy of what played, so the switch must change the
+ * read address only; seq_selectActivePattern() would reset rolls/conditions,
+ * realign and send PC (audible), and seq_alignActivePatternToScene() also
+ * realigns.
+ * Inputs: Scene 17 built (scene_backgroundExists()).
+ * Outputs: seq_activePattern = seq_perTrackPattern[] = 16.
+ * Context: foreground.
+ * Accessors: preset_requestBackgroundBankLoad() tick.
+ * Affiliates: seq_loopRefreshSceneSnapshots() (S080 looper invariants: under
+ * PRIMASK, anchors kept), seq_clearPendingSceneChange(),
+ * seq_refreshTrackEffectiveParams(), LiveRecord (follows the played Scene).
+ */
+void seq_switchToBackgroundScene(void)
+{
+	uint32_t primask;
+	uint8_t track;
+
+	if (!scene_backgroundExists() || !pat_patternValid(SCENE_BACKGROUND_INDEX))
+		return;
+	primask = __get_PRIMASK();
+	__disable_irq();
+	seq_previousScene = seq_activePattern;
+	seq_activePattern = SCENE_BACKGROUND_INDEX;
+	seq_pendingPattern = SCENE_BACKGROUND_INDEX;
+	for (track = 0u; track < NUM_TRACKS; track++)
+		seq_perTrackPattern[track] = SCENE_BACKGROUND_INDEX;
+	seq_perTrackActive = 0u;
+	seq_loadPendigFlag = 0u;
+	seq_newPatternAvailable = 0u;
+	seq_loopRefreshSceneSnapshots();
+	__set_PRIMASK(primask);
+	/*
+	 * A background load owns the transport now: drop every pending Scene
+	 * change (direct, queued and chain-fired) so nothing fires mid-load.
+	 */
+	seq_clearPendingSceneChange();
+	seq_chainBarCount = 0u;
+	seq_chainRepCount = 0u;
+	seq_chainStopped = 0u;
+	seq_refreshTrackEffectiveParams();
+}
+
+/*
+ * Move selected tracks onto Scene 17 without a sound change (S082 P1 D31).
+ *
+ * What: under PRIMASK, points seq_perTrackPattern[t] at index 16 for each
+ * track in track_mask, recomputes seq_perTrackActive and re-snapshots the
+ * looper; then cancels pending Scene changes and refreshes the effective
+ * track cache. Active Scene, step positions, DDA accumulators, rolls,
+ * conditions, epochs, the live-record take (D35) and looper anchors are kept.
+ * Why: a rebuild in place copies only the tracks whose resident Scene the
+ * load replaces; only those may move, because tracks on unaffected Scenes
+ * stay where they are (D31). Each moved track's data and slot were just
+ * copied from the Scene it was playing, so the move changes the read address
+ * only (D4).
+ * Inputs: track_mask (bit t = track t), Scene 17 exists.
+ * Outputs: seq_perTrackPattern[], seq_perTrackActive.
+ * Context: foreground.
+ * Accessors: preset_tickBackgroundBankLoad() phase 3 (rebuild).
+ * Affiliates: seq_switchToBackgroundScene() (fresh build),
+ * seq_recomputePerTrackActive(), seq_loopRefreshSceneSnapshots(),
+ * seq_clearPendingSceneChange(), seq_refreshTrackEffectiveParams().
+ */
+void seq_moveTracksToBackgroundScene(uint8_t track_mask)
+{
+	uint32_t primask;
+	uint8_t track;
+
+	if (!scene_backgroundExists() || !pat_patternValid(SCENE_BACKGROUND_INDEX))
+		return;
+	primask = __get_PRIMASK();
+	__disable_irq();
+	for (track = 0u; track < NUM_TRACKS; track++)
+		if (track_mask & (uint8_t)(1u << track))
+			seq_perTrackPattern[track] = SCENE_BACKGROUND_INDEX;
+	seq_recomputePerTrackActive();
+	seq_loopRefreshSceneSnapshots();
+	__set_PRIMASK(primask);
+	seq_clearPendingSceneChange();
+	seq_refreshTrackEffectiveParams();
 }
 
 /*
@@ -5489,6 +5594,13 @@ static uint8_t seq_chainResolveNext(uint8_t next, uint8_t cur)
 	uint8_t target;
 	uint16_t rnd = (uint16_t)GetRngValue() & 0x7FFFu;
 
+	/*
+	 * S082 C9: Scene 17 has no chain number. Its chain fields are cleared when
+	 * it is built, so this is a defensive guard against a stale condition
+	 * evaluating while a background Bank load runs; never wrap (cur + 1) to 0.
+	 */
+	if (cur >= SCENE_COUNT)
+		return 0xFFu;
 	if (next == 0u)
 		target = cur;
 	else if (next == 1u)
@@ -6317,6 +6429,13 @@ static void seq_sendProgChg(const uint8_t ptn)
 
 	// --AS FILT filter out PC msgs if appropriate
 	if((midiParser_txRxFilter & 0x80)==0)
+		return;
+	/*
+	 * S082 C9/D8: Scene 17 has no program-change number. The seamless switch
+	 * never calls this function, but other Scene paths must not emit a
+	 * truncated or bogus PC while 17 is the active read address.
+	 */
+	if (ptn >= SCENE_COUNT)
 		return;
 
 	msg.status = PROG_CHANGE | midi_MidiChannels[7];

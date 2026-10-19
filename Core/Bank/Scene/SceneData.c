@@ -25,6 +25,26 @@ _Static_assert(EFFECT_COMMON_PARAM_COUNT < EFFECT_PARAM_COUNT,
 scene_t scenes[SCENE_COUNT];
 static uint8_t scene_active_index;
 
+/*
+ * Scene 17: the background Scene of a running Bank load (S082 P1).
+ *
+ * What: one scene_t outside scenes[16] (index SCENE_BACKGROUND_INDEX), plus an
+ * exists flag and the index of the Scene that was active when it was built.
+ * scene_get()/scene_getConst()/scene_selectActive() address it as index 16
+ * while it exists; scene_indexValid() stays 0..15, so storage, AutoSave,
+ * HCNAMES and the 16-bit Bank masks never see it.
+ * Why: playback continues unchanged from Scene 17 while Scenes 1-16 are
+ * replaced (D1-D5); Scene 17 is otherwise a normal, editable Scene (D9, D15).
+ * SRAM: 1,656 B + 2 B, SRAM1 static, owner SceneData (accepted 2026-10-17).
+ * Lifetime: exists from the switch (C6) until a whole-Scene change (C8).
+ * Accessors: scene_background*(), scene_get(), scene_getConst().
+ * Affiliates: pat_background_region (its Pattern), seq_switchToBackgroundScene(),
+ * preset_buildBackgroundScene(), the S082 P1 §5 audit (C3).
+ */
+static scene_t scene_background;
+static uint8_t scene_backgroundFlags;
+static uint8_t scene_backgroundHome;
+
 static uint8_t scene_defaultVoiceAudioOut(uint8_t slot)
 {
     /*
@@ -138,26 +158,15 @@ uint8_t scene_indexValid(uint8_t scene_index)
 
 scene_t *scene_get(uint8_t scene_index)
 {
-    /*
-     * Borrow mutable Scene storage.
-     *
-     * Input: resident Scene index. Output: pointer to scenes[index] or NULL for
-     * invalid input. Affiliates are Preset, filesystem load/apply, PatternData,
-     * and future Scene/Bank file code; all use this central bounds check rather
-     * than indexing the global array directly.
-     */
+    if (scene_index == SCENE_BACKGROUND_INDEX && scene_backgroundFlags)
+        return &scene_background;
     return scene_indexValid(scene_index) ? &scenes[scene_index] : 0;
 }
 
 const scene_t *scene_getConst(uint8_t scene_index)
 {
-    /*
-     * Borrow read-only Scene storage.
-     *
-     * Input: resident Scene index. Output: const pointer or NULL. Menu,
-     * InstrumentManager, and runtime apply code use this when they need current
-     * Scene metadata without taking ownership of retained data writes.
-     */
+    if (scene_index == SCENE_BACKGROUND_INDEX && scene_backgroundFlags)
+        return &scene_background;
     return scene_indexValid(scene_index) ? &scenes[scene_index] : 0;
 }
 
@@ -175,17 +184,44 @@ uint8_t scene_getActiveIndex(void)
 
 uint8_t scene_selectActive(uint8_t scene_index)
 {
-    /*
-     * Selection changes identity, never data.
-     *
-     * Input is a resident Scene index; output reports acceptance. DSP apply is
-     * deliberately owned by Preset so selecting a record cannot unexpectedly
-     * perform a large foreground update.
-     */
+    if (scene_index == SCENE_BACKGROUND_INDEX && scene_backgroundFlags) {
+        scene_active_index = scene_index;
+        return 1u;
+    }
     if (!scene_indexValid(scene_index))
         return 0u;
     scene_active_index = scene_index;
     return 1u;
+}
+
+uint8_t scene_backgroundExists(void)
+{
+    return scene_backgroundFlags;
+}
+
+uint8_t scene_backgroundHomeIndex(void)
+{
+    return (scene_active_index < SCENE_COUNT)
+        ? scene_active_index : scene_backgroundHome;
+}
+
+uint8_t scene_playableIndexValid(uint8_t scene_index)
+{
+    if (scene_index < SCENE_COUNT)
+        return 1u;
+    return (uint8_t)(scene_index == SCENE_BACKGROUND_INDEX &&
+                     scene_backgroundFlags);
+}
+
+void scene_backgroundBegin(uint8_t home_index)
+{
+    scene_backgroundHome = home_index;
+    scene_backgroundFlags = 1u;
+}
+
+void scene_backgroundRelease(void)
+{
+    scene_backgroundFlags = 0u;
 }
 
 kit_instrument_slot_t *scene_instrumentSlot(uint8_t scene_index, uint8_t slot)
@@ -1194,6 +1230,45 @@ void scene_resetKitToDefaults(uint8_t scene_index)
     scene_setSlot6Track7MorphAmpEnvelopeDecay(scene_index, 0u);
     bank_invalidateSdCleanScene(scene_index);
     autosave_markKitDirty(scene_index);
+}
+
+/*
+ * Reset one resident Scene's retained data to the empty Scene (S082 B3).
+ *
+ * What: settings (bus compressor, MIDI, per-voice routing/send/fader), the six
+ * Kit slots (default types) and the Effect record are reset to the values a
+ * fresh boot uses. Pattern, HCNAMES, present bit and edit masks belong to
+ * their owners and are handled by the caller.
+ * Why: one data definition of "empty Scene" for the boot reader (Case 3) and
+ * the S082 Replace Bank Load (R7); before S082 the boot reader owned a private
+ * copy.
+ * Inputs: resident Scene index 0..15 (Scene 17 is never emptied).
+ * Outputs: scenes[index] rewritten; no AutoSave mark (callers mark).
+ * Accessors: filesystem_bootReaderEmptyScene(), filesystem_bankEmptyScenes().
+ * Affiliates: scene_busCompDefaults(), instrumentManager_resetSlot(),
+ * scene_effectRecordDefaults(), pat_initScene() (caller).
+ */
+void scene_resetResidentToEmpty(uint8_t scene_index)
+{
+    scene_t *scene = scene_get(scene_index);
+    uint8_t slot;
+    uint8_t track;
+
+    if (!scene)
+        return;
+    memset(scene, 0, sizeof(*scene));
+    scene_busCompDefaults(&scene->settings);
+    for (track = 0u; track < NUM_TRACKS; track++)
+        scene->settings.midi_channel[track] = (uint8_t)(track + 1u);
+    for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++) {
+        scene->settings.audio_out[slot] = scene_defaultVoiceAudioOut(slot);
+        scene->settings.fx_send_amount[slot] = 0u;
+        scene->settings.fx_send_morph[slot] = 0u;
+        scene->settings.fader_setting[slot] = 0u;
+        instrumentManager_resetSlot(&scene->kit.instruments[slot],
+                                    scene_initialInstrumentTypes[slot]);
+    }
+    scene_effectRecordDefaults(&scene->effect);
 }
 
 /*

@@ -84,6 +84,7 @@ static pat_scene_region_t pat_regions[SCENE_COUNT];
  *     or AutoSave can start.
  */
 static pat_scene_region_t pat_background_region;
+static pat_scene_region_t *pat_regionFor(uint8_t scene_index);
 
 /*
  * Mark one Pattern mutation at the existing card-clean boundary.
@@ -194,10 +195,10 @@ uint8_t pat_poolUsagePercent(uint8_t scene_index)
 static uint16_t *pat_addrPtr(uint8_t scene_index, uint8_t track,
                              uint8_t step)
 {
-    if (!scene_indexValid(scene_index) || !pat_trackValid(track) ||
-        !pat_stepValid(step))
+    pat_scene_region_t *r = pat_regionFor(scene_index);
+    if (!r || !pat_trackValid(track) || !pat_stepValid(step))
         return NULL;
-    return &pat_regions[scene_index].address[track][step];
+    return &r->address[track][step];
 }
 
 /*
@@ -658,7 +659,7 @@ static uint8_t pat_writeDynamic(uint8_t scene_index, uint8_t track,
     entry = pat_addrPtr(scene_index, track, step);
     if (!entry)
         return 0u;
-    r = &pat_regions[scene_index];
+    r = pat_regionFor(scene_index);
     new_flags &= (uint8_t)PAT_SPECIAL_FLAGS_MASK;
     if (auto_count > PAT_BLOCK_AUTO_COUNT_MASK)
         return 0u;
@@ -958,7 +959,7 @@ uint8_t pat_trackValid(uint8_t track)
 
 uint8_t pat_patternValid(uint8_t scene_index)
 {
-    return scene_indexValid(scene_index);
+    return (uint8_t)(pat_regionFor(scene_index) != NULL);
 }
 
 uint8_t pat_stepValid(uint8_t step)
@@ -966,9 +967,21 @@ uint8_t pat_stepValid(uint8_t step)
     return (uint8_t)(step < NUM_STEPS);
 }
 
-void pat_initScene(uint8_t scene_index)
+/*
+ * Initialize one Pattern region to the empty Scene.
+ *
+ * What: writes every address entry to the no-data sentinel, zeroes the
+ * reserved pool, frees the lower bitmap chunks, occupies the unbacked upper
+ * range, and restores every per-track and Pattern-global default.
+ * Why: the resident initializer and the Scene 17 reset share one definition
+ * of an empty region (S082 C5); a copy would let the two drift.
+ * Inputs: a live region owned by pat_regions[] or pat_background_region.
+ * Outputs: the region rewritten in publication order.
+ * Accessors: pat_initScene(), pat_rawRegionReset().
+ * Affiliates: SceneData initialization, Scene Load, copy/clear clear pattern.
+ */
+static void pat_initRegion(pat_scene_region_t *region)
 {
-    pat_scene_region_t *region;
     uint8_t track;
     uint16_t step;
 
@@ -982,9 +995,6 @@ void pat_initScene(uint8_t scene_index)
      * at boot; Scene Load and pattern-clear reuse the same reset boundary.
      * The pool bitmap is prepared for the Session-062 synchronous allocator.
      */
-    if (!scene_indexValid(scene_index))
-        return;
-    region = &pat_regions[scene_index];
     for (track = 0u; track < NUM_TRACKS; track++)
         for (step = 0u; step < NUM_STEPS; step++)
             region->address[track][step] = PAT_ADDR_SENTINEL;
@@ -1024,6 +1034,20 @@ void pat_initScene(uint8_t scene_index)
     region->track_auto_smooth = 0u;
 }
 
+void pat_initScene(uint8_t scene_index)
+{
+    /*
+     * Initialize one resident Scene's live Pattern storage.
+     *
+     * Input: resident Scene index 0..15. Output: empty region. Scene 17 is
+     * reset through pat_rawRegionReset(SCENE_BACKGROUND_INDEX) so the
+     * background region is never reached by the resident initialization path.
+     */
+    if (!scene_indexValid(scene_index))
+        return;
+    pat_initRegion(&pat_regions[scene_index]);
+}
+
 /*
  * Return the resident read-only region for one Scene.
  *
@@ -1031,21 +1055,35 @@ void pat_initScene(uint8_t scene_index)
  * index. Filesystem readers use this boundary after pat_initScene() so the
  * storage owner remains private to PatternData.c.
  */
-const pat_scene_region_t *pat_sceneRegion(uint8_t scene_index)
+/*
+ * Resolve a playable Scene index to its Pattern region.
+ *
+ * What: resident Scenes 0..15 map to pat_regions[]; index 16 maps to
+ * pat_background_region while Scene 17 exists; anything else is NULL.
+ * Why: one choke point lets playback, edits, live record and copy/clear
+ * address Scene 17 without knowing it is the background region (S082 P1 §5).
+ * Inputs: scene index. Outputs: region pointer or NULL.
+ * Accessors: every Scene-indexed pat_* function in this file.
+ * Affiliates: scene_backgroundExists(), pat_patternValid(),
+ * filesystem_patternSnapshotInUse() (the snapshot user is gated off).
+ */
+static pat_scene_region_t *pat_regionFor(uint8_t scene_index)
 {
-    return scene_indexValid(scene_index) ? &pat_regions[scene_index] : NULL;
+    if (scene_index < SCENE_COUNT)
+        return &pat_regions[scene_index];
+    if (scene_index == SCENE_BACKGROUND_INDEX && scene_backgroundExists())
+        return &pat_background_region;
+    return NULL;
 }
 
-/*
- * Return the resident mutable region for one Scene.
- *
- * Inputs: Scene index. Output: writable region or NULL for an invalid index.
- * The v4 file reader uses this accessor to stream validated bytes directly
- * into resident storage without a second full-size staging buffer.
- */
+const pat_scene_region_t *pat_sceneRegion(uint8_t scene_index)
+{
+    return pat_regionFor(scene_index);
+}
+
 pat_scene_region_t *pat_sceneRegionMut(uint8_t scene_index)
 {
-    return scene_indexValid(scene_index) ? &pat_regions[scene_index] : NULL;
+    return pat_regionFor(scene_index);
 }
 
 uint8_t pat_isStepActive(uint8_t track, uint8_t step, uint8_t scene_index)
@@ -1126,7 +1164,7 @@ void pat_eraseStep(uint8_t scene_index, uint8_t track, uint8_t step)
     }
     if ((addr & PAT_ADDR_SPECIALS_BIT) != 0u &&
         pat_poolOffsetValid(offset)) {
-        pat_scene_region_t *r = &pat_regions[scene_index];
+        pat_scene_region_t *r = pat_regionFor(scene_index);
         uint8_t chunks = pat_blockChunks(r->pool[offset + 2u],
                                          (uint8_t)(r->pool[offset + 1u] &
                                                    PAT_BLOCK_AUTO_COUNT_MASK));
@@ -1164,7 +1202,7 @@ void pat_releaseStepDynamic(uint8_t scene_index, uint8_t track,
     __asm volatile("cpsie i" ::: "memory");
     if ((addr & PAT_ADDR_SPECIALS_BIT) != 0u &&
         pat_poolOffsetValid(offset)) {
-        pat_scene_region_t *r = &pat_regions[scene_index];
+        pat_scene_region_t *r = pat_regionFor(scene_index);
         uint8_t chunks = pat_blockChunks(r->pool[offset + 2u],
                                          (uint8_t)(r->pool[offset + 1u] &
                                                    PAT_BLOCK_AUTO_COUNT_MASK));
@@ -1210,7 +1248,7 @@ pat_step_specials_t pat_readStepSpecials(uint8_t scene_index,
     offset = (uint16_t)(addr & PAT_ADDR_OFFSET_MASK);
     if (!pat_poolOffsetValid(offset))
         return out;
-    return pat_blockRead(&pat_regions[scene_index], offset);
+    return pat_blockRead(pat_regionFor(scene_index), offset);
 }
 
 uint8_t pat_sceneHasActiveSteps(uint8_t scene_index)
@@ -1226,9 +1264,9 @@ uint8_t pat_sceneHasActiveSteps(uint8_t scene_index)
      * otherwise zero. Menu load feedback uses this owner-level scan rather
      * than learning either the address-array layout or future pool format.
      */
-    if (!scene_indexValid(scene_index))
+    region = pat_sceneRegion(scene_index);
+    if (!region)
         return 0u;
-    region = &pat_regions[scene_index];
     for (track = 0u; track < NUM_TRACKS; track++)
         for (step = 0u; step < NUM_STEPS; step++)
             if ((region->address[track][step] & PAT_ADDR_TRIGGER_BIT) != 0u)
@@ -1253,9 +1291,9 @@ void pat_clearTrack(uint8_t scene_index, uint8_t track)
      * blocks are reclaimed. Affiliates: the stack-service clear barrier and
      * pat_poolFree().
      */
-    if (!scene_indexValid(scene_index) || !pat_trackValid(track))
+    r = pat_regionFor(scene_index);
+    if (!r || !pat_trackValid(track))
         return;
-    r = &pat_regions[scene_index];
     for (step = 0u; step < NUM_STEPS; step++) {
         addr = r->address[track][step];
         offset = (uint16_t)(addr & PAT_ADDR_OFFSET_MASK);
@@ -1281,14 +1319,19 @@ void pat_clearPattern(uint8_t scene_index)
 {
     /*
      * Clear the complete live Pattern region without touching Scene settings
-     * or Kit data. Inputs: resident Scene index. Outputs: address array,
+     * or Kit data. Inputs: playable Scene index (0..15, or Scene 17 while it
+     * exists). Outputs: address array,
      * reserved pool, and free bitmap return to pat_initScene()'s empty state.
      * Affiliates: copyClearService.c through pat_rawRegionReset().
      */
-    if (!scene_indexValid(scene_index))
+    if (!pat_patternValid(scene_index))
         return;
-    pat_initScene(scene_index);
-    pat_markSceneDirty(scene_index);
+    /*
+     * S082 C5: Scene 17 clears through the same region reset as a resident
+     * Scene. pat_initScene() stays resident-only, so the background region is
+     * reset directly instead of silently no-oping.
+     */
+    pat_rawRegionReset(scene_index);
 }
 
 /*
@@ -1676,7 +1719,7 @@ uint8_t pat_removeTrackAutomationByTarget(uint8_t scene_index, uint8_t track,
     uint8_t step;
     uint8_t removed = 0u;
 
-    if (!scene_indexValid(scene_index) || !pat_trackValid(track) ||
+    if (!pat_patternValid(scene_index) || !pat_trackValid(track) ||
         target >= INSTRUMENT_TOTAL_ID_COUNT)
         return 0u;
     for (step = 0u; step < NUM_STEPS; step++)
@@ -2429,6 +2472,10 @@ uint8_t pat_rawRegionPublishRewritten(uint8_t src_scene, uint8_t dst_scene,
  */
 void pat_rawRegionReset(uint8_t scene_index)
 {
-    pat_initScene(scene_index);
+    pat_scene_region_t *region = pat_regionFor(scene_index);
+
+    if (!region)
+        return;
+    pat_initRegion(region);
     pat_markSceneDirty(scene_index);
 }

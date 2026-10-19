@@ -801,6 +801,21 @@
 #define I2S_TEST_TONE_HZ     440.0f
 #define AUDIO_RENDER_IN_DMA_ISR 0 /* 1 = diagnostic only; full mixer in DMA ISR can starve UI */
 
+/*
+ * Idle-time filesystem budget during a background Bank load (S082 P2 fix 3).
+ *
+ * What: the longest stretch, in microseconds, that the main loop may spend
+ * running extra filesystem_tick() calls in one pass while both audio render
+ * slots are full and a background Bank load owns the busy facade.
+ * Why: with audio playing, one filesystem step per main-loop pass makes a
+ * 16-Scene Bank load take tens of seconds; the full-queue window (up to one
+ * 2.18 ms slot) is otherwise spent spinning. The loop also stops the moment
+ * a render slot frees, so audio is delayed by at most one filesystem step.
+ * Tune only from hardware evidence (per-child load time, underrun count).
+ * Accessors: main_serviceBackgroundLoadIdle() (main.c).
+ */
+#define BG_LOAD_IDLE_FS_BUDGET_US  200u
+
 // wether to interpolate the oscillator wavetables or not
 // TODO DAC_PORT - I think ok to leave this, setting to 0 will cause other ifndef
 // errors further along, it isn't really a viable option any more.

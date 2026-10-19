@@ -16,6 +16,7 @@
 #include "copyOps.h"
 #include "clearOps.h"
 #include "PatternData.h"
+#include "SceneData.h"
 #include "PatternStackService.h"
 #include "filesystem.h"
 #include "Autosave.h"
@@ -672,6 +673,17 @@ uint8_t ccSvc_runPatternPaste(const cc_job_t *job)
         uint8_t r;
 
         if (ccSvc_pasteOverlaps(job, &g)) {
+            /*
+             * S082 C9/D23: an overlapping paste needs the shared background
+             * region as its source snapshot, but Scene 17 owns that region
+             * while a background Bank Load runs. Refuse with the existing
+             * copy/clear display; non-overlapping pastes still work.
+             */
+            if (scene_backgroundExists()) {
+                ccSvc_traceDropReason(AUTOSAVE_TRACE_CC_DROP_SCENE17,
+                                      job->kind);
+                return CC_RUN_DROP;
+            }
             run->phase = 1u;
             if (filesystem_patternSnapshotInUse()) {
                 CC_TRACE_SAT16(ccSvc_traceState.scratch_wait);
@@ -1367,6 +1379,39 @@ void ccSvc_interactionStarted(void)
     ccSvc_traceState.jobs_dropped = 0u;
     ccSvc_traceState.reg_passes = 0u;
 #endif
+}
+
+/*
+ * Drop every queued copy/clear job that has not started (S082 C7, D12).
+ *
+ * What: keeps the running queue-head job (CC_SVC_JOB_ACTIVE) and discards the
+ * tail jobs, restoring the early-trigger bits of each dropped paste.
+ * Why: a background Bank Load must own the Pattern/card boundary; queued
+ * fan-out work would otherwise write Scenes being replaced.
+ * Inputs: the job FIFO and early-trigger flags.
+ * Outputs: at most the running job remains; each drop is traced.
+ * Accessors: preset_requestBackgroundBankLoad() phase 2.
+ * Affiliates: ccSvc_busy(), ccSvc_restoreEarlyTriggers().
+ */
+void ccSvc_dropQueued(void)
+{
+    uint8_t keep = (uint8_t)((ccSvc_flags & CC_SVC_JOB_ACTIVE) ? 1u : 0u);
+
+    while (ccSvc_count > keep) {
+        uint8_t slot = (uint8_t)((ccSvc_head + ccSvc_count - 1u) %
+                                 CC_QUEUE_SIZE);
+        cc_job_t *job = &ccSvc_queue[slot];
+
+        if (((ccSvc_earlyFlags >> slot) & 1u) != 0u) {
+            ccSvc_restoreEarlyTriggers(job, slot);
+            ccSvc_earlyFlags =
+                (uint8_t)(ccSvc_earlyFlags & (uint8_t)~(1u << slot));
+        }
+        ccTrace(AUTOSAVE_TRACE_CC_EVT_JOB_END,
+                (uint32_t)CC_RUN_DROP |
+                ((uint32_t)job->op << 8u));
+        ccSvc_count--;
+    }
 }
 
 cc_run_t *ccSvc_run(void)

@@ -2471,6 +2471,216 @@ engine.
 
 ---
 
+## 11. Implementation log
+
+### Phase A1 — COMPLETE
+- A1.1: replaced per-delta `menu_repaintAll()` with `menu_knobs_dirty = 1u` for pots 2-4 in `menu_handleLoadSaveKnobDelta()`.
+- A1.2: added Load/Save routing in `menu_serviceKnobRepaint()` through `menu_repaint()`.
+- A1.3: removed `name[ci + 1u] = ' '` from BAR2 in `menu_loadSaveBarButtonPressed()`; both `menu_repaintAll()` → `menu_repaint()`.
+- A1.4: updated BAR2 comment in `buttonHandler.c` to "cursor-forward (keeps characters)".
+- Build: 573,688 / 753,664 B flash, headroom 179,976 B.
+
+### Phase A2 — COMPLETE
+- A2.1: added `MENU_INSTRUMENT_SOURCE_CHANGE` enum with comment block.
+- A2.2: added `menu_instrumentLoadKitRowAvailable()`.
+- A2.3: added `menu_instrumentTypeSelectableForMask()` and `menu_instrumentLoadCommitChange()`.
+- A2.4: replaced type check with mask check in `menu_instrumentLoadStepType()`; added CHANGE/KIT/POOL source selection.
+- A2.5a: added CHANGE handling in lower-row encoder block.
+- A2.5b: added `kit` row clamp when unavailable.
+- A2.7: replaced `(void)btnClicked;` with `chg` click commit logic.
+- A2.8: type-change finalization in `menu_finishInstrumentApplySession()` (moved from `menu_tickInstrumentApply()` due to declaration ordering).
+- A2.9: added CHANGE renderer branch before KIT branch.
+- A2.10: updated renderer header comment to mention `chg`.
+- Forward declarations added for `menu_instrumentLoadCommitChange`, `menu_instrumentLoadKitRowAvailable`, `menu_instrumentLoadRefreshBaseType`.
+- Build: 574,224 / 753,664 B flash, headroom 179,440 B (+536 B over A1).
+
+### Phase B1 — COMPLETE
+- B1.1: added `op_bank_child_content_mask` with comment block in filesystem.c; reset in `filesystem_start()`.
+- B1.2: modified `filesystem_scanBankScenes_tick()`: case 8 now copies display names into `op_bank_child_scratch.bank_child_display[]` with lexical-winner rule; case 10 enters probe phase 11 when present children exist; added phases 11-20 for cooperative content probe (directory iterate for `.pat`, seek past header, read address array in 160 B chunks, test trigger bits).
+- B1.3: added `filesystem_bankChildContentMask()` accessor.
+- B1.4: added header declaration in filesystem.h.
+- B1.5: updated `filesystem_requestScanBankScenes()` comment to mention both masks and Load/Save usage.
+- B1.6: added `AUTOSAVE_TRACE_STAGE_BANK_PREVIEW = 'b'` to AutosaveTrace.h; trace emission at probe completion (`#if DEV_MODE_LOGGING`); decode_devlogs.py updated with 'b' stage enum, producer, and decode branch.
+- Build: 575,248 / 753,664 B flash, headroom 178,416 B (+1,024 B over A2).
+
+### Phase B2 — COMPLETE
+- B2.13(a-e): COPY button handling for Bank pages in buttonHandler.c — press/release/hold/overflow intercepts with `bh_bankCopyPressTick` storage.
+- B2.14: Load/Save exit cleanup in `menu_switchPage()` — `menu_bankCopyForceRelease()`, `menu_bankUiFlags = 0`, COPY LED off; DOC note at LOAD_PAGE entry about Bank pages overriding Kit scene mask.
+- B2.15: Refactored `menu_resetSaveParameters()` into `menu_resetSaveParametersEx(uint8_t after_command)` so Bank page scene selection is retained after a Bank Save command completes.
+- B2.16: Type-row reset DOC note.
+- Build: 575,840 / 753,664 B flash, headroom 177,824 B (+592 B over B1).
+
+### Phase B3 — COMPLETE
+- B3.1: `preset_bankLoadRequestMasks()` and `preset_bankLoadEmptyMask()` in presetManager.h/.c.
+- B3.2: Added op fields `op_bank_scene_empty_mask`, `op_bank_save_written_mask`, `op_bank_flags` with flag defines in filesystem.c; reset in `filesystem_start()`.
+- B3.3: Changed `filesystem_requestLoadBank()` to 5-arg signature `(slot, act_mask, empty_mask, flags, cb)`; updated filesystem.h declaration, presetManager.c caller, and generic `filesystem_requestLoad()` FS_FILE_BANK case.
+- B3.4: Rewrote Bank Load phase 17 — Replace-empties-missing rule, BOOT-gated active-Scene re-pick, phase 98 routing.
+- B3.5: Added Bank Load phase 98 — empties Scenes via `filesystem_bankEmptyScenes()`, routes to empty-Bank or child-loop.
+- B3.6: Added three static helpers before `filesystem_loadBankDirectory_tick()`: `filesystem_stageEmptySceneRows()`, `filesystem_stageKeptSceneSources()`, `filesystem_bankEmptyScenes()`. Added `scene_resetResidentToEmpty()` in SceneData.c/.h. Refactored `filesystem_bootReaderEmptyScene()` to use the new helpers.
+- B3.7: Updated Bank Load phase 20 commit — `old_bank_source` capture, `filesystem_stageKeptSceneSources()`, new present-mask merge formula, BOOT-gated active/playback, `bank_mergeVoiceEditMasksAfterLoad()`.
+- B3.8: Updated empty-Bank branch (phase 17) and phase 98 empty-Bank sub-path with same changes as B3.7.
+- B3.9(a-e): New HCNAMES source tokens (`FS_RESIDENT_SOURCE_BANK_CHILD_BASE`, `FS_RESIDENT_SOURCE_EMPTY`) in filesystem.h; updated `filesystem_residentSourceValid()`, `filesystem_parseResidentSourceToken()`, `filesystem_formatResidentNameLine()`, `filesystem_resolveResidentSource()`.
+- B3.10(a): Boot reader EMPTY dispatch — `filesystem_bootReaderEvaluateScene()` handles EMPTY as intentional empty without Case-3 notice; BANK_CHILD sets resolved_row to Scene row and is accepted in the Case-2 dispatch.
+- B3.10(b): `filesystem_bootReaderEnterSceneFolder()` BANK_CHILD branch — enters Bank/NNN/NN/ using cached Bank index for the decoded slot.
+- B3.10(c): Kit folder routing through Scene folder handles BANK_CHILD via existing resolved_row dispatch.
+- B3.11(a): Changed `filesystem_requestSaveBank()` to accept `uint16_t empty_mask`; stages written entries with `bank_mergeVoiceEditEntry()`, empty entries as self-only, seen = written | empty.
+- B3.11(b): Added Bank Save phases 61-64 — reads old bankset.bcg for partial Merge Save, parses untouched entries with `storage_banksetParseLineMasked()`, completes them with `bank_mergeVoiceEditEntry()`.
+- B3.11(c): Per-child loop (phases 11, 12, 20, 21) uses visit mask (written | empty); removal bit at phase 20 skips `prepareBankSceneSaveSource()` and routes to phase 12 after delete at phase 21.
+- B3.11(d): Phase 45 rewritten — REM present-mask OR, active-Scene set, mask restore loop; ADD old_bank_source capture, written Scenes → INHERIT, kept Scenes → `filesystem_stageKeptSceneSources()`, empty Scenes → `filesystem_stageEmptySceneRows()` + `bank_invalidateSdCleanScene()`.
+- B3.12: Rewrote Menu `PRESET_OP_BANK_LOAD` completion — removed empty-Bank fallback ladder for runtime loads; added re-apply rule (S25); `bank_revalidateVoiceEditMasks()` after every Bank Load; `autosave_markResidentBankDirty()` when Merge.
+- B3.13: Added `bank_mergeVoiceEditEntry()` and `bank_mergeVoiceEditMasksAfterLoad()` in BankData.c/.h.
+- B3.14: Added `storage_banksetParseLineMasked()` in storageTypes.c/.h — wrapper that protects per-Scene entries and active_scene from overwrite.
+- B3.15: Added `filesystem_lastBankLoadEmptyMask()` getter in filesystem.c/.h.
+- Build: 578,464 / 753,664 B flash, headroom 175,200 B (+3,216 B over B1).
+
+### Phase C0 — COMPLETE
+- Added `SCENE_BACKGROUND_INDEX 16u` and `SCENE_SLOT_TOTAL 17u` in SceneData.h.
+- Added `scene_background` (scene_t), `scene_backgroundFlags`, `scene_backgroundHome` static storage in SceneData.c.
+- Modified `scene_get()`, `scene_getConst()`, `scene_selectActive()` to accept index 16 when Scene 17 exists.
+- Added 5 accessors: `scene_backgroundExists()`, `scene_backgroundHomeIndex()`, `scene_playableIndexValid()`, `scene_backgroundBegin()`, `scene_backgroundRelease()`.
+- Build: 577,992 / 753,664 B flash.
+
+### Phase C1 — COMPLETE
+- Added `pat_regionFor()` static helper with forward declaration in PatternData.c.
+- Changed `pat_sceneRegion()`, `pat_sceneRegionMut()`, `pat_patternValid()`, `pat_addrPtr()` to delegate to `pat_regionFor()`.
+- Updated 6 direct `pat_regions[scene_index]` accesses to use `pat_regionFor()`.
+- Left `pat_snapshotScene()` and `pat_initScene()` as resident-only.
+- Build: 577,392 / 753,664 B flash.
+
+### Phase C2 — COMPLETE
+- Replaced `scene_indexValid(scene)` with `pat_patternValid(scene)` at 6 sites in PatternStackService.c.
+- Left `patSvc_prepareSceneReplace()` as `scene_indexValid()` (resident-only).
+- Build: 577,424 / 753,664 B flash.
+
+### Phase C4 — COMPLETE
+- BankData.c/.h: Added `bank_editTargetMask()` (returns uint32_t; Scene 17 → bit 16 only) and `bank_sceneFanoutMask32()`.
+- EffectsManager.c: `effects_fanoutMask()` return type widened to uint32_t with Scene 17 body logic; all `uint16_t mask` → `uint32_t mask`; all bit-test patterns → `(1ul << x)`; 12 fan-out loop bounds → `SCENE_SLOT_TOTAL`; type-match loop at line 576 stays `SCENE_COUNT`.
+- menu.c: 7 fan-out sites (`MENU_CELL_KIT_SETTING`, `MENU_CELL_INSTRUMENT`, `MENU_CELL_SCENE_SETTING`, `menu_commitBusCompParam`, `PAR_MORPH`, `PAR_VOICEn_MORPH`) changed from `uint16_t bank_sceneMaskVoiceEdit()` to `uint32_t bank_editTargetMask()` with `SCENE_SLOT_TOTAL` bounds and `(1ul <<)` bit tests. LED refresh at line 8992 kept 16-bit (D8).
+- copyOps.c: `ccCopy_bit()` widened to uint32_t; `ccCopy_activeIn()` param to uint32_t; 5 mask locals → uint32_t; 6 `bank_sceneFanoutMask()` → `bank_sceneFanoutMask32()`; 8 loops → `SCENE_SLOT_TOTAL`; cleaned `(uint16_t)~ccCopy_bit()` casts.
+- clearOps.c: `ccClear_bit()` widened to uint32_t; `ccClear_effectRowsChanged()` param to uint32_t; 3 mask locals → uint32_t; all `bank_sceneFanoutMask()` → `bank_sceneFanoutMask32()`; 3 loops → `SCENE_SLOT_TOTAL`; cleaned `(uint16_t)~ccClear_bit()` cast.
+- Build: 577,544 / 753,664 B flash, headroom 176,120 B (+120 B over C2).
+
+### Phase C3 — COMPLETE
+- preset_loadDrumset(): Kit Load destination mask now uses
+  scene_backgroundHomeIndex() while Scene 17 is active (never bit 16).
+- filesystem_requestLoad(): generic Kit/Scene/Pattern loads use the home
+  Scene for their 16-bit destination masks while Scene 17 is active.
+- menu_residentPresentSceneMask(): the one-Scene fallback uses the home
+  Scene.
+- menu_resetLoadSaveSceneSelection(): the default single Scene bit uses the
+  home Scene; menu_loadSaveSourceScene keeps the active index so Scene Save
+  from 17 stays allowed (D15).
+- menu_switchPage() LOAD_PAGE entry: the Kit/Scene/Pattern default bit uses
+  the home Scene (Bank pages still override to 0xFFFF).
+- ccCopy_runKit(): a Kit copy into Scene 17 commits the image but neither
+  sets a Bank present bit nor marks AutoSave (17 is never Bank-present).
+- preset_saveBank() and filesystem_requestSaveBank(): the manifest
+  active_scene uses the home Scene while 17 is active.
+- filesystem_requestSaveSceneDirectory(): Scene Save from 17 publishes no
+  resident HCNAMES row (mask stays zero) while still writing the directory.
+- Verified no change needed: preset_startInstrumentApplyImage() (mask bit is
+  feedback only; resident destinations), liveRec_paramIn() (no Scene bit
+  mask), seq_rampService() (Scene coordinate through pat_*),
+  menu_voiceHeldSceneButtonPressed() (comparison with 16 is false).
+
+### Phase C5 — COMPLETE
+- PatternData.c: factored the empty-region initializer into
+  pat_initRegion(); pat_initScene() stays resident-only and
+  pat_rawRegionReset() now resets either a resident region or Scene 17.
+- pat_clearPattern() and pat_removeTrackAutomationByTarget() now accept
+  Scene 17 through pat_patternValid().
+- presetManager.c: added preset_backgroundTrackChunks(),
+  preset_copyBackgroundTrack(), preset_copyBackgroundSlot() and
+  preset_buildBackgroundScene(). The fast path copies the whole active
+  region when no per-track overrides exist; the per-track path resets Scene
+  17, copies each track that fits (leaving a non-fitting track empty),
+  copies track parameters/MIDI/Morph endpoints and the T1..T7 voice slots,
+  with slot 6 following T6 when T6 fits. Chain fields are cleared; fresh
+  builds copy Pattern globals from the active Scene.
+- Header declaration with the C5 contract added to presetManager.h.
+
+### Phase C6 — COMPLETE
+- Added seq_switchToBackgroundScene() in sequencer.c/.h: under PRIMASK it
+  points active/pending/all per-track Scenes at 16, re-snapshots the looper,
+  then clears every pending Scene change and refreshes the effective track
+  cache. No realign, roll/condition/epoch reset, PC, note-off or LED notify.
+
+### Phase C7 — COMPLETE
+- presetManager.c/.h: added preset_requestBackgroundBankLoad(),
+  preset_backgroundBankLoadRunning(), preset_tickBackgroundBankLoad() and
+  the one-byte pm_bg_phase state (phase + MIDI/Replace/rebuild/discard
+  bits). The slot and act mask reuse pm_request_slot /
+  pm_kit_request_scene_mask; the empty mask is derived from Replace.
+- Phase 1 decides Scene 17; phase 2 drops queued copy/clear jobs, sets the
+  AutoSave yield and waits for the facade/Pattern snapshot to become idle
+  before discarding the Replace dirty mask; phase 3 builds and switches;
+  phase 4 posts the ordinary two-mask Bank Load; phase 5 waits for Menu to
+  acknowledge and releases the yield.
+- copyClearService.c/.h: added ccSvc_dropQueued() (keeps the running job,
+  restores early-trigger bits, traces each drop).
+- filesystem.c/.h: added the one-byte persistent fs_autosave_yield and
+  filesystem_setAutosaveYield(); both AutoSave schedulers decline new
+  drains while it is set.
+- Menu failure paths call the new menu_backgroundBankLoadAbort() so a
+  refused phase 4 cannot strand the accepted command busy state.
+
+### Phase C8 — COMPLETE
+- seq_selectActivePattern() releases Scene 17 after a resident Scene has
+  been published and the looper re-snapshotted. Per-track changes do not
+  release.
+
+### Phase C9 — COMPLETE
+- AutoSave service tick gates the scalar and both Pattern scheduler calls on
+  !scene_backgroundExists(); settings.cfg is unchanged (D24).
+- seq_sendProgChg() refuses indices >= 16; seq_chainResolveNext() returns
+  no target when the current Scene is 17.
+- ccSvc_runPatternPaste() refuses an overlapping paste while Scene 17
+  exists with new trace reason AUTOSAVE_TRACE_CC_DROP_SCENE17 (decoder
+  updated).
+- Bank Save on 17 writes the home Scene as active_scene; Scene Save from 17
+  writes its directory with a zero HCNAMES publication mask.
+- Scene number labels: no current LCD screen prints the active Scene number
+  (the only "Sc NN" text is the boot empty-Scene notice, which is resident
+  0..15), so D22 needs no code site today.
+
+### Phase C10 — COMPLETE
+- menu.c/.h: added menu_backgroundBankLoadUiBegin() (MIDI origin: enter
+  Load:[Bank], explicit slot, Replace, all 16, accepted-command busy state,
+  latched menu closed) and menu_backgroundBankLoadAbort().
+- menu_loadSaveEnterTop() now delegates to
+  menu_loadSaveEnterTopAt(page, what, bank_slot) so the MIDI path can install
+  its slot before the entry index request.
+- menu_pollPresetStatus() calls preset_tickBackgroundBankLoad() before the
+  Preset completion dispatch.
+- Menu Bank Load OK now posts through preset_requestBackgroundBankLoad()
+  (Phase C), replacing the direct preset_loadBank() call.
+ - Build: 589,816 / 753,664 B flash, headroom 163,848 B.
+
+---
+
+### Post-C10 verification fixes
+- Preset/filesystem Bank Load: added PRESET_BANK_LOAD_REPLACE (0x02). A
+  Replace with all 16 selected has empty_mask = 0, so the filesystem could
+  not infer Replace from a nonempty empty mask; missing source children would
+  have been kept instead of emptied. The background request now passes the
+  flag, and boot still passes BOOT only.
+
+- HCNAMES-authoritative boot loader: the effective present mask is now
+  extended from Scene rows (bNNN sets, x clears except the active Scene) and
+  its per-Scene loop handles EMPTY and BANK_CHILD sources. Without this, a
+  Merge-saved mixed Bank lost its kept Scenes and marked them Case 3 on the
+  boot path that runs when no AutoSave record is usable.
+- Bank Save phase 45 keeps present Scenes whose slot child was removed in the
+  kept-source set (they still hold RAM content); only non-present removed
+  Scenes get the explicit x row.
+- Bank Load phase 98 empty-Bank path now captures the old row-0 source and
+  stages kept Scene provenance like the phase-20 commit.
+- tools/verify_bank_autosave.py accepts missing children whose Scene row is
+  x, accepts bNNN sources, and checks the S082 present-mask rules instead of
+  requiring all 16 children and an exact mask.
+- Final build and image: 589,816 B flash, 163,848 B headroom;
+  build/LXRV2_lxr02.img written.
+
 ## Appendix A — Scene-index audit (`S082_P1` §5), generated at `8b1b647`
 
 Every non-comment line in `Core/**/*.c` and `main.c` that reads
@@ -2696,3 +2906,350 @@ the sources of index 16 while Scene 17 is active.
 | `Sequencer/sequencer.c` | `seq_markRecordedStep()` | 6218 | L |
 | `Sequencer/sequencer.c` | `seq_setStepIndexToStart()` | 6410 | P |
 | `main.c` | `main()` | 1364 | A |
+### Phase D — COMPLETE (docs and tools)
+- FILESYSTEM_SPEC.md: S082 Bank Load/Save outcome, two masks, present-mask
+  assignment, runtime active-Scene rule, boot-only active_scene, Merge Save
+  manifest read, bNNN/x tokens, Bank preview probe.
+- AUTOSAVE.md: present-mask assignment, Merge re-mark, Scene 17 suspension,
+  new source tokens.
+- MODULE_INTERCHANGE_SPEC.md: Bank page/COPY/labels/retention, name editing,
+  Instrument chg, Scene 17 rules, and the new Preset APIs.
+- BANK_PRESET_ARCHITECTURE.md: legacy active_scene, edit-mask mutual
+  exclusion, Scene 17 mask.
+- COPYCLEAR_UTILITIES.md: Scene 17 source/destination, overlap refusal, 32-bit
+  fan-out, no present bit for a Kit copy into 17.
+- PATTERN_DYNAMIC_STACK.md: background region use 4 (Scene 17) and
+  pat_regionFor().
+- STORAGE_SRAM_MANIFEST.md: S082 allocation table (16 B outside Scene 17 plus
+  1,658 B for Scene 17).
+- MEMORY.md: closed the runtime Bank Load active-Scene bug, Load/Save pot
+  repaint rule, Scene 17 invariants, and card preparation (delete .hcnames,
+  .hcnamtmp, .hcprms1/.hcprms2).
+- tools/verify_bank_autosave.py and tools/decode_devlogs.py updated; both
+  files compile with python3 -m py_compile.
+- S082_P1_LOAD_SAVE.md §7 records the implementation notes.
+
+---
+
+## 12. Post-implementation review and first-boot freeze assessment (2026-10-18)
+
+*Code review of the uncommitted working tree on `45846b7`, plus the card copy
+`SD_CARD_082_P0/` (`asavetrc.bin` decoded with `tools/decode_devlogs.py`).
+No code was changed for this assessment.*
+
+### 12.1 The report
+
+On the first boot of the S082 image the user opened Load/Save and turned
+endless pot 1 to scroll the Load/Save type. The screen froze and did not
+recover without a power cycle. Later boots did not reproduce it. The user
+suspected AutoSave interference.
+
+### 12.2 What the trace shows
+
+The new-firmware sessions start at record #051462: the first
+`AUTOSAVE_TRACE_STAGE_BANK_PREVIEW` (`b`) record is #051480.
+
+| Record | Tick (ms) | Event |
+|-------:|----------:|-------|
+| #051462 | 1444 | **Session 1** (first boot): boot reader done, no Case 2/3 |
+| #051463 | 3191 | AutoSave writer armed; deadline 8191 |
+| #051467 | 8192 | **Parameter drain admitted** (owns the filesystem facade) |
+| #051468 | 9394 | **Load/Save entered** (`menu_requestKitEntryNames()` branch 1); the HCNAMES request is refused because the drain owns the facade, and deferred |
+| #051472–74 | 10693–10846 | Drain validates, merges, **finishes DONE** |
+| #051475–76 | 10846–11061 | Deferred Kit entry retried; Kit index accepted |
+| #051477 | 15440 | 5-second budget report |
+| #051480 | 15627 | Bank child preview complete (16 present, 16 with content) |
+| — | — | **No further record**, then **session 2** boots (#051481) |
+
+How to read the end of session 1:
+- The trace flush runs every 500 ms whenever the facade is idle and no OK/OW
+  command is active (`filesystem_autosaveTraceFlushSchedule_tick()`;
+  browsing does not block it).
+- A budget report (`H`) is produced every 5 s by `filesystem_tick()`.
+- The preview record at 15627 reached the card, so the facade was idle at
+  least once after it. No `H` record after 15440 ever reached the card.
+- So from shortly after 15627 until the power cycle, either the facade
+  stayed **BUSY**, or the main loop stopped. The records describing the
+  freeze itself were in RAM and were lost at reset.
+
+Session 1 is also the **only** session in which Load/Save was entered while
+an AutoSave drain owned the facade:
+- in sessions 2 and 3, Load/Save was entered (5209 ms, and similar) before
+  the writer's deadline;
+- later arms were held by the Load/Save page guard (`W` record #053039).
+
+### 12.3 Assessment
+
+The freeze is **not proven** by the card: its own records were never written.
+The evidence and the code support this account.
+
+1. **AutoSave's role is indirect.** The drain behaved correctly: it finished
+   DONE at 10846 and wrote nothing afterwards. What it did was delay the
+   Load/Save entry requests, so the user's pot-1 scrolling overlapped
+   in-flight index loads and the new, longer Bank child preview (16 child
+   visits and PAT4 reads on a cold first-boot card). These overlapping
+   windows exist only when Load/Save is entered during a drain, which
+   happened only in session 1.
+2. **All four Load/Save pots bypass the storage busy gate (pre-existing,
+   widened by S082).**
+   - `menu_parseEncoder()` (`menu.c:14274` ff.) drops input while
+     `menu_storageBusy || preset_getStatus() != PRESET_IDLE`, except plain
+     Load-number turns.
+   - The pot path `menu_parseKnobDelta()` → `menu_handleLoadSaveKnobDelta()`
+     (`menu.c:14911`, `10141`) checks only `menu_loadSaveCommandActive`.
+   - So pot 1 can change page, type or nested Instrument mode
+     (`menu_loadSaveEnterTopAt()`, `menu_loadSaveEnterInstrumentLoad()`) and
+     call `filesystem_clearNameCache()` while an index load, HCNAMES read,
+     `.hctmp` save, Instrument apply or Bank preview owns the facade.
+   - S082 lengthened the Bank preview (B1 probe) and added a Save:[Bank]
+     preview, so these windows are now seconds long instead of milliseconds.
+3. **Refusal and completion paths overwrite the busy owner.**
+   - `menu_requestLibraryIndexLoad()` (`menu.c:8012`) and
+     `menu_requestKitEntryNames()` (`menu.c:7759`) set `menu_storageBusy = 1`
+     and then `0` on refusal, even when another request (for example the
+     Bank preview) owns the flag.
+   - `menu_bankLoadPreviewComplete()` clears it unconditionally.
+   - After a pot-1 sweep, Menu can therefore believe it is idle while the
+     facade is busy, or the reverse, and completions run against a context
+     that has already changed.
+4. **Deferred retries can go to the wrong owner (pre-existing).** The
+   dispatcher (`menu.c:15460-15478`) re-posts every deferral that is not a
+   nested pool reload through `menu_requestCurrentLoadSaveSelection()`, which
+   acts on the last **top-level** type.
+   - A deferral raised by nested Instrument entry (HCNAMES / `.hctmp` /
+     typed index) during a pot-1 sweep is re-posted as, for example, a Bank
+     preview.
+   - The Instrument session then never completes its entry. The trace's
+     later sessions show such sweeps: bursts of refused Kit index requests
+     (#052380–#052385) and Instrument entries every ~11 ms
+     (#053374–#053382).
+5. **The new probe has wait points that never time out.**
+   `filesystem_scanBankScenes_tick()`:
+   - case 18 (`filesystem.c:16263`) returns on `afatfs_fread() == 0` forever
+     at end of file (a short or foreign `.pat`);
+   - cases 12 and 16 (`16157`, `16223`) retry `afatfs_opendir_lfn()` /
+     `afatfs_fopen_lfn()` forever if the handle pool refuses;
+   - `FS_INTERNAL_OP_SCAN_BANK_SCENES` has no `filesystem_pollPhaseStall()`
+     observer, so such a wait would hold the facade BUSY indefinitely and
+     leave Menu gated with no trace.
+
+   On this card the probe itself completed (content `0xffff`). This is a
+   hazard, not the proven cause.
+
+**Most probable mechanism:**
+1. A fast pot-1 sweep during the first-boot overlap (item 1) left Menu and the
+   facade out of step (items 2–4): the facade busy, or Menu's busy gate never
+   released.
+2. Every input path was then refused: encoder and MODE are gated on
+   `menu_storageBusy` / Preset status, and the page switch queues behind them
+   (`menu_pendingPageSwitch`).
+3. The screen stopped repainting because both pot paths repaint only when
+   `!menu_storageBusy`.
+
+The absence of any later `H` record is consistent with the facade staying
+BUSY. A main-loop hang cannot be excluded, because `DEV_LOGGING_IWDG` is 0.
+
+### 12.4 Review findings (code check of the S082 implementation)
+
+| Id | Severity | Location | Finding | Fix (not applied) |
+|----|----------|----------|---------|-------------------|
+| F1 | **High** | `presetManager.c:3523` ff. `preset_tickBackgroundBankLoad()` phases 1–3 | Phase 1 computes "Scene 17 needed" into `PM_BG_REBUILD`, but phase 3 **always** builds Scene 17 and calls `seq_switchToBackgroundScene()`. Every Menu Bank Load, including a stopped one (D14) and a Merge that keeps every played Scene (D25), ends on Scene 17: PERF shows no Scene, AutoSave is suspended until the next Scene change, and the user's Scene has changed (against S9/S25). Phase 2's copy/clear drop, AutoSave yield and Replace discard also run when not needed. | Use one bit `PM_BG_NEEDED`. Phase 1: not needed → phase 4 directly (no drop, yield, discard or build). Needed → phase 2. Keep a separate rebuild-in-place test (`scene_backgroundExists()`) for C5. |
+| F2 | Medium | `menu.c:14911` → `menu_handleLoadSaveKnobDelta()` | All Load/Save pots bypass the busy gate that the encoder applies (12.3 item 2). The most probable freeze route. | Apply the encoder's gate at the top of `menu_handleLoadSaveKnobDelta()`: while `menu_storageBusy || preset_getStatus() != PRESET_IDLE`, drop the delta, except pot 2 on the Load-number field under the same conditions as `allow_load_number_scroll` in `menu_parseEncoder()`. Pot behaviour is otherwise unchanged (S14). DEV trace one record per dropped burst. |
+| F3 | Medium | `menu.c:8012`, `7759`, `menu_bankLoadPreviewComplete()` | Requesters overwrite another owner's `menu_storageBusy` on refusal; the preview completion clears it unconditionally (12.3 item 3). | A refused request must not write `menu_storageBusy` unless it set it from 0 itself (capture `was_busy` first), or refuse early when `menu_storageBusy` is already set. Completions clear only the busy flag they own. |
+| F4 | Medium | `filesystem.c:16157-16311` probe | Unbounded waits; no stall observer (12.3 item 5). | Case 18: `n == 0 && afatfs_feof(op_file)` → close, content unknown (bit 0). Cases 12/16: an open refusal counts as a failed child after a bounded retry count. Add the `filesystem_pollPhaseStall()` observer to the scan op, as other ops have, with a named error code so a stall ends DONE/ERROR instead of holding the facade. |
+| F5 | Medium | Boot #053402–#053403 | The latest boot emptied **Scene 2** as Case 3: Kit row 18 ("Barf") was refreshed with direct source 000 and the narrow Kit load failed, although `Kit/000 Barf` exists. A Kit Load into Scene 2 had committed at tick 45929 in the previous session (#052553–#052947). No earlier session on this card has a Case 3. **Not yet explained**; possibly S082-related (boot reader changes B3.10). | Reproduce: Kit Load into a non-active Scene, wait for the AutoSave drain, copy `.hcnames` + `.hcprms*` **before** rebooting, reboot, then compare. Check `filesystem_bootReaderNarrowLoadKit()` against the new `filesystem_bootReaderEvaluateScene()` dispatch and the S082 changes in `filesystem_bootHcnamesAuthoritativeLoad()`. |
+| F6 | Low | `menu.c:15460-15478` | Deferred retries are re-posted to the top-level request even when the deferral came from nested Instrument entry (12.3 item 4; pre-existing). | Dispatch nested-Instrument deferrals to `menu_requestInstrumentEntryNames()` when the entry is incomplete (no valid scratch / temp / typed index), and to the pool request otherwise. |
+| F7 | Low | `presetManager.c:3476` `preset_requestBackgroundBankLoad()` | Replace is inferred as `empty_mask != 0 || act_mask == 0xFFFF`, so a Merge in which all 16 source Scenes have content and are selected becomes a Replace (AutoSave discard instead of a whole-Bank re-mark; a vanished child is emptied instead of kept). | Pass the mode explicitly from Menu (an origin/mode flags argument). |
+| F8 | Low | B1.6 trace (`filesystem.c` case 11) | The preview record carries the masks but not the elapsed time, so R1 (preview duration on slow/fast cards) cannot be measured from the trace. | Record the start tick at phase 0 and put the elapsed ms in `flags` (saturated) or in a second record. |
+
+The rest of the reviewed diff matches the schedule:
+- A1: pots 2–4 coalesced; BAR2 no longer blanks.
+- A2: `chg` state, commit, clamp, apply-time finalisation (moved to
+  `menu_finishInstrumentApplySession()`, as the log says).
+- B1 probe: handle use is balanced on every path; the scratch is cleared
+  per start in `filesystem_start()`.
+- C4 32-bit fan-out.
+- C9 gates.
+
+The Appendix A audit rows were not re-verified one by one in this review.
+
+### 12.5 Recommended order
+
+1. **F1**: functional bug on every Bank Load.
+2. **F2 + F3**: the freeze class.
+3. **F4**: removes the silent facade-hang route.
+4. **F5**: investigate with the capture protocol below. It can lose a
+   Scene's contents at boot.
+5. F6–F8.
+
+### 12.6 Reproduction and capture protocol for the freeze
+
+1. Build with `DEV_LOGGING_IWDG 1` for this test only (`config.h:200`). A
+   main-loop hang then resets and leaves the `.devwdg_noinit` capsule in
+   `/bootlog.bin`; a facade stall does not reset (`filesystem_tick()` keeps
+   feeding), so F4's stall observer is what records that case.
+2. Make AutoSave dirty: edit any parameter (or use a first boot after
+   flashing), leave Load/Save, and wait for the `S` arm.
+3. Enter Load/Save **after** the writer deadline, while the drain runs (about
+   5–8 s after the edit).
+4. Turn pot 1 continuously, fast, from Kit through Scene, Bank, Pattern and
+   Samples into the Instrument Load entries and back, especially while the
+   Bank index and preview are loading.
+5. On a freeze, wait 10 s, power off, and copy the card. Decode
+   `asavetrc.bin` and `bootlog.bin`.
+6. With F2 applied, the same sweep must show the pot deltas dropped (DEV
+   trace) and no freeze. With F4 applied, a forced short `.pat` in a Bank
+   child must end the preview with an error code instead of a hang.
+
+**Status:** the freeze is **unresolved and not reproduced**; F1–F8 are
+**open**; nothing in this section has been hardware-verified.
+
+---
+
+## 13. Review fixes and Scene 2 evidence instrumentation (2026-10-18)
+
+*Applied to the working tree after §12. User context for F5: the Scene 2
+invalidation followed a **rapid spin test**, turning all four endless pots and
+the main encoder fast at the same time, on Scene 2. That means Kit Loads (Kit
+Load live-loads on every slot change) interleaved with repeated Load/Save type
+changes.*
+
+### 13.1 Fixes applied
+
+| Id | File : anchor | Change |
+|----|---------------|--------|
+| F1 | `presetManager.c` `preset_tickBackgroundBankLoad()` phases 1/3; `PM_BG_REBUILD` renamed `PM_BG_NEEDED` | Phase 1: Scene 17 needed → phase 2 (drop/yield/discard → build → switch); not needed → **phase 4 directly** (ordinary two-mask Bank Load; no copy/clear drop, no AutoSave yield or discard, no Scene 17). Phase 3 rebuilds in place only when Scene 17 already exists (`scene_backgroundExists()`). A stopped load (D14) and a Merge that keeps every played Scene (D25) no longer change the user's Scene. |
+| F7 | `presetManager.h` `PRESET_BANK_REQUEST_MERGE` (0x80, ORed into `origin`); `preset_requestBackgroundBankLoad()`; `menu.c` Bank OK | The mode is stated by Menu (`menu_bankMergeOn()`) instead of inferred from the masks; MIDI origin is always Replace (Q15). An all-16 Merge stays a Merge. |
+| F2 | `menu.c` `menu_handleLoadSaveKnobDelta()` (top) | The Load/Save pots obey the encoder's storage gate: while `menu_storageBusy` or Preset is not idle, every pot delta is dropped, except pot 2 on the Load-number field for Kit/KitMrp or nested Instrument Load (the same turn `menu_parseEncoder()` allows). Pot behaviour is otherwise unchanged (S14). |
+| F3 | `menu.c` `menu_requestLibraryIndexLoad()`, `menu_requestKitEntryNames()`, `menu_requestResidentNameScratch()` | A refused request restores `menu_storageBusy` to its prior value instead of forcing 0, so it no longer releases the gate of another in-flight request or Instrument apply. |
+| F4 | `filesystem.c` `filesystem_scanBankScenes_tick()` case 18; new stall observer at the top of the tick; `filesystem_requestScanBankScenes()` rearm; `AutosaveTrace.h` `AUTOSAVE_TRACE_PHASE_STALL_SITE_BANK_PREVIEW` = 10 | A zero-byte read at EOF or with the filesystem not ready closes the `.pat` with no content bit (no longer waits forever). With `DEV_STALL_DETECTION`, 20,000 polls in one phase record an `X` stall, close the preview's handles, return to root and finish with error `BkPv`. |
+| F6 | `menu.c` deferred-selection dispatcher in `menu_pollPresetStatus()` | A deferral raised while nested Instrument Load/Save is open is re-posted through `menu_requestInstrumentEntryNames()` (except the existing pool-number retry), no longer through the top-level type's request. |
+| F8 | `filesystem.c` case 11 trace; `AutosaveTrace.h` `b` comment | The `b` record's `flags` byte now carries the elapsed preview time in 64 ms units (saturated at 255). |
+| F9 | `filesystem.c`: 7 HCNAMES request functions (`filesystem_requestLoadResidentInstrumentName`, `…UpdateResidentInstrumentNames`, `…LoadResidentKitName`, `…UpdateResidentKitNames`, `…LoadResidentSceneName`, `…CopyResidentNames`, `…UpdateResidentSceneNames`); rule documented in `filesystem_prepareResidentNamesCache()` | **New, from the Scene 2 analysis (13.3).** The register reset (`filesystem_prepareResidentNamesCache()`, which turns every non-dirty source into UNKNOWN while **keeping** the refreshed witness) now runs only **after** `filesystem_start()` accepts the operation. Before, a refused start left the reset applied with no read to restore it. |
+
+Not changed: F5 (root cause still open; evidence below).
+
+### 13.2 Evidence instrumentation added (DEV logging only)
+
+A new trace stage **`h` = `AUTOSAVE_TRACE_STAGE_HCNAMES_PROVENANCE`**
+(`AutosaveTrace.h`, `AUTOSAVE_TRACE_HCN_*` flags), plus one new boot-reader
+record:
+
+| Record | Producer | Fires when | value32 |
+|--------|----------|------------|---------|
+| `h` 0x01 REFRESHED_RESET | `filesystem_prepareResidentNamesCache()` | refreshed, non-dirty Scene/Kit/Instrument rows are about to become UNKNOWN | count, first row, current_op, op_phase |
+| `h` 0x02 WRITE_UNKNOWN_REFRESHED | `filesystem_formatResidentNameLine()` | a present Scene/Kit/Instrument row is **written to the card** as `?` + R (the durable Case-3 precursor) | row, current_op, op_phase |
+| `h` 0x03 KIT_SOURCE_STAGED | `filesystem_setResidentSource()` | a Kit row (17..32) source is staged | row, source |
+| `h` 0x04 REFRESH_ON_UNKNOWN | `filesystem_setResidentRefreshed()` | R is raised on a Scene/Kit/Instrument row whose source is UNKNOWN | row, current_op, op_phase |
+| `h` 0x05 KIT_LOAD_CONTEXT | Menu `PRESET_OP_KIT_LOAD` completion | a Kit Load completes after Menu left Load:[Kit]/[KitMrp] (or entered nested Instrument) | what, page, request mask |
+| `h` 0x06 POT_DROPPED | `menu_handleLoadSaveKnobDelta()` | first pot delta of a burst dropped by the F2 gate | knob, what, page, busy |
+| `Q` 0x08 Case-3 detail | `filesystem_bootReaderEvaluateScene()` | right after every Case-3 record | raw register word of the failing row (value, R bit 13, dirty bit 15) \| reason \<\<16 \| sub \<\<24 |
+
+Case-3 reasons come from the new `FS_BOOT_FAIL()` codes in the narrow Scene
+and Kit loaders:
+
+| Code | Meaning |
+|-----:|---------|
+| 1 | unresolvable source |
+| 2 | folder not entered |
+| 3 | `sceneset.scg` not opened |
+| 4 | `sceneset.scg` parse/finalize |
+| 5 | `kitset.kcg` parse/finalize |
+| 6 | Instrument member file (sub = slot) |
+| 7 | Scene storage missing |
+| 9 | other loader (sub = row index) |
+
+Notes:
+- The existing Case-3 record never carried the source: the decoder's
+  "source=0x0000" was always zero. The new record replaces that guess.
+- `tools/decode_devlogs.py` decodes all of the above, the `b` elapsed time
+  and stall site 10. It compiles and re-decodes `SD_CARD_082_P0/asavetrc.bin`
+  unchanged.
+
+### 13.3 Analysis: Scene 2 invalidation (F5)
+
+**Facts:**
+- The last boot (#053402/03) emptied Scene 2 because Kit row 18 failed to
+  resolve.
+- `Kit/000 Barf` and its `kitset.kcg` and six members are intact on the card.
+- In the previous session a Kit Load committed into Scene 2 at tick 45929.
+- That session shows the spin: bursts of refused Kit index requests
+  (#052380–#052385, six in 30 ms) and Instrument entries every ~11 ms.
+
+**Mechanism this points to (consistent with the evidence, not yet proven):**
+1. A `?` + R Kit row is exactly what makes boot empty a Scene (Case 3:
+   refreshed, unresolvable).
+2. A committed Kit Load stages the Kit row's source as **dirty**, which
+   survives a register reset. So the row must have lost its staged source
+   and kept R through a register image that was **reset but not fully
+   re-read** before a writer persisted it.
+3. Two routes produce such an image:
+   - **(a)** a refused HCNAMES request after its reset (fixed by F9);
+   - **(b)** pot-1 type changes during in-flight name reads, `.hctmp` saves
+     and Kit Loads, with the seven-name session ended and restarted under a
+     running Kit Load (made unreachable by F2's gate; the busy-owner loss
+     fixed by F3).
+
+   Rapid all-pot spinning on the Kit page is the condition that exercises
+   both.
+4. A third candidate cannot be excluded until the `h` records show the
+   writer: an AutoSave post-drain register publication using a partially
+   restored image.
+
+**What the new records will show on the next occurrence:**
+- `h` 0x02 names the operation (`current_op`/`op_phase`) that wrote row 18
+  as `?` + R.
+- `h` 0x01 or 0x04 just before it shows where R survived a reset.
+- `h` 0x03 shows the last staged Kit source.
+- `h` 0x05 shows whether the Kit Load completed out of context.
+- At the next boot, `Q` 0x08 shows the register word and failure reason
+  (reason 1 = unresolvable, i.e. the `?` + R route; reasons 2/5/6 = a real
+  folder/kitset/member failure, which would point elsewhere).
+
+### 13.4 Build results
+
+- `make all && make img`: no new warnings (only the existing unused-function
+  warnings in `filesystem.c`).
+- `text=590,528`, `data=416`, `bss=430,816`; flash payload 590,944 /
+  753,664 B (**162,720 B free**, +1,128 B over the previous image).
+- New static storage is all logging/diagnostic:
+  - `menu_loadSavePotDropBurst` 1 B (`DEV_MODE_LOGGING`);
+  - `op_bank_preview_start_tick` 2 B (`DEV_MODE_LOGGING`);
+  - `fs_boot_fail_reason`/`_sub` 2 B (`DEV_MODE_LOGGING`);
+  - preview stall observer 5 B (`DEV_STALL_DETECTION`, the same class as
+    the existing observers).
+
+  There is no production RAM change. The fixes F1–F3, F6, F7 and F9 add no
+  storage.
+- **Not hardware-tested.** No host test exists for these paths.
+
+### 13.5 Test protocol
+
+1. **F1:**
+   - stopped transport, Load:[Bank] OK → PERF still shows the same Scene; no
+     Scene 17; AutoSave arms afterwards;
+   - running, Merge that excludes the playing Scene → no Scene 17;
+   - running Replace → Scene 17 (D2–D5).
+2. **F2/F3:** spin all four pots and the encoder rapidly across every
+   Load/Save type and nested Instrument Load for ≥ 30 s, including during the
+   Bank preview and while an AutoSave drain runs at entry (§12.6).
+   - Expect no freeze; `h` 0x06 bursts in the trace; pots inert only while
+     storage is busy.
+3. **F4:** put a truncated `.pat` (< 1,952 B) in one Bank child → the
+   preview completes (that child unlit) or ends with `BkPv`; never a hang.
+4. **F5 capture:**
+   - repeat the Scene 2 spin (Kit page, all pots + encoder, active Scene 2);
+   - exit Load/Save, wait for the AutoSave drain (`T` record);
+   - **copy the card before rebooting** (`.hcnames`, `.hcprms1/2`,
+     `asavetrc.bin`);
+   - reboot, copy again;
+   - look for `h` 0x02/0x01/0x04 on rows 17..32 and `Q` 0x08 at boot.
+5. Regression: Kit Load/Save, Instrument Load (`kit` row, `chg`), Scene and
+   Bank Load/Save round trips (§10 B3 rows).
+
+**Status:**
+- F1, F2, F3, F4, F6, F7, F8 and F9 are applied, built, and **not
+  hardware-verified**.
+- F5 is **open**, with instrumentation in place.
+- The first-boot freeze is **not reproduced**; F2/F3/F4 address its most
+  probable routes.

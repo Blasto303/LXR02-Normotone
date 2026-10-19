@@ -810,3 +810,21 @@ The voice-edit mask is restored after the active Scene is set, ensuring the
 active-Scene-in-mask invariant holds at every step. Pattern restore happens
 last because it is independent of scalar state and has its own generation-
 based winner selection.
+S082 active Scene and edit masks:
+
+* `bankset.bcg` `active_scene` is legacy boot data. It is applied only by a
+  boot Bank load with no AutoSave record; a runtime Bank Load never applies it
+  and never changes the active or viewed Scene. A Bank Save writes the home
+  Scene while Scene 17 is active (17 has no Bank number).
+* Replace Load assigns the present mask (loaded Scenes set, emptied Scenes
+  clear, the active Scene always stays present). Replace Save never changes
+  resident presence. A Merge Load re-marks the whole resident Bank for
+  AutoSave; a Merge Save reads the slot's existing manifest to keep untouched
+  children mutually exclusive.
+* Voice edit masks stay mutually exclusive after a partial operation. A
+  loaded/written Scene takes its source/RAM entry restricted to the acted set
+  plus itself; an emptied/removed Scene resets to self and is removed from
+  every other entry; a kept Scene drops every Scene that was acted on. A
+  missing or malformed slot manifest counts as every untouched entry = self.
+* Scene 17's edit mask is itself only (bit 16 in the 32-bit fan-out helpers);
+  it is never part of a 16-bit resident Bank mask.

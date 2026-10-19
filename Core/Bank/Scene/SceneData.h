@@ -22,6 +22,8 @@
  * display Scene membership.
  */
 #define SCENE_COUNT 16u
+#define SCENE_BACKGROUND_INDEX 16u
+#define SCENE_SLOT_TOTAL       17u
 
 /*
  * Fixed-width resident object display names.
@@ -375,6 +377,14 @@ uint8_t scene_getActiveIndex(void);
  */
 uint8_t scene_selectActive(uint8_t scene_index);
 /*
+ * Scene 17 background Scene accessors (S082 P1).
+ */
+uint8_t scene_backgroundExists(void);
+uint8_t scene_backgroundHomeIndex(void);
+uint8_t scene_playableIndexValid(uint8_t scene_index);
+void scene_backgroundBegin(uint8_t home_index);
+void scene_backgroundRelease(void);
+/*
  * Borrow a mutable instrument slot from a Scene's embedded Kit.
  *
  * Inputs: Scene index and zero-based instrument slot. Output: pointer to the
@@ -646,6 +656,14 @@ uint8_t scene_commitSettings(uint8_t scene_index, const scene_settings_t *src);
  * clearOps.c.
  */
 void scene_resetKitToDefaults(uint8_t scene_index);
+/*
+ * Reset one resident Scene's retained data to the empty Scene (S082 B3).
+ *
+ * What: settings, Kit (default types) and Effect are reset; Pattern, HCNAMES,
+ * present bit and edit masks belong to their owners (caller).
+ * Accessors: filesystem_bootReaderEmptyScene(), filesystem_bankEmptyScenes().
+ */
+void scene_resetResidentToEmpty(uint8_t scene_index);
 
 /*
  * Replace one Scene's whole Kit (S075, `copy kit` and `copy scene`).

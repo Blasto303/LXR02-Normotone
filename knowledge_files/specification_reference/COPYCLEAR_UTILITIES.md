@@ -1285,3 +1285,22 @@ Decision tags in comments (all recorded in `075_SESSION_HANDOFF_LOG.md`):
 | D1–D5 | trace decisions (log §8.2) |
 | F2-A … F2-H, F2-Q1 … F2-Q9, R2-1 … R2-3 | F2 follow-up (log §10) |
 | F3 Q1, Q2, P1 | automation priority (log §11.4) |
+## S082 Scene 17 (background Bank load)
+
+* Scene 17 is a copy/clear source and a non-overlapping destination. Its
+  Pattern data is reached through `pat_regionFor()`; Scene-child edits fan out
+  with `bank_sceneFanoutMask32()` (bit 16 = Scene 17 itself only).
+* An overlapping paste needs the shared background-region snapshot, which
+  Scene 17 owns. While Scene 17 exists such a paste is refused with the
+  existing copy/clear refusal display and trace reason
+  `AUTOSAVE_TRACE_CC_DROP_SCENE17`; non-overlapping pastes still run.
+* A Kit copy into Scene 17 commits the Kit image but does not set a Bank
+  present bit and does not mark AutoSave (17 is never a Bank child).
+* `clear scene` keeps its existing per-field commit path and never targets
+  Scene 17.
+* A MIDI-origin Bank load (`buttonHandler_enterLoadSaveForBackgroundLoad()`)
+  ends an open COPY/CLEAR session with nothing applied: latched surfaces are
+  closed and the session is ended before the Load/Save mode switch. Queued
+  copy/clear jobs are dropped by every Bank load (Menu and MIDI), because
+  phase 2 of `preset_tickBackgroundBankLoad()` waits for card idle, which
+  includes the running job (S082 P1 D12, R6).

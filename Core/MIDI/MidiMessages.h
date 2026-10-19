@@ -91,6 +91,11 @@ typedef struct MidiStruct {
 //-----------------------------------------------------------
 // CCs (2nd byte controller number)
 //#define CC_BANK_CHANGE		0x00 //-> see CC enum
+/*
+ * Bank Select LSB (CC32). With CC_BANK_CHANGE (CC0) it forms a MIDI Bank
+ * Change; both are dropped while a Bank load is in flight (S082 P1 D13).
+ */
+#define CC_BANK_SELECT_LSB  0x20u
 #define CC_MOD_WHEEL		0x01
 #define CC_ALL_SOUND_OFF	0x78
 #define CC_ALL_NOTES_OFF	0x7B

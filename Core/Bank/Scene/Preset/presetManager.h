@@ -170,22 +170,89 @@ uint8_t preset_loadKitForScenes(uint16_t presetNr, uint16_t scene_mask);
  */
 uint8_t preset_loadSceneForScenes(uint16_t presetNr, uint16_t scene_mask);
 /*
- * Load and save root Bank folders.
+ * Load and save root Bank folders with explicit outcome masks (S082 B3).
  *
- * Bank Load validates bankset.bcg and may load one Bank-local two-digit Scene
- * child into the selected resident Scene mask. Empty Banks complete as
- * PRESET_OP_BANK_LOAD with no child payload; callers then run
- * preset_loadFirstAvailableSceneOrKit() for the required fallback chain.
+ * preset_loadBank(): act_mask = Scenes loaded from their Bank-local child;
+ * empty_mask = Scenes reset to the empty Scene (Replace). Scenes in neither
+ * mask are kept (Merge). PRESET_BANK_LOAD_BOOT (boot only) also applies the
+ * manifest's active_scene and realigns playback; a runtime load never changes
+ * the active or viewed Scene (S9-S11).
+ * preset_saveBank(): act_mask = resident Scenes written to their child;
+ * empty_mask = children removed from the slot; others untouched.
+ * Inputs: root slot, masks, flags/force. Outputs: accepted/refused; completion
+ * through PRESET_OP_BANK_LOAD / PRESET_OP_BANK_SAVE. PRESET_BANK_LOAD_REPLACE
+ * marks a runtime Replace even when every Scene is selected (empty_mask = 0).
+ * Accessors: Menu Bank OK, main.c boot, preset_requestBackgroundBankLoad().
+ * Affiliates: filesystem_requestLoadBank(), filesystem_requestSaveBank().
  */
+#define PRESET_BANK_LOAD_BOOT     0x01u
+#define PRESET_BANK_LOAD_REPLACE  0x02u
+uint8_t preset_loadBank(uint16_t presetNr, uint16_t act_mask,
+                        uint16_t empty_mask, uint8_t flags);
+uint8_t preset_saveBank(uint16_t presetNr, uint16_t act_mask,
+                        uint16_t empty_mask);
 /*
- * Bank requests use settings.cfg only for the boot restore slot.  Successful
- * Bank loads publish their own HCNAMES Bank/child provenance through the
- * filesystem close gate; neither this interface nor settings.cfg owns Scene
- * source state.
+ * Build or rebuild Scene 17 from what is playing (S082 P1 D2-D4, D9, D19).
+ *
+ * What: copies the active Scene's Scene-level state and, per track, the
+ * Pattern track and voice slot from the track's played Scene into the
+ * background Scene. A rebuild in place copies only the tracks whose played
+ * resident Scene the load replaces (D31); Scene 17's Scene-level state and
+ * every other track stay.
+ * Inputs: rebuild flag; replaced mask (act | empty) selects rebuild
+ * candidates (D31). Outputs: Scene 17 state and name capture; copied-track
+ * mask. Accessors: preset_tickBackgroundBankLoad() phase 3.
  */
-uint8_t preset_loadBank(uint16_t presetNr, uint16_t scene_mask);
-uint8_t preset_saveBank(uint16_t presetNr, uint16_t scene_mask,
-                        uint8_t force_save);
+uint8_t preset_buildBackgroundScene(uint8_t rebuild_in_place,
+                                    uint16_t replaced_mask);
+/*
+ * Background Bank Load orchestration (S082 P1 §4, D1-D27).
+ *
+ * What: accepts a Bank Load immediately, builds and switches to Scene 17 only
+ * when a played Scene would be replaced, then runs the ordinary two-mask Bank
+ * Load. preset_tickBackgroundBankLoad() advances one bounded phase per Menu
+ * poll. preset_backgroundBankLoadRunning() tells MIDI/S083 to defer.
+ * Inputs: slot, act/empty masks, origin (MENU or MIDI).
+ * Outputs: accepted/refused; completion through PRESET_OP_BANK_LOAD.
+ * Accessors: Menu Bank OK, S083 MIDI CC0, menu_pollPresetStatus().
+ * Affiliates: preset_buildBackgroundScene(), seq_switchToBackgroundScene(),
+ * ccSvc_dropQueued(), filesystem_setAutosaveYield().
+ */
+#define PRESET_BANK_ORIGIN_MENU 0u
+#define PRESET_BANK_ORIGIN_MIDI 1u
+/*
+ * Explicit Merge request bit, ORed into `origin` (S082 review F7).
+ *
+ * What: marks the request as a Merge; without it the request is a Replace.
+ * Why: the mode was inferred from the masks, so a Merge whose act mask is all
+ * 16 Scenes became a Replace (AutoSave discard instead of the Merge whole-Bank
+ * re-mark; a vanished child emptied instead of kept). The Menu knows the mode
+ * and now states it. MIDI CC0 is always Replace (Q15) and never sets it.
+ * Inputs: Menu Bank OK. Outputs: PM_BG_REPLACE in preset_requestBackgroundBankLoad().
+ */
+#define PRESET_BANK_REQUEST_MERGE 0x80u
+uint8_t preset_requestBackgroundBankLoad(uint16_t slot, uint16_t act_mask,
+                                         uint16_t empty_mask, uint8_t origin);
+uint8_t preset_backgroundBankLoadRunning(void);
+void preset_tickBackgroundBankLoad(void);
+/*
+ * Background Bank load result codes (S082 P1 D34).
+ * What: NONE (nothing new), DONE, FAILED; PRESET_BG_RESULT_MIDI is ORed in
+ * when the load had MIDI origin.
+ * Accessors: preset_takeBackgroundBankLoadResult(); S083 CC0 TX.
+ */
+#define PRESET_BG_RESULT_NONE    0x00u
+#define PRESET_BG_RESULT_DONE    0x01u
+#define PRESET_BG_RESULT_FAILED  0x02u
+#define PRESET_BG_RESULT_CODE    0x03u
+#define PRESET_BG_RESULT_MIDI    0x80u
+/*
+ * Read and clear the last background Bank load result (S082 P1 D34).
+ * Inputs: none. Outputs: PRESET_BG_RESULT_* | optional _MIDI; NONE when no
+ * load finished since the last read.
+ * Accessors: S083 MIDI service (CC0 TX).
+ */
+uint8_t preset_takeBackgroundBankLoadResult(void);
 uint8_t preset_completedBankLoadedScene(void);
 uint16_t preset_bankLoadFailedSceneMask(void);
 uint8_t preset_loadFirstAvailableSceneOrKit(void);
@@ -240,6 +307,7 @@ void    preset_applyLoadedName(void);
  *
  * browser_index is 16-bit because the single cache exposes rows 0..999; using
  * uint8_t here would wrap selection at row 255 before filesystem validation.
+ * S082 P1 R1: destination_scene >= SCENE_COUNT is rejected (returns 0).
  */
 uint8_t preset_loadInstrument(uint8_t destination_scene,
                               uint8_t destination_slot,
@@ -269,11 +337,15 @@ uint8_t preset_loadInstrumentForScenes(uint16_t destination_scene_mask,
  * filesystem temp APIs and Menu's one nine-byte kit-name lifetime.
  */
 uint8_t preset_saveInstrumentTemp(uint8_t source_scene, uint8_t source_slot);
+/*
+ * S082 P1 R1: destination_scene >= SCENE_COUNT is rejected (returns 0).
+ */
 uint8_t preset_loadInstrumentTemp(uint8_t destination_scene,
                                   uint8_t destination_slot,
                                   instrument_type_t type);
 /* Save/load only the current Morphable Morph endpoints for the reversible
- * InstrumentMrp `kit` row. */
+ * InstrumentMrp `kit` row.
+ * S082 P1 R1: destination_scene >= SCENE_COUNT is rejected (returns 0). */
 uint8_t preset_saveInstrumentMorphTemp(uint8_t source_scene,
                                        uint8_t source_slot);
 uint8_t preset_loadInstrumentMorphTemp(uint8_t destination_scene,
@@ -308,6 +380,7 @@ uint8_t preset_saveInstrumentMorph(uint8_t source_scene,
  * slot's currently loaded type. Output: the file is parsed through the normal
  * Instrument loader, then only same-type morphable normal endpoint values are
  * copied into the resident morph image. Type mismatches are rejected/no-change.
+ * S082 P1 R1: destination_scene >= SCENE_COUNT is rejected (returns 0).
  */
 uint8_t preset_loadInstrumentMorph(uint8_t destination_scene,
                                    uint8_t destination_slot,
