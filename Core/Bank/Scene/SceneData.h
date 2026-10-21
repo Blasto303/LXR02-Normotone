@@ -494,15 +494,15 @@ void scene_setVoiceFxSendMorph(uint8_t scene_index, uint8_t slot,
                                uint8_t amount);
 uint8_t scene_getVoiceFxSendMorph(uint8_t scene_index, uint8_t slot);
 /*
- * Largest stored fader mode (S074): 0 pre, 1 pst, 2 fx, 3 xfd.
+ * Largest stored fader mode: 0 pre, 1 pst, 2 fx, 3 xfd (S074), 4 d/w.
  *
  * What: the single domain limit for fader_setting[]. The SceneData setter
  * and getter, Preset's setter, the sceneset.scg parser and the Menu clamp
- * all use it. mixer.c asserts that it equals MIXER_FADER_XFD, so SceneData
+ * all use it. mixer.c asserts that it equals MIXER_FADER_DW, so SceneData
  * stays free of mixer includes while the two cannot drift. A future mode
  * raises this value and adds a mixer branch and a Menu label.
  */
-#define SCENE_FADER_SETTING_MAX 3u
+#define SCENE_FADER_SETTING_MAX 4u
 void scene_setVoiceFaderSetting(uint8_t scene_index, uint8_t slot,
                                 uint8_t mode);
 uint8_t scene_getVoiceFaderSetting(uint8_t scene_index, uint8_t slot);

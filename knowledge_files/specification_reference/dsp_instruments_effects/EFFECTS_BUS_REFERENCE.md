@@ -145,6 +145,7 @@ FX-send step override. The fader never changes the stored send.
 | 1 | `pst` | vol × fader | send |
 | 2 | `fx` | vol | send × fader |
 | 3 | `xfd` (S074) | vol × fader | send × fader′, the mirrored taper `taper(1 − x)` |
+| 4 | `d/w` | vol × fader × √(1 − w) | vol × fader × √w, with w = send / 127 |
 
 - **`xfd`** crossfades the voice between the FX bus (fader at the bottom:
   full send, no dry signal) and its normal output (top: normal dry, no send).
@@ -152,8 +153,14 @@ FX-send step override. The fader never changes the stored send.
   Both taps are −16.4 dB at centre (log taper on each side). The mirrored
   gain is `adc_sliderGainMirrored()` (one division); the DSP details are in
   `EFFECTS_MIXER_DSP_REFERENCE.md` §3.2.
-- Storage: `fader_setting[slot]` 0..`SCENE_FADER_SETTING_MAX` (3). Firmware
-  older than S074 rejects a Scene file containing `3`.
+- **`d/w`** turns the voice's FX send into a per-voice dry/wet amount with an
+  equal-power law: 0 is fully dry, 127 fully wet (no dry signal). vol and the
+  fader scale both taps, so with a 100 % wet type at unity return (`dvb`) the
+  voice keeps its level at any setting. Cost: two `sqrtf` per `d/w` slot per
+  block.
+- Storage: `fader_setting[slot]` 0..`SCENE_FADER_SETTING_MAX` (4). Firmware
+  older than S074 rejects a Scene file containing `3`; firmware without
+  `d/w` rejects one containing `4`.
 - There is no bus mute; track mutes stop triggers and automation, so tails
   ring out.
 - The DTCM cost is the bus (256 B) plus ramp state (32 B).
@@ -205,6 +212,7 @@ future, tokens never change meaning.
 | 0 | `off` / `Off␣␣` / `Off` | none | 3 | — | default / none | 0 | 0 |
 | 1 | `flt` / `StFlt` / `StFilter` | stereo in, stereo out | 7 | freq, reso, drive, type, vol, pan | default / none | 76 B (two filter states) | 0 |
 | 2 | `cbt` / `CrmBt` / `CrumpBit` | stereo in, stereo out | 11 | bof, biv, mix, fbk, rte, snc, vol, pan, dpn | custom layout; `select`, `render_leds`, `paint_row0`, `format_value3`, flag `OWNS_SELECT_LEDS` | 56 B | 70,592 B |
+| 3 | `dvb` / `DlyVb` / `DlyVerb` | stereo in, stereo out, 100 % wet | 19 | div, fbk, mdl, stm, wid, lpf, hpf, drv, mod, age, dlv, rvl, rdc, rdp, vol | default layout; `format_value3` only | 28 B | min 49,664 B; uses the whole share |
 
 `effects_runtime_t` is a union of every runtime struct and is **76 B**
 (StereoFilter is the largest). `_Static_assert`s check each member against
@@ -892,6 +900,39 @@ No other file needs changing: storage, AutoSave, Menu, automation and LFO are
 all registry-driven.
 
 ---
+
+## 14A. DlyVerb (`dvb`)
+
+A tempo-synced character delay into a Dattorro plate, modelled on the
+delay/reverb combination of a Eurorack character delay. Source:
+`Core/DSP/Effects/DlyVerb/`.
+
+- **Half rate.** Everything runs at 22,054 Hz between a 9 kHz Butterworth
+  decimator and a linear + 9 kHz interpolator. This halves CPU and the bytes
+  per second of delay. The wet bandwidth is about 9 kHz.
+- **Share layout.** 256 B state, a 16,384-sample int16 ring holding every
+  plate line (paper lengths × 0.72), then two int16 delay rings sharing the
+  rest: 23,392 samples (1.06 s) each with the whole arena, 10,144 (0.46 s)
+  at the minimum share. A division longer than the ring is halved until it
+  fits, so it stays on the beat. Seating clears the state and the plate ring
+  and mutes the delay rings through a fill counter (never adopts).
+- **Rows** (SELECT 2..5 in order): `div` (14 musical StepScale stops, 1/64..
+  1/2, always synced), `fbk` (0..1.05), `dlv` delay level, `rvl` reverb
+  level; `mdl` (`dig` crossfades two taps on a time change, `bbd` glides fast
+  with clock-limited bandwidth and gentle saturation, `tap` glides slowly with
+  wow/flutter and full saturation), `stm` (`str`, `png` ping-pong, `wid`
+  right side up to a third longer), `wid`, `drv`; `lpf`, `hpf` (one-pole, in
+  the echo path), `mod` depth (up to 4 ms), `mrt` rate (0.05..8 Hz); `age`
+  (hiss and crackle inside the loop), `rdc` decay, `rdp` damping, `rrt`
+  (`par` plate on the driven input, `ser` plate on the echoes, `fbk` plate on
+  the echoes and half its output back into the loop).
+- **Safety.** The plate cross-feed is soft-clipped and the wet sum passes a
+  gentle limiter (ceiling 1.33), so feedback 127 self-oscillates but stays
+  bounded.
+- **Cost.** About 770 instructions per half-rate sample in the linked loop
+  (≈385 per output frame, est. 8–12 % of 4,897 cycles). Measure on the
+  worst-case Scene with the `cpu` widget.
+- **Dry/wet** is per voice: set the voice's fader mode to `d/w` (§3).
 
 ## 15. Pitfalls
 

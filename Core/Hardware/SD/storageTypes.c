@@ -771,7 +771,7 @@ storage_status_t storage_scenesetParseLine(
          * Parse retained per-voice fader modes.
          *
          * Inputs: six comma-separated values in the
-         * 0..SCENE_FADER_SETTING_MAX domain (0..3; mixer.h MIXER_FADER_*,
+         * 0..SCENE_FADER_SETTING_MAX domain (0..4; mixer.h MIXER_FADER_*,
          * 3 = xfd since S074). Output: staged Scene settings; the mixer reads
          * the mode every block (Session 072 Step 5). A value above the
          * domain rejects the file, as before. Firmware older than S074

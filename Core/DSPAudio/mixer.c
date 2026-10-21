@@ -516,7 +516,7 @@ static void mixer_addVoiceInt16ToOutput(uint8_t dest,
  * mixer_calcNextSampleBlock().
  */
 /* The Scene domain limit and the last mixer mode must agree (S074). */
-_Static_assert(MIXER_FADER_XFD == SCENE_FADER_SETTING_MAX,
+_Static_assert(MIXER_FADER_DW == SCENE_FADER_SETTING_MAX,
 		"fader modes: SceneData domain and mixer modes differ");
 static void mixer_faderGains(uint8_t slot,
 		uint8_t scene_index,
@@ -551,6 +551,18 @@ static void mixer_faderGains(uint8_t slot,
 		 * Affiliates: adc_sliderGainMirrored(), MIXER_FADER_XFD.
 		 */
 		*send_gain = send * adc_sliderGainMirrored(fader);
+	} else if (mode == MIXER_FADER_DW) {
+		/*
+		 * d/w: the FX send is the voice's dry/wet amount. Equal power,
+		 * because the wet return (delay, reverb) is decorrelated from the
+		 * dry voice: the summed level stays constant across the range. vol
+		 * and the fader scale both taps. Cost: two square roots per d/w
+		 * slot per block. Affiliates: MIXER_FADER_DW.
+		 */
+		const float level = volume * fader;
+
+		*mix_gain = level * sqrtf(1.0f - send);
+		*send_gain = level * sqrtf(send);
 	}
 	/*
 	 * S079 P2 fix 4: fold the roll fill gate fade into both taps. The dry and

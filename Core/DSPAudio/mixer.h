@@ -73,9 +73,9 @@ enum
 };
 
 /*
- * Per-voice fader modes (Scene setting fader_setting[slot], 0..3; plan §8.3,
+ * Per-voice fader modes (Scene setting fader_setting[slot], 0..4; plan §8.3,
  * user rule A24). Values match the stored byte and the Menu labels
- * (menu_sceneSettingFaderName: pre / pst / fx / xfd). S074 adds xfd, a dry ↔
+ * (menu_sceneSettingFaderName: pre / pst / fx / xfd / d/w). S074 adds xfd, a dry ↔
  * FX crossfade with the same logarithmic taper mirrored around the fader.
  *
  * The voice signal s (decimated, pre-volume) feeds two parallel taps:
@@ -88,6 +88,12 @@ enum
  * XFD : F_mix = fader, F_send = fader' (mirrored taper; bottom is FX send
  *                                       only at full send, top is dry
  *                                       only at vol)
+ * DW  : the stored FX Send becomes a per-voice dry/wet amount w = send/127
+ *       with an equal-power law: mix = s x vol x fader x sqrt(1 - w),
+ *       send = s x vol x fader x sqrt(w). 0 is fully dry, 127 fully wet
+ *       (no dry signal), and vol and the fader scale both taps, so the
+ *       voice level is the same at any setting for a 100 % wet Effect at
+ *       unity return (DlyVerb).
  * The fader never changes the stored FX Send parameter. Consumer:
  * mixer_calcNextSampleBlock(). Affiliates: SceneData fader_setting,
  * presetManager fader/send setters, Menu VOICE mix cells.
@@ -96,6 +102,7 @@ enum
 #define MIXER_FADER_POST  1u
 #define MIXER_FADER_FX    2u
 #define MIXER_FADER_XFD   3u
+#define MIXER_FADER_DW    4u
 
 void mixer_init();
 void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2);
