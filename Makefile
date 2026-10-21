@@ -41,6 +41,7 @@ CFLAGS  = $(MCU) -O2 -flto -Wall -Wextra -std=gnu11 \
           -ICore/DSP/Effects/CrumpBit \
           -ICore/DSP/Effects/DlyVerb \
           -ICore/DSP/Instruments/PlaitsKick \
+          -ICore/DSP/Instruments/PlaitsSnare \
           -ICore/Bank/Scene \
           -ICore/Bank/Scene/Pattern \
           -ICore/Sequencer \
@@ -121,6 +122,7 @@ SRCS = \
   Core/DSP/Effects/CrumpBit/CrumpBitParameters.c \
   Core/DSP/Effects/DlyVerb/DlyVerbParameters.c \
   Core/DSP/Instruments/PlaitsKick/PlaitsKickParameters.c \
+  Core/DSP/Instruments/PlaitsSnare/PlaitsSnareParameters.c \
   Core/MIDI/FIFO.c \
   Core/MIDI/MidiRealtime.c \
   Core/MIDI/Uart.c \
@@ -153,6 +155,7 @@ DSP_SRCS = \
   Core/DSP/Effects/CrumpBit/CrumpBitEffect.c \
   Core/DSP/Effects/DlyVerb/DlyVerbEffect.c \
   Core/DSP/Instruments/PlaitsKick/PlaitsKickVoice.c \
+  Core/DSP/Instruments/PlaitsSnare/PlaitsSnareVoice.c \
   Core/DSPAudio/lfo.c \
   Core/DSPAudio/mixer.c \
   Core/DSPAudio/modulationNode.c \
@@ -228,6 +231,11 @@ $(BUILD)/Core/DSP/Effects/CrumpBit/CrumpBitEffect.o: Core/DSP/Effects/CrumpBit/C
 # Plaits kick DSP (C translation of Plaits' analog bass drum) runs with the
 # fast-math policy like the other voices; its descriptor table is -O2.
 $(BUILD)/Core/DSP/Instruments/PlaitsKick/PlaitsKickVoice.o: Core/DSP/Instruments/PlaitsKick/PlaitsKickVoice.c | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(CC) -c $(CFLAGS_DSP) $< -o $@
+
+# Plaits snare DSP (C translation of Plaits' analog snare drum), -Ofast.
+$(BUILD)/Core/DSP/Instruments/PlaitsSnare/PlaitsSnareVoice.o: Core/DSP/Instruments/PlaitsSnare/PlaitsSnareVoice.c | $(BUILD)
 	@mkdir -p $(dir $@)
 	$(CC) -c $(CFLAGS_DSP) $< -o $@
 

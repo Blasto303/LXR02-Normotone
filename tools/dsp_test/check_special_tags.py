@@ -18,6 +18,7 @@ TABLES = {
     'CYM': 'Core/DSP/Instruments/Cymbal/CymbalParameters.c',
     'HAT': 'Core/DSP/Instruments/HiHat/HiHatParameters.c',
     'PBD': 'Core/DSP/Instruments/PlaitsKick/PlaitsKickParameters.c',
+    'PSN': 'Core/DSP/Instruments/PlaitsSnare/PlaitsSnareParameters.c',
 }
 ROW = re.compile(r'^\s*(ROW[A-Z_]*)\("([^"]+)"(.*)\),\s*$')
 

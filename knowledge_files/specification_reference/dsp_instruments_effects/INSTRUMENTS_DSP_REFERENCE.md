@@ -125,6 +125,7 @@ tap is foreground-only, like the rest of the funnel.
   | Cymbal | `CymbalVoice` | 476 |
   | HiHat | `HiHatVoice` | 484 |
   | Plaits kick | `PlaitsKickVoice` | 284 |
+  | Plaits snare | `PlaitsSnareVoice` | 376 |
 
   Building blocks: `OscInfo` 72 B, `ResonantFilter` 36 B, `Lfo` 124 B,
   `ModulationNode` 44 B, `SlopeEg2` 28 B, `DecayEg` 12 B,
@@ -361,6 +362,27 @@ fused post-chain: amp EG ramp -> velocity gain -> distortion        --> buf
 - **Cost:** about 145 instructions and 5 `VDIV` per sample (est. ~4 %), the
   same order as Drum.
 - **Library:** `SD_CARD/Instrument/PlKick/*.pbd` (six presets).
+
+### 5.4b Plaits snare (`PlaitsSnareVoice.c`, Basic, token `psn`)
+
+A C translation of Plaits' analog snare (`AnalogSnareDrum`; Emilie Gillet,
+MIT; notice in `PlaitsSnareVoice.h`), then the shared LXR post-chain:
+
+```
+trigger pulse (1 ms) --> 5 shell band-passes (1, 2, 3.18, 4.16, 5.62 x f0)
+   Tone < 2/3: two modes (808); above: up to five; soft clip
+half-wave noise x decaying envelope --> band-pass at 16 x f0 (Snappy mix)
+noise + shell x (1 - snappy) --> x0.8 --> amp EG -> velocity -> distortion
+```
+
+- **Rows:** `snare_note`, `snare_fine`, `snare_snappy`, `snare_tone`,
+  `snare_decay` (Plaits Harmonics/Timbre/Morph), then the standard rows.
+- **Rate:** per-sample decay factors are raised to 48000/44108 and every Q
+  uses f0 as a fraction of 48 kHz. Host comparison with the original C++
+  (5 settings): RMS within 4 %, decay times within about 5 %.
+- **Cost:** coefficients are set once per block; about 165 instructions and
+  one `VDIV` per sample (est. 3.5–4 %).
+- **Library:** `SD_CARD/Instrument/PlSnare/*.psn` (six presets).
 
 ### 5.5 Where each engine's hot code runs
 
