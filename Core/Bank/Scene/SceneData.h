@@ -419,18 +419,19 @@ uint8_t scene_editLayoutMatches(uint8_t scene_a, uint8_t scene_b);
 /*
  * Store one track's MIDI channel setting.
  *
- * Inputs: Scene index, track index, and requested channel. Output: the channel
- * is clamped to the current 1..16 bridge domain and stored when coordinates
- * are valid. Future MIDI rework may extend this with an off sentinel.
+ * Inputs: Scene index, track index, and requested channel 0..16 (S083).
+ * Output: values above 16 clamp to 16 and valid coordinates store the byte;
+ * 0 means unassigned (`glb`, the track follows the global channel). A changed
+ * byte marks the track's AutoSave Scene cell.
  */
 void scene_setTrackMidiChannel(uint8_t scene_index, uint8_t track,
                                uint8_t channel);
 /*
  * Read one track's MIDI channel setting.
  *
- * Inputs: Scene index and track index. Output: stored valid channel, or the
- * track+1 fallback for unset/stale values, or 1 for invalid coordinates. This
- * keeps legacy boot defaults stable while storage moves under SceneData.
+ * Inputs: Scene index and track index. Output: the stored 1..16 channel, or 0
+ * when the track is unassigned (it follows G), the coordinates are invalid or
+ * the byte is out of range. The pre-S083 track+1 fallback is gone.
  */
 uint8_t scene_getTrackMidiChannel(uint8_t scene_index, uint8_t track);
 /*

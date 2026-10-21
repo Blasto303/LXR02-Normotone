@@ -35,7 +35,6 @@
 #include "menu.h"
 #include "CcNr2Text.h"
 #include "ParameterArray.h"
-#include "MidiParser.h"
 #include "sequencer.h"
 #include "modulationNode.h"
 #include "DrumVoice.h"
@@ -891,58 +890,6 @@ void preset_init(void)
     preset_ensureMorphInitialized();
 }
 
-void preset_applySoundParameter(uint16_t paramNr, uint8_t value,
-                                uint8_t recordAutomation)
-{
-    MidiMsg msg = {0};
-
-    /*
-     * Applies one sound parameter directly to stored preset state and DSP.
-     *
-     * Callers: Menu edits, morph interpolation, reset-lock restore, and loaded
-     * kit/performance apply. This replaces SET_P1/SET_P2/front-panel parser
-     * packing for sound parameters.
-     *
-     * Why it lives in Preset: parameter_values[] and the sound-engine CC
-     * application path are Preset/sound state. Menu decides what the user
-     * changed; Preset applies that change and optionally records automation.
-     *
-     * Inputs:
-     *   - paramNr: canonical sound parameter id, before any MIDI_CC packing.
-     *   - value: 0..127 menu/DSP value.
-     *   - recordAutomation: non-zero records this edit into the active Pattern
-     *     via Sequencer automation capture.
-     *
-     * Outputs: parameter_values[paramNr] is updated, midiParser_ccHandler()
-     * applies the value to the DSP voice objects, and seq_recordAutomation()
-     * records the edit when requested.
-     *
-     * Risk: param 127 remains forbidden because the legacy CC encoding maps it
-     * to CC0 and then midiParser_ccHandler() underflows while recovering the
-     * parameter id. Keeping that guard preserves old behavior until the DSP CC
-     * path is replaced with a true typed sound-parameter API.
-     */
-    if (paramNr == 127u)
-        return;
-    if (paramNr >= END_OF_SOUND_PARAMETERS)
-        return;
-
-    parameter_values[paramNr] = value;
-
-    if (paramNr < 128u) {
-        msg.status = MIDI_CC;
-        msg.data1 = (uint8_t)((paramNr + 1u) & 0x7fu);
-    } else {
-        msg.status = MIDI_CC2;
-        msg.data1 = (uint8_t)(paramNr - 128u);
-    }
-    msg.data2 = value;
-    midiParser_ccHandler(msg, 1);
-
-    /* Pattern automation was removed with Step storage; retain no edit copy. */
-    (void)recordAutomation;
-}
-
 static uint8_t preset_applyInstrumentRuntimeValueInternal(uint8_t scene_index,
                                                           instrument_param_id_t id,
                                                           instrument_param_value_t value,
@@ -1173,58 +1120,6 @@ uint8_t preset_setSupplementalParameter(uint8_t scene_index, uint8_t slot,
 {
     return preset_setSupplementalParameterInternal(
         scene_index, slot, descriptor_index, value, 0u);
-}
-
-/*
- * Enter one instrument parameter from external MIDI (S075 F3, user P1:
- * MIDI takes the lowest priority).
- *
- * What: stores `value` as the active Scene's Normal endpoint of one descriptor
- * and queues that voice for the Morph sweep. Nothing is written to the runtime
- * here: the sweep applies the new interpolation whenever it reaches the
- * parameter, and skips it while step automation holds it. Non-morphable
- * parameters go through preset_setSupplementalParameter(), the same path as a
- * menu edit.
- * Why: automation wins, then menu edits, then MIDI. A CC is an endpoint entry,
- * not a runtime override, so it can override neither automation nor the Morph
- * interpolation.
- * Inputs: slot 0..5, descriptor-local index for the active Scene's slot type,
- * and a value already clamped to the descriptor domain.
- * Output: 1 when stored/queued, 0 for an invalid slot/descriptor. Retention: a
- * changed byte marks its AutoSave Normal cell and clears the Scene card-clean
- * bit, like a menu edit. Active Scene only (no edit-mask fan-out).
- * Client: MidiParser.c midiParser_enterTaggedParameter(). Affiliates:
- * preset_storeInstrumentEndpoint(), presetMorph_requestVoice(),
- * seq_automationHoldsParameter().
- */
-uint8_t preset_setInstrumentParameterFromMidi(uint8_t slot,
-                                              uint8_t descriptor_index,
-                                              uint8_t value)
-{
-    const uint8_t scene_index = scene_getActiveIndex();
-    const kit_instrument_slot_t *instrument =
-        scene_instrumentSlotConst(scene_index, slot);
-    const ParamDescriptor *descriptor;
-
-    /*
-     * Contract in presetManager.h. Lowest priority: store and queue only.
-     * The sweep's guarded write (presetMorph_writeRuntimeBase()) decides when,
-     * and whether, the runtime changes.
-     */
-    if (!instrument)
-        return 0u;
-    descriptor = instrumentManager_descriptor(instrument->type,
-                                              descriptor_index);
-    if (!descriptor)
-        return 0u;
-    if (!(descriptor->flags & INSTRUMENT_PARAM_FLAG_MORPHABLE))
-        return preset_setSupplementalParameter(scene_index, slot,
-                                               descriptor_index, value);
-    preset_storeInstrumentEndpoint(scene_index, slot, descriptor_index,
-                                   INSTRUMENT_IMAGE_MAIN, value);
-    preset_ensureMorphInitialized();
-    presetMorph_requestVoice(scene_index, slot);
-    return 1u;
 }
 
 /*

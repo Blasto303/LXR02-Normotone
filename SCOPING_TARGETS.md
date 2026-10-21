@@ -590,7 +590,8 @@ Replace the remaining legacy target runtime path for descriptor-backed targets:
   descriptor-aware for direct descriptor targets, supplemental voice-local
   decimation, per-voice Morph Scene targets, and Scene Decimation.
 - Make `AutomationNode` descriptor-aware instead of emitting legacy MIDI CC/CC2
-  into `midiParser_ccHandler()`.
+  into the (now retired) legacy CC handler; new writes go through
+  `menu_commitTargetEdit()`.
 - Stop narrowing step automation destinations to `uint8_t`; preserve canonical
   descriptor IDs.
 - Make `preset_applyInstrumentRuntimeValueInternal()` honor automation
@@ -1232,7 +1233,9 @@ forward:**
 - `/Effect/` browser and Effect Load/Save item (A35);
 - ~~Scene copy/clear of the Effect and FX lock removal (A15)~~ — **done
   (S075, Phase 6 copy/clear; hardware verification pending);**
-- MIDI mapping of Effect parameters (A20);
+- ~~MIDI mapping of Effect parameters (A20)~~ — **done (S083): NRPN 448..510
+  and MIDI Learn address the Effect rows of the active type; a write is a
+  menu edit (R13);**
 - live record of FX moves (A22);
 - ~~track step-scale/shuffle playback (A10)~~ — **done (S078)**: Pattern
   tracks and the FX sequencer share the 128-position curve and Q8.8 DDA.
@@ -1437,7 +1440,7 @@ when formats and allocations are implemented.
 
 ## Phase 6 — MIDI, UI & Performance Workflow Cleanup
 
-**Location:** `Core/Menu/menu.c`, `Core/MIDI/MidiParser.c`,
+**Location:** `Core/Menu/menu.c`, `Core/MIDI/` (S083 modules),
 `Core/Hardware/frontPanel/buttonHandler.c`,
 `Core/Hardware/frontPanel/ledHandler.c`, `Core/DSPAudio/lfo.c`
 
@@ -1483,17 +1486,20 @@ automation `hold` reconciliation (§4.3a).
 
 ### 6.1 MIDI and External Control Cleanup
 
-`midi_MidiChannels[8]` already exists: one channel per voice plus one global
-channel. Follow-up work:
-
-- Add a `0` sentinel meaning MIDI input disabled for that voice or global slot.
-- Verify chromatic note handling on a voice's own channel.
-- Route CC1 global-channel Morph and per-voice-channel Morph through the
-  0..255 Morph conversion defined in Phase 3.
-- Decide how MIDI CC0/Bank MSB maps onto Bank/Scene/instrument loading once the
-  Phase 3 file operations are implemented.
-- Keep MIDI storage ownership aligned with Scene settings, not `kitset.kcg` or
-  instrument files.
+**Done in S083 (2026-10-21).** `Core/MIDI/` was rebuilt as single-role
+modules (MidiDefs, MidiBuffer, MidiDin, MidiIn, MidiTransport, MidiNoteMap,
+MidiNotes, MidiControl, MidiLearn, MidiProgram, MidiOut, MidiPitch); the
+legacy `MidiParser`/`Uart`/`FIFO`/`MidiRealtime`/`MidiMessages` files and the
+CC/CC2 map were removed. Implemented: G off and track `chn` unassigned (0),
+the consume-then-route dispatcher and the new MRT list, N1-N5 note mapping
+with the Q4 transmit-range rule, CC2/per-track overlay rolls, arrival-time
+record placement, Continue/SPP, PC 0..15 whole Scene and per-track, CC0
+background Bank load, NRPN over the 9-bit target space, CC1 on G and voice
+channels, the 128-entry type-tagged MIDI Learn table with `settings.cfg`
+lines, and note/parameter/PC/CC0 transmit with echo suppression. MIDI writes
+are menu edits (S083 Q1). Behaviour authority: `MIDI_SPEC.md`; module APIs:
+`MODULE_INTERCHANGE_SPEC.md`. Hardware verification is the S083 close-out
+matrix.
 
 ### 6.2 One-shot LFOs
 

@@ -117,12 +117,37 @@ uint8_t buttonHandler_getShift(void);
  * Accessors: menu_backgroundBankLoadUiBegin().
  */
 void buttonHandler_enterLoadSaveForBackgroundLoad(void);
-int8_t  buttonHandler_getArmedAutomationStep(void);
 void    buttonHandler_setRunStopState(uint8_t running);
 void    buttonHandler_showMuteLEDs(void);
 void    buttonHandler_muteVoice(uint8_t voice, uint8_t isMuted);
 /* S080 P2 Defect 11: clear the VOICE mute mirror after a bulk unmute. */
 void    buttonHandler_clearAllMutes(void);
+/*
+ * Overlay executor entry points for MIDI notes (S083 Q5, N6, C8).
+ *
+ * buttonHandler_overlayHeldBar(): 1/2 while the BAR </> overlay is active
+ * in PERF, else 0. MidiNotes gives an active BAR priority over CC2 (C-9);
+ * when the BAR overlay turns off, MIDI-held entries switch to the CC2
+ * overlay rather than stopping (S083 assessment F-3).
+ * buttonHandler_overlayMidiNoteOn(): start overlay `which` (1/2) on `track`
+ * at `internal` pitch; `midiNote` is remembered so its note-off ends a
+ * roll; ageUs is the arrival age for the first hit's record placement.
+ * buttonHandler_overlayMidiNoteOff(): end the roll held by `midiNote`
+ * (the resolved track first, then any track holding that note); a flam's
+ * main hit still plays.
+ * buttonHandler_overlayMidiActionChanged(): CC2 changed to `which`;
+ * re-configures MIDI-held entries unless a BAR overlay is active.
+ * Context: foreground. Accessor: MidiNotes.c. Affiliates: the per-track
+ * overlay table, LiveRecord.
+ */
+uint8_t buttonHandler_overlayHeldBar(void);
+void    buttonHandler_overlayMidiNoteOn(uint8_t track, uint8_t which,
+                                        uint8_t internal, uint8_t midiNote,
+                                        uint16_t ageUs);
+void    buttonHandler_overlayMidiNoteOff(uint8_t track, uint8_t midiNote);
+void    buttonHandler_overlayMidiActionChanged(uint8_t which);
+/* S083 C5: flash SHIFT/PLAY/REC while Learn is active; restore on off. */
+void    buttonHandler_setLearnLeds(uint8_t on);
 /*
  * S080 P2 Defect 4: SELECT index (0..7) of the PERF looper division while the
  * looper is held or engaged, else 0xFF. Client: menu_syncPerfSelectLed().
@@ -130,8 +155,5 @@ void    buttonHandler_clearAllMutes(void);
 uint8_t buttonHandler_loopSelectLed(void);
 
 extern uint8_t  buttonHandler_selectedStep;
-extern uint16_t buttonHandler_originalParameter;
-extern uint8_t  buttonHandler_originalValue;
-extern uint8_t  buttonHandler_resetLock;
 
 #endif

@@ -36,7 +36,8 @@
 #include "usbd_ioreq.h"
 #include "usbd_req.h"
 #include "usbd_desc.h"
-#include "MidiMessages.h"
+#include "MidiDefs.h"
+#include "config.h"
 
 typedef struct UsbMidiStruct
 {
@@ -52,8 +53,22 @@ typedef struct UsbMidiStruct
 #define NUM_SUB_BUFFERS									0x2	//double buffering
 
 
-#define USB_MIDI_INPUT_BUFFER_SIZE 	256
-#define USB_MIDI_INPUT_BUFFER_MASK	0xFF	/**< mask to wrap the read/wrt pointers*/
+/*
+ * USB-in message ring size (S083 Q13 (b)).
+ *
+ * What: entries of 6-byte MidiMsg, set in config.h. Why: Q13 halves the
+ * ring to 128 entries to carry the arrival stamp and keeps the size
+ * scalable: 256 x 8 B = 2,048 B before S083 (the old MidiMsg measured
+ * 8 B, its enum bitfield took an int container) -> 128 x 6 B = 768 B
+ * (S083 assessment D-1). The indices are uint8_t, so the size is a power of two
+ * up to 256. RAM: MIDI_USB_RX_RING_SIZE x 6 B SRAM1.
+ */
+#define USB_MIDI_INPUT_BUFFER_SIZE  MIDI_USB_RX_RING_SIZE
+#define USB_MIDI_INPUT_BUFFER_MASK  (USB_MIDI_INPUT_BUFFER_SIZE - 1u)
+#if (USB_MIDI_INPUT_BUFFER_SIZE > 256u) || \
+    ((USB_MIDI_INPUT_BUFFER_SIZE & USB_MIDI_INPUT_BUFFER_MASK) != 0u)
+#error "MIDI_USB_RX_RING_SIZE must be a power of two no larger than 256"
+#endif
 /*
 extern uint8_t  usb_MidiOutBuff [TOTAL_MIDI_BUF_SIZE * 2];
 extern uint8_t* usb_MidiOutWrPtr;
@@ -157,4 +172,3 @@ extern USBD_Class_cb_TypeDef  MIDI_cb;
 
 
 #endif /* USB_MIDI_CORE_H_ */
-

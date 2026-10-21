@@ -5799,10 +5799,261 @@ output, and hardware results per verification list.
 | Phase | Build (text / data / bss) | RAM as linked | Notes |
 |-------|---------------------------|---------------|-------|
 | baseline (S082 close) | 598,120 / 420 / 430,928 | — | |
-| A | | | |
-| B | | | |
-| C | | | |
-| D | | | |
-| E | | | |
-| F | | | |
-| G | | | |
+| A | 594,400 / 428 / 430,268 | — | Core/MIDI rebuilt (MidiDefs, MidiBuffer, MidiDin, MidiTransport, MidiIn, MidiOut, MidiPitch); old parser/FIFO/UART/realtime files removed; valueShaper.h moved to Core/DSPAudio; consume-then-route with the S082 drop filter kept; MRT/menu/settings/Scene channel changes applied. Flash headroom 158,836 B. bss −660 B vs baseline (legacy parser state released, new receive buffers added). Build and image PASS; hardware items await the user. |
+| B | 595,352 / 424 / 430,312 | +47 B vs A (overlay table 56 B − 9 B single slot, alignment included) | MidiNoteMap (N1–N5, TX inverse Q4), MidiNotes (single trigger, CC2, overlay dispatch), per-track overlay executor with panel/MIDI entry points, LiveRecord `age_us` placement. Host test `make -C tools/midi_test run` PASS (examples, N5, G off, 200,000 random settings). Flash headroom 157,888 B. Hardware matrix pending. |
+| C | 595,736 / 424 / 430,312 | +4 B (`seq_resumeTick`, R-C) inside the existing alignment | `seq_setRunningEx` with selectable realtime output, `seq_continueRunning`/`seq_setResumeTick`, `sync_midiContinue`, Continue handled separately from Start, SPP framed and applied while stopped and `snc`-selected. No LXR re-send for received transport (C-11). Flash headroom 157,504 B. Hardware items pending. |
+| D | 595,864 / 428 / 430,328 | +1 B origin flag (Q13) plus 3 B alignment/data | A1 queued-action fix (unavailable target skipped whole), PERF LED guard (C-5), `menu_perfModeSceneChangeFrom()` with origin, `seq_sceneChangeFromMidi` no-echo flag (cleared by chain fires), shared `seq_assignTracksToScene()` used by panel and MIDI, `MidiProgram` (PC whole Scene/per-track with availability, CC0 background Bank request). Flash headroom 157,372 B. Hardware items pending. |
+| E | 599,608 / 428 / 430,376 | +48 B (NRPN contexts 2 × 8 × 3 B, exact) | One shared commit path: `menu_cellCommitValueEx(panel)` with `menu_cellCommitValue()` panel wrapper; MIDI = `menu_commitTargetEdit()` (Normal image, fan-out, R12/R13, recording, target-ID repaint); `menu_commitGlobalMorphFromMidi()` (G-1, no recording); `menu_cellMidiTarget()`/`menu_targetVisible()`; track timing by target ID; `MidiControl` with NRPN contexts, CC1, CC2 and the channel rule; `preset_setInstrumentParameterFromMidi()` and `menu_clampInstrumentValue()` removed. Host test PASS. Flash headroom 153,628 B. Hardware items pending. |
+| F | 602,688 / 424 / 430,904 | +528 B (Learn table 512 B + 16 B state, alignment included) | `MidiLearn` (128 type-tagged rows, capture/replace/full/cancel, type matching, `learn=` parse/format), SHIFT+PLAY+REC gesture with SHIFT/PLAY/REC flashing, pot/encoder target selection without value change, `LRN`/`FUL` display, page/mode cancel, `settings.cfg` writer (`lines=24+N`) and load. Flash headroom 150,552 B. Hardware items pending. |
+| G | 603,984 / 424 / 430,896 | −8 B vs F (TX state filled existing alignment) | `MidiOut_trackTrigger()` through the inverse map (Q4: no TX outside the range), per-track PC TX (C-8), parameter TX (learned CC else NRPN, number cache, 10 ms throttle, 9 B FIFO check), CC0 on a successful Menu-origin Bank load only, no echo for MIDI-originated changes; preview/`def` play internal 63 (C-1). Flash headroom 149,256 B at that measurement. Hardware items pending. |
+| G+ (size fix) | 603,896 / 424 / 430,120 | −784 B vs G (measured after the fix) | Deviation from A-2: the planned `struct MidiBits` used an `enum MidiSource` bitfield plus `unsigned` fields, which GCC stores in 4 B, so `MidiMsg` measured 12 B and the USB ring would have been 1,536 B. `MidiBits` is now one byte of `uint8_t` bitfields (`_Static_assert` in `MidiIn.c`), giving the planned 6 B `MidiMsg` and a 768 B USB ring. All final numbers above are post-fix. |
+| H | 603,896 / 424 / 430,120 | — | Documents and memory updated (see the list below). No code change. |
+
+### 12.1 Deviations and findings while implementing
+
+- **A:** the new module set is exactly the planned files. The old receive
+  framer's `IGNORE` initial state is kept, so a stray data byte before any
+  status is discarded. `valueShaper.h` moved to `Core/DSPAudio/`; no include
+  edits were needed (`-ICore/DSPAudio` is already on the path). The old
+  fixed-point/legacy parser statics (`midiParser_originalCcValues[255]`,
+  `midi_NoteOverride[7]`, `midi_MidiChannels[8]`) are gone with the file.
+- **B:** the single-trigger path calls `seq_triggerVoice()` and then reports
+  the same hit to LiveRecord, so the trigger jack/TX and the record agree,
+  and the existing reset rule applies. Roll repeats pass `reset = 0`.
+  `MidiNoteMap` is table-free; the host test also exercises the Q4 inverse
+  rule on the §4.2 examples.
+- **C:** the SPP source test is the side-effect-free twin of the realtime
+  gate (Q11); it deliberately does not touch AUTO activity flags.
+- **D:** a chain fire clears the MIDI-origin bit, so a chain-raised change
+  does send its PC; the A1 queue fix skips the whole action (mute and Morph
+  included) for an unavailable target.
+- **E:** `menu_cellCommitValueEx()` keeps the live Morph-image decision only
+  for the flat sound ids that `menu_paramUsesMorphView()` admits; the MIDI
+  targets are static Scene/instrument/Effect cells and therefore always
+  commit the Normal image even when a panel Morph view is open. This is the
+  intended Q1 result and was verified by reading the commit path.
+- **F:** the `settings.cfg` writer has no `printf`; `midiLearn_append()`
+  builds each line by hand (the firmware still links no printf family). A
+  row whose names no longer resolve is written as a `#` comment so `lines=`
+  stays exact.
+- **G:** `midiOut_service()` is the sole consumer of the S082 one-shot Bank
+  result byte. A Menu-origin DONE sends CC0; a MIDI-origin or failed load
+  sends nothing. Parameter TX reserves 9 B of DIN room for a full NRPN.
+- **Verification run:** `make all`, `make img` and
+  `python3 tools/link_budget.py arm-none-eabi-nm build/lxr02.elf` pass;
+  `make -C tools/midi_test run` prints `PASS (0 failures)`. The A–G hardware
+  matrices remain to be reported by the user.
+
+---
+
+## 13. Assessment of the implementation (2026-10-21)
+
+*Written for the user and the implementer. Scope: the working tree on
+`dev-ph6-midi` after the S083 implementation (uncommitted on top of
+`f9aaeec`), checked against this schedule (§1–§11) and the plan
+(revision 5 + Q13). Method: clean rebuild of every MIDI object, the host
+test, linked symbol sizes (`arm-none-eabi-nm -S`), and a line-by-line read
+of all new `Core/MIDI/` modules and every changed caller (buttonHandler,
+menu, sequencer, clockSync, LiveRecord, filesystem, SceneData,
+storageTypes, USB, presetManager, main, Makefile, config).*
+
+### 13.1 Gates
+
+| Gate | Result |
+|------|--------|
+| `make all`, `make img` | PASS. No compiler warnings in project sources; the only warnings are the existing newlib syscall stubs (`_close`, `_lseek`, `_read`, `_write`) and the LTO serial-compilation note. |
+| Link | `text=603,896`, `data=424`, `bss=430,120`; flash 604,320 / 753,664 B (**149,344 B free**). ITCM 4,168 B; DTCM statics 4,472 B; FXBUF margin 3,712 B (unchanged). |
+| Host test `make -C tools/midi_test run` | `PASS (0 failures)` (§4.2 examples, N5, G off, 200,000 random settings, Q4 inverse). |
+| Static asserts | `sizeof(MidiMsg) == 6`, `sizeof(struct MidiBits) == 1` (`MidiIn.c`). |
+| Hardware | Not run (verification lists A-25, B-13, C-5, D-9, E-7, F-10, G-9 remain). |
+
+### 13.2 RAM as linked (SRAM1, static)
+
+| Item | Planned | Linked | Note |
+|------|--------:|-------:|------|
+| `midiLearn_table` | 512 | 512 | + count/state/target/deadline 6 B |
+| `bh_overlay` (per-track table) | 56 (R-A) | 56 | |
+| `midiControl_nrpn` | 48 | 48 | |
+| `midiOut_nrpnKey` + `_pending` + `_lastSendMs` | 8 | 8 | |
+| `midiOut_trackNote` + `_trackChannel` | 14 (R-B) | 14 | |
+| `midiDin_rx` (bytes + stamps) | 194 | 194 | |
+| `usb_MidiMessages` | 768 | 768 | |
+| `midiIn_dinMsg` | 6 (R-D) | 6 | |
+| `seq_resumeTick` | 4 (R-C) | 4 | |
+| `seq_sceneChangeFromMidi`, `midiNotes_action` | 1 + 1 | 1 + 1 | |
+
+Net `bss` versus the S082 close: **−808 B** (the plan expected about +220 B).
+The difference is the old USB ring: the pre-S083 `MidiMsg` was **8 B**,
+not 4 B (its `enum` bitfield takes an `int` container on this ABI;
+measured with the old struct definition on `arm-none-eabi-gcc -mcpu=cortex-m7`),
+so the old ring was 256 × 8 = **2,048 B** and Q13 (b) released 1,280 B,
+not 256 B. For the same reason R-D is −2 B (the old `midiMsg_tmp` was
+8 B), not +2 B. The implementer's G+ note found the same packing effect in
+the new struct and fixed it with `uint8_t` bitfields. See finding D-1 for
+the documents that still say 1,024 B.
+
+### 13.3 Conformance with the schedule
+
+Every scheduled step is present: A-1..A-24, B-1..B-11, C-1..C-4,
+D-1..D-7, E-1..E-5, F-1..F-8, G-1..G-8 and the Phase H document list.
+Deviations found:
+
+| Step | Deviation | Verdict |
+|------|-----------|---------|
+| A-2 | `MidiBits` uses `uint8_t` bitfields (6 B `MidiMsg`). | Correct; better than the schedule (§12 G+). |
+| F-6b | The Learn arm test is the first statement of `case BUT_REC:`, before the SHIFT+REC-menu and live-erase tests (the schedule put it after the erase test). | Accepted. While erase is on, the erase router consumes PLAY before the chord can arm, so the order cannot change behaviour. |
+| G-4 | `midiOut_trackProgramChange()` maps channels with the target Scene's settings, not the active Scene's. | Accepted, consistent with C-6 (a track sends on the channel of the Scene it plays). Its comment is wrong (finding D-2). |
+| G-7 | The TX hook is skipped by the early-return edit paths (LFO/velocity target cells, roll rhythm, held-step overlays). | Accepted: those are not plain parameter values. |
+
+### 13.4 Findings
+
+Ordered by severity. "Fix" is a proposal; nothing was changed.
+
+**F-1 (medium) — Continue replays the last tick played before Stop.**
+`seq_setRunningEx()` stores `seq_resumeTick = seq_elapsedPpqTicks` (the
+tick already processed), and `seq_continueRunning()` sets
+`seq_elapsedPpqTicks = resume − 1`, so the first scheduler tick after
+Continue processes that same tick again. When a step boundary (master or a
+track's DDA crossing) fell on that tick, its trigger and its step
+automation fire twice: an audible double hit on resume. SPP is not
+affected (`pos × 24` is the next position, as intended).
+*Fix:* at stop store the next tick:
+`seq_resumeTick = seq_initialSchedulerTick ? 0u : seq_elapsedPpqTicks + 1u;`
+(`sequencer.c`, stop branch of `seq_setRunningEx()`). Verify with C-5 item 1
+on a pattern whose steps fall on every 1/16.
+
+**F-2 (low-medium) — Track note record can be overwritten across TIM3 and
+the foreground.** `midiOut_trackNoteOn()` sends the note-off, the note-on,
+and only then records note and channel under PRIMASK. If TIM3 (sequencer)
+and the foreground (MIDI-in, overlay, preview) trigger the same track at
+the same moment, the preempted caller writes its record last and the
+other note is never turned off downstream.
+*Fix:* hold one PRIMASK section across off + send + record in
+`midiOut_trackNoteOn()` and across read + clear + send in
+`midiOut_trackNoteOff()` (both drivers already nest PRIMASK; the section is
+a few µs: at most 2 DIN queue inserts and 2 USB packet writes).
+
+**F-3 (low) — Turning the BAR overlay off stops MIDI rolls although CC2
+still selects an overlay.** `buttonHandler_overlaySwitchHeld()` calls
+`buttonHandler_overlayReconfigure(bh_overlayActive, 0u)`; with
+`bh_overlayActive == 0` it stops every entry, MIDI-held ones included. By
+C-9 a BAR only wins while active; once it is off, MIDI-held entries should
+follow CC2.
+*Fix:* when `bh_overlayActive == 0`, reconfigure panel entries with 0 and
+MIDI-held entries with `midiNotes_noteAction()` (add the accessor call;
+`MidiNotes.h` already exposes it).
+
+**F-4 (low) — Parameter TX can carry a data byte above 127.**
+`midiControl_targetValue7()` returns the raw Instrument byte, and the
+target-selection descriptors (`DTYPE_TARGET_SELECTION_*`,
+`DTYPE_VOICE_LFO`) hold tokens up to 0xFF. `midiOut_cc()` does not mask,
+and a byte ≥ 0x80 on the wire is a status byte (0xFF is System Reset).
+Today no panel path reaches it (those cells return before the TX hook),
+but a CC96/97 step on such a target reads 0xFF and a later caller could
+send it.
+*Fix:* clamp to 127 at the end of `midiControl_targetValue7()` and mask
+`data1`/`data2` with 0x7F in `midiOut_cc()`.
+
+**F-5 (low) — Learn is not cancelled by a MIDI Bank load started while
+already on Load/Save.** The cancel lives in `menu_switchPage()` and runs
+only on a page change; `menu_backgroundBankLoadUiBegin()` does not switch
+pages when Load/Save is already shown. Learn can be armed there (the
+gesture works in every mode), so it stays waiting through the load.
+*Fix:* call `midiLearn_cancel()` at the start of the MIDI-origin UI begin
+path.
+
+**F-6 (low) — Stamp read after the read index is published.**
+`midiBuffer_rxOut()` advances `read` and then reads `stamp[slot]`; with the
+buffer full, the USART ISR can write a new stamp into that slot first. The
+result is a wrong age (bounded by `MIDI_ARRIVAL_MAX_AGE_US`), never a wrong
+byte.
+*Fix:* read `stamp[read]` before `midiBuffer_out()`.
+
+**F-7 (low, pre-existing pattern) — A per-track Scene change of T6 or T7
+alone.** `seq_setTrackPlayedScene()` moves the HiHat pair together, but
+`seq_assignTracksToScene()` realigns and ends the MIDI note only for the
+tracks in the mask. A voice-channel PC that maps only T7 (or a panel hold
+of only one HiHat VOICE) leaves the partner track unaligned until its next
+realign. The panel loop behaved the same before S083.
+*Fix:* when bit 5 or 6 is set, set both bits in the mask at the start of
+`seq_assignTracksToScene()`.
+
+**D-1 (documentation) — Old USB ring size.** The plan (§2 table row
+"Arrival time", §6 Q13 row, §12 Q13 text), `MIDI_SPEC.md` §13 and the
+comment in `usb_midi_core.h:60` say the old ring was 256 × 4 B = 1,024 B
+and the saving 256 B; it was 256 × 8 B = 2,048 B and the saving is
+1,280 B (§13.2). `STORAGE_SRAM_MANIFEST.md` should record the measured
+values.
+
+**D-2 (documentation) — `midiOut_trackProgramChange()` comment.** It says
+the panel and the MIDI assignment helpers both call it after
+`seq_assignTracksToScene()`. Only the panel does (`buttonHandler.c:1484`),
+which is correct: a MIDI per-track PC must not be echoed (Q9).
+`MidiProgram.c` correctly does not call it.
+
+### 13.5 Observations for hardware testing
+
+- **Filters default to off.** `filesystem_resetSettingsToDefaults()` sets
+  `midi_filt_rx` and `midi_filt_tx` to 0. On a card without these keys,
+  the LXR consumes nothing and sends nothing (everything is forwarded per
+  MRT, which also defaults to `off`). Set RXF and TXF to `all` before the
+  hardware matrices. This default predates S083; changing it is a product
+  decision.
+- **SHIFT+PLAY no longer toggles the transport in any mode** (MIDI_SPEC
+  §6.3, F-6a). Expect this during the S080/S081 regression rows.
+- **A MIDI flam ignores its note-off; a MIDI roll ends at it**; MIDI-held
+  rolls are not VOICE holds for the looper (B-12).
+- **First hardware order:** A-25 (clock, MRT matrix, settings display),
+  then B-13 with the host-test examples on DIN and USB, then C-5 after
+  F-1 is fixed.
+
+### 13.6 Verdict
+
+The implementation follows the schedule closely and builds clean; the
+module layout, consume-then-route, the note map, the shared menu commit
+(Q1), Learn and the transmit rules are all present and read correctly. Fix
+F-1 before testing Continue on hardware. F-2 to F-7 are small, local fixes
+that can go in one pass with D-1/D-2. No finding needs new RAM.
+
+---
+
+## 14. Fixes after the assessment (2026-10-21)
+
+*Targeted fixes for every §13.4 finding, with the comment blocks beside
+each change amended to describe the new behaviour. No new RAM.*
+
+| Finding | File(s) | Change | Comment blocks amended |
+|---------|---------|--------|------------------------|
+| **F-1** Continue replayed the last tick | `sequencer.c` `seq_setRunningEx()` stop branch | `seq_resumeTick = seq_initialSchedulerTick ? 0 : seq_elapsedPpqTicks + 1` (the first unplayed tick; 0 when no tick was played). `seq_continueRunning()` is unchanged: it places the clock one tick before `resume`, so the next tick is the first unplayed one and nothing is processed twice. SPP already stored the next position. | `seq_resumeTick` state block; the stop-branch block; `seq_setRunningEx()` outputs; `seq_continueRunning()` what. |
+| **F-2** Note record race (TIM3 vs foreground) | `MidiOut.c/h` | New static `midiOut_trackNoteOffLocked()` (read, clear, send under the caller's PRIMASK). `midiOut_trackNoteOff()` holds one PRIMASK section per track; `midiOut_trackNoteOn()` holds one section across the previous note-off, the note-on and the record update. The note-on velocity is masked to 7 bits. | Per-track record block (writers); new helper block; both function notes; `MidiOut.h` contracts of `midiOut_trackNoteOn/Off()`. |
+| **F-3** BAR overlay off stopped MIDI rolls | `buttonHandler.c/h`, `MidiNotes.c` | `buttonHandler_overlayReconfigure()` takes a selector (`BH_OVERLAY_SEL_ALL`, `_MIDI`, `_PANEL`). `buttonHandler_overlaySwitchHeld()`: when the BAR overlay turns off and CC2 selects an overlay, panel entries stop and MIDI-held entries take the CC2 overlay; otherwise every entry takes the BAR state (BAR active wins, C-9). CC2 changes and the event-ring overflow use `_MIDI` and `_ALL`. `buttonHandler.c` includes `MidiNotes.h` for `midiNotes_noteAction()`. | Reconfigure block (selector, callers); new `buttonHandler_overlaySwitchHeld()` block; `buttonHandler.h` overlay API block ("active", F-3); the C-9 line in `midiNotes_handle()`. |
+| **F-4** Data bytes above 127 on parameter TX | `MidiControl.c/h`, `MidiOut.c` | `midiControl_targetValue7()` clamps Instrument bytes to 127 (target-selection tokens reach 0xFF). `midiOut_cc()` masks channel to 4 bits and both data bytes to 7 bits. | Inline block in `midiControl_targetValue7()`; `MidiControl.h` contract ("always 0..127"); new `midiOut_cc()` block. |
+| **F-5** Learn not cancelled by a MIDI Bank load on Load/Save | `menu.c` | `menu_backgroundBankLoadUiBegin()` calls `midiLearn_cancel()` first. | Its contract (cancel, why, affiliate); the Learn-cancel block in `menu_switchPage()` (points to the new site). |
+| **F-6** Stamp read after the slot was released | `MidiBuffer.c/h` | `midiBuffer_rxOut()` reads the stamp before `midiBuffer_out()` publishes the read index (empty check first). | New block above `midiBuffer_rxOut()`; the `MidiBuffer.h` contract ("byte and stamp"). |
+| **F-7** HiHat pair moved but only one track realigned | `sequencer.c/h`, `MidiOut.c/h` | `seq_assignTracksToScene()` and `midiOut_trackProgramChange()` set both bits 5 and 6 when either is set, so both tracks are realigned, have their MIDI note ended and are counted for the per-track PC. | `seq_assignTracksToScene()` contract and its `sequencer.h` line; `midiOut_trackProgramChange()` inline block and `MidiOut.h` contract. |
+| **D-1** Old USB ring size | `usb_midi_core.h`, `STORAGE_SRAM_MANIFEST.md` (ledger row), `MIDI_SPEC.md` §13, plan (§2 row, §6 row, §12 Q13 text and table) | 256 × 8 B = 2,048 B before S083 (measured); Q13 (b) released 1,280 B. The manifest's ledger row now reads 768 B. | The USB ring block in `usb_midi_core.h`. |
+| **D-2** Wrong caller list | `MidiOut.c` | `midiOut_trackProgramChange()` comment: panel only; a received per-track PC is not echoed (Q9). | As stated. |
+
+### 14.1 Gates after the fixes
+
+| Gate | Result |
+|------|--------|
+| `make all`, `make img` | PASS. Image copied to `build/LXRV2_lxr02.img`. |
+| Warnings | None in the files S083 touched. A full rebuild of `filesystem.c` (it changed in Phase F) shows seven `-Wunused-function` warnings for older helpers (`filesystem_applyLegacy22Globals`, `filesystem_blockRename`, `filesystem_reportBootSubstep`, `filesystem_bootLoggingSetKitDetail`, `filesystem_applyStaleGlobalsFallback`, `filesystem_staleMetaPrefixLen`, `filesystem_metaHasStoredGlobalsLen`). They predate S083: each name has the same reference count at `HEAD`. This corrects §13.1, which saw no warnings only because `filesystem.o` was not rebuilt there. Left as is (outside S083's scope). |
+| Link | `text=604,200`, `data=424`, `bss=430,112`; flash 604,624 / 753,664 B (**149,040 B free**). Versus §13.1: text +304 B, bss −8 B (layout/alignment; no new statics). |
+| Host test | `make -C tools/midi_test run` → `PASS (0 failures)`. |
+
+### 14.2 Hardware checks added by the fixes
+
+- **F-1:** C-5 item 1 with a pattern that has a step on every 1/16: Stop
+  and Continue repeatedly; no step plays twice at the resume point.
+- **F-2:** play a track from a DAW (MIDI notes) while the sequencer also
+  triggers it; a downstream monitor shows every note-on paired with a
+  note-off.
+- **F-3:** CC2 = 1, hold MIDI notes on two tracks with a roll type, toggle
+  the BAR `>` overlay on and off in PERF: with it on, the rolls follow `>`;
+  with it off, they return to `<` (CC2) and keep rolling.
+- **F-5:** arm Learn on the Load/Save page, send CC0: Learn ends (LEDs stop
+  flashing) and the load runs.
+- **F-7:** per-track PC (or hold one HiHat VOICE + SEQ) that maps only T7:
+  T6 and T7 both move, realigned.

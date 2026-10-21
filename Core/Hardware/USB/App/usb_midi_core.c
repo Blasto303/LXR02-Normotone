@@ -31,7 +31,7 @@
  *      Author: Julian
  */
 #include "usb_midi_core.h"
-#include "MidiRealtime.h"
+#include "MidiTransport.h"
 #include "timebase.h"
 /* MidiParser.h not needed here — received messages go into usb_MidiMessages[]
 ** ring buffer and are dispatched by usb_manager / main loop, not here. */
@@ -371,7 +371,8 @@ static uint8_t  usbd_midi_DataOut (void *pdev, uint8_t epnum)
 		/* reset data in buffer since it might not be completely overwritten */
 		usb_MidiOutRdPtr[i] = 0;
 
-    	uint8_t length=0;
+			uint8_t length=0;
+			uint8_t sysex = 0u;
 
     	//TODO midi parsing can be improved
     	// we only have cable 0
@@ -397,22 +398,26 @@ static uint8_t  usbd_midi_DataOut (void *pdev, uint8_t epnum)
 				case CIN_SYSEX_START:
 					// SYSEX
 					length = 3;
+					sysex = 1u;
 					break;
 
-				case CIN_SYSEX_END_1:
-					// SYSEX end
-					length = 1;
-					break;
+					case CIN_SYSEX_END_1:
+						// SYSEX end
+						length = 1;
+						sysex = 1u;
+						break;
 
-				case CIN_SYSEX_END_2:
-					// SYSEX end
-					length = 2;
-					break;
+					case CIN_SYSEX_END_2:
+						// SYSEX end
+						length = 2;
+						sysex = 1u;
+						break;
 
-				case CIN_SYSEX_END_3:
-					// SYSEX end
-					length = 3;
-					break;
+					case CIN_SYSEX_END_3:
+						// SYSEX end
+						length = 3;
+						sysex = 1u;
+						break;
 
 				case CIN_SINGLE_BYTE:
 					length = 1;
@@ -433,28 +438,43 @@ static uint8_t  usbd_midi_DataOut (void *pdev, uint8_t epnum)
 		}
     	if(length != 0)
     	{
-    		if (midiRealtime_isStatus(usbData.status)) {
+			if (midiTransport_isRealtime(usbData.status)) {
     			/* USB MIDI packets are already message-framed, but clock/start/stop
     			** still need a timestamp close to packet receipt. Queue realtime
     			** here and leave channel/common messages for the normal USB ring. */
-    			midiRealtime_push(usbData.status, MIDI_REALTIME_SOURCE_USB,
-    					packetTimestampUs);
+				midiTransport_push(usbData.status, MIDI_REALTIME_SOURCE_USB,
+						packetTimestampUs);
     			continue;
     		}
 
-    		usb_MidiMessages[usb_MidiMessagesWrite].status	= usbData.status;
-    		usb_MidiMessages[usb_MidiMessagesWrite].data1 	= usbData.data1;
-    		usb_MidiMessages[usb_MidiMessagesWrite].data2 	= usbData.data2;
-    		usb_MidiMessages[usb_MidiMessagesWrite].bits.length = length-1; // we don't count the status byte in our length
-    		// --AS todo keep track of sysex mode
-    		// if we are in sysex mode, this will be set, and status will contain the current sysex message byte
-    		// is it possible for there to be more than one sysex message byte received?
-    		usb_MidiMessages[usb_MidiMessagesWrite].bits.sysxbyte = 0;
-    		usb_MidiMessages[usb_MidiMessagesWrite].bits.source = midiSourceUSB;
+			/*
+			 * Store one USB message (S083 Q12/Q13).
+			 *
+			 * What: drops the NEW message when the ring is full (was: overwrite
+			 * the oldest unread entry, which also lost the read position);
+			 * stores the low 16 bits of the packet's arrival time; marks SysEx
+			 * packets as pass-through (sysxbyte) so no consumer parses them.
+			 * Why: Q12 drop-newest; Q6/Q13 arrival stamps; SysEx packets were
+			 * stored as if their first byte were a status. Affiliates:
+			 * usb_getMidi(), midiIn_service().
+			 */
+			{
+				uint8_t next = (uint8_t)((usb_MidiMessagesWrite + 1u) &
+				                         USB_MIDI_INPUT_BUFFER_MASK);
+				MidiMsg *slot;
 
-    		//increment and wrap write pointer
-    		usb_MidiMessagesWrite++;
-    		usb_MidiMessagesWrite &= USB_MIDI_INPUT_BUFFER_MASK;
+				if (next == usb_MidiMessagesRead)
+					continue;
+				slot = &usb_MidiMessages[usb_MidiMessagesWrite];
+				slot->status = usbData.status;
+				slot->data1 = usbData.data1;
+				slot->data2 = usbData.data2;
+				slot->bits.length = (uint8_t)(length - 1u);
+				slot->bits.sysxbyte = sysex;
+				slot->bits.source = midiSourceUSB;
+				slot->stamp = (uint16_t)packetTimestampUs;
+				usb_MidiMessagesWrite = next;
+			}
     	}
  }
 

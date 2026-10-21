@@ -112,6 +112,8 @@ uint8_t seq_loopableTrackMask(void);
  * Affiliates: menu_serviceDeferredSceneChange(), buttonHandler SHIFT+SEQ.
  */
 void seq_requestSceneChange(uint8_t scene_index, uint8_t division);
+/* S083 Q9: mark the next whole-Scene change as panel or MIDI (no echo). */
+void seq_setSceneChangeOrigin(uint8_t origin);
 void seq_queueSceneChange(uint8_t scene_index, uint8_t division);
 uint8_t seq_sceneChangeFirePending(void);
 uint8_t seq_pendingSceneIsQueue(void);
@@ -160,6 +162,9 @@ extern uint8_t seq_perTrackActive;
  * together. Client: the buttonHandler PERF hold-VOICE+press-SEQ gesture.
  */
 void seq_setTrackPlayedScene(uint8_t track, uint8_t scene_index);
+/* S083 P3: shared panel/MIDI per-track Scene move (realign + note-off);
+** the HiHat pair (bits 5/6) always moves together (F-7). */
+void seq_assignTracksToScene(uint8_t trackMask, uint8_t scene_index);
 
 /*
  * Coalesce all tracks back to the active Scene (S077 P2 §1.5).
@@ -228,6 +233,11 @@ void seq_tick(void);
 void seq_resetDeltaAndTick(void);
 void seq_resetToPatternStart(void);
 void seq_realignActivePatternToMasterClock(void);
+/* S083 T1 transport: contract in sequencer.c. sendRealtime = 0 when the
+** change came from received MIDI transport (C-11: MRT forwards it). */
+void seq_setRunningEx(uint8_t isRunning, uint8_t sendRealtime);
+void seq_continueRunning(uint8_t sendRealtime);
+void seq_setResumeTick(uint32_t tick);
 void seq_setDeltaT(float delta);
 void seq_triggerNextMasterStep(uint8_t stepSize);
 void seq_setBpm(uint16_t bpm);
@@ -248,7 +258,6 @@ enum SeqExternalSyncSource {
 void seq_setExtSyncSource(uint8_t source);
 uint8_t seq_getExtSyncSource(void);
 void seq_noteExtSyncActivity(uint8_t source, uint32_t timestampUs);
-void seq_setNextPattern(const uint8_t patNr);
 /*
  * Immediately select the active Scene/Pattern for front-panel PERF switching.
  *
@@ -545,8 +554,5 @@ uint32_t seq_quantiseTick(uint32_t tick, uint8_t frac8);
 uint8_t seq_getPlaybackEpoch(void);
 uint8_t seq_getSceneEpoch(void);
 uint8_t seq_getQuantisation(void);
-
-void seq_midiNoteOff(uint8_t chan);
-void seq_sendMidiNoteOn(const uint8_t channel, const uint8_t note, const uint8_t veloc);
 
 #endif /* SEQUENCER_H_ */

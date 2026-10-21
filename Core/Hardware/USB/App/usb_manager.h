@@ -26,13 +26,20 @@
 #include "usbd_conf.h"
 #include "usbd_usr.h"
 #include "usb_midi_core.h"
-#include "MidiMessages.h"
+#include "MidiDefs.h"
 
 void    usb_init(void);
 void    usb_stop(void);
 void    usb_start(void);
 void    usb_tick(void);
-void    usb_sendMidi(MidiMsg msg);
+/*
+ * Queue one 4-byte USB-MIDI event packet (S083).
+ * Inputs: code index (cable 0) and the three MIDI bytes (unused bytes 0).
+ * Output: bytes in the USB IN buffer, flushed by usb_tick(). Context: any
+ * (PRIMASK). Why: MidiOut now computes the code index (usb_sendMidi() used
+ * status >> 4 for every message). Accessor: midiOut_sendMsg() only.
+ */
+void    usb_sendMidiPacket(uint8_t cin, uint8_t b0, uint8_t b1, uint8_t b2);
 uint8_t usb_getMidi(MidiMsg *msg);
 void    usb_flushMidi(void);
 

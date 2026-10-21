@@ -152,7 +152,7 @@ at the end of this document):
   switch/move/release in Sequencer, `effects_rebindSourceScene()`;
 - MIDI-origin UI entry (`buttonHandler_enterLoadSaveForBackgroundLoad()`,
   `menu_backgroundBankLoadUiBegin/UiIdle/UiPoll()`), the MIDI drop filter
-  `midiParser_acceptedDuringBankLoad()` and `CC_BANK_SELECT_LSB`;
+  `midiIn_acceptedDuringBankLoad()` and `CC_BANK_SELECT_LSB`;
 - the Scene 17 name capture (`filesystem_backgroundNamesCaptureScene()`,
   `filesystem_backgroundNameCaptureInstrument()`,
   `filesystem_backgroundNameSet()`);
@@ -177,7 +177,7 @@ module owns each call, state transition, and retained object.
   direct `pat_*` calls.
 - Live recording and live erase go through LiveRecord (`liveRec_*`, S081).
   The Sequencer never calls LiveRecord; LiveRecord never calls buttonHandler
-  or MidiParser and calls Menu only for `menu_automationTargetRecorded()`.
+  or MidiNotes and calls Menu only for `menu_automationTargetRecorded()`.
   The step-boundary ring has one producer function (`seq_recRingPush()`).
 - Automation priority: Instrument automation holds until the voice's next
   resetting trigger, except against a menu edit of that parameter (R12,
@@ -187,7 +187,10 @@ module owns each call, state transition, and retained object.
 - LED rendering goes through `led_*`.
 - Transport/playback timing goes through `seq_*`.
 - Sound parameter application goes through Preset.
-- MIDI runtime configuration goes through MidiParser.
+- MIDI runtime configuration goes through MidiIn (`ch`, RXF/TXF, MRT);
+  received messages are consumed by MidiNotes/MidiControl/MidiProgram/MidiLearn
+  and transmitted through MidiOut only. A MIDI parameter write is a menu edit
+  and goes through `menu_commitTargetEdit()` (S083 Q1).
 - Filesystem may serialize Pattern data through PatternData pointer accessors.
 - Filesystem owns async SD/FAT access; storage text schemas and parameter maps
   live in `storageTypes.c/h`.
@@ -578,7 +581,7 @@ Pattern owner. See `STORAGE_SRAM_MANIFEST.md` for linked sizes and
 `PATTERN_DYNAMIC_STACK.md` for the complete specification.
 
 Affiliate modules: Menu, buttonHandler, ledHandler, CopyClear, filesystem,
-Sequencer, EuklidGenerator, Preset/MidiParser indirectly through Sequencer
+Sequencer, EuklidGenerator, Preset indirectly through Sequencer
 automation.
 
 Purpose: owns pattern, track, step, length/rotation, pattern settings, and step
@@ -801,7 +804,7 @@ STEP mode keeps its own bar chaselight; PERF never shows the bar.
 ## Core/Hardware/frontPanel/buttonHandler
 
 Affiliate modules: ledHandler, Menu, `menuEffects`, PatternData,
-EuklidGenerator, Sequencer, Preset, MidiParser, CopyClear, and
+EuklidGenerator, Sequencer, Preset, MidiNotes, CopyClear, and
 EffectsManager.
 
 Purpose: owns physical button event queue, select modes, shift state, selected
@@ -815,8 +818,7 @@ dispatch to owners.
 | `buttonHandler_tick()` | Long-press timer promotion. | foreground timing path |
 | `buttonHandler_getMode()` | Current SELECT mode. | ledHandler, Menu/UI checks |
 | `buttonHandler_getShift()` | Current shift-held state. | ledHandler, button logic |
-| `buttonHandler_getArmedAutomationStep()` | Read currently armed automation step. | diagnostics/future clients |
-| `buttonHandler_setRunStopState(running)` | Sync UI transport bit and START/STOP LED. | MidiParser, local button path |
+| `buttonHandler_setRunStopState(running)` | Sync UI transport bit and START/STOP LED. | MidiTransport (MTC start/stop), local button path |
 | `buttonHandler_showMuteLEDs()` | Show mute-state LEDs. | Menu/voice/performance paths |
 | `buttonHandler_muteVoice(voice, isMuted)` | Update front-panel mute shadow. | buttonHandler local, MIDI/UI paths if needed |
 | `SELECT_MODE_FX` / FX dispatch | SHIFT+PERF owns the Effect page; SELECT/TRACK/BAR gestures first offer the active type's `effect_ui_hooks_t`, while default TRACK/SELECT behavior remains in buttonHandler/Menu. | `menuEffects`, EffectsManager registry |
@@ -826,7 +828,9 @@ dispatch to owners.
 | VOICE hold-SHIFT Morph view (S075 F2) | SHIFT press in VOICE mode → `menu_setVoiceModeShowMorph(1)`; release → back to the SHIFT+MODE VOICE latch (`buttonHandler_morphVoiceModeActive`). | Menu |
 | STEP hold-SHIFT Morph view (S078) | SHIFT press in STEP mode → `menu_setPatternTrackMorphEndpoint(1)` (+ LED leave); SHIFT release in STEP mode → `menu_setPatternTrackMorphEndpoint(0)` + `buttonHandler_enterSeqModeStepMode()`. A release handled in another mode (SHIFT+mode button) cannot clear it, so Menu also gates the view on `buttonHandler_getShift()` (S078 P4). No latch: SHIFT+MODE STEP is the only SOM entry. | Menu |
 | STEP held steps + TRACK (S078) | In `handleVoiceButton()`'s STEP arm, `buttonHandler_seqHeldMask() != 0` calls `menu_enterStepTrackAutomationOverlay(voiceNr)` and returns before the ordinary half toggle. | Menu |
-| PERF looper / overlay / SHIFT+REC / chain chord (S080) | See "PERF performance surface". Hold state `bh_loopSelectHeldMask`, `bh_loopLastSelectButton`, `bh_loopTrackMask` (mask returned by the sequencer), `bh_loopBarModifier`, `bh_loopBarHeld` (event-order BAR holds); helpers `buttonHandler_loopCheckDisengage()`, `buttonHandler_loopForceRelease()`; overlay `bh_overlayActive` + 1 ms repeat slot (`bh_overlayInterval/Next/Count`, serviced in `buttonHandler_tick()`); latches `bh_shiftRecMenuActive`, `bh_shiftReleaseConsume`, `bh_chainPlayArmed`. | Sequencer, Menu, ledHandler |
+| PERF looper / overlay / SHIFT+REC / chain chord (S080; overlay S083 Q5) | See "PERF performance surface". Hold state `bh_loopSelectHeldMask`, `bh_loopLastSelectButton`, `bh_loopTrackMask` (mask returned by the sequencer), `bh_loopBarModifier`, `bh_loopBarHeld` (event-order BAR holds); helpers `buttonHandler_loopCheckDisengage()`, `buttonHandler_loopForceRelease()`; overlay `bh_overlayActive` + the per-track table `bh_overlay[7]` (heldMidiNote, note + `def` bit, velocity, count 0/1/0xFF, interval, next; serviced in `buttonHandler_tick()`); latches `bh_shiftRecMenuActive`, `bh_shiftReleaseConsume`, `bh_chainPlayArmed`. | Sequencer, Menu, ledHandler, MidiNotes |
+| MIDI overlay entry points (S083) | `buttonHandler_overlayHeldBar()` (1/2 while a PERF BAR is held; wins over CC2, C-9), `buttonHandler_overlayMidiNoteOn(track, which, internal, midiNote, ageUs)`, `buttonHandler_overlayMidiNoteOff(track, midiNote)` (ends a MIDI-held roll; a flam main still plays), `buttonHandler_overlayMidiActionChanged(which)` (re-configures MIDI-held rows unless a BAR is held). One executor for panel and MIDI. | MidiNotes |
+| Learn LEDs (S083) | `buttonHandler_setLearnLeds(on)`: on flashes SHIFT/PLAY/REC; off restores SHIFT hold, transport and REC LATCH states. | MidiLearn |
 | `buttonHandler_loopSelectLed()` | S080: SELECT index (0..7) of the looper division while the looper is held or engaged, else 0xFF. | `menu_syncPerfSelectLed()` |
 | REC button (S081) | Press: SHIFT → SHIFT+REC menu; menu open → close it; live erase on → nothing (SHIFT or not); otherwise start the hold timer (`bh_recPressTick` `u16`, wrap-safe, `bh_recArmed`). `buttonHandler_tick()` enters OVERDUB once the hold passes `DOUBLE_CLICK_TIMEOUT` (300 ms) (`liveRec_overdubBegin()` + REC LED pulse). Release: an overdub → `liveRec_overdubEnd()` + pulse; otherwise toggle `liveRec_setLatch()`. REC LED flashes while SHIFT+REC is open and armed. REC works while looping (S081 P3). | LiveRecord |
 | Live-erase chord and router (S081) | `bh_shiftHeld`/`bh_clearHeld` are updated before any early exit. With `liveRec_armed()`, SHIFT+COPY in either order calls `buttonHandler_liveEraseBegin()` (the single entry; clears the gesture masks only when entering from off) → `liveRec_eraseBegin()`; SHIFT and CLEAR LEDs stay lit while either is held; releasing both calls `buttonHandler_liveEraseEnd()` (the single exit: `liveRec_eraseEnd()`, REC LED restored, automation-underline search restarted). The SHIFT release runs the erase-end test before its consume/latched-menu breaks. Router right after `copyClear_buttonPressed()`: SEQ in VOICE/STEP → `liveRec_eraseSeqHeld(activeTrack, held)`, in FX → `liveRec_eraseFxSeqHeld()`, else consumed; VOICE in VOICE/STEP/PERF/FX → `liveRec_eraseTrackHeld()` (not while the loop is engaged: the VOICE stays a looper button), else consumed; PLAY → plain transport toggle (`buttonHandler_setRunStopState()` + `seq_setRunning()`, bypassing `bh_chainPlayArmed`). Per-button gesture masks `bh_eraseSeqMask`, `bh_eraseFxSeqMask`, `bh_eraseVoiceMask` end exactly the gesture a press started (even after erase ended); a MODE press clears them and calls `liveRec_eraseReleaseHeld()`. | LiveRecord |
@@ -843,14 +847,12 @@ dispatch to owners.
 Public state used by other modules:
 
 - `buttonHandler_selectedStep`: selected sub-step base for LED/menu refresh.
-- `buttonHandler_originalParameter`, `buttonHandler_originalValue`,
-  `buttonHandler_resetLock`: reset-lock state used around automation edits.
 
 ## Core/Menu/menu
 
 Affiliate modules: buttonHandler, ledHandler, PatternData, Preset, Sequencer,
-MidiParser, EuklidGenerator, SomGenerator, filesystem, triggerJacks, mod nodes,
-InstrumentManager.
+Core/MIDI (MidiIn/MidiControl/MidiLearn/MidiOut), EuklidGenerator,
+SomGenerator, filesystem, triggerJacks, mod nodes, InstrumentManager.
 
 Purpose: owns menu pages, visible/edit state, `parameter_values`, dynamic
 descriptor-backed VOICE page resolution, load/save UI, encoder and endless-pot
@@ -863,7 +865,11 @@ edit dispatch, and post-load operation follow-up.
 | `menu_parseEncoder(inc, button)` | Main encoder edit/navigation. | main loop |
 | `menu_parseKnobDelta(knobNr, delta)` | RV1-RV4 edit dispatch. | main loop |
 | `menu_serviceKnobRepaint()` | Coalesced knob repaint. | main loop |
-| `menu_notifyExternalParamChanged(paramNr)` | Mark externally changed param for repaint. | MidiParser |
+| `menu_commitTargetEdit(id, value, origin)` | S083 Q1: the single parameter commit used by the panel and MIDI. Clamps to the menu domain, commits the Normal image, fans out through `bank_editTargetMask()`, applies the R12/R13/Scene-target actions, records in LATCH/OVERDUB and requests the repaint. | `MidiControl`, `menu_cellCommitValue()` |
+| `menu_commitGlobalMorphFromMidi(value)` | CC1 on G: global Morph through the `mrp` cell, fan-out, never recorded (G-1). | `MidiControl` |
+| `menu_notifyTargetChanged(id)` | Coalesced repaint request when a target ID is on screen (replaces the flat-ID `menu_notifyExternalParamChanged()`). | `MidiControl`, `MidiLearn` |
+| `menu_learnDisplayChanged()` | Learn state changed: repaint `LRN`/`FUL`. | `MidiLearn` |
+| `menu_perfModeSceneChangeFrom(scene, origin)` | Whole-Scene change with origin; a MIDI origin suppresses the PC echo (Q9). | `MidiProgram`, panel wrapper |
 | `menu_pollPresetStatus()` | Async preset/filesystem completion and sound/global apply. | main loop |
 | `menu_parseGlobalParam(paramNr, value)` | Dispatch global/menu parameter side effects to owner modules. | Menu edits, globals load |
 | `menu_sendAllParameters()` / `menu_sendAllGlobals()` | Apply all parameters/globals to owners. | load/apply paths |
@@ -876,7 +882,6 @@ edit dispatch, and post-load operation follow-up.
 | STEP multi-step specials (internal, S078) | `menu_broadcastStepSpecial()` writes velocity/note/probability to every held SEQ step of the visible bar (2+ held) through `patSvc_setStepVolume/Note/Probability()`; one held step = single-step path. | `menu_parseGlobalParam(PAR_STEP_*)` |
 | `menu_fxVoiceMixOverlayBegin(track)` / `menu_fxVoiceMixOverlayEnd()` / `menu_fxVoiceMixOverlayActive()` | S075 F2 Effect-page SHIFT+TRACK overlay: Begin saves the Effect position in a 4-byte record and shows VOICE `track`'s mix sub-page on its first Scene-setting screen (a second call moves it); End restores the Effect page, applies latched `menuEffects_service()` actions and repaints. Does **not** go through `menu_switchPage()` (which would run `menuEffects_leave()`); a real page switch ends it without restore. `menu_serviceRuntimeWidgets()` keeps running `menuEffects_service()` under it so the Effect LEDs stay live. | buttonHandler, ledHandler |
 | VOICE mix FX-send cell (internal, S075 F2) | Normal view shows the step override or the Normal endpoint (`preset_getFxSendDisplayAmount()`); Morph view shows and edits the Morph endpoint (`scene_getVoiceFxSendMorph()` / `preset_setVoiceFxSendMorph()`); never the interpolated send. Edits fan out over the edit mask. | Menu internals |
-| `menu_clampInstrumentValue(slot, descriptor_index, value)` | S075 F3: the VOICE-page descriptor-domain clamp (`menu_clampCellValue()` on a transient instrument cell) for one parameter of the active Scene, so external MIDI never stores an out-of-domain byte. | MidiParser |
 | `menu_setEffectShowMorph(onOff)` | Toggle the momentary SHIFT Morph endpoint view on `EFFECT_PAGE`; refreshes Effect pot snapshots and repaint without touching VOICE morph state. | buttonHandler FX SHIFT press/release |
 | `MENU_CELL_EFFECT` delegation (internal) | Effect page cells resolve, format, clamp and commit through `menuEffects_*`; early `EFFECT_PAGE` branches in navigation/encoder/pots/service hand the cursor to menuEffects (Session 072 step 7). `menu_isScreenPage()` covers the four-cell compact model for VOICE and EFFECT. | Menu internals |
 | `fx` step-automation category (internal) | Category 7 of the STEP automation page lists the viewed Scene's AUTOMATABLE Effect rows (`effects_stepTarget()`); WIDE8 rows display the `expand7` value; `menu_stepAutomationIsEffect()` excludes the 511 off sentinel. `fxm` in `scn` stores seven bits like voice Morph (`menu_sceneTargetIsMorph()`). | Menu STEP page |
@@ -891,7 +896,7 @@ edit dispatch, and post-load operation follow-up.
 | `menu_resetSaveParameters()` | Reset load/save UI state for the promoted Kit/Scene/Bank families and clear nested Instrument/HCNAMES/temp-session state. Retired File/Dir types are not restored by Dev Mode. | load/save page |
 | `menu_setNumSamples(num)` | Sample count display state. | sample/filesystem paths |
 | `menu_getActivePage()` / `menu_getSubPage()` | Read visible page/subpage. | buttonHandler, ledHandler |
-| `menu_getActiveVoice()` / `menu_setActiveVoice(voiceNr)` | UI active voice. | buttonHandler, MidiParser, PatternData callers |
+| `menu_getActiveVoice()` / `menu_setActiveVoice(voiceNr)` | UI active voice. | buttonHandler, MidiNotes, MidiProgram, PatternData callers |
 | `menu_areMuteLedsShown()` | Mute LED UI state query. | ledHandler/buttonHandler |
 | `menu_setShownPattern(patternNr)` / `menu_getViewedPattern()` | UI viewed/edited pattern. | buttonHandler, ledHandler, PatternData callers |
 | `menu_setPlayedPattern(patternNr)` | Side-effect-free alignment of the played-Pattern UI mirror (`menu_playedPattern`) the chase renderer compares against the viewed Pattern to gate chase-LED visibility (Session 068). Unlike `led_notifyPatternChanged()` (the runtime writer, with follow/PERF/LED side effects), performs only a validated assignment — safe to call from pre-audio filesystem realignment. | `filesystem.c` Scene/Bank realignment (3 sites) |
@@ -1014,7 +1019,7 @@ tickInstrumentApply/startDrumsetApply/applySceneSettings`,
 
 ## Core/Sequencer/sequencer
 
-Affiliate modules: PatternData, ledHandler, Menu, MidiParser, MidiVoiceControl,
+Affiliate modules: PatternData, ledHandler, Menu, MidiNotes, MidiProgram, MidiOut, MidiVoiceControl,
 triggerJacks, clockSync, SOM, USB/UART MIDI.
 
 Purpose: owns playback timing, transport, mute, roll, quantization, external
@@ -1035,13 +1040,15 @@ Sequencer no longer exposes `seq_patternSet`, `seq_tmpPattern`, or
 | `seq_realignActivePatternToMasterClock()` / `seq_realignTrackToMasterClock(track)` | Recalculate each track's step and Q8.8 accumulator phase from `seq_elapsedPpqTicks` and the track's effective scale/length, mapped through its run mode (`seq_stepIndexForMode()`); stopped once-mode tracks are skipped (S078). | buttonHandler/PERF realign gesture, per-track Scene assignment |
 | `seq_triggerNextMasterStep(stepSize)` | External clock master-step scheduling. | trigger/MIDI sync paths |
 | `seq_setBpm(bpm)` / `seq_getBpm()` | Tempo. | Menu/global apply |
-| `seq_sync()` | External MIDI clock tick. | MidiParser |
-| `seq_getExtSync()` / `seq_setExtSync(isExt)` / `seq_setExtSyncSource(source)` / `seq_getExtSyncSource()` / `seq_noteExtSyncActivity(source, timestampUs)` | External sync mode/activity. | Menu, MidiParser, triggerJacks |
+| `seq_sync()` | External MIDI clock tick. | MidiTransport |
+| `seq_getExtSync()` / `seq_setExtSync(isExt)` / `seq_setExtSyncSource(source)` / `seq_getExtSyncSource()` / `seq_noteExtSyncActivity(source, timestampUs)` | External sync mode/activity. | Menu, MidiTransport, triggerJacks |
 | `seq_setQuantisation(value)` / `seq_getQuantisation()` | Recording and looper quantisation 0..5 (`NO_QUANTISATION`, `QUANT_8`, `QUANT_16`, `QUANT_32`, `QUANT_64`, S081 `QUANT_TRACK` = `trk`). | Menu, LiveRecord |
-| `seq_setNextPattern(patNr)` | Queue next playback pattern. | buttonHandler, MidiParser |
 | `seq_armActivePatternReload()` | Mark active pattern for reload/commit. | filesystem/preset load paths |
-| `seq_setRunning(isRunning)` / `seq_isRunning()` | Transport. Stop branch (Session 071) now queues `SEQ_LED_DIRTY_CHASE` after setting `seq_running = 0u` so the foreground drain clears any retained chase layer. | buttonHandler, MidiParser |
-| `seq_setMute(trackNr, isMuted)` / `seq_isTrackMuted(trackNr)` | Playback mute state. | buttonHandler, MidiParser |
+| `seq_setRunning(isRunning)` / `seq_setRunningEx(isRunning, sendRealtime)` / `seq_isRunning()` | Transport. `Ex` with `sendRealtime = 0` is the received-MIDI path (C-11: MRT forwards the message, the LXR does not send a second copy). A stop stores `seq_resumeTick` for Continue (S083 R-C). The stop branch queues `SEQ_LED_DIRTY_CHASE` after setting `seq_running = 0u`. | buttonHandler, MidiTransport, clockSync |
+| `seq_continueRunning(sendRealtime)` / `seq_setResumeTick(tick)` | S083 T1: resume at the stored tick (or a plain start at 0), and set the tick from SPP x 24 while stopped. | `sync_midiContinue()`, `midiTransport_handleSystemCommon()` |
+| `seq_assignTracksToScene(trackMask, scene)` | S083 P3: shared per-track Scene move (set played Scene, realign, note-off, one slot apply) for the panel and a MIDI PC on a voice channel. | buttonHandler, MidiProgram |
+| `seq_setSceneChangeOrigin(origin)` | S083 Q9: suppress the PC for a MIDI-originated whole-Scene change, including a deferred one. | `menu_perfModeSceneChangeFrom()` |
+| `seq_setMute(trackNr, isMuted)` / `seq_isTrackMuted(trackNr)` | Playback mute state. | buttonHandler, Menu |
 | ~~`seq_setRoll()` / `seq_setRollRate()`~~ | Removed in S081 with the legacy live roll and `PAR_ROLL`. Step rolls use `seq_rollBegin()` / `seq_processRollTicks()` with the 96-PPQ table `seq_rollPpq()` (`PATTERN_DYNAMIC_STACK.md` §6). | — |
 | ~~`seq_addNote()`~~, ~~`seq_recordAutomation()`~~ | Stale rows corrected at the S081 close: neither exists in the code (removed with the old pattern storage). MIDI notes and knob/CC automation are recorded through LiveRecord (`liveRec_triggerIn()`, `liveRec_paramIn()`). | — |
 | ~~`seq_setRecordingMode()` / `seq_setErasingMode()` / `seq_recordTrigger()` / `seq_quantize()`~~ | Removed in S081; LiveRecord owns record and erase ("Core/Sequencer/LiveRecord (S081)"). `seq_recordActive` stays as the published writing flag (`seq_setRecordTarget()`). | — |
@@ -1064,7 +1071,6 @@ Sequencer no longer exposes `seq_patternSet`, `seq_tmpPattern`, or
 | `seq_restoreAllAutomation()` | Walk all 6 slots' 64-bit dirty bitmaps and restore each dirty descriptor index from `morph_interpolation[]` via `instrumentManager_writeRuntime()`. Called from `seq_setStepIndexToStart()` before `seq_clearAutomationDirty()` (Session 070). | Sequencer transport restart |
 | `seq_restoreAllSceneAutomation()` | Walk `seq_scene_automation_dirty` (uint32_t) bitmap and restore each dirty Scene target from its retained SceneData getter. Clears morph step overrides, slot6 decay step state, and audio routing. Called from `seq_setStepIndexToStart()` (Session 070). | Sequencer transport restart |
 | `seq_clearSceneAutomationDirty()` | Clear the `seq_scene_automation_dirty` bitmap. Rule B: called from `seq_selectActivePattern()` and `seq_alignActivePatternToScene()` so a Scene activation starts with a clean overlay state. (S076 P1) | Sequencer Scene activation paths |
-| `seq_midiNoteOff(chan)` / `seq_sendMidiNoteOn(channel, note, veloc)` | MIDI note output ownership. | MidiParser, Sequencer |
 | `seq_switchToBackgroundScene()` | S082: move playback to Scene 17 without a sound change. Under PRIMASK: active, pending and every per-track Scene = 16, `seq_perTrackActive = 0`, looper re-snapshot (anchors kept); then pending direct/queued/chain changes are cleared and the effective track cache refreshed. **No** realign, roll/condition/epoch reset, PC, note-off or LED notify; the live-record take continues (D35). | Preset background tick phase 3 (fresh build) |
 | `seq_moveTracksToBackgroundScene(track_mask)` | S082 P1 E4.6: under PRIMASK, move selected tracks (7-bit mask) to play from Scene 17's Pattern region; recompute `seq_perTrackActive` and re-snapshot the looper; clear pending changes; refresh the effective cache. Used by the rebuild-in-place path (D19/D31); the view is never moved (D28). | presetManager |
 | Scene 17 release (S082, in `seq_selectActivePattern()`) | The first whole-Scene change to a resident Scene (SEQ press, MIDI PC, queued or chain change) calls `scene_backgroundRelease()` after publishing; per-track moves never release (D10). `seq_sendProgChg()` refuses index ≥ 16; `seq_chainResolveNext()` refuses cur ≥ 16 (17 has no chain). | Menu executor, MIDI |
@@ -1102,7 +1108,7 @@ boundary.
 
 ## Core/Bank/Scene/Preset/presetManager
 
-Affiliate modules: filesystem, Menu, MidiParser, Sequencer, DSP voice/mod nodes,
+Affiliate modules: filesystem, Menu, MidiControl, Sequencer, DSP voice/mod nodes,
 InstrumentManager, SceneData, and EffectsManager.
 
 Purpose: owns preset load/save status, Scene kit apply, and sound-parameter
@@ -1135,9 +1141,7 @@ prefixes remain `preset_*` for the mechanical move.
 | `preset_bankLoadFailedSceneMask()` (Session 057) | Read `pm_bank_load_failed_scene_mask`, populated from `filesystem_lastBankLoadFailedSceneMask()` in `on_bank_load_complete()`. Nonzero after an otherwise-successful (`FS_STATUS_DONE`) Bank Load means Menu still needs to show the filesystem error overlay once for the excluded child(ren). | Menu `PRESET_OP_BANK_LOAD` success path (both the empty-Bank fallback and normal sound-apply branches) |
 | `preset_loadFirstAvailableSceneOrKit()` | Fallback after absent/empty Bank: lowest root Scene, then lowest root Kit, then defaults. | boot, Bank Load completion |
 | `preset_sendDrumsetParameters()` | Synchronous pre-audio clear plus six-slot tagged reset/routing/descriptor-image apply. It intentionally leaves target installation to the exact ordinary Scene worker started after audio initialization. | Menu boot/load path |
-| `preset_applySoundParameter(paramNr, value, recordAutomation)` | Direct legacy/static sound parameter application and optional automation recording. | Menu, morph, reset-lock |
 | `preset_setInstrumentParameter(scene, slot, descriptor_index, image, value)` | Store one descriptor-backed Normal or Morph endpoint (AutoSave marker, card-clean bit). On the active Scene re-interpolate **only that parameter** at the resolved Morph amount (`presetMorph_applyParameterNow()`); a parameter held by step automation keeps its value until the next trigger. The runtime never receives the raw edited value. (`record_automation` removed in S075 F3.) | Menu dynamic VOICE cells |
-| `preset_setInstrumentParameterFromMidi(slot, descriptor_index, value)` | S075 F3, lowest priority: store the active Scene's Normal endpoint (value already clamped) and queue the voice for the Morph sweep (`presetMorph_requestVoice()`); no runtime write. Non-morphable descriptors go through `preset_setSupplementalParameter()`. No edit-mask fan-out. | MidiParser external CC/NRPN |
 | `preset_setSupplementalParameter(scene, slot, descriptor_index, value)` | Store one single-endpoint supplemental descriptor value. | Menu dynamic VOICE cells, storage |
 | `preset_applyInstrumentRuntimeValue(scene, id, value)` | Apply one descriptor-backed instrument value to the DSP runtime through InstrumentManager. | Menu, morph/runtime apply |
 | `preset_applyKitAudioRouting(scene, slot)` | Apply one Scene kit slot's audio route to mixer routing. | Kit load/apply paths |
@@ -1214,7 +1218,7 @@ into `busComp`.
 
 ## Core/Bank/Scene/Preset/ParameterArray
 
-Affiliate modules: Menu, Preset manager, MidiParser, modulationNode, DSP voice
+Affiliate modules: Menu, Preset manager, MidiControl, modulationNode, DSP voice
 modules, mixer, filesystem, PatternData.
 
 Purpose: owns the legacy numeric parameter id map and runtime pointer map from
@@ -1227,7 +1231,7 @@ still needs the same descriptor/Scene target migration.
 
 | API / Data | Use | Usual callers / clients |
 |---|---|---|
-| `enum ParamEnums` / `PAR_*` / `END_OF_SOUND_PARAMETERS` / `NUM_PARAMS` | Legacy/static parameter id space for sound, menu, pattern, and globals. | Menu, filesystem, Preset, MidiParser, PatternData |
+| `enum ParamEnums` / `PAR_*` / `END_OF_SOUND_PARAMETERS` / `NUM_PARAMS` | Legacy/static parameter id space for sound, menu, pattern, and globals. | Menu, filesystem, Preset, PatternData |
 | `TYPE_UINT8`, `TYPE_FLT`, `TYPE_SPECIAL_F`, `TYPE_UINT32`, `TYPE_SPECIAL_P`, `TYPE_SPECIAL_FILTER_F` | Type tags for runtime parameter pointer entries. | ParameterArray, modulationNode |
 | `ptrValue` | Float/integer value carrier for typed writes. | modulationNode, ParameterArray |
 | `Parameter` / `parameterArray[]` | Map legacy sound parameter id to target DSP field and value type. | ParameterArray, modulationNode |
@@ -1416,103 +1420,57 @@ IDs 448..511.
 | `sceneModTarget_get(id)` | Read descriptor metadata: kind, voice slot, range, labels, flags. | Menu, InstrumentManager |
 | `sceneModTarget_first(use_mask)` / `sceneModTarget_step(current, dir, use_mask)` | Non-looping target-list traversal with skipped invalid entries. | Menu target pickers |
 
-## Core/MIDI/MidiParser
+## Core/MIDI (Session 083 rebuild)
 
-Affiliate modules: Uart, USB, Sequencer, Menu, Preset, MidiVoiceControl,
-buttonHandler, triggerJacks, MidiRealtime.
+Affiliate modules: USB, Sequencer, Menu, Preset, MidiVoiceControl,
+buttonHandler, LiveRecord, EffectsManager, InstrumentManager, SceneData.
 
-Purpose: owns incoming MIDI parsing, MIDI runtime config, MTC behavior, and
-CC application to the sound engine. S081: `midiParser_noteOn()` reports each
-recorded note to LiveRecord (`liveRec_triggerIn()`, kind SINGLE, source MIDI;
-processing time until the MIDI rework adds timestamps) and
-`midiParser_enterTaggedParameter()` calls `liveRec_paramIn(0xFFFF, MIDI)`, a
-stub until the CC → target mapping exists. Those two calls are the whole MIDI
-side of live record (R11). The global-channel CC1 (master morph) is never
-recorded (S081 G-1).
+Purpose: the single-role MIDI modules built in S083. The old `MidiParser`,
+`Uart`, `MidiMessages`, `FIFO` and `MidiRealtime` files are gone; their
+duties are split below. A received message is offered to its consumers first
+and forwarded per MRT only when no consumer acted (consume-then-route).
 
-| API | Use | Usual callers / clients |
-|---|---|---|
-| `midiParser_parseUartData(data)` | Parse DIN byte stream. | Uart |
-| `midiParser_parseMidiMessage(msg)` | Parse complete USB/DIN MIDI message. | main MIDI service, Uart |
-| `midiParser_processRealtimeEvents()` | Drain timestamped realtime ring. | TIM3 |
-| `midiParser_ccHandler(msg, updateOriginalValue)` | Internal CC entry for the legacy flat sound parameters: instrument keys get a **runtime-only** write (`midiParser_writeTaggedRuntime()`). Wraps `midiParser_ccDispatch(msg, update, 0)`. | `preset_applySoundParameter()` (Menu, buttonHandler armed-step reset) |
-| `midiParser_ccDispatch(msg, update, external)` (static, S075 F3) | Shared CC/NRPN dispatcher. The global-channel CC entry in `midiParser_parseMidiMessage()` and NRPN data entry pass `external = 1`: instrument keys go to `midiParser_enterTaggedParameter()` (key on the active Scene's slot type → `menu_clampInstrumentValue()` → `preset_setInstrumentParameterFromMidi()`), so external MIDI is the lowest priority and never overrides automation or the Morph interpolation. | MidiParser |
-| `midiParser_triggerVoice(voice, note, vel, do_rec)` | Trigger one voice through MIDI note path. | external clients |
-| `midiParser_playVoiceMidiNote(voice, vel)` | BAR1/BAR2 voice note path. | buttonHandler |
-| `midiParser_getVoiceMidiNote(voice)` | Resolve default/override voice note. | MidiParser, clients |
-| `midiParser_calcDetune(value)` | Convert MIDI detune value. | sound/MIDI paths |
-| `midiParser_checkMtc()` | Stop transport if MTC times out. | Sequencer |
-| `midiParser_setRouting(value)` | Apply MIDI routing menu value. | Menu |
-| `midiParser_setChannel(voice, channel)` | Apply per-voice/global MIDI channel. | Menu |
-| `midiParser_setFilter(is_tx, value)` | Apply TX/RX MIDI filter nibble. | Menu |
+| Module | API | Use | Context |
+|---|---|---|---|
+| `MidiDefs.h` | `MidiMsg` (6 B: status/data1/data2/bits/stamp), status and CC constants, `midiDefs_ccReserved()`, `midiDefs_routeMask()`, `MIDI_ORIGIN_*` | Shared vocabulary; no legacy CC/CC2 map | — |
+| `MidiBuffer.c/h` | `midiBuffer_*` | DIN TX lanes and stamped RX buffer | ISR / foreground |
+| `MidiDin.c/h` | `midiDin_init()`, `midiDin_sendBytes()`, `midiDin_txFree()`, `midiDin_rxPop()` | USART3 driver; realtime bytes diverted to the transport ring | USART3 ISR |
+| `MidiIn.c/h` | `midiIn_service()`, `midiIn_setGlobalChannel/Filter/Routing()`, `midiIn_rxAllows()`, `midiIn_txAllows()`, `midiIn_routeMask()` | Framing (incl. SPP/Song Select), RXF gate, S082 Bank-load drop filter, dispatcher, MRT forwarding | Foreground |
+| `MidiTransport.c/h` | `midiTransport_processRealtime()` (TIM3), `midiTransport_handleSystemCommon()`, `midiTransport_checkMtc()` | Realtime ring and `snc` gate, Start/Continue/Stop, SPP, MTC | TIM3; foreground for SPP/MTC |
+| `MidiNoteMap.c/h` | `midiNoteMap_load/resolve/inverse/effectiveChannel/tracksOnChannel()` | N1–N5 note → track/pitch map and Q4 TX inverse; stateless | Foreground (inverse also TIM3) |
+| `MidiNotes.c/h` | `midiNotes_handle()`, `midiNotes_setNoteAction()` | Single trigger, overlay dispatch, CC2 state, LiveRecord with arrival age | Foreground |
+| `MidiControl.c/h` | `midiControl_handleCc()`, `midiControl_writeTarget()`, `midiControl_targetValue7/Channel()`, `midiControl_targetOnChannel()` | NRPN contexts, CC1, value clamp/Morph translation, menu-edit commit | Foreground |
+| `MidiLearn.c/h` | `midiLearn_arm/cancel/service()`, `midiLearn_captureCc/applyCc()`, `midiLearn_ccForTarget()`, `midiLearn_format/parseSettingsValue()` | 128-entry global Learn table and `settings.cfg` lines | Foreground |
+| `MidiProgram.c/h` | `midiProgram_programChange()`, `midiProgram_bankChange()` | PC on G/per-track; CC0 background Bank request | Foreground |
+| `MidiOut.c/h` | `midiOut_sendMsg()`, `midiOut_forward()`, `midiOut_trackTrigger/NoteOn/NoteOff()`, `midiOut_parameterChanged()`, `midiOut_trackProgramChange()`, `midiOut_service()` | All transmission, USB CIN framing, per-track note-off, coalesced parameter TX, no echoes | Foreground and TIM3 |
+| `MidiPitch.h` | `MIDI_DEFAULT_TRIGGER_NOTE`, `MidiNoteFrequencies[]`, `midiPitch_detune()` | Pitch constants and detune | — |
 
-Shared config:
+Shared runtime state:
 
-- `midi_MidiChannels[8]`: voice channels plus global channel.
-- `midi_NoteOverride[7]`: per-voice note override.
-- `midiParser_txRxFilter`: packed TX/RX filter.
-- `midiParser_originalCcValues[]`: return targets for automation/mod nodes.
+- `midiIn_config`: global channel (0 = off), packed RX/TX filter, MRT mask.
+- `midiControl_nrpn[2][8]`: one NRPN context per port/channel.
+- `midiLearn_table[128]`: global type-tagged CC rows.
+- `midiOut_trackNote/Channel[7]`: per-track sounding note and its channel.
+- `midiOut_nrpnKey[2]`, `midiOut_pending`, `midiOut_lastSendMs`: parameter TX.
 
-## Core/MIDI/Uart
-
-Affiliate modules: MidiParser, USB/MIDI service, Sequencer realtime output.
-
-Purpose: USART3 MIDI DIN only. Front-panel UART stubs are gone.
-
-| API | Use | Usual callers / clients |
-|---|---|---|
-| `initMidiUart()` | Initialize USART3 MIDI. | `main.c` boot |
-| `uart_sendMidiByte(data)` | Queue one DIN byte. | Sequencer/MidiParser |
-| `uart_sendMidi(msg)` | Queue complete MIDI message. | Sequencer/MidiParser |
-| `uart_processMidi()` | Drain received DIN bytes into MidiParser. | main MIDI service |
-| `uart_getMidiTxDropCount()` / `uart_getMidiRealtimeTxDropCount()` | Diagnostics. | diagnostics/future UI |
-
-## Core/MIDI/MidiMessages
-
-Affiliate modules: MidiParser, Uart, USB, Sequencer, Preset.
-
-Purpose: defines MIDI message struct, MIDI status bytes, real MIDI CC values,
-and sound-engine CC enumerations. It no longer defines front-panel protocol
-opcodes.
-
-Key API/data:
-
-- `MidiMsg`: `{ status, data1, data2, bits }`
-- `enum MidiSource`: `midiSourceMIDI`, `midiSourceUSB`
-- `NOTE_ON`, `NOTE_OFF`, `MIDI_CC`, `MIDI_CC2`, `PROG_CHANGE`,
-  realtime/system status constants
-- Sound CC enums used by `midiParser_ccHandler()`
-- `CC_BANK_SELECT_LSB` (0x20): S082 P1 — identifies CC 32 so the drop filter
-  can reject Bank Select LSB along with CC 0 during a background load.
-
-S082 P1 MIDI drop filter (`midiParser_acceptedDuringBankLoad()`):
-while `preset_backgroundBankLoadRunning()` returns nonzero, only realtime
-messages (0xF8–0xFF), Note On, Note Off, and CC (except CC 0 and CC 32) are
-accepted. Program Change, Pitch Bend, Aftertouch, SysEx and the Bank Select
-CCs are silently dropped. MIDI Thru still forwards everything regardless.
-Deferred MIDI Bank load requests: `preset_requestBackgroundBankLoad()` with
-MIDI origin is **dropped** while a load is already in flight (D13). Otherwise
-it stores the one pending slot (`pm_bg_pending_slot`, latest wins), which tick
-phase 0 starts once Preset, the facade and the Menu are idle (D33); a Menu
-Bank OK discards a pending MIDI request.
-`preset_takeBackgroundBankLoadResult()` returns a one-shot result byte: bits
-0..1 encode DONE/FAILED/CODE, and bit 7 (`PRESET_BG_RESULT_MIDI`) flags
-MIDI origin so the caller can distinguish Menu from MIDI completion.
-- `NO_AUTOMATION`
+The S082 Bank-load drop filter moved verbatim into `MidiIn.c`
+(`midiIn_acceptedDuringBankLoad()`): while a load runs, only realtime,
+note on/off and CC except CC 0/32 act; everything else is forwarded. A
+message dropped by the filter is not consumed, so it still follows MRT.
 
 ## Core/MIDI/MidiVoiceControl
 
-Affiliate modules: Sequencer, MidiParser, audio render boundary.
+Affiliate modules: Sequencer, MidiNotes, MidiOut, audio render boundary.
 
 Purpose: owns voice note-on/off dispatch and pending trigger drain at the audio
 render boundary. Session 028 removed obsolete front-panel dependency.
 
 | API | Use | Usual callers / clients |
 |---|---|---|
-| `voiceControl_noteOn(voice, note, vel)` | Trigger/queue voice-on behavior; always requests a step reset for the voice (live triggers reset at each press, S081). | Sequencer, MidiParser, preview, overlay |
+| `voiceControl_noteOn(voice, note, vel)` | Trigger/queue voice-on behavior; always requests a step reset for the voice (live triggers reset at each press, S081). | Sequencer, MidiNotes, preview, overlay |
 | `voiceControl_noteOnNoReset(voice, note, vel)` | S081: queue a trigger that does **not** reset the voice's held automation (roll retriggers 2+). | Sequencer (`seq_triggerVoice(…, 0)`) |
 | `voiceControl_resetOnly(voice)` | S081: request a reset with no trigger (a roll carried into the next step). | Sequencer roll carry |
-| `voiceControl_noteOff(voice)` | Stop one voice or all voices with `0xff`. | Sequencer, MidiParser |
+| `voiceControl_noteOff(voice)` | Stop one voice or all voices with `0xff`. | Sequencer, MidiNotes |
 | `voiceControl_processPending()` | Drain pending triggers at the audio render boundary. S081: `voiceControl_popPending()` returns each entry's voice reset bit, tested and cleared under the queue's PRIMASK from the per-voice mask `voiceControl_pendingReset` (`u8`, bits 0..6; never a flag in the entry, because `voiceControl_noteOff()` drops every queued entry of the voice). After the ring is empty the leftover mask is taken under PRIMASK and each voice is restored (reset-only renewals, resets whose entry was dropped). Runs before `seq_drainPendingAutomation()`, so a step's automation always lands after its reset. | `audio_check_and_render()` |
 | `voiceControl_triggerNow(voice, note, vel, reset)` (the trigger funnel) | Apply one trigger in the foreground in the order `preset_applyDeferredSceneSlotForTrigger()` → `seq_restoreAutomatedParameters()` (only if `reset`, S081) → `instrumentManager_triggerTrack()`, sidechain, LED. The restore must not move ahead of the deferred Scene-slot apply. Since S074 it also calls `busComp_sidechainTrigger(track, velocity)`, so every trigger source (sequencer, rolls, MIDI, previews) can duck the bus compressor. | `voiceControl_processPending()`, previews |
 | `voiceControl_isVoicePlaying(voice)` | Query voice state. | clients/future UI |
@@ -1815,7 +1773,7 @@ Current ownership decisions:
 
 Affiliate modules: Sequencer (timing services, TIM3 ring), PatternStackService
 (writes, target override), EffectsManager (FX-sequence erase), SceneData /
-PatternData getters (values, types), buttonHandler / Menu / MidiParser
+PatternData getters (values, types), buttonHandler / Menu / MidiNotes
 (callers), Menu (`menu_automationTargetRecorded()`, the one Menu call).
 
 Purpose: live record (LATCH, OVERDUB) and live erase of the PERF overlay
@@ -1824,12 +1782,12 @@ one target Scene T = P(rtk), best effort, while playback keeps priority. Rules
 and mechanisms: `PATTERN_DYNAMIC_STACK.md` §6.7. Session record:
 `081_SESSION_HANDOFF_LOG.md` §2–§8.
 
-Dependency rules: buttonHandler, Menu and MidiParser call LiveRecord;
+Dependency rules: buttonHandler, Menu and MidiNotes/MidiControl call LiveRecord;
 LiveRecord calls the Sequencer, PatternStackService, EffectsManager and
 SceneData getters, and (one deviation, S081 hardware fix 1)
 `menu_automationTargetRecorded()`. The Sequencer never calls LiveRecord (the
 drain reads the bitmaps LiveRecord registers). LiveRecord never calls
-buttonHandler or MidiParser, never runs in TIM3, and never writes a Scene
+buttonHandler or the MIDI modules, never runs in TIM3, and never writes a Scene
 other than T (Pattern) or the origin Scene's fan-out set (FX sequence).
 
 | API | Use | Usual callers / clients |
@@ -1841,9 +1799,9 @@ other than T (Pattern) or the origin Scene's fan-out set (FX sequence).
 | `liveRec_mode()` / `liveRec_armed()` / `liveRec_patternWriting()` | `LIVEREC_MODE_OFF/LATCH/OVERDUB/ERASE`; armed = mode ≠ OFF (copy/clear refusal, REC/erase gates); writing = armed and running (Pattern AutoSave gate, target override). | buttonHandler, Menu, copyClearSession, filesystem |
 | `liveRec_onActiveTrackChanged(track)` / `liveRec_setRecordTrack(track)` / `liveRec_recordTrack()` | `rtk` follow (on a real track change), SHIFT+REC override, display. | `menu_setActiveVoice()`, `rtk` cell |
 | `liveRec_activePatternLocked()` | Q13: 1 while writing into T ≠ the active Scene; Pattern edits of the viewed Pattern are refused silently. | Menu, `buttonHandler_setRemoveStep()` |
-| `liveRec_triggerIn(const liveRec_trigger_t *)` | One hit when it sounds: {track, note, velocity, kind `LIVEREC_HIT_SINGLE/FLAM_GRACE/FLAM_MAIN/ROLL_START/ROLL_HIT`, roll index, source `LIVEREC_SRC_OVERLAY/MIDI`, note_is_default}. Capture, placement, flam pairing, roll classification and spans. | `buttonHandler_overlayReport()`, `midiParser_noteOn()` |
+| `liveRec_triggerIn(const liveRec_trigger_t *)` | One hit when it sounds: {track, note, velocity, kind `LIVEREC_HIT_SINGLE/FLAM_GRACE/FLAM_MAIN/ROLL_START/ROLL_HIT`, roll index, source `LIVEREC_SRC_OVERLAY/MIDI`, note_is_default}. Capture, placement, flam pairing, roll classification and spans. | `buttonHandler_overlayReport()`, `midiNotes_handle()` |
 | `liveRec_rollRateChange(track, rollIndex)` / `liveRec_rollRelease(track)` | Overlay switch or toggle-off while held; release (roll end write). | `buttonHandler_overlaySwitchHeld()`, `buttonHandler_overlayRelease()` |
-| `liveRec_paramIn(target9, source)` | Mark an adjusted recordable target (dirty; latch in LATCH) after the ownership check; captures individual voice/FX Morph edits into `liveRec_morphValue[7]`; with `LIVEREC_AUTOMATION_FIRST_CHANGE` 1 writes the first change of the step at once. No value is passed: the write reads the current value from the origin Scene A. | `menu_liveRecRecordCell()`, `midiParser_enterTaggedParameter()` (stub `0xFFFF`) |
+| `liveRec_paramIn(target9, source)` | Mark an adjusted recordable target (dirty; latch in LATCH) after the ownership check; captures individual voice/FX Morph edits into `liveRec_morphValue[7]`; with `LIVEREC_AUTOMATION_FIRST_CHANGE` 1 writes the first change of the step at once. No value is passed: the write reads the current value from the origin Scene A. | `menu_liveRecRecordCell()`, `menu_commitTargetEdit()` (MIDI) |
 | `liveRec_eraseParam(target9, fxLane)` | Knob erase: the target joins the erase bitmap; an FX lane joins the knob lanes. | Menu knob-erase branch |
 | `liveRec_eraseSeqHeld(track, held)` / `liveRec_eraseFxSeqHeld(held)` / `liveRec_eraseTrackHeld(track, held)` | SEQ hold on the active track (specials) / FX SEQ hold (counted) / TRACK hold (full). | buttonHandler erase router |
 | `liveRec_eraseReleaseHeld()` | Drop every held SEQ/TRACK/FX-SEQ erase gesture, keeping erase mode and the knob targets. | `handleModeButtons()`, `liveRec_eraseEnd()` |

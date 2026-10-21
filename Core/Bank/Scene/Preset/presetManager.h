@@ -420,16 +420,6 @@ uint8_t preset_saveTestSimpleDir(const char *display_name);
 void    preset_sendDrumsetParameters(void);
 
 /*
- * Direct sound-apply helpers.
- * Why: local UI/preset code should not pack fake front-panel protocol bytes to
- * reach DSP parameter application. Inputs are real legacy sound parameter IDs.
- * Outputs update DSP/menu parameter state and optionally record automation.
- * Risk: parameter 127 is rejected because the old MIDI_CC packing underflowed.
- */
-void    preset_applySoundParameter(uint16_t paramNr, uint8_t value,
-                                   uint8_t recordAutomation);
-
-/*
  * Scene-owned instrument mutation/apply API.
  *
  * Why these functions exist: root Kit directories now parse into
@@ -469,33 +459,6 @@ uint8_t preset_setInstrumentParameter(uint8_t scene_index, uint8_t slot,
 uint8_t preset_setSupplementalParameter(uint8_t scene_index, uint8_t slot,
                                         uint8_t descriptor_index,
                                         instrument_param_value_t value);
-/*
- * Enter one instrument parameter from external MIDI (S075 F3, user P1:
- * MIDI takes the lowest priority).
- *
- * What: stores `value` as the active Scene's Normal endpoint of one
- * descriptor and queues that voice for the Morph sweep. Nothing is written
- * to the runtime here: the sweep applies the new interpolation whenever it
- * reaches the parameter, and skips it while step automation holds it.
- * Non-morphable parameters (never automatable, never swept) go through
- * preset_setSupplementalParameter(), which stores and applies them as a menu
- * edit does.
- * Why: automation wins, then menu edits, then MIDI. A CC is an endpoint entry,
- * not a runtime override, so it can override neither automation nor the Morph
- * interpolation.
- * Inputs: slot 0..5, descriptor-local index for the active Scene's slot type,
- * and a value already clamped to the descriptor domain
- * (menu_clampInstrumentValue()). Output: 1 when stored/queued, 0 for an
- * invalid slot/descriptor. Retention: a changed byte marks its AutoSave
- * Normal cell and clears the Scene's card-clean bit, like a menu edit.
- * Active Scene only (no edit-mask fan-out). Caller: MidiParser.c
- * midiParser_enterTaggedParameter(). Affiliates:
- * preset_storeInstrumentEndpoint(), presetMorph_requestVoice(),
- * seq_automationHoldsParameter().
- */
-uint8_t preset_setInstrumentParameterFromMidi(uint8_t slot,
-                                              uint8_t descriptor_index,
-                                              uint8_t value);
 uint8_t preset_applyInstrumentRuntimeValue(uint8_t scene_index,
                                            instrument_param_id_t id,
                                            instrument_param_value_t value);

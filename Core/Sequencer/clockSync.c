@@ -125,13 +125,29 @@ void sync_midiStartStop(uint8_t isStart)
 	if(isStart) {
 		// this message does NOT mean start immediately! it just 'arms' the seq to start at the next MIDI_CLOCK received
 		sync_clockCnt = 0;
-		seq_setRunning(1);
+		seq_setRunningEx(1u, 0u);
 		sync_timeLastUs = timebase_tim2Now();
 		sync_haveTimestamp = 0;
 	} else {
-		seq_setRunning(0);
+		seq_setRunningEx(0u, 0u);
 		sync_haveTimestamp = 0;
 	}
+}
+
+/*
+ * MIDI Continue (S083 T1).
+ *
+ * What: like Start, arms clock counting from the next MIDI clock, but the
+ * sequencer resumes at the stored position (seq_continueRunning()). The
+ * Continue is not re-sent (C-11). Context: TIM3 (realtime handler).
+ * Accessor: MidiTransport.c. Affiliates: seq_continueRunning().
+ */
+void sync_midiContinue(void)
+{
+	sync_clockCnt = 0;
+	seq_continueRunning(0u);
+	sync_timeLastUs = timebase_tim2Now();
+	sync_haveTimestamp = 0;
 }
 //---------------------------------------------------------
 uint8_t sync_getClockCnt()

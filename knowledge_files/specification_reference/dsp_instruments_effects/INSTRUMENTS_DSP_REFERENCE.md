@@ -9,7 +9,8 @@ part costs, and how to change or extend it.
   (§2) and a mirrored fader gain used by the mixer's `xfd` mode. S075
   changed no engine either: it retired the global `srt` LFO/automation
   target and fixed **who may write a voice parameter's runtime value
-  when** (§4.3, §7.5: automation, then menu edits, then MIDI). S076 added
+  when** (§4.3, §7.5). S083 Q1 made a MIDI write a menu edit (same priority
+  and actions). S076 added
   LFO retrigger value 7 (`scn`, Scene-change phase handoff) and fixed
   the LFO phase offset scaling (§7.1).
 - **Related documents:**
@@ -208,10 +209,10 @@ parameter cell (Drum 39 rows, Snare 38, Cymbal 39, HiHat 39):
 retained value reaches the DSP. Its callers: Preset (Kit/Scene/Instrument
 apply, supplemental edits), the Morph worker and the one-parameter menu
 apply (both through the guarded `presetMorph_writeRuntimeBase()`), step
-automation drain and restore, Scene activation, and the legacy internal CC
-path (`midiParser_writeTaggedRuntime()`). Since S075 F3 **external MIDI no
-longer writes the runtime**: it stores an endpoint and the Morph sweep
-applies it (§7.5).
+  automation drain and restore, and Scene activation. External MIDI does not
+  write the runtime directly either: since S083 Q1 it commits through the
+  shared menu path (`menu_commitTargetEdit()`), whose menu-edit write reaches
+  the runtime through the same guarded `presetMorph_*` route (§7.5).
 
 1. `instrumentManager_writeSpecialRuntime()` switches on the row's special
    tag (§4.4). If the row has a special writer, it converts the byte and calls
@@ -569,7 +570,7 @@ local token in that namespace. Install:
   `morph_interpolation[]` through `instrumentManager_writeRuntime()`. An LFO
   aimed at a voice Morph re-queues a pass of every Morphable parameter every
   block, which is foreground cost.
-- **Priority (S075 F3, user): automation, then menu edits, then MIDI.**
+- **Priority (S083 Q1, user): a MIDI write is a menu edit.**
   A voice-parameter automation value holds until the voice's next trigger:
   `seq_automationHoldsParameter(slot, local)` reports it, and every
   Morph-base runtime write (`presetMorph_tick()`,
@@ -580,8 +581,8 @@ local token in that namespace. Install:
   the whole voice); since S081 R12 the edit also clears the held bit and sets
   a menu override (`seq_menuOverrideSet()`), so the new value sounds at once
   and that parameter's automation is suppressed until the voice's next
-  trigger. External MIDI CC/NRPN stores the active Scene's clamped
-  Normal endpoint and lets the Morph sweep apply it. Before S075 F3 a menu
+  trigger. External MIDI CC/NRPN goes through the same menu commit, so it has
+  the same effect. Before S075 F3 a menu
   edit, a Morph change, an LFO on Morph, `Nvm` automation or a Kit apply
   reset automated parameters mid-note.
 - **LFO:** step automation and Morph set the base; the LFO modulates around

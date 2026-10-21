@@ -60,7 +60,9 @@
 #include "SomGenerator.h"
 #include "menuEffects.h"
 #include "triggerJacks.h"
-#include "MidiParser.h"
+#include "MidiIn.h"
+#include "MidiOut.h"
+#include "MidiLearn.h"
 #include "modulationNode.h"
 #include <string.h>
 #include <stdint.h>
@@ -817,27 +819,19 @@ static uint8_t menu_tickInstrumentApply(void)
 static void menu_sendSoundParameter(uint16_t paramNr, uint8_t value)
 {
     /*
-     * Route flat menu parameters by ownership, not by MIDI CC packing range.
+     * Route a flat menu parameter to its owner (S083: legacy sound path
+     * removed).
      *
-     * Instrument sound parameters no longer live in ParameterArray's flat
-     * namespace; descriptor-backed voice edits use preset_setInstrumentParameter().
-     * The remaining flat ids include PERF Morph/Roll, Pattern, generator, MIDI,
-     * trigger, and globals. Many of those ids are numerically below 128, so the
-     * old "param < 128 means sound CC" test bypassed menu_parseGlobalParam()
-     * and lost owner-specific side effects such as preset_morph().
-     *
-     * Inputs: canonical flat ParameterArray id and clamped byte value. Outputs:
-     * only true legacy sound ids use preset_applySoundParameter(); all non-sound
-     * flat ids run their typed owner path in menu_parseGlobalParam(). This stays
-     * as a separate helper because menu_sendEditedParameter() also owns the
-     * morph-endpoint edit overlay; collapsing both decisions would make it too
-     * easy for future clients to route descriptor endpoint edits through the
-     * active runtime parameter path.
+     * What: every flat ParameterArray id runs its typed owner path in
+     * menu_parseGlobalParam(). Why: instrument sound parameters left the
+     * flat namespace (END_OF_SOUND_PARAMETERS is 1), so the old
+     * preset_applySoundParameter() branch only ever saw id 0 and fed the
+     * retired legacy MIDI CC map. Kept as a function because
+     * menu_sendEditedParameter() still separates Morph-endpoint edits from
+     * active edits. Inputs: id and clamped value. Affiliates:
+     * menu_parseGlobalParam(), menu_sendEditedParameter().
      */
-    if (paramNr < END_OF_SOUND_PARAMETERS)
-        preset_applySoundParameter(paramNr, value, 1);
-    else
-        menu_parseGlobalParam(paramNr, value);
+    menu_parseGlobalParam(paramNr, value);
 }
 
 /*
@@ -2086,6 +2080,12 @@ typedef struct {
 /* S080 E6/F10: shared resolver for the overlay/scene-global static names. */
 static uint8_t menu_getS080StaticName(const menu_cell_t *cell,
                                       uint16_t value, char *buf);
+/* S083: cell MIDI target (defined with menu_paramVisible()). */
+static uint8_t menu_cellMidiTarget(const menu_cell_t *cell, uint16_t *id);
+static uint8_t menu_cellMidiTargetAt(uint8_t active_page, uint8_t position,
+                                     uint16_t *id);
+/* S083: target-ID visibility test used by menu_commitGlobalMorphFromMidi(). */
+static uint8_t menu_paramVisible(uint16_t paramNr);
 /* S080 F9 / P2 Defect 15: ungated PERF scene-change executor; `restart`
  * selects a PC reset (pcr for direct/chain changes, qac for queued ones). */
 static void menu_perfSceneChangeExecute(uint8_t scene_index, uint8_t restart);
@@ -2119,7 +2119,8 @@ static menu_cell_t menu_resolveCell(uint8_t subPage, uint8_t position);
 static uint8_t menu_voiceSubPageScreenCount(uint8_t subPage);
 static uint8_t menu_cellDtype(const menu_cell_t *cell);
 static uint16_t menu_cellDisplayValue(const menu_cell_t *cell);
-static uint8_t menu_cellCommitValue(const menu_cell_t *cell, uint16_t value);
+static uint8_t menu_cellCommitValueEx(const menu_cell_t *cell, uint16_t value,
+                                      uint8_t panel);
 /* S081 P1B item 14: recordable-cell hook (defined near menu_cellClearTarget). */
 static void menu_liveRecRecordCell(uint8_t subPage, uint8_t position);
 static uint8_t menu_cellIsEmpty(const menu_cell_t *cell);
@@ -4014,10 +4015,12 @@ static instrument_param_id_t menu_seqCellToTrackTarget(
  * presetMorph_trackParam_t lane. Affiliates: menu_seqCellToTrackTarget(),
  * presetMorph_clearTrackParamStepOverride(), seq_clearSceneAutomationBit().
  */
-static void menu_clearTrackTimingOverride(uint8_t cell_position,
-                                          presetMorph_trackParam_t param)
+/* S083: MIDI writes a track timing target of any track (plan C2), not only
+** the active one. */
+static void menu_clearTrackTimingOverrideFor(uint8_t track,
+                                             uint8_t cell_position,
+                                             presetMorph_trackParam_t param)
 {
-    uint8_t track = menu_getActiveVoice();
     uint16_t target = (uint16_t)menu_seqCellToTrackTarget(cell_position, track);
     uint8_t index;
 
@@ -4025,6 +4028,13 @@ static void menu_clearTrackTimingOverride(uint8_t cell_position,
     if (target != (uint16_t)INSTRUMENT_PARAM_INVALID &&
         sceneModTarget_indexFromId(target, &index))
         seq_clearSceneAutomationBit(index);
+}
+
+static void menu_clearTrackTimingOverride(uint8_t cell_position,
+                                          presetMorph_trackParam_t param)
+{
+    menu_clearTrackTimingOverrideFor(menu_getActiveVoice(), cell_position,
+                                     param);
 }
 
 /*
@@ -5058,13 +5068,36 @@ static uint16_t menu_cellDisplayValue(const menu_cell_t *cell)
     return 0u;
 }
 
-static uint8_t menu_cellCommitValue(const menu_cell_t *cell, uint16_t value)
+static uint8_t menu_cellCommitValueEx(const menu_cell_t *cell, uint16_t value,
+                                      uint8_t panel)
 {
     if (!cell)
         return 0u;
+    /*
+     * Panel or external edit (S083 Q1).
+     *
+     * What: `panel` = 1 for an encoder/pot edit: the live view flags decide
+     * the image (VOICE SHIFT Morph view, Effect page Morph view, STEP Morph
+     * view) and Global-page edits mark settings.cfg. `panel` = 0 for a MIDI
+     * write: always the Normal image and no page rules, because MIDI never
+     * edits a Morph endpoint (S083 3.5). Everything else - fan-out through
+     * bank_editTargetMask(), seq_menuOverrideSet() (R12), the Scene-target
+     * override clears, menuHold for Effects (R13) - is identical, which is
+     * what makes a MIDI write a menu edit. Callers: menu_cellCommitValue()
+     * (panel), menu_commitTargetEdit() (MIDI).
+     */
+    const uint8_t morphView = (uint8_t)(panel && voiceModeShowMorph);
     /* Effect page cells are owned by menuEffects.c (Session 072 step 7). */
-    if (cell->kind == MENU_CELL_EFFECT)
-        return menuEffects_cellCommit(&cell->fx, value);
+    if (cell->kind == MENU_CELL_EFFECT) {
+        if (panel)
+            return menuEffects_cellCommit(&cell->fx, value);
+        if (cell->fx.kind == MENU_FX_CELL_PARAM)
+            return effects_setParameter(scene_getActiveIndex(), cell->fx.index,
+                                        EFFECT_IMAGE_NORMAL, (uint8_t)value);
+        if (cell->fx.kind == MENU_FX_CELL_MORPH_AMOUNT)
+            return menu_commitEffectMorphParam((uint8_t)value);
+        return 0u;
+    }
     if (cell->kind == MENU_CELL_KIT_SETTING) {
         uint32_t edit_mask = bank_editTargetMask();
         uint8_t scene_index;
@@ -5088,10 +5121,10 @@ static uint8_t menu_cellCommitValue(const menu_cell_t *cell, uint16_t value)
                     continue;
                 changed |= preset_setSlot6Track7AmpEnvelopeDecay(
                     scene_index,
-                    voiceModeShowMorph ? INSTRUMENT_IMAGE_MORPH
+                    morphView ? INSTRUMENT_IMAGE_MORPH
                                        : INSTRUMENT_IMAGE_MAIN,
                     (uint8_t)value,
-                    (uint8_t)(!voiceModeShowMorph &&
+                    (uint8_t)(!morphView &&
                               scene_index == scene_getActiveIndex()));
             }
             /*
@@ -5150,10 +5183,10 @@ static uint8_t menu_cellCommitValue(const menu_cell_t *cell, uint16_t value)
             if (cell->descriptor->flags & INSTRUMENT_PARAM_FLAG_MORPHABLE) {
                 changed |= preset_setInstrumentParameter(
                     scene_index, cell->slot, cell->descriptor_index,
-                    voiceModeShowMorph ? INSTRUMENT_IMAGE_MORPH
+                    morphView ? INSTRUMENT_IMAGE_MORPH
                                        : INSTRUMENT_IMAGE_MAIN,
                     (uint8_t)value);
-            } else if (!voiceModeShowMorph) {
+            } else if (!morphView) {
                 changed |= preset_setSupplementalParameter(
                     scene_index, cell->slot, cell->descriptor_index, value);
             }
@@ -5185,7 +5218,7 @@ static uint8_t menu_cellCommitValue(const menu_cell_t *cell, uint16_t value)
                 break;
             case MENU_SCENE_SETTING_FX_SEND_AMOUNT:
                 /* S075 F2-H: view selects the retained send endpoint. */
-                changed |= voiceModeShowMorph
+                changed |= morphView
                     ? preset_setVoiceFxSendMorph(scene_index, cell->slot,
                                                  (uint8_t)value)
                     : preset_setVoiceFxSendAmount(scene_index, cell->slot,
@@ -5300,7 +5333,7 @@ static uint8_t menu_cellCommitValue(const menu_cell_t *cell, uint16_t value)
      * fallback). Affiliates: menu_getParameterDisplayValue(),
      * menu_getPlayModeName().
      */
-    if (cell->kind == MENU_CELL_STATIC &&
+    if (panel && cell->kind == MENU_CELL_STATIC &&
         menu_patternTrackMorphEndpointActive(cell->static_param)) {
         /*
          * Commit a STEP-page track Morph endpoint edit (S078 §5.4).
@@ -5353,7 +5386,7 @@ static uint8_t menu_cellCommitValue(const menu_cell_t *cell, uint16_t value)
          * by the page test. Affiliates: filesystem settings scheduler and
          * filesystem_setAutosaveEnabled().
          */
-        if (old_value != *paramValue &&
+        if (panel && old_value != *paramValue &&
             /* rtk is runtime-only; a change must not schedule a settings write
              * (S081 §11, B-5c). */
             cell->static_param != PAR_AUTOM_TRACK &&
@@ -5366,6 +5399,205 @@ static uint8_t menu_cellCommitValue(const menu_cell_t *cell, uint16_t value)
         return 1u;
     }
     return 0u;
+}
+
+/* Panel edit commit (encoder, pots): live view state. Contract above. */
+static uint8_t menu_cellCommitValue(const menu_cell_t *cell, uint16_t value)
+{
+    return menu_cellCommitValueEx(cell, value, 1u);
+}
+
+/*
+ * Track timing target from MIDI (S083 C2; plan 3.5 Scene targets).
+ *
+ * What: writes length/scale/shuffle of track `d->voice_slot` in the active
+ * Scene (Pattern data: never fanned out, edit-mask rule), clears that
+ * track's step override and Scene automation bit like a STEP menu edit
+ * (S081 5.2), and refreshes the STEP mirrors when that track and Scene
+ * are on screen. Inputs: descriptor, 7-bit value. Output: 1.
+ */
+static uint8_t menu_commitTrackTimingTarget(
+    const scene_mod_target_descriptor_t *d, uint8_t value)
+{
+    const uint8_t scene = scene_getActiveIndex();
+    const uint8_t track = d->voice_slot;
+
+    if (track >= NUM_TRACKS)
+        return 0u;
+    if (value < d->min_value) value = (uint8_t)d->min_value;
+    if (value > d->max_value) value = (uint8_t)d->max_value;
+    switch (d->kind) {
+    case SCENE_MOD_TARGET_KIND_TRACK_LENGTH:
+        pat_setTrackLength(scene, track, value);
+        menu_clearTrackTimingOverrideFor(track, 0u, PRESETMORPH_TRACK_LENGTH);
+        break;
+    case SCENE_MOD_TARGET_KIND_TRACK_SCALE:
+        pat_setTrackScale(scene, track, value);
+        menu_clearTrackTimingOverrideFor(track, 1u, PRESETMORPH_TRACK_SCALE);
+        break;
+    default:
+        pat_setTrackShuffle(scene, track, value);
+        menu_clearTrackTimingOverrideFor(track, 2u, PRESETMORPH_TRACK_SHUFFLE);
+        break;
+    }
+    if (scene == menu_getViewedPattern() && track == menu_getActiveVoice())
+        pat_applyTrackSettingsToMenu(scene, track);
+    return 1u;
+}
+
+/* 7-bit -> 8-bit Morph amount (the automation translation, plan C3). */
+static uint8_t menu_morphFrom7(uint8_t v)
+{
+    return (v < 127u) ? (uint8_t)(v * 2u) : 255u;
+}
+
+/*
+ * Commit one MIDI parameter write as a menu edit (S083 Q1, C3, C9).
+ *
+ * What: resolves a 9-bit target in the ACTIVE Scene (Scene 17 while
+ * active) to the same commit a menu cell performs, with the panel's view
+ * state switched off (Normal image), then records it and repaints it:
+ *  - Instrument 0..383: an Instrument cell for the active slot type; the
+ *    value is clamped to the descriptor's menu domain (dtype, lists,
+ *    target tokens); seq_menuOverrideSet() + fan-out (R12);
+ *  - Scene 384..447: Nvm/fxm through their static cells with the 7-bit
+ *    Morph translation; Nou/Nfx through the Scene-setting cell (override
+ *    clears); 7dc through the Kit-setting cell; track len/scl/shf through
+ *    menu_commitTrackTimingTarget(); retired/unused IDs refused;
+ *  - Effect 448..510: the Effect row of the active type, WIDE8 rows
+ *    through the type's expand7 (the automation rule), Normal image,
+ *    EffectsManager fan-out and menuHold (R13).
+ * Then, in LATCH/OVERDUB, liveRec_paramIn(id, MIDI) for automatable
+ * targets except track length (as menu_liveRecRecordCell() minus its
+ * panel-view exclusions, which cannot apply to MIDI), and
+ * menu_notifyTargetChanged(id).
+ * Why: Q1: MIDI has the same effect as a menu edit, same priority, same
+ * actions against automation and recording; the display follows.
+ * Inputs: id, value 0..127, origin (MIDI_ORIGIN_MIDI; reserved for later
+ * external sources). Output: 1 when the ID is a valid target in the active
+ * Scene (the caller counts the message as consumed), else 0.
+ * Context: foreground. Accessors: midiControl_writeTarget().
+ * Affiliates: menu_cellCommitValueEx(), menu_clampCellValue(),
+ * liveRec_paramIn(), effects_setParameter(), sceneModTarget_descriptor().
+ */
+uint8_t menu_commitTargetEdit(uint16_t id, uint8_t value, uint8_t origin)
+{
+    menu_cell_t cell;
+    uint16_t v = value;
+    uint8_t recordable = 0u;
+
+    (void)origin;
+    if (value > 127u)
+        value = 127u;
+    memset(&cell, 0, sizeof(cell));
+    if (instrumentParam_isVoiceParameter(id)) {
+        const kit_instrument_slot_t *instr = scene_instrumentSlotConst(
+            scene_getActiveIndex(), instrumentParam_slot(id));
+
+        if (!instr)
+            return 0u;
+        cell.kind = MENU_CELL_INSTRUMENT;
+        cell.slot = instrumentParam_slot(id);
+        cell.descriptor_index = instrumentParam_local(id);
+        cell.descriptor = instrumentManager_descriptor(instr->type,
+                                                       cell.descriptor_index);
+        if (!cell.descriptor)
+            return 0u;
+        menu_clampCellValue(&cell, &v);
+        (void)menu_cellCommitValueEx(&cell, v, 0u);
+        recordable = (uint8_t)((cell.descriptor->flags &
+                                INSTRUMENT_PARAM_FLAG_AUTOMATABLE) != 0u);
+    } else if (sceneModTarget_isSceneTarget(id)) {
+        const scene_mod_target_descriptor_t *d = sceneModTarget_descriptor(id);
+
+        if (!d)
+            return 0u;
+        if (value < d->min_value) value = (uint8_t)d->min_value;
+        if (value > d->max_value) value = (uint8_t)d->max_value;
+        switch (d->kind) {
+        case SCENE_MOD_TARGET_KIND_VOICE_MORPH:
+            cell.kind = MENU_CELL_STATIC;
+            cell.static_param = (uint16_t)(PAR_VOICE1_MORPH + d->voice_slot);
+            v = menu_morphFrom7(value);
+            break;
+        case SCENE_MOD_TARGET_KIND_EFFECT_MORPH:
+            cell.kind = MENU_CELL_STATIC;
+            cell.static_param = PAR_EFFECT_MORPH;
+            v = menu_morphFrom7(value);
+            break;
+        case SCENE_MOD_TARGET_KIND_AUDIO_OUT:
+            cell.kind = MENU_CELL_SCENE_SETTING;
+            cell.scene_setting = MENU_SCENE_SETTING_AUDIO_OUT;
+            cell.slot = d->voice_slot;
+            v = value;
+            break;
+        case SCENE_MOD_TARGET_KIND_FX_SEND:
+            cell.kind = MENU_CELL_SCENE_SETTING;
+            cell.scene_setting = MENU_SCENE_SETTING_FX_SEND_AMOUNT;
+            cell.slot = d->voice_slot;
+            v = value;
+            break;
+        case SCENE_MOD_TARGET_KIND_SLOT6_TRACK7_AMP_DECAY:
+            cell.kind = MENU_CELL_KIT_SETTING;
+            cell.kit_setting = MENU_KIT_SETTING_SLOT6_TRACK7_AMP_DECAY;
+            v = value;
+            break;
+        case SCENE_MOD_TARGET_KIND_TRACK_LENGTH:
+        case SCENE_MOD_TARGET_KIND_TRACK_SCALE:
+        case SCENE_MOD_TARGET_KIND_TRACK_SHUFFLE:
+            (void)menu_commitTrackTimingTarget(d, value);
+            break;
+        default:
+            return 0u;	/* retired or unused */
+        }
+        if (cell.kind != MENU_CELL_EMPTY)
+            (void)menu_cellCommitValueEx(&cell, v, 0u);
+        recordable = (uint8_t)((d->use_flags &
+                                SCENE_MOD_TARGET_USE_AUTOMATION) != 0u &&
+                               d->kind != SCENE_MOD_TARGET_KIND_TRACK_LENGTH);
+    } else if (effectTarget_isEffectId(id)) {
+        uint8_t local = effectTarget_local(id);
+        effect_type_id_t type = effects_activeType();
+        const effect_param_descriptor_t *d = effects_descriptor(type, local);
+
+        if (!d || local >= EFFECT_TARGET_PATTERN_LOCAL_LIMIT)
+            return 0u;
+        v = ((d->effect_flags & EFFECT_PARAM_FLAG_WIDE8) && d->expand7)
+            ? d->expand7(value) : value;
+        (void)effects_setParameter(scene_getActiveIndex(), local,
+                                   EFFECT_IMAGE_NORMAL, (uint8_t)v);
+        recordable = effects_paramAutomatable(type, local);
+    } else {
+        return 0u;
+    }
+    if (recordable)
+        liveRec_paramIn(id, LIVEREC_SRC_MIDI);
+    menu_notifyTargetChanged(id);
+    return 1u;
+}
+
+/*
+ * Global Morph from MIDI CC1 on G (S083 C7, Q1; G-1 binding).
+ *
+ * What: commits PAR_MORPH through its static cell exactly like the PERF
+ * `mrp` edit (edit-mask fan-out through preset_morphScene()), never records
+ * (global Morph is never recorded, G-1), and repaints `mrp` and the six
+ * per-voice Morph cells when visible. Inputs: 7-bit value (translated
+ * 0..126 -> x2, 127 -> 255). Accessor: midiControl_handleCc().
+ */
+void menu_commitGlobalMorphFromMidi(uint8_t value)
+{
+    menu_cell_t cell;
+    uint8_t slot;
+
+    memset(&cell, 0, sizeof(cell));
+    cell.kind = MENU_CELL_STATIC;
+    cell.static_param = PAR_MORPH;
+    (void)menu_cellCommitValueEx(&cell, menu_morphFrom7(value), 0u);
+    if (menu_paramVisible(PAR_MORPH))
+        menu_knobs_dirty = 1u;
+    for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++)
+        menu_notifyTargetChanged(sceneModTarget_voiceMorphId(slot));
 }
 
 static uint8_t menu_lfoTargetContext(const menu_cell_t *cell,
@@ -5897,11 +6129,63 @@ static void menu_displayInstrumentTargetFull(uint16_t target)
     menu_copyPaddedField(&editDisplayBuffer[1][8], descriptor->long_name, 8u);
 }
 
+/*
+ * Learn display (S083 C5, F29).
+ * What: the cell whose MIDI target is Learn's target shows `LRN` while a
+ * CC is awaited and `FUL` while a refused learn is shown. Inputs: cell,
+ * buf (3 chars). Output: 1 when written. Accessors:
+ * menu_formatCellValue3(), menu_repaintGeneric().
+ */
+static uint8_t menu_learnName(const menu_cell_t *cell, char *buf)
+{
+    uint16_t want = midiLearn_displayTarget();
+    uint16_t id;
+
+    if (want == MIDI_TARGET_OFF || !menu_cellMidiTarget(cell, &id) ||
+        id != want)
+        return 0u;
+    memcpy(buf, midiLearn_showingFull() ? "FUL" : "LRN", 3);
+    return 1u;
+}
+
+/* MidiLearn: state changed; repaint through the coalesced path. */
+void menu_learnDisplayChanged(void)
+{
+    menu_knobs_dirty = 1u;
+}
+
+/*
+ * Names for the MIDI static cells (S083).
+ *
+ * What: `ch` 0 -> `off`; `chn` 0 -> `glb`; `nte` 0 -> `def`. Returns 1 when
+ * it wrote buf (3 chars), else 0 and the generic formatter runs. Why: the
+ * zero values are special cases of DTYPE_1B16/DTYPE_NOTE_NAME (dtype space
+ * full). `nte` 0 showed `any` before S083; it now means "no note assigned"
+ * (`def`). Inputs: cell, value. Accessors: menu_formatCellValue3(),
+ * menu_repaintGeneric().
+ */
+static uint8_t menu_getMidiStaticName(const menu_cell_t *cell, uint16_t value,
+                                      char *buf)
+{
+    if (!cell || cell->kind != MENU_CELL_STATIC || value != 0u)
+        return 0u;
+    switch (cell->static_param) {
+    case PAR_MIDI_CHAN_GLOBAL: memcpy(buf, menuText_off, 3); return 1u;
+    case PAR_TRACK_MIDI_CHAN:  memcpy(buf, menuText_glb, 3); return 1u;
+    case PAR_TRACK_MIDI_NOTE:  memcpy(buf, menuText_def, 3); return 1u;
+    default:                   return 0u;
+    }
+}
+
 static void menu_formatCellValue3(const menu_cell_t *cell, char *valueAsText)
 {
     uint8_t dtype = (uint8_t)(menu_cellDtype(cell) & 0x0f);
     uint16_t raw = menu_cellDisplayValue(cell);
     uint8_t value = (raw > 255u) ? 255u : (uint8_t)raw;
+
+    /* S083: LRN / FUL take precedence over every formatted value. */
+    if (menu_learnName(cell, valueAsText))
+        return;
 
     /* Effect page cells are owned by menuEffects.c (Session 072 step 7). */
     if (cell && cell->kind == MENU_CELL_EFFECT &&
@@ -5933,6 +6217,10 @@ static void menu_formatCellValue3(const menu_cell_t *cell, char *valueAsText)
 
     /* S080 E6/F10: overlay trigger/note and scene-global names. */
     if (menu_getS080StaticName(cell, value, valueAsText))
+        return;
+
+    /* S083: `off` / `glb` / `def` at MIDI value 0. */
+    if (menu_getMidiStaticName(cell, value, valueAsText))
         return;
 
     /*
@@ -5996,12 +6284,7 @@ static void menu_formatCellValue3(const menu_cell_t *cell, char *valueAsText)
         numtostrps(valueAsText, (int8_t)(value - 63));
         break;
     case DTYPE_NOTE_NAME:
-        if (cell->kind == MENU_CELL_STATIC &&
-            cell->static_param == PAR_TRACK_MIDI_NOTE && value == 0u) {
-            memcpy(valueAsText, menuText_any, 3);
-        } else {
-            setNoteName(value, valueAsText);
-        }
+        setNoteName(value, valueAsText);
         break;
     case DTYPE_MIX_FM:
         if (value == 1u) memcpy(valueAsText, menuText_mix, 3);
@@ -6068,6 +6351,18 @@ static void menu_clampCellValue(const menu_cell_t *cell, uint16_t *value)
      */
     if (cell->kind == MENU_CELL_STATIC) {
         switch (cell->static_param) {
+        /*
+         * S083: MIDI channel cells accept 0 (plan 3.10).
+         *
+         * What: G (`ch`) and the track channel (`chn`) are 0..16; 0 shows
+         * `off` (G) or `glb` (track). Why: DTYPE_1B16 clamps to 1..16 and
+         * the dtype space is full, so the zero is a static-param special
+         * case (the run-mode precedent). Affiliates: menu_getMidiStaticName().
+         */
+        case PAR_MIDI_CHAN_GLOBAL:
+        case PAR_TRACK_MIDI_CHAN:
+            if (*value > 16u) *value = 16u;
+            return;
         case PAR_PERF_BTN_LT:
         case PAR_PERF_BTN_RT:
             if (*value > 11u) *value = 11u;
@@ -6272,49 +6567,6 @@ static void menu_clampCellValue(const menu_cell_t *cell, uint16_t *value)
             *value = INSTRUMENT_TARGET_VOICE_NAMESPACE_LAST;
     }
 }
-
-/*
- * Clamp one value to an instrument parameter's menu domain (S075 F3).
- *
- * What: applies the same descriptor-domain clamp as a VOICE-page edit
- * (menu_clampCellValue() for an instrument cell: dtype ranges, list sizes,
- * on/off, target-selector tokens, and LFO target voice range) to one
- * parameter of the active Scene's slot.
- * Why: external MIDI now enters values into the Scene (stored, saved); a raw
- * 0..127 CC must not persist an out-of-domain byte, for example 127 on an
- * on/off parameter. The clamp rules live in Menu; this wrapper keeps one copy.
- * Inputs: slot 0..5, descriptor-local index, raw value 0..255. Output: the
- * clamped value, or the input unchanged when the slot/descriptor is invalid.
- * Caller: MidiParser.c midiParser_enterTaggedParameter(). Affiliates:
- * menu_clampCellValue(), menu_cellDtype().
- */
-uint8_t menu_clampInstrumentValue(uint8_t slot, uint8_t descriptor_index,
-                                  uint8_t value)
-{
-    const kit_instrument_slot_t *instrument =
-        scene_instrumentSlotConst(scene_getActiveIndex(), slot);
-    menu_cell_t cell;
-    uint16_t clamped = value;
-
-    /*
-     * Contract in menu.h. A transient instrument cell carries only what the
-     * clamp reads: kind, slot, descriptor index and descriptor (dtype,
-     * runtime kind for the LFO target checks).
-     */
-    if (!instrument)
-        return value;
-    memset(&cell, 0, sizeof(cell));
-    cell.kind = MENU_CELL_INSTRUMENT;
-    cell.slot = slot;
-    cell.descriptor_index = descriptor_index;
-    cell.descriptor = instrumentManager_descriptor(instrument->type,
-                                                   descriptor_index);
-    if (!cell.descriptor)
-        return value;
-    menu_clampCellValue(&cell, &clamped);
-    return (uint8_t)clamped;
-}
-
 
 static uint8_t menu_isLoadSaveSelectionCurrent(void)
 {
@@ -9095,6 +9347,32 @@ void menu_refreshPerfSceneLeds(void)
                      (uint8_t)(LED_SEQ1 + active_scene));
 }
 
+/*
+ * Whole-Scene change with an origin (S080 F9; S083 P2, Q9).
+ *
+ * What: as a PERF SEQ press: deferred to the scd division while running,
+ * else executed now with the pcr reset. The origin is handed to the
+ * Sequencer so the program change this change would transmit is suppressed
+ * for a MIDI-originated change (no echo, Q9), including when a deferred
+ * change fires later. Inputs: Scene 0..15, origin (MIDI_ORIGIN_*).
+ * Accessors: menu_perfModeSceneButtonPressed() (panel),
+ * midiProgram_programChange() (MIDI PC on G). Affiliates:
+ * seq_setSceneChangeOrigin(), seq_requestSceneChange(),
+ * menu_perfSceneChangeExecute().
+ */
+void menu_perfModeSceneChangeFrom(uint8_t scene_index, uint8_t origin)
+{
+    uint8_t div = parameter_values[PAR_SCENE_CHANGE_DIV];
+
+    seq_setSceneChangeOrigin(origin);
+    if (div != 0u && seq_isRunning()) {
+        seq_requestSceneChange(scene_index, div);
+        return;
+    }
+    menu_perfSceneChangeExecute(scene_index,
+                                (uint8_t)(parameter_values[PAR_BAR_RESET_MODE] != 0u));
+}
+
 void menu_perfModeSceneButtonPressed(uint8_t scene_index)
 {
     /*
@@ -9112,18 +9390,7 @@ void menu_perfModeSceneButtonPressed(uint8_t scene_index)
      * executor when the ISR raises the fire flag. A stopped transport always
      * changes instantly (no clock to quantise against).
      */
-    uint8_t div = parameter_values[PAR_SCENE_CHANGE_DIV];
-
-    if (div != 0u && seq_isRunning()) {
-        seq_requestSceneChange(scene_index, div);
-        return;
-    }
-    /*
-     * S080 P2 Defect 5/15: a direct change resets only when pcr
-     * (PAR_BAR_RESET_MODE) is on.
-     */
-    menu_perfSceneChangeExecute(scene_index,
-                                (uint8_t)(parameter_values[PAR_BAR_RESET_MODE] != 0u));
+    menu_perfModeSceneChangeFrom(scene_index, MIDI_ORIGIN_PANEL);
 }
 
 static void menu_perfSceneChangeExecute(uint8_t scene_index, uint8_t restart)
@@ -9168,7 +9435,16 @@ static void menu_perfSceneChangeExecute(uint8_t scene_index, uint8_t restart)
     if (restart)
         seq_resetToPatternStart();
     preset_startDrumsetApply();
-    menu_refreshPerfSceneLeds();
+    /*
+     * PERF Scene LEDs only in PERF mode (S083 C-5).
+     * What: the SEQ row shows PERF Scene state only while PERF is the mode;
+     * elsewhere it belongs to that mode, which led_notifyPatternChanged()
+     * (called by seq_selectActivePattern()) refreshes. Why: a MIDI PC (any
+     * mode, plan P2) and chain/queued changes fired outside PERF overwrote
+     * the STEP row. Affiliates: buttonHandler_getMode().
+     */
+    if (buttonHandler_getMode() == SELECT_MODE_PERF)
+        menu_refreshPerfSceneLeds();
     menu_repaintAll();
 }
 
@@ -9268,10 +9544,27 @@ void menu_serviceDeferredSceneChange(void)
 
         seq_clearPendingSceneChange();
         if (isQueue) {
-            uint8_t flags = menu_applyQueuedSceneAction(scene);
+            /*
+             * Skip a queued change to an unavailable Scene whole (S082 P3 A1,
+             * S083 Q2).
+             *
+             * What: when the queued target is not available (not resident, or
+             * still being written by a Bank load), neither the qac mute/Morph
+             * parts nor the change run. Why: user rule (S083 Q2, binding):
+             * "Scenes or tracks from Scenes are not automatable unless they
+             * are changed via a voice edit mask from an active Scene or
+             * track." Before this fix a queue armed before a direct Merge load
+             * still cleared the mutes and wrote Morph 0 into the replaced
+             * Scene although the change itself was dropped. Inputs: scene,
+             * bank_sceneAvailable(). Affiliates: menu_applyQueuedSceneAction(),
+             * menu_perfSceneChangeExecute() (which already drops the change).
+             */
+            if (scene < 16u && bank_sceneAvailable(scene)) {
+                uint8_t flags = menu_applyQueuedSceneAction(scene);
 
-            menu_perfSceneChangeExecute(
-                scene, (uint8_t)((flags & MENU_QAC_RESET) != 0u));
+                menu_perfSceneChangeExecute(
+                    scene, (uint8_t)((flags & MENU_QAC_RESET) != 0u));
+            }
         } else if (isChain && scene == scene_getActiveIndex()) {
             seq_chainRepeatSelf(pcr);
         } else {
@@ -10355,7 +10648,10 @@ static void menu_loadSaveEnterTop(uint8_t page, uint8_t what)
  * runs and whose single Bank index request then previews the slot installed
  * right after it (the slot is read only at the asynchronous completion).
  * Replace with all 16 Scenes selected; the accepted-command state (`...`)
- * locks input from here to the end of the load.
+ * locks input from here to the end of the load. A waiting MIDI Learn is
+ * cancelled first (MIDI_SPEC 6.3: a Bank load cancels Learn); the page
+ * switch below only cancels it when the page changes, which it does not
+ * when Load/Save is already shown (S083 assessment F-5).
  * Why: a MIDI CC0 load must look exactly like a front-panel OK and must take
  * the UI whatever it was doing (D32).
  * Inputs: Bank slot. Precondition: menu_backgroundBankLoadUiIdle() (the
@@ -10364,10 +10660,11 @@ static void menu_loadSaveEnterTop(uint8_t page, uint8_t what)
  * Accessors: preset_tickBackgroundBankLoad() phase 0.
  * Affiliates: buttonHandler_enterLoadSaveForBackgroundLoad(),
  * menu_loadSaveEnterTopAt(), menu_switchPage(), menu_beginLoadSaveCommand(),
- * menu_backgroundBankLoadUiPoll().
+ * menu_backgroundBankLoadUiPoll(), midiLearn_cancel().
  */
 void menu_backgroundBankLoadUiBegin(uint16_t slot)
 {
+    midiLearn_cancel();	/* F-5: a Bank load always ends a waiting Learn. */
     buttonHandler_enterLoadSaveForBackgroundLoad();
     menu_pendingPageSwitch = MENU_PENDING_PAGE_NONE;
     menu_bankCopyForceRelease();
@@ -13592,7 +13889,12 @@ static void menu_repaintGeneric(void)
                     editDisplayBuffer[0][8u + ci] = lng[ci];
             }
 
-            switch (dtype) {
+            if (menu_learnName(&cell, &editDisplayBuffer[1][13])) {
+                /* Learn target: LRN / FUL. */
+            } else if (menu_getMidiStaticName(&cell, value,
+                                       &editDisplayBuffer[1][13])) {
+                /* S083 zero names: off / glb / def. */
+            } else switch (dtype) {
             case DTYPE_TARGET_SELECTION_VELO:
             case DTYPE_TARGET_SELECTION_LFO:
                 if (cell.kind == MENU_CELL_INSTRUMENT)
@@ -13639,11 +13941,7 @@ static void menu_repaintGeneric(void)
                 numtostrps(&editDisplayBuffer[1][13], (int8_t)(value - 63));
                 break;
             case DTYPE_NOTE_NAME:
-                if (cell.kind == MENU_CELL_STATIC &&
-                    cell.static_param == PAR_TRACK_MIDI_NOTE && value==0)
-                    memcpy(&editDisplayBuffer[1][13], menuText_any, 3);
-                else
-                    setNoteName(value, &editDisplayBuffer[1][13]);
+                setNoteName(value, &editDisplayBuffer[1][13]);
                 break;
             case DTYPE_0b1:
                 numtostrpu(&editDisplayBuffer[1][13], (uint8_t)(value+1), ' ');
@@ -13864,6 +14162,19 @@ static void menu_encoderChangeParameter(int8_t inc)
         return;
     }
 
+    /*
+     * Learn target selection by encoder (S083 C5, Q10, C-4). The touch
+     * selects the visible cell's MIDI target and does not change its value.
+     */
+    if (midiLearn_selectingTarget()) {
+        uint16_t lrnId;
+
+        if (menu_cellMidiTargetAt(activePage, activeParameter, &lrnId)) {
+            midiLearn_selectTarget(lrnId);
+            return;
+        }
+    }
+
     menu_cell_t cell = menu_resolveCell(activePage, activeParameter);
     uint16_t value;
 
@@ -13960,6 +14271,14 @@ static void menu_encoderChangeParameter(int8_t inc)
 
     menu_clampCellValue(&cell, &value);
     (void)menu_cellCommitValue(&cell, value);
+    /* S083 plan 3.9 C: panel encoder edits are transmitted, never echoed. */
+    if (!voiceModeShowMorph && !menu_patternTrackMorphViewActive() &&
+        !(menu_activePage == EFFECT_PAGE && menuEffects_showMorph())) {
+        uint16_t txId;
+
+        if (menu_cellMidiTargetAt(activePage, activeParameter, &txId))
+            midiOut_parameterChanged(txId);
+    }
     /*
      * Record an encoder edit (S081 §9.1 F-1b, P1B item 14).
      *
@@ -15192,14 +15511,131 @@ static uint8_t menu_paramVisible(uint16_t paramNr)
     return 0;
 }
 
-void menu_notifyExternalParamChanged(uint16_t paramNr)
+/*
+ * MIDI target ID of a menu cell (S083, Learn and parameter TX).
+ *
+ * What: like menu_cellClearTarget(), but every addressable parameter has an
+ * ID, automatable or not: any Instrument descriptor (slot x 64 + index),
+ * the Scene targets (Nou, Nfx, Nvm, 7dc, fxm, STEP len/scl/shf of the
+ * active track), and Effect rows 0..62 and the Effect Morph. Cells with no
+ * MIDI address (BPM, settings, step data, fader mode, `typ`) return 0.
+ * Why: NRPN and Learn address the whole canonical ID space (plan C1);
+ * recording still uses the automatable-only resolver. Inputs: cell.
+ * Output: 1 with *id. Accessors: menu_cellMidiTargetAt(), the Learn
+ * capture hook (F-9/F-10), the LRN display (F-11), the parameter TX hook
+ * (G-7), menu_targetVisible().
+ */
+static uint8_t menu_cellMidiTarget(const menu_cell_t *cell, uint16_t *id)
 {
-    /* MIDI CC and future external control paths can update parameter_values[]
-    ** without passing through menu_parseKnobDelta(). Only request a display
-    ** refresh when the changed value is already visible; the main loop's
-    ** existing LCD_LIMIT_TICKS_PER_REFRESH gate coalesces fast CC streams. */
-    if (menu_paramVisible(paramNr))
-        menu_knobs_dirty = 1;
+    uint16_t target = INSTRUMENT_PARAM_INVALID;
+
+    if (!cell || !id)
+        return 0u;
+    switch (cell->kind) {
+    case MENU_CELL_INSTRUMENT:
+        if (cell->descriptor)
+            target = instrumentParam_make(cell->slot, cell->descriptor_index);
+        break;
+    case MENU_CELL_SCENE_SETTING:
+        /* Nou, Nfx, Nvm; the fader mode has no target. */
+        target = (uint16_t)menu_sceneSettingAutomationTarget(cell);
+        break;
+    case MENU_CELL_KIT_SETTING:
+        if (cell->kit_setting == MENU_KIT_SETTING_SLOT6_TRACK7_AMP_DECAY)
+            target = sceneModTarget_slot6DecayId();
+        break;
+    case MENU_CELL_STATIC:
+        if (cell->static_param >= PAR_VOICE1_MORPH &&
+            cell->static_param <= PAR_VOICE6_MORPH)
+            target = sceneModTarget_voiceMorphId(
+                (uint8_t)(cell->static_param - PAR_VOICE1_MORPH));
+        else if (cell->static_param == PAR_EFFECT_MORPH)
+            target = sceneModTarget_effectMorphId();
+        else if (menu_activePage == SEQ_PAGE &&
+                 (cell->static_param == PAR_TRACK_LENGTH ||
+                  cell->static_param == PAR_TRACK_SCALE ||
+                  cell->static_param == PAR_SHUFFLE))
+            /* STEP len/scl/shf of the active track (cell positions 0/1/2). */
+            target = (uint16_t)menu_seqCellToTrackTarget(
+                (cell->static_param == PAR_TRACK_LENGTH) ? 0u :
+                (cell->static_param == PAR_TRACK_SCALE) ? 1u : 2u,
+                menu_activeVoice);
+        break;
+    case MENU_CELL_EFFECT:
+        if (cell->fx.kind == MENU_FX_CELL_MORPH_AMOUNT)
+            target = sceneModTarget_effectMorphId();
+        else if (cell->fx.kind == MENU_FX_CELL_PARAM &&
+                 cell->fx.index < EFFECT_TARGET_PATTERN_LOCAL_LIMIT &&
+                 effects_descriptor(effects_activeType(), cell->fx.index))
+            target = effectTarget_id(cell->fx.index);
+        break;
+    default:
+        break;
+    }
+    if (target == INSTRUMENT_PARAM_INVALID || target >= MIDI_TARGET_OFF)
+        return 0u;
+    *id = target;
+    return 1u;
+}
+
+/* Position form (active page, cell position) of menu_cellMidiTarget(). */
+static uint8_t menu_cellMidiTargetAt(uint8_t active_page, uint8_t position,
+                                     uint16_t *id)
+{
+    menu_cell_t cell = menu_resolveCell(active_page, position);
+
+    return menu_cellMidiTarget(&cell, id);
+}
+
+/*
+ * Is target `id` shown on the current page? (S083 Q1 display rule)
+ *
+ * What: the target-ID twin of menu_paramVisible(): true when one of the
+ * visible cells (the edited cell in edit mode) resolves to `id`.
+ * Why: "if the parameter is being shown in the menu, the parameter should
+ * update" (Q1); MIDI writes Instrument, Scene and Effect targets that have
+ * no flat ParameterArray id. Inputs: id. Output: 0/1. Accessor:
+ * menu_notifyTargetChanged().
+ */
+static uint8_t menu_targetVisible(uint16_t id)
+{
+    const uint8_t activePage = (uint8_t)((menuIndex & MASK_PAGE) >> PAGE_SHIFT);
+    const uint8_t activeParameter = menuIndex & MASK_PARAMETER;
+    uint16_t cellId;
+    uint8_t i;
+
+    if (menu_activePage >= LOAD_PAGE && menu_activePage <= SAVE_PAGE)
+        return 0u;
+    if (editModeActive)
+        return (uint8_t)(menu_cellMidiTargetAt(activePage, activeParameter,
+                                               &cellId) && cellId == id);
+    {
+        const uint8_t is2ndPage = menu_isScreenPage(menu_activePage)
+            ? 0u : (uint8_t)((activeParameter > 3) ? 4 : 0);
+
+        for (i = 0u; i < 4u; i++) {
+            if (menu_cellMidiTargetAt(activePage, (uint8_t)(i + is2ndPage),
+                                      &cellId) && cellId == id)
+                return 1u;
+        }
+    }
+    return 0u;
+}
+
+/*
+ * Repaint a target changed from outside the panel (S083 Q1; closes the
+ * S075 open item "MIDI-entered values reach the LCD only at the next
+ * repaint").
+ *
+ * What: sets the coalesced knob-repaint flag when the target is visible;
+ * the main loop's LCD rate limit coalesces fast CC streams. Inputs: target
+ * ID. Accessors: menu_commitTargetEdit(), menu_commitGlobalMorphFromMidi().
+ * Affiliates: menu_targetVisible(), menu_serviceKnobRepaint().
+ */
+void menu_notifyTargetChanged(uint16_t id)
+{
+    if (menu_targetVisible(id))
+        menu_knobs_dirty = 1u;
 }
 
 static uint8_t menu_paramIsMorphAmount(uint16_t paramNr)
@@ -15549,6 +15985,28 @@ void menu_parseKnobDelta(uint8_t knobNr, int8_t delta)
         return;
 
     /*
+     * Learn target selection by pot (S083 C5, Q10, C-4).
+     *
+     * What: while Learn waits for a target, turning a pot over a cell with
+     * a MIDI address makes it the target (it shows LRN) without changing
+     * its value; a touch elsewhere edits normally and Learn keeps waiting.
+     * Inputs: knobNr, visible half. Affiliates: menu_cellMidiTargetAt(),
+     * midiLearn_selectTarget().
+     */
+    if (midiLearn_selectingTarget() && knobNr < ENDLESS_POT_COUNT) {
+        const uint8_t lrnPage = (uint8_t)((menuIndex & MASK_PAGE) >> PAGE_SHIFT);
+        const uint8_t lrnParam = (uint8_t)(menuIndex & MASK_PARAMETER);
+        const uint8_t lrnHalf = menu_isScreenPage(menu_activePage)
+            ? 0u : (uint8_t)((lrnParam > 3u) ? 4u : 0u);
+        uint16_t id;
+
+        if (menu_cellMidiTargetAt(lrnPage, (uint8_t)(knobNr + lrnHalf), &id)) {
+            midiLearn_selectTarget(id);
+            return;
+        }
+    }
+
+    /*
      * S078 P2 §B: STEP held-step track automation overlay owns the pots.
      *
      * What: while the overlay is active on SEQ_PAGE subpage 0, an endless-pot
@@ -15724,6 +16182,24 @@ void menu_parseKnobDelta(uint8_t knobNr, int8_t delta)
     menu_clampCellValue(&cell, &value);
     if (menu_cellCommitValue(&cell, value))
         menu_knobs_dirty = 1;
+    /*
+     * Parameter TX of a panel edit (S083 plan 3.9 C).
+     *
+     * What: a pot edit of a cell with a MIDI address is offered to MidiOut,
+     * which sends the target's Normal value (learned CC or NRPN). Not in a
+     * Morph view (the edit changed a Morph endpoint, not the value MIDI
+     * addresses). MIDI-originated writes never come through here, so they
+     * are never echoed. Affiliates: menu_cellMidiTargetAt(),
+     * midiOut_parameterChanged().
+     */
+    if (!voiceModeShowMorph && !menu_patternTrackMorphViewActive() &&
+        !(menu_activePage == EFFECT_PAGE && menuEffects_showMorph())) {
+        uint16_t txId;
+
+        if (menu_cellMidiTargetAt(activePage, (uint8_t)(knobNr + is2ndPage),
+                                  &txId))
+            midiOut_parameterChanged(txId);
+    }
     /* S081 F-1a: every recordable pot edit marks its target. */
     menu_liveRecRecordCell(activePage, (uint8_t)(knobNr + is2ndPage));
 }
@@ -17181,6 +17657,14 @@ void menu_switchPage(uint8_t pageNr)
      */
     if (preset_backgroundBankLoadLocked())
         return;
+    /*
+     * A page or mode change cancels Learn (S083 MIDI_SPEC 6.3). A
+     * MIDI-started Bank load cancels it itself in
+     * menu_backgroundBankLoadUiBegin(), because it does not change page when
+     * Load/Save is already shown (assessment F-5).
+     */
+    if (pageNr != menu_activePage)
+        midiLearn_cancel();
     if (preset_backgroundBankLoadUnlocked() && pageNr == LOAD_PAGE &&
         menu_activePage == LOAD_PAGE)
         return;
@@ -17691,34 +18175,37 @@ void menu_sendAllGlobals(void)
 void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
 {
     switch (paramNr) {
-    case PAR_MIDI_CHAN_7:
-        paramNr = (uint16_t)(paramNr - 5u);
-        /* fall through */
     case PAR_MIDI_CHAN_1:
     case PAR_MIDI_CHAN_2:
     case PAR_MIDI_CHAN_3:
     case PAR_MIDI_CHAN_4:
     case PAR_MIDI_CHAN_5:
     case PAR_MIDI_CHAN_6:
-    case PAR_MIDI_CHAN_GLOBAL:
-    {
+    case PAR_MIDI_CHAN_7:
+    case PAR_MIDI_MODE:
         /*
-         * MIDI channel parameters are MIDI parser configuration.
+         * Retired no-op slots (S083 plan 3.10).
          *
-         * The menu value is stored as 1..16 for display; MidiParser stores
-         * zero-based channels. Voice 7 is the historical global channel slot.
-         * This direct call replaces a parser opcode that only forwarded the
-         * same channel assignment.
+         * What: these ids keep their enum positions (no renumbering, the
+         * S080 mirror precedent) but do nothing. Why: track channels live in
+         * Scene settings (`chn`), and the trigger/note mode is gone; the
+         * legacy per-voice channel mirror was a second source of truth.
+         * menu_sendAllGlobals() still replays the ids; this case absorbs it.
          */
-        uint8_t voice;
-        uint8_t channel = (uint8_t)(value - 1u);
-        if (paramNr == PAR_MIDI_CHAN_GLOBAL)
-            voice = 7u;
-        else
-            voice = (uint8_t)(paramNr - PAR_MIDI_CHAN_1);
-        midiParser_setChannel(voice, channel);
         break;
-    }
+
+    case PAR_MIDI_CHAN_GLOBAL:
+        /*
+         * Global MIDI channel G (S083 M2).
+         *
+         * What: 1..16, 0 = off. With G off nothing is received or sent on a
+         * global channel, and unassigned tracks have no channel. Inputs:
+         * menu/settings value. Output: MidiIn configuration (MidiIn ends
+         * every sounding track note when G changes). Affiliates:
+         * midiIn_setGlobalChannel(), filesystem_sanitizeLoadedGlobals().
+         */
+        midiIn_setGlobalChannel(value);
+        break;
 
     case PAR_POS_X:
         /*
@@ -17777,34 +18264,31 @@ void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
     case PAR_TRACK_MIDI_CHAN:
     {
         /*
-         * Pattern-owned current-track MIDI channel for the STEP front page.
+         * Track MIDI channel `chn` for the STEP track settings (S083).
          *
-         * PatternData is the storage owner for the track-settings page. The
-         * legacy PAR_MIDI_CHAN_* parameter and MidiParser channel are mirrored
-         * as a compatibility output so existing note routing keeps following
-         * the currently edited track setting until Phase 4/Scene routing fully
-         * replaces the old global MIDI channel ownership.
+         * What: stores 0 (`glb`: follow G) or 1..16 in the viewed Scene's
+         * track settings, and ends the track's sounding MIDI note when the
+         * value changes. Why: the legacy PAR_MIDI_CHAN_* mirror and the
+         * MidiParser channel copy are retired (plan 3.10); Scene settings
+         * are the only source. Inputs: active track, viewed Scene, value.
+         * Affiliates: scene_setTrackMidiChannel(), midiOut_trackNoteOff().
          */
         uint8_t track = menu_getActiveVoice();
-        uint16_t realParam = (track == 6u)
-            ? PAR_MIDI_CHAN_7
-            : (uint16_t)(PAR_MIDI_CHAN_1 + track);
-        scene_setTrackMidiChannel(menu_getViewedPattern(), track, value);
-        parameter_values[realParam] = value;
-        menu_parseGlobalParam(realParam, value);
+        uint8_t scene = menu_getViewedPattern();
+
+        if (scene_getTrackMidiChannel(scene, track) != value)
+            midiOut_trackNoteOff(track);
+        scene_setTrackMidiChannel(scene, track, value);
         break;
     }
 
     case PAR_TRACK_MIDI_NOTE:
     {
         /*
-         * Pattern-owned current-track MIDI note for the STEP front page.
-         *
-         * PatternData stores the value shown on the track settings page. The
-         * legacy per-voice note override is mirrored through Preset so existing
-         * MIDI playback/input code still sees the edited note while the broader
-         * Scene/Instrument ownership is pending.
-        */
+         * Track MIDI note `nte` (S083): 0 = `def` (unassigned), 1..127 the
+         * root of the track's receive range (plan 3.3). Not a pitch: the
+         * root plays the default pitch. Affiliate: scene_setTrackMidiNote().
+         */
         uint8_t track = menu_getActiveVoice();
         scene_setTrackMidiNote(menu_getViewedPattern(), track, value);
         break;
@@ -18121,26 +18605,26 @@ void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
 
     case PAR_MIDI_ROUTING:
         /*
-         * MIDI routing/filter parameters are MidiParser configuration. Menu is
-         * the UI source of the new value; MidiParser owns runtime behavior.
+         * MIDI routing/filter parameters are MidiIn configuration. Menu is
+         * the UI source of the new value; MidiIn owns runtime behavior.
          */
-        midiParser_setRouting(value);
+        midiIn_setRouting(value);
         break;
 
     case PAR_MIDI_FILT_TX:
         /*
-         * MIDI transmit filter is MidiParser runtime configuration. Direction
+         * MIDI transmit filter is MidiIn runtime configuration. Direction
          * 1 is TX by historical API convention.
          */
-        midiParser_setFilter(1u, value);
+        midiIn_setFilter(1u, value);
         break;
 
     case PAR_MIDI_FILT_RX:
         /*
-         * MIDI receive filter is MidiParser runtime configuration. Direction
+         * MIDI receive filter is MidiIn runtime configuration. Direction
          * 0 is RX by historical API convention.
          */
-        midiParser_setFilter(0u, value);
+        midiIn_setFilter(0u, value);
         break;
 
     case PAR_PRESCALER_CLOCK_IN:

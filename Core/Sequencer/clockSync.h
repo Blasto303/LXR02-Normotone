@@ -62,6 +62,7 @@
 void sync_tick();
 void sync_tickTimestamp(uint32_t timestampUs);
 void sync_midiStartStop(uint8_t isStart);
+void sync_midiContinue(void);
 uint8_t sync_getClockCnt();
 
 #endif /* CLOCKSYNC_H_ */

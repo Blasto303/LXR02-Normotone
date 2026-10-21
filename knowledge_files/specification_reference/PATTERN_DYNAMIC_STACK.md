@@ -653,8 +653,13 @@ never reverted by anything (also not when recording or overdub ends).
   (`seq_selectActivePattern()`, `seq_alignActivePatternToScene()`), by a
   per-track Scene change of that slot (`seq_setTrackPlayedScene()`; tracks 6
   and 7 share slot 6) and by realign.
-- The Morph sweep guard is unchanged. MIDI CC keeps the S075 path below
-  (lowest priority) until the MIDI rework decides otherwise.
+- The Morph sweep guard is unchanged. **S083 Q1:** a MIDI write is a menu
+  edit, not a lower priority: `MidiControl` writes through
+  `menu_commitTargetEdit()`, which calls the same `menu_cellCommitValueEx()`
+  path (R12 for Instrument targets, R13 for Effects, the per-target clears
+  for Scene targets) and records through `liveRec_paramIn()`. The retired
+  S075 F3 "MIDI lowest" path (`preset_setInstrumentParameterFromMidi()`) no
+  longer exists.
 
 **Other (non-Instrument) targets: the menu value applies until the next
 automation of that parameter.** A menu edit clears that target's runtime
@@ -678,7 +683,7 @@ edit:
 |---|---|---|
 | Morph sweep (`presetMorph_tick()`), synchronous voice apply (`presetMorph_applyVoiceNow()`) | updates `morph_interpolation[local]` only; the runtime value is left alone | every Morph-base runtime write goes through `presetMorph_writeRuntimeBase()`, which skips an inactive Scene and any parameter for which `seq_automationHoldsParameter(slot, local)` is set |
 | Menu edit of any instrument endpoint (`preset_setInstrumentParameter()`) | stores the endpoint; re-interpolates **only that parameter** at the voice's resolved Morph amount (`presetMorph_applyParameterNow()`). Since S081 R12 the commit first calls `seq_menuOverrideSet()`, so the parameter is no longer held and the new value sounds at once | no whole-voice queue; the runtime never receives the raw edited value |
-| External MIDI CC/NRPN (`midiParser_enterTaggedParameter()` → `preset_setInstrumentParameterFromMidi()`) | stores the active Scene's clamped Normal endpoint and queues the voice for the Morph sweep (lowest priority) | the sweep's guarded write applies it when it gets there |
+| External MIDI CC/NRPN (`MidiControl` → `menu_commitTargetEdit()`) | exactly a menu edit (S083 Q1): stores the active Scene's clamped Normal endpoint, calls `seq_menuOverrideSet()` and fans out; the value sounds at once | the menu edit's own guarded write (`presetMorph_applyParameterNow()` at the Morph amount) |
 
 At the trigger, `seq_restoreAutomatedParameters()` writes
 `morph_interpolation[local]` — which by then holds every edit and Morph
@@ -1068,6 +1073,13 @@ with `SEQ_PLAY_STATE_STOPPED` set past the end and cleared when rewound
 inside. It uses the current effective scale and length for the whole span,
 so a Morph/automation change during the span is approximated.
 
+**Continue and Song Position Pointer (S083 T1).** A MIDI Stop stores the
+reached master tick in `seq_resumeTick`; an SPP while stopped stores
+`pos x 24` there; Continue (`seq_continueRunning()`) starts the ordinary
+transport sequence and then sets `seq_elapsedPpqTicks = resume - 1` and
+calls `seq_realignActivePatternToMasterClock()` (the §6.5 anchor mapping),
+so the next scheduler tick plays the resume position. Start clears it.
+
 **Loop start** (`seq_loopEventAnchor(mask)`): one anchor per gesture. With
 recording quantisation on (`seq_quantisation` 8/16/32/64 → 48/24/12/6 ticks)
 it is the last quantise boundary `now − now % q` (may be more than one loop
@@ -1267,11 +1279,11 @@ removes stored content as the playheads pass. Both live in
 timing services, the Pattern Stack Service performs the writes. Decision
 history: `081_SESSION_HANDOFF_LOG.md` §2–§8.
 
-**Dependency direction.** buttonHandler, Menu and MidiParser call
+**Dependency direction.** buttonHandler, Menu and MidiNotes/MidiControl call
 LiveRecord; LiveRecord calls the Sequencer, PatternStackService,
 EffectsManager and SceneData getters. The Sequencer never calls LiveRecord:
 the drain reads bitmaps LiveRecord registers (`seq_setAutomationFilter()`).
-LiveRecord never calls buttonHandler or MidiParser. The one deviation is
+LiveRecord never calls buttonHandler or the MIDI modules. The one deviation is
 `menu_automationTargetRecorded()` (the automation underline), for which
 LiveRecord includes `menu.h`. Gesture timing (REC hold, SHIFT/CLEAR chord)
 stays in buttonHandler; LiveRecord receives decided events.
@@ -1279,6 +1291,14 @@ stays in buttonHandler; LiveRecord receives decided events.
 `patSvc_tick()` (`timebase.c`), so an idle-direct write executes in the same
 pass; `liveRec_init(menu_getActiveVoice())` runs at boot after
 `copyClear_init()`.
+
+**Arrival time (S083 Q6).** `liveRec_trigger_t` carries `age_us` (stack
+only); a MIDI hit sets it from the message stamp, panel and repeat hits
+pass 0. `liveRec_triggerIn()` moves the captured position back by
+`age_us x 256 / snap.periodUs` Q8 ticks (at most one step interval) before
+quantising, so a note that waited for the foreground records on the step it
+actually arrived on. Ages above `MIDI_ARRIVAL_MAX_AGE_US` (20 ms) are
+treated as processing time.
 
 #### 6.7.1 Modes and gestures
 

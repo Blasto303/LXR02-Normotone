@@ -81,8 +81,9 @@
 #include "PatternData.h"
 #include "PatternStackService.h"
 #include "PatternTrace.h"
-#include "MidiNoteNumbers.h"
-#include "MidiMessages.h"
+#include "MidiPitch.h"
+#include "MidiDefs.h"
+#include "MidiLearn.h"
 #include "timebase.h"
 #include "random.h"
 #include "globals.h"
@@ -189,6 +190,8 @@
  * while still avoiding whole-file staging.
  */
 #define FS_TEXT_LINE_MAX 160u
+/* settings.cfg data lines before the learn= rows (cases 0..23). */
+#define FS_SETTINGS_FIXED_LINES 24u
 /* The shared cache is the complete Instrument browser capacity. */
 #define FS_LIBRARY_NAME_CACHE_MAX 1000u
 #define FS_TEST_OBJECT_MAX 64u
@@ -2767,7 +2770,8 @@ static void filesystem_resetGlobalsToDefaults(void)
 static void filesystem_sanitizeLoadedGlobals(void)
 {
     uint8_t ch = parameter_values[PAR_MIDI_CHAN_GLOBAL];
-    if (ch == 0u || ch > 16u)
+    /* S083: 0 = G off is valid; out of range falls back to 1. */
+    if (ch > 16u)
         parameter_values[PAR_MIDI_CHAN_GLOBAL] = 1u;
     /*
      * S080 P2 Defect 15: qac has nine values (0..8). A hand-edited or corrupt
@@ -2878,6 +2882,9 @@ static void filesystem_resetSettingsToDefaults(void)
      * touched here, because those now belong to Scene/Bank storage rather than
      * root machine settings.
      */
+    /* S083: the Learn table belongs to settings.cfg; a load starts empty
+    ** (the recovery pass's parse is discarded with the other values). */
+    midiLearn_clearAll();
     parameter_values[PAR_BPM] = 120u;
     parameter_values[PAR_EXT_SYNC] = SEQ_EXT_SYNC_AUTO;
     parameter_values[PAR_QUANTISATION] = 0u;
@@ -3057,6 +3064,15 @@ static fs_status_t filesystem_parseSettingsLine(const char *line)
         if (!filesystem_parseSettingsU16(value, &parsed))
             return FS_STATUS_ERROR;
         bank_setRestoreBankSlot(parsed);
+        return FS_STATUS_DONE;
+    }
+    /*
+     * MIDI Learn row (S083 F34). A malformed or unresolvable line is
+     * skipped: the rest of the file still loads (MIDI_SPEC 6.4), so the
+     * line is always accepted here.
+     */
+    if (strcmp(key, "learn") == 0) {
+        (void)midiLearn_parseSettingsValue(value);
         return FS_STATUS_DONE;
     }
     if (strncmp(key, "scene_source_", 13u) == 0) {
@@ -17689,8 +17705,8 @@ static void filesystem_initSceneStage(filesystem_scene_stage_t *stage)
     memset(stage, 0, sizeof(*stage));
     scene_effectRecordDefaults(&stage->effect);
     for (track = 0u; track < NUM_TRACKS; track++) {
-        stage->settings.midi_channel[track] = (uint8_t)(track + 1u);
-        stage->settings.midi_note[track] = MIDI_DEFAULT_TRIGGER_NOTE;
+        stage->settings.midi_channel[track] = MIDI_CHANNEL_NONE;
+        stage->settings.midi_note[track] = 0u;
     }
     for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++) {
         /*
@@ -18427,6 +18443,31 @@ static uint8_t filesystem_nextSettingsLine(char *dst, uint16_t cap,
     (void)raw;
 
     /*
+     * Learn rows and the terminator (S083 F34, R11).
+     *
+     * What: after the FS_SETTINGS_FIXED_LINES fixed lines come one line per
+     * Learn row, then "lines=N" with N = fixed + rows. Rows are only ever
+     * appended or replaced in place at runtime (no UI remove), so a row
+     * learned during a write is either included or written next time; the
+     * live count keeps the terminator equal to the lines written. A row
+     * whose names cannot be resolved writes a comment line, keeping the
+     * count exact. Line length: at most ~50 characters (< FS_TEXT_LINE_MAX).
+     * Line count: at most 24 + 128 = 152 (uint8_t recovery counter).
+     * Affiliates: midiLearn_formatSettingsLine(), the recovery prelude.
+     */
+    if (op_write_line_index >= FS_SETTINGS_FIXED_LINES) {
+        uint16_t row = (uint16_t)(op_write_line_index - FS_SETTINGS_FIXED_LINES);
+        uint8_t rows = midiLearn_count();
+
+        if (row < rows)
+            return midiLearn_formatSettingsLine((uint8_t)row, dst, cap);
+        if (row == rows)
+            return filesystem_formatAssignmentU16Line(
+                dst, cap, "lines", (uint16_t)(FS_SETTINGS_FIXED_LINES + rows));
+        return 0u;
+    }
+
+    /*
      * Stream one settings.cfg line.
      *
      * Inputs: op_write_line_index and the live global settings/Bank restore
@@ -18532,21 +18573,6 @@ static uint8_t filesystem_nextSettingsLine(char *dst, uint16_t cap,
     case 23u:
         return filesystem_formatAssignmentU16Line(
             dst, cap, "qac", parameter_values[PAR_SCENE_QUEUE_ACTION]);
-    case 24u:
-        /*
-         * Self-checking terminator for format expansion.
-         *
-         * What: emits "lines=24\n" as the final line, where 24 is the count
-         * of preceding data lines (cases 0u..23u: 17 original + 4 overlay
-         * (S080 E10) + 3 scene globals (S080 F5, P2 Defect 5)). Why: gives
-         * consumers a cheap completeness signal that distinguishes a genuine
-         * end-of-file from a clean-but-early EOF after a crash. Adding a
-         * settings key requires incrementing both its own case and this
-         * declared count. The boot recovery prelude validates this count; the
-         * normal load path ignores it as an unknown key. Affiliates: §6 of
-         * S057_SETTINGS_WRITE_SAFE.md.
-         */
-        return filesystem_formatAssignmentU16Line(dst, cap, "lines", 24u);
     default:
         return 0u;
     }

@@ -330,7 +330,11 @@ Parameters change through these paths:
    use runtime-only overlays (Session 070). Neither path changes stored
    images.
 
-   **S075 F3 priority (user): automation, then menu edits, then MIDI.**
+   **S083 Q1 priority (user): a MIDI write is a menu edit.** The S075 F3
+   "automation, then menu edits, then MIDI" order is superseded: MIDI writes
+   through `menu_commitTargetEdit()`, so it has the same priority and the
+   same actions against automation (R12/R13, Scene-target clears), fan-out
+   through `bank_editTargetMask()`, recording and display as a panel edit.
    - A voice-parameter automation value holds until the voice's next
      trigger. `seq_automationHoldsParameter(slot, local)` reports it; every
      Morph-base runtime write goes through `presetMorph_writeRuntimeBase()`,
@@ -340,10 +344,10 @@ Parameters change through these paths:
      re-interpolates that one parameter at the voice's resolved Morph amount
      (`presetMorph_applyParameterNow()`); with Morph above 0 the sound
      changes by less than the edit (correct). The whole voice is not queued.
-   - External MIDI CC/NRPN is lowest priority:
-     `preset_setInstrumentParameterFromMidi()` stores the active Scene's
-     clamped Normal endpoint (retained and AutoSaved, no fan-out) and queues
-     the voice; the Morph sweep applies it when it gets there.
+   - External MIDI CC/NRPN commits exactly like a menu edit: the active
+     Scene's clamped Normal endpoint, `seq_menuOverrideSet()` and edit-mask
+     fan-out. The retired `preset_setInstrumentParameterFromMidi()` path no
+     longer exists.
    - Before S075 F3 a menu edit queued the whole voice and the worker
      overwrote held automation mid-note (also on Morph changes, LFO on
      Morph, `Nvm` and Kit/Instrument applies).
@@ -676,12 +680,12 @@ result[i] = normal[i] + ((morph[i] - normal[i]) * amount) / 255
 Results are stored in `morph_interpolation[slot][descriptor_index]` and
 applied to DSP runtime through the normal descriptor writer.
 
-S075 F3 priority is explicit at the runtime boundary: step automation holds
+Priority at the runtime boundary (S081 R12, S083 Q1): step automation holds
 the current runtime value until the next trigger; a menu endpoint edit
 re-interpolates only the edited descriptor at the voice's resolved Morph
-amount and (S081 R12) overrides that descriptor's automation until the next
-trigger; an external MIDI CC stores the active Scene's Normal endpoint and is
-applied by the bounded worker, which skips automation-held descriptors.
+amount and overrides that descriptor's automation until the next trigger; an
+external MIDI CC/NRPN goes through the same menu commit and therefore has the
+same effect.
 
 ### Track timing Morph (S078)
 

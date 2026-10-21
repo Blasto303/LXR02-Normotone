@@ -289,6 +289,57 @@
  */
 #define LIVEREC_AUTOMATION_FIRST_CHANGE 1
 
+/*
+ * MIDI configuration (S083).
+ *
+ * What: compile-time sizes and budgets for the rebuilt Core/MIDI modules.
+ *  - MIDI_USB_RX_RING_SIZE: entries in the USB-in message ring
+ *    (usb_midi_core.c). Each entry is one 6-byte MidiMsg. Power of two,
+ *    at most 256 (the read/write indices are uint8_t).
+ *  - MIDI_USB_DRAIN_PER_PASS / MIDI_DIN_DRAIN_PER_PASS: messages (USB) and
+ *    bytes (DIN) midiIn_service() takes per main-loop pass.
+ *  - MIDI_ARRIVAL_MAX_AGE_US: oldest arrival age (us) used for live-record
+ *    placement; older notes fall back to processing time (the 16-bit stamp
+ *    wraps every 65.5 ms).
+ * Why: S083 Q13 (b) keeps the USB ring scalable here. 128 entries hold
+ * eight full USB packets of 16 events; with drop-newest on overflow and a
+ * 16-message drain per pass a dense DAW stream is not lost.
+ * RAM: MIDI_USB_RX_RING_SIZE x 6 B SRAM1 (768 B at 128, accepted
+ * 2026-10-21). Raising it is a new RAM allocation and needs the user's
+ * acknowledgement (MEMORY.md RAM Allocation Approval Policy).
+ * Affiliates: usb_midi_core.c/h, MidiIn.c, MidiNotes.c (B), LiveRecord.c.
+ */
+#define MIDI_USB_RX_RING_SIZE      128u
+#define MIDI_USB_DRAIN_PER_PASS    16u
+#define MIDI_DIN_DRAIN_PER_PASS    16u
+#define MIDI_ARRIVAL_MAX_AGE_US    20000u
+
+/*
+ * NRPN receive contexts per port (S083, plan 3.5). One context holds the
+ * selected NRPN number of one channel (3 B). Only G and voice channels use
+ * NRPN, so at most 8 channels are meaningful. RAM: 2 x 8 x 3 = 48 B SRAM1
+ * (approved). Affiliate: MidiControl.c.
+ */
+#define MIDI_NRPN_CONTEXTS         8u
+
+/*
+ * MIDI Learn (S083 C4, F36). MIDI_LEARN_MAX_ENTRIES: table rows (4 B each,
+ * 512 B SRAM1 at 128, approved). Raising it is a new RAM allocation and
+ * also grows settings.cfg (24 + entries lines, uint8_t line count: at most
+ * 231). MIDI_LEARN_FULL_SHOW_MS: how long `FUL` shows when a learn is
+ * refused because the table is full. Affiliates: MidiLearn.c, filesystem.c.
+ */
+#define MIDI_LEARN_MAX_ENTRIES     128u
+#define MIDI_LEARN_FULL_SHOW_MS    1000u
+
+/*
+ * Parameter transmit interval (S083 plan 3.9 C, R5): the minimum time
+ * between two parameter messages of a knob sweep (the latest value of the
+ * pending target is sent). A full NRPN is 9 bytes, ~2.9 ms on DIN; 10 ms
+ * keeps clock and notes undisturbed in the 64-byte DIN FIFO.
+ */
+#define MIDI_OUT_PARAM_INTERVAL_MS 10u
+
 //if 1 the amp EGs will be calculated on a per sample basis
 //takes too much calcuklation time
 //if 0 they are calculated for each dma buffer once, only a smoothing LP will be calculated in the sync loop

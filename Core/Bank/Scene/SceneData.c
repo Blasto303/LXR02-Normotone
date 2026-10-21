@@ -1,7 +1,8 @@
 #include "SceneData.h"
 #include "Autosave.h"
 #include "BankData.h"
-#include "MidiNoteNumbers.h"
+#include "MidiPitch.h"
+#include "MidiDefs.h"
 #include <string.h>
 
 /*
@@ -288,19 +289,16 @@ void scene_setTrackMidiChannel(uint8_t scene_index, uint8_t track,
 {
     scene_t *scene = scene_get(scene_index);
     /*
-     * Store a track MIDI channel in Scene settings.
+     * Store a track MIDI channel in Scene settings (S083: 0 = unassigned).
      *
-     * Inputs: Scene index, track index, and requested channel. Output: valid
-     * coordinates store a clamped 1..16 value. A changed byte then marks the
-     * track's named Scene parameter; an equal final channel is a no-op. This
-     * remains a Scene setting so Kit/instrument changes do not rewrite MIDI
-     * assignment. Affiliate: scene_storeParameterByte().
+     * Inputs: Scene index, track, channel 0..16 (0 = `glb`: the track
+     * follows G). Values above 16 clamp to 16. Output: a changed byte marks
+     * the track's AutoSave Scene cell. Affiliates: scene_storeParameterByte(),
+     * menu_parseGlobalParam(PAR_TRACK_MIDI_CHAN), AutoSave restore.
      */
     if (!scene || track >= NUM_TRACKS)
         return;
-    if (channel < 1u)
-        channel = 1u;
-    else if (channel > 16u)
+    if (channel > 16u)
         channel = 16u;
     scene_storeParameterByte(
         scene_index, &scene->settings.midi_channel[track],
@@ -312,19 +310,17 @@ uint8_t scene_getTrackMidiChannel(uint8_t scene_index, uint8_t track)
     const scene_t *scene = scene_getConst(scene_index);
     uint8_t channel;
     /*
-     * Read a track MIDI channel from Scene settings.
+     * Read a track MIDI channel (S083).
      *
-     * Inputs: Scene index and track index. Output: valid stored 1..16 channel,
-     * track+1 fallback for unset/stale values, or 1 for invalid coordinates.
-     * The fallback preserves current bridge defaults until MIDI off/channel
-     * policy is redesigned in Phase 5.
+     * Output: 1..16, or 0 when the track is unassigned (it follows G), the
+     * coordinates are invalid, or the byte is out of range. The pre-S083
+     * fallback to track+1 is gone: an unassigned track has no channel of
+     * its own. Accessors: MidiNoteMap loader, MidiOut callers, menu.
      */
     if (!scene || track >= NUM_TRACKS)
-        return 1u;
+        return 0u;
     channel = scene->settings.midi_channel[track];
-    return (channel >= 1u && channel <= 16u)
-        ? channel
-        : (uint8_t)(track + 1u);
+    return (channel <= 16u) ? channel : 0u;
 }
 
 void scene_setTrackMidiNote(uint8_t scene_index, uint8_t track, uint8_t note)
@@ -1146,8 +1142,9 @@ void scene_settingsDefaults(scene_settings_t *out)
         return;
     memset(out, 0, sizeof(*out));
     for (i = 0u; i < NUM_TRACKS; i++) {
-        out->midi_channel[i] = (uint8_t)(i + 1u);
-        out->midi_note[i] = MIDI_DEFAULT_TRIGGER_NOTE;
+        /* S083: tracks follow G and have no note root until assigned. */
+        out->midi_channel[i] = MIDI_CHANNEL_NONE;
+        out->midi_note[i] = 0u;
         /*
          * Track Morph endpoint defaults (S078 §5.4).
          *
@@ -1252,14 +1249,11 @@ void scene_resetResidentToEmpty(uint8_t scene_index)
 {
     scene_t *scene = scene_get(scene_index);
     uint8_t slot;
-    uint8_t track;
 
     if (!scene)
         return;
     memset(scene, 0, sizeof(*scene));
     scene_busCompDefaults(&scene->settings);
-    for (track = 0u; track < NUM_TRACKS; track++)
-        scene->settings.midi_channel[track] = (uint8_t)(track + 1u);
     for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++) {
         scene->settings.audio_out[slot] = scene_defaultVoiceAudioOut(slot);
         scene->settings.fx_send_amount[slot] = 0u;
@@ -1309,9 +1303,6 @@ void scene_initAll(void)
     for (scene_index = 0u; scene_index < SCENE_COUNT; scene_index++) {
         /* S074/S075 F2-B: bus compressor defaults are off, 0, 0, off. */
         scene_busCompDefaults(&scenes[scene_index].settings);
-        for (track = 0u; track < NUM_TRACKS; track++)
-            scenes[scene_index].settings.midi_channel[track] =
-                (uint8_t)(track + 1u);
         for (track = 0u; track < INSTRUMENT_SLOT_COUNT; track++) {
             /*
              * Initialize Scene-owned per-voice mix settings before any SD

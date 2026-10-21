@@ -1,53 +1,52 @@
+/*
+ * MidiPitch.h
+ *
+ *  Derived from MidiNoteNumbers.h, original LXR firmware by Julian Schmidt.
+ */
 
 /*
- * MidiNoteNumbers.h
- *
- *  Created on: 03.04.2012
+ *  Modified on: 21.10.2026
  * ------------------------------------------------------------------------------------------------------------------------
- *  Copyright 2013 Julian Schmidt
- *  Julian@sonic-potions.com
+ *  Modifications Copyright 2026 Brendan Clarke
+ *  brendanpaulclarke@gmail.com
+ *  https://www.brendanclarke.com
  * ------------------------------------------------------------------------------------------------------------------------
- *  This file is part of the Sonic Potions LXR drumsynth firmware.
- * ------------------------------------------------------------------------------------------------------------------------
- *  Redistribution and use of the LXR code or any derivative works are permitted
- *  provided that the following conditions are met:
- *
- *       - The code may not be sold, nor may it be used in a commercial product or activity.
- *
- *       - Redistributions that are modified from the original source must include the complete
- *         source code, including the source code for all components used by a binary built
- *         from the modified sources. However, as a special exception, the source code distributed
- *         need not include anything that is normally distributed (in either source or binary form)
- *         with the major components (compiler, kernel, and so on) of the operating system on which
- *         the executable runs, unless that component itself accompanies the executable.
- *
- *       - Redistributions must reproduce the above copyright notice, this list of conditions and the
- *         following disclaimer in the documentation and/or other materials provided with the distribution.
- * ------------------------------------------------------------------------------------------------------------------------
- *   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
- *   INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- *   DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- *   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- *   SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
- *   WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
- *   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *  The modifications to this file are part of the LXR02 Open-Source software.
+ *  The same license and restrictions on use for the LXR software apply.
  * ------------------------------------------------------------------------------------------------------------------------
  */
 
-
-#ifndef MIDINOTENUMBERS_H_
-#define MIDINOTENUMBERS_H_
+#ifndef MIDIPITCH_H_
+#define MIDIPITCH_H_
 
 /*
- * Default note for fixed-grid trigger steps.
+ * MidiPitch.h - pitch constants shared by MIDI, the Sequencer and the DSP
+ * oscillators (S083, was MidiNoteNumbers.h).
  *
- * Inputs: Sequencer, MIDI fallback, SOM, and Scene load defaults use this
- * MIDI-domain value when no Scene track-note override is set. Output: note 63.
- * Keeping it here prevents DSP and filesystem users from depending on
- * PatternData merely to obtain a musical constant.
+ * What: the default internal note (63 = the voice's default pitch), the
+ * MIDI-note frequency table, and the fine-tune helper.
+ * Why: MidiNoteNumbers.h is renamed with the Core/MIDI rebuild (Q7), and
+ * midiParser_calcDetune() moves here because MidiParser is deleted and the
+ * helper is pure pitch maths (Oscillator.c is its only user).
+ * Affiliates: Oscillator.c (frequency, detune), sequencer.c, SceneData.c,
+ * filesystem.c, SomGenerator.c, buttonHandler.c, MidiNoteMap.c (63 base).
+ */
+
+#include <stdint.h>
+
+/*
+ * Default internal note (unchanged value).
+ *
+ * Inputs: Sequencer, overlay, preview, SOM and the note map use this when
+ * no pitch offset applies. Output: 63; the oscillator plays its default
+ * pitch, and note - 63 is the offset in semitones (Oscillator.c
+ * osc_setBaseNote()). S083: a track's MIDI note (`nte`) is no longer a
+ * pitch; it is only the root of the track's receive range (plan 3.3, C-1).
  */
 #define MIDI_DEFAULT_TRIGGER_NOTE 63u
 
+/* 2^(1/12): one semitone. */
+#define MIDI_PITCH_SEMITONE_UP 1.0594630943592952645618252949463f
 
 static const float MidiNoteFrequencies[] =
 {
@@ -181,5 +180,21 @@ static const float MidiNoteFrequencies[] =
 		12543.8539514160
 };
 
+/*
+ * Fine-tune factor from a 7-bit value (was midiParser_calcDetune()).
+ *
+ * What: 0..127 maps linearly to about -1/2 .. +1/2 semitone around 1.0.
+ * Inputs: value 0..127 (the oscillator's fine-tune byte). Output: frequency
+ * multiplier. The old function had two identical branches; the result is
+ * the same expression. Accessors: Oscillator.c osc_setBaseNote(),
+ * osc_recalcFreq().
+ */
+static inline float midiPitch_detune(uint8_t value)
+{
+	const float frac = ((float)value / 127.f) - 0.5f;
 
-#endif /* MIDINOTENUMBERS_H_ */
+	return 1.0f + frac * (MIDI_PITCH_SEMITONE_UP - 1.0f);
+}
+
+#endif /* MIDIPITCH_H_ */
+

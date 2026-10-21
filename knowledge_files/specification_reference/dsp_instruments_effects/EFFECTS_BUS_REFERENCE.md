@@ -301,6 +301,12 @@ once and forgotten; an FX-sequence lock (including the Morph lane) applies at
 its step start and returns to the menu value at its step end; a lock beats
 track automation; a menu edit beats both until the next automation.
 
+**S083 Q1:** a MIDI write is a menu edit. `MidiControl` writes Effect rows
+through `menu_commitTargetEdit()` -> `effects_setParameter(...,
+EFFECT_IMAGE_NORMAL, ...)`, which sets `menuHold` exactly like an Effect-page
+edit, so it beats a lock and the overlay until the next automation (R13).
+MIDI never writes a Morph image.
+
 Per Effect parameter `i` there are four layers:
 
 | Layer | Set by | Cleared by |

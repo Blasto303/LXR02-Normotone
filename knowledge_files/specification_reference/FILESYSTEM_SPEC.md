@@ -707,13 +707,19 @@ The current writer emits keyed text with:
 
 The remaining accepted/written keys are bpm, ext_sync, quantisation (0..5;
 5 = `trk` since S081),
-midi_chan_global, midi_filt_tx, midi_filt_rx, midi_routing,
+midi_chan_global (S083: 0 = off, 1..16), midi_filt_tx, midi_filt_rx,
+midi_routing (S083: 0..7 = off UtD DtD DtU bth DtA AtD all),
 screensaver_on_off, bar_reset_mode, prescaler_clock_in,
 prescaler_clock_out1, prescaler_clock_out2, follow, and osc_wave_interp, and
 since Session 080 `perf_btn_lt`, `perf_note_lt`, `perf_btn_rt`,
 `perf_note_rt`, `scd`, `qcd`, `qac` (writer cases 17..23; defaults 0). The
-complete writer schema is 24 data lines plus the `lines=24` terminator (17
-before S080). Load sanitizes out-of-range S080 values to 0: `qac` > 8,
+complete writer schema is 24 fixed data lines, then one `learn=` line per
+MIDI Learn row (S083; at most 128), then the `lines=24+N` terminator (17
+before S080). A `learn=` line is
+`learn=CCC,<g|v>,<v1..v6|fx|scn>,<type>,<key>` (Scene rows omit `<type>`);
+a malformed or unresolvable line is skipped while the rest of the file
+loads, and an unresolvable row is written as a `#` comment so the count
+stays exact. Load sanitizes out-of-range S080 values to 0: `qac` > 8,
 `qcd` > 17, `scd` > 9. Value meanings: `scd` 0..9 = ins 1/8 1/4 1/2 1b 2b 3b
 4b ens enl; `qcd` 0..17 = ins 1/8 1/4 1/2 1b..9b 12b 15b 16b ens enl; `qac`
 0..8 = nrm mut mrp res u+r o+r mmr rld r+r. P1-era files storing qac 3/4 or
@@ -1249,8 +1255,8 @@ The writer emits one `key=value` line per field, in this order:
 | 1 | `version` | `1` | |
 | 2 | `morph_amount` | 0..255 | |
 | 3 | `voice_morph_amount` | 6 × 0..255, comma-separated | |
-| 4 | `midi_channel` | 7 values | |
-| 5 | `midi_note` | 7 values | |
+| 4 | `midi_channel` | 7 values, each 0..16 | **S083: 0 = unassigned (`glb`, follows G); defaults 0.** |
+| 5 | `midi_note` | 7 values, each 0..127 | **S083: 0 = `def` (no note root); defaults 0.** |
 | 6 | `audio_out` | 6 × 0..5 | |
 | 7 | `fx_send_amount` | 6 × 0..127 | |
 | 8 | `fader_setting` | 6 × 0..3 (`pre pst fx xfd`) | **3 = `xfd` since S074.** A value above the domain rejects the file, so firmware older than S074 rejects a Scene that uses `xfd` (downgrade only). |

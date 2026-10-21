@@ -639,10 +639,7 @@ storage_status_t storage_scenesetParseLine(
                                 16u);
         if (st != STORAGE_STATUS_OK)
             return st;
-        for (parsed = 0u; parsed < NUM_TRACKS; parsed++) {
-            if (target_settings->midi_channel[parsed] < 1u)
-                return STORAGE_STATUS_BAD_VALUE;
-        }
+        /* S083: 0 = unassigned (`glb`), 1..16 a channel. */
     } else if (storage_streq(key, "midi_note")) {
         if (!target_settings)
             return STORAGE_STATUS_BAD_VALUE;

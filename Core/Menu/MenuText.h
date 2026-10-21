@@ -45,6 +45,8 @@ static const char menuText_fm[]    = "fm ";
 static const char menuText_dash[]  = "---";
 static const char menuText_blank[] = "   ";
 static const char menuText_any[]   = "any";
+static const char menuText_glb[]   = "glb";
+static const char menuText_def[]   = "def";
 
 /* Each table: [0]=count, [1..n]=entries, 3+1 chars each */
 static const char ppqNames[][4] = {
@@ -133,8 +135,13 @@ static const char outputNames[][7] = {
 static const char filterTypes[][8] = {
     {8}, {"LP"},{"HP"},{"BP"},{"UBP"},{"Nch"},{"Pek"},{"LP2"},{"off"},
 };
+/*
+ * MRT routing names (S083 F22, MIDI_SPEC 3.3).
+ * Order matches midiDefs_routeMask(): off UtD DtD DtU bth DtA AtD all.
+ * Stored values change meaning (no migration, standing rule).
+ */
 static const char midiRoutingNames[][6] = {
-    {6}, {"off"},{"U2M"},{"M2M"},{"A2M"},{"M2U"},{"M2A"},
+    {8}, {"off"},{"UtD"},{"DtD"},{"DtU"},{"bth"},{"DtA"},{"AtD"},{"all"},
 };
 static const char midiFilterNames[][16] = {
     {16},

@@ -20,14 +20,16 @@ make all && make img   →   build/LXRV2_lxr02.img   (use `make all`: bare `make
 
 **Commits belong to the user.** Do not suggest or prompt when to commit.
 
-**Current working source**: **Session 082 is closed** on `dev-ph6-midi`
-(2026-10-20/21). S082 rebuilt Load/Save (Bank Replace/Merge with the COPY
-button, Instrument `chg`, fast name editing) and built the background Bank
-load: a running Bank change plays on from Scene 17 while Scenes 1–16 load,
-with the Effect source rebind, range AutoSave marks and idle-time card
-servicing (P2), and since P3 the user can keep working (and switch to loaded
-Scenes) while the load finishes. Next session: **S083 MIDI**
-(`S083_P1_MIDI_IMPLEMENTATION_PLAN.md`, see its §13 for what S082 changed).
+**Current working source**: **Session 083 (MIDI) is implemented** on
+`dev-ph6-midi` (2026-10-21), pending the hardware matrix. `Core/MIDI/` was
+rebuilt as the single-role modules listed under "MIDI / Clock Reminders"
+below; `MidiParser`, `Uart`, `FIFO`, `MidiRealtime`, `MidiMessages`,
+`MidiNoteNumbers` and the legacy LXR CC/CC2 map are gone. MIDI reads and
+writes follow `MIDI_SPEC.md` (now "current as of S083"). Schedule and
+per-phase notes: `S083_P1_IMPLEMENTATION.md` §12. DEV build at the
+implementation close: `text=603,896`, `data=424`, `bss=430,120`; flash
+headroom 149,344 B. Session 082 remains closed (Load/Save, background Bank
+load, Scene 17: `082_SESSION_HANDOFF_LOG.md`).
 
 - **Commits:** S082 planning `8206a73`, `8b1b647`, `45846b7`; P0–P2 code
   `b25ffbe`; P3 code `8a83df0`; the close-out documents are uncommitted. The
@@ -40,8 +42,10 @@ Scenes) while the load finishes. Next session: **S083 MIDI**
   automation ramps (`asm`), loop while record, the G-1 global Morph fix and
   the VOICE bar pulse. Its hardware checks passed (user, 2026-10-21, S083
   Q3). S082 did not change LiveRecord.
-- **Build at S082 close (DEV config):** `text=598,120`, `data=420`,
-  `bss=430,928`; flash payload 598,540 B of 753,664 (**155,124 B free**).
+- **Build at S083 implementation close (DEV config):** `text=603,896`,
+  `data=424`, `bss=430,120`; flash payload 604,320 B of 753,664
+  (**149,344 B free**). S082's baseline was `598,120 / 420 / 430,928`
+  (155,124 B free).
   S082 SRAM: Scene 17 1,658 B, P0 16 B, P1 93 B, P3 4 B (DEV-only
   diagnostics extra). Production build (`DEV_MODE_LOGGING 0`) last measured
   at S075 F1; needs a rebuild.
@@ -49,9 +53,10 @@ Scenes) while the load finishes. Next session: **S083 MIDI**
   (2026-10-21, S083 Q3). The P0 first-boot freeze was not reproduced; the
   F5 Scene 2 Case-3 invalidation is open (`082_SESSION_HANDOFF_LOG.md` §11,
   §13).
-- **Session 083 (MIDI) is planning:** `S083_P1_MIDI_IMPLEMENTATION_PLAN.md`
-  revision 5 (Q1–Q12 answered; Q13 timestamp RAM open). Target spec:
-  `MIDI_SPEC.md`. `Core/MIDI/` is to be rebuilt as new modules (plan §3.1).
+- **Session 083 (MIDI) is implemented (2026-10-21):** plan revision 5 and
+  `S083_P1_IMPLEMENTATION.md` applied in full (A–G; H documents updated).
+  Target spec: `MIDI_SPEC.md`. Hardware verification of the A–G matrices is
+  still to be reported by the user.
 - **Automated Scene changes (user, S083 Q2, 2026-10-21) — binding:**
   "Scenes or tracks from Scenes are not automatable unless they are changed
   via a voice edit mask from an active Scene or track." A queued action whose
@@ -270,9 +275,10 @@ end; durable facts belong in `knowledge_files/log_archive/` or
   `voiceControl_processPending()` → `seq_drainPendingAutomation()` →
   `seq_rampService()` must not change. A roll runs its own length; only the
   next step's trigger cuts it (F-R).
-- **Live record invariants (S081) — binding:** buttonHandler, Menu and
-  MidiParser call LiveRecord; the Sequencer never calls LiveRecord (it reads
-  registered bitmaps); LiveRecord never calls buttonHandler or MidiParser and
+- **Live record invariants (S081; S083 names) — binding:** buttonHandler,
+  Menu and MidiNotes/MidiControl call LiveRecord; the Sequencer never calls
+  LiveRecord (it reads registered bitmaps); LiveRecord never calls
+  buttonHandler or the MIDI modules and
   calls Menu only for `menu_automationTargetRecorded()` (hardware fix 1,
   recorded deviation). LiveRecord never runs in TIM3; TIM3 never touches pool
   bytes for record/erase (TIM3-safe service enqueues only). Values recorded
@@ -433,11 +439,10 @@ end; durable facts belong in `knowledge_files/log_archive/` or
   overlap paste pool, and (since S082) Scene 17's Pattern; never two at once.
   `filesystem_patternSnapshotInUse()`
   gates overlap availability.
-- **Automation priority (user, S075 F3, amended by S081 R12) — binding:**
-  step automation, then menu edits, then MIDI — **[superseded for MIDI by
-  S083 Q1, 2026-10-21: a MIDI write is a menu edit, with the same priority
-  and actions against automation and recording; MIDI_SPEC §5.6, plan §3.5.
-  Not yet built.]** — **except that a menu edit of
+- **Automation priority (user, S075 F3, amended by S081 R12 and S083 Q1) —
+  binding:** step automation, then menu edits, and **a MIDI write is a menu
+  edit** (S083 Q1, built): same priority and actions against automation and
+  recording through `menu_commitTargetEdit()`; MIDI_SPEC §5.6. A menu edit of
   an automated Instrument parameter now sounds at once and suppresses that
   parameter's automation until the voice's next trigger, a transport change
   or a Scene change** (R12: `seq_menuOverrideSet()` clears the held bit and
@@ -1285,16 +1290,20 @@ are superseded by `knowledge_files/log_archive/052_SESSION_HANDOFF_LOG.md`.
     │   ├── CopyClear/               ← S075 Phase 6 copy/clear: session (routing, range rule, menus, LEDs, suspension), copyOps, clearOps, copyClearService (queue, Pattern engines, register, name buffer, HCNAMES write)
     │   ├── menuEffects.c/h          ← SHIFT+PERF Effect page: SELECT layout, `typ` transaction, SHIFT Morph view, SEQ lock editing/LEDs
     │   └── screensaver.c/h          ← screensaver with explicit LCD off/on phases
-    ├── MIDI/
-    │   ├── Uart.c/h                 ← USART3, 31250 baud, interrupt-driven dual FIFO (realtime + normal)
-    │   ├── MidiRealtime.c/h         ← 32-entry timestamped SPSC ring for MIDI_CLOCK/START/CONTINUE/STOP
-    │   ├── FIFO.c/h
-    │   ├── MidiMessages.h           ← full mainboard version (MIDI_NRPN_* prefix)
-    │   ├── MidiNoteNumbers.h
-    │   ├── MidiParser.c/h
-    │   ├── MidiVoiceControl.c/h
-    │   ├── SeqStep.h
-    │   └── valueShaper.h
+    ├── MIDI/                        ← S083 rebuild, single-role modules
+    │   ├── MidiDefs.h               ← MidiMsg (6 B, arrival stamp), statuses, CCs, filters, MRT
+    │   ├── MidiBuffer.c/h           ← DIN TX lanes and stamped RX buffer
+    │   ├── MidiDin.c/h              ← USART3 driver (PB10/PB11)
+    │   ├── MidiIn.c/h               ← framing, RXF, S082 drop filter, consume-then-route, MRT
+    │   ├── MidiTransport.c/h        ← realtime ring, TIM3 handler, Start/Continue/Stop, SPP, MTC
+    │   ├── MidiNoteMap.c/h          ← N1-N5 note map and Q4 TX inverse
+    │   ├── MidiNotes.c/h            ← triggers, overlays, CC2, LiveRecord age
+    │   ├── MidiControl.c/h          ← NRPN, CC1, value rules, menu-edit writes
+    │   ├── MidiLearn.c/h            ← 128-row Learn table, gesture, settings.cfg lines
+    │   ├── MidiProgram.c/h          ← PC and CC0
+    │   ├── MidiOut.c/h              ← all TX, forwarding, framing, no echo
+    │   ├── MidiPitch.h              ← default note 63, frequency table, detune
+    │   └── MidiVoiceControl.c/h     ← trigger funnel (unchanged)
     ├── Bank/
     │   ├── BankData.c/h             ← resident Bank display name, active Bank-local Scene slot, loaded-bank flag
     │   └── Scene/
@@ -1493,7 +1502,7 @@ reset vector stays in sector 1.
 | IRQ23 | 3 | EXTI9_5_IRQHandler | RST IN — PD5 rising edge; PD6/PD7 masked and polled as jack state |
 | IRQ27 | 1 | TIM1_CC_IRQHandler | Main encoder A/B input capture |
 | IRQ29 | 2 | TIM3_IRQHandler | 4kHz sequencer timing owner: processRealtimeEvents → triggerJacks_tick → seq_tick |
-| IRQ39 | 5 | USART3_IRQHandler | MIDI DIN RX/TX; timestamps bytes with TIM2; realtime bytes → MidiRealtime ring |
+| IRQ39 | 5 | USART3_IRQHandler | MIDI DIN RX/TX; timestamps bytes with TIM2; realtime bytes → MidiTransport ring, others → stamped MidiBuffer |
 | IRQ47 | 4 | DMA1_Stream7_IRQHandler | I2S3/DAC1 — audio slave (flags only) |
 | IRQ54 | 6 | TIM6_DAC_IRQHandler | 1kHz — counters + foreground front-panel service flag |
 | IRQ55 | 7 | TIM7_IRQHandler | 5kHz — LCD queue drain |
@@ -1861,19 +1870,57 @@ sequencerTimer_init(); // TIM3 4kHz sequencer owner — AFTER audioCodec_init()
   (unless chain `stp`) `seq_loopProcessTick()` → per-track DDA → rolls → FX
   clock. Scene changes themselves run in the foreground
   (`menu_serviceDeferredSceneChange()` from `buttonHandler_tick()`).
-- `midiParser_processRealtimeEvents()` and `triggerJacks_tick()` are also owned by TIM3. Do NOT call them from the main loop.
+- `midiTransport_processRealtime()` and `triggerJacks_tick()` are also owned by TIM3. Do NOT call them from the main loop.
 - `voiceControl_processPending()` is called only inside `audio_check_and_render()` before `mixer_calcNextSampleBlock()`. Do NOT call from ISR context.
 - DIN TX FIFO inserts and USB MIDI writes from foreground code must use short critical-section wrappers to avoid corruption from TIM3 clock/note output.
 
-### MIDI / Clock Reminders (Session 019)
+### MIDI / Clock Reminders (S083; supersedes the Session 019 notes)
 - TIM2 is a shared free-running 1 µs counter. Do NOT reset it on each pulse. Use unsigned subtraction for deltas.
 - TIM5 is free and reserved for future `afatfs_poll()` ISR migration. Do NOT use it for anything else.
 - PAR_EXT_SYNC values in order: `off` / `usb` / `din` / `pls` / `aut`. PAR_BPM minimum is 1; value 0 no longer means external sync.
-- CC1 on the global MIDI channel controls MORPH as a 7-bit input to a 0..255 parameter: values 0..126 map to `value * 2`, and 127 maps to 255 so the endpoint is reachable. This is handled in the incoming channel-MIDI path, not in `midiParser_ccHandler()`. Do not add CC1 to the CC handler.
-- BAR1/BAR2 use `midiParser_playVoiceMidiNote(voice, vel)`. Do NOT revert to direct `voiceControl_noteOn/Off()`.
-- Default voice MIDI notes: Drum1=36 … Drum7=42. Overridden by CC2_MIDI_NOTE per-voice setting.
+- **`Core/MIDI/` is rebuilt (S083).** Modules: `MidiDefs.h`, `MidiBuffer`,
+  `MidiDin`, `MidiIn`, `MidiTransport`, `MidiNoteMap`, `MidiNotes`,
+  `MidiControl`, `MidiLearn`, `MidiProgram`, `MidiOut`, `MidiPitch.h`;
+  `MidiVoiceControl` is unchanged. `MidiParser`, `Uart`, `FIFO`,
+  `MidiRealtime`, `MidiMessages` and `MidiNoteNumbers` are gone, as is the
+  legacy LXR CC/CC2 map. Authority: `MIDI_SPEC.md`.
+- **Consume-then-route:** `midiIn_dispatch()` offers a message to its
+  consumers first and forwards it per MRT only if no consumer acted. The
+  S082 Bank-load drop filter runs before the consumers; a dropped message
+  counts as not consumed and is forwarded. Never forward before parsing.
+- **Channels are 1..16 with 0 = off/unassigned everywhere in MIDI code** (the
+  wire nibble is channel - 1). G is 0..16; a track's `chn` is 0 = `glb`.
+  `SceneData` no longer falls back to track+1.
+- **Note map:** a track's `nte` is the root of its receive range, not a pitch
+  (`MidiNoteMap`). A note triggers at most one track (lowest wins). A note is
+  transmitted only when the inverse lands on the same track and pitch (Q4).
+  Default internal note 63 is the default pitch for stripe hits, overlay
+  `def` and preview (C-1).
+- **A MIDI parameter write is a menu edit (Q1).** `MidiControl` calls
+  `menu_commitTargetEdit()`: Normal image, R12/R13 and Scene-target clears,
+  edit-mask fan-out, LiveRecord in LATCH/OVERDUB, target-ID LCD repaint. It
+  is never echoed. The S075 F3 "MIDI lowest" path is retired.
+- **CC1:** on G it is global Morph through `menu_commitGlobalMorphFromMidi()`
+  (fan-out, never recorded, G-1); on a voice channel it is that voice's Morph
+  and is recorded.
+- **CC2** (note action: 0 single, 1 BAR <, 2 BAR >) is G-only; a held BAR in
+  PERF wins over CC2. **CC0** on G requests the S082 background Bank load
+  under RXF P. **PC** 0..15 on G is a whole-Scene change; on a voice channel
+  it moves that channel's tracks. PC/CC0 are dropped during a Bank load.
+- **MIDI Learn** is global, 128 type-tagged rows in `settings.cfg`
+  (`learn=` lines after the 24 fixed lines, `lines=24+N`). Gesture:
+  SHIFT+PLAY+REC; `LRN`/`FUL`; one parameter has at most one CC.
+- **Arrival time** is carried in `MidiMsg.stamp` (low 16 bits of TIM2 µs) and
+  used only for live-record placement (`liveRec_trigger_t.age_us`, clamped to
+  `MIDI_ARRIVAL_MAX_AGE_US`).
+- **Transport:** Start restarts, Continue resumes from `seq_resumeTick`, SPP
+  sets it while stopped (x24), and all are gated by `snc`. Received START/
+  STOP/CONTINUE are forwarded per MRT but never re-sent by the LXR (C-11).
+- BAR1/BAR2 overlay triggers go through the per-track executor
+  (`buttonHandler_overlay[7]`), shared with MIDI notes; the legacy default
+  notes 36..42 are gone.
 - RST IN semantics: GPIO input with pull-up; low-to-high rising edge resets pattern position without toggling transport or sending MIDI stop/start.
-- MIDI realtime bytes (0xF8/FA/FB/FC) are routed to the MidiRealtime ring in the USART3 ISR and must NOT disturb the channel-message running-status parser state.
+- MIDI realtime bytes (0xF8/FA/FB/FC) are routed to the MidiTransport ring in the USART3/OTG ISRs and must NOT disturb the channel-message running-status parser state.
 
 ---
 

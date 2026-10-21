@@ -45,7 +45,7 @@
  */
 
 #include "sequencerTimer.h"
-#include "MidiParser.h"
+#include "MidiTransport.h"
 #include "sequencer.h"
 #include "triggerJacks.h"
 #include <stdint.h>
@@ -97,7 +97,7 @@ void TIM3_IRQHandler(void)
 		** 1. Apply timestamped MIDI realtime bytes.
 		** 2. Apply timestamped CLK/RST jack events.
 		** 3. Advance/schedule the sequencer and emit clock outs. */
-		midiParser_processRealtimeEvents();
+		midiTransport_processRealtime();
 		triggerJacks_tick();
 		seq_tick();
 	}

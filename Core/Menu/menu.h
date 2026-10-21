@@ -463,6 +463,8 @@ void menu_loadInstrumentExit(void);
  */
 uint8_t menu_loadSceneButtonPressed(uint8_t scene_index);
 void    menu_perfModeSceneButtonPressed(uint8_t scene_index);
+/* S083 P2/Q9: whole-Scene change with origin (MIDI_ORIGIN_PANEL/MIDI). */
+void    menu_perfModeSceneChangeFrom(uint8_t scene_index, uint8_t origin);
 /* Bank page COPY: tap toggles Merge, hold shows the other view (S082 B2.12).
  * Inputs: ButtonHandler edges. Outputs: menu_bankUiFlags, LEDs, label. */
 uint8_t menu_bankCopyPressed(void);
@@ -559,24 +561,6 @@ void menu_effectShowHome(void);
 uint8_t menu_fxVoiceMixOverlayBegin(uint8_t track);
 void menu_fxVoiceMixOverlayEnd(void);
 uint8_t menu_fxVoiceMixOverlayActive(void);
-
-/*
- * Clamp one value to an instrument parameter's menu domain (S075 F3).
- *
- * What: applies the same descriptor-domain clamp as a VOICE-page edit
- * (menu_clampCellValue() for an instrument cell: dtype ranges, list sizes,
- * on/off, target-selector tokens, and LFO target voice range) to one
- * parameter of the active Scene's slot.
- * Why: external MIDI now enters values into the Scene (stored, saved); a raw
- * 0..127 CC must not persist an out-of-domain byte, for example 127 on an
- * on/off parameter. The clamp rules live in Menu; this wrapper keeps one copy.
- * Inputs: slot 0..5, descriptor-local index, raw value 0..255. Output: the
- * clamped value, or the input unchanged when the slot/descriptor is invalid.
- * Caller: MidiParser.c midiParser_enterTaggedParameter(). Affiliates:
- * menu_clampCellValue(), menu_cellDtype().
- */
-uint8_t menu_clampInstrumentValue(uint8_t slot, uint8_t descriptor_index,
-                                  uint8_t value);
 
 /*
  * VOICE held-step automation overlay bridge.
@@ -725,7 +709,23 @@ uint8_t menu_paramUsesMorphView(uint16_t paramNr);
 uint8_t menu_getParameterDisplayValue(uint16_t paramNr);
 uint8_t *menu_getParameterEditPtr(uint16_t paramNr);
 void menu_parseKnobDelta(uint8_t knobNr, int8_t delta);
-void menu_notifyExternalParamChanged(uint16_t paramNr);
+/*
+ * MIDI write path (S083 Q1): a MIDI write commits exactly like a menu edit.
+ *
+ * menu_commitTargetEdit(): 9-bit target, 7-bit value, origin; returns 1 for
+ * a valid target in the active Scene. It clamps, fans out through
+ * bank_editTargetMask(), applies the R12/R13 actions, records in LATCH/
+ * OVERDUB and requests the repaint. menu_commitGlobalMorphFromMidi(): CC1
+ * on G (fan-out, never recorded, G-1). menu_notifyTargetChanged(): repaint
+ * request for a target ID (visible-cell test).
+ * Context: foreground only. Accessor: MidiControl.c. Affiliates:
+ * menu_cellCommitValueEx(), liveRec_paramIn(), effects_setParameter().
+ */
+uint8_t menu_commitTargetEdit(uint16_t id, uint8_t value, uint8_t origin);
+void menu_commitGlobalMorphFromMidi(uint8_t value);
+void menu_notifyTargetChanged(uint16_t id);
+/* S083 C5: Learn state changed; request a coalesced repaint (LRN/FUL). */
+void menu_learnDisplayChanged(void);
 void menu_serviceKnobRepaint(void);  /* call from main loop after RV1-4 read loop */
 void menu_pollPresetStatus(void);   /* call from main loop — handles async SD completion */
 /*

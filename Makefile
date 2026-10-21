@@ -117,11 +117,17 @@ SRCS = \
   Core/DSP/Effects/EffectsManager.c \
   Core/DSP/Effects/StereoFilter/StereoFilterParameters.c \
   Core/DSP/Effects/CrumpBit/CrumpBitParameters.c \
-  Core/MIDI/FIFO.c \
-  Core/MIDI/MidiRealtime.c \
-  Core/MIDI/Uart.c \
-	  Core/MIDI/MidiVoiceControl.c \
-	  Core/MIDI/MidiParser.c \
+  Core/MIDI/MidiBuffer.c \
+  Core/MIDI/MidiDin.c \
+  Core/MIDI/MidiTransport.c \
+  Core/MIDI/MidiIn.c \
+  Core/MIDI/MidiOut.c \
+  Core/MIDI/MidiNoteMap.c \
+  Core/MIDI/MidiNotes.c \
+  Core/MIDI/MidiProgram.c \
+  Core/MIDI/MidiControl.c \
+  Core/MIDI/MidiLearn.c \
+  Core/MIDI/MidiVoiceControl.c \
   Core/Bank/Scene/Pattern/PatternData.c \
   Core/Bank/Scene/Pattern/PatternStackService.c \
   Core/Bank/Scene/Pattern/EuklidGenerator.c \

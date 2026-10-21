@@ -124,7 +124,7 @@ recordable range is clamped (§3.3).
 | `settings.cfg` | Streamed one line at a time (`filesystem_nextSettingsLine()`, no file buffer). 1 s debounce, temp + sync + promote. The `lines=N` terminator is checked only by the `settings.tmp` boot recovery; normal load ignores it. | Learn lines fit the existing writer. |
 | Bank Load | **Built in S082:** `preset_requestBackgroundBankLoad()` (Menu and MIDI origin), Scene 17 (`scene_background` + `pat_background_region`), progressive load with the panel unlocked from phase 5, MIDI deferral and drop filter, result byte (§13). | CC0 RX → the request API (Phase D). |
 | Layout (checked 2026-10-21) | `Core/MIDI/` holds `FIFO`, `Uart`, `MidiParser` (2,203 lines), `MidiRealtime`, `MidiVoiceControl`, `MidiMessages.h`, `MidiNoteNumbers.h` and `valueShaper.h`. Callers outside `Core/MIDI/`: `main.c`, `menu.c/h`, `sequencer.c`, `sequencerTimer.c`, `LiveRecord.c`, `presetManager.c/h`, `buttonHandler.c`, `Oscillator.c` (`midiParser_calcDetune()`), `filesystem.c`, `SceneData.c`, `SomGenerator.c`, `usb_manager.h`, `usb_midi_core.c/h`. `valueShaper.h` is used only by DSP and Preset code (`lfo.c`, `InstrumentManager.c`, `StereoFilterEffect.c`, `presetManager.c`). | Rebuilt in Phase A (§3.1, S083 Q7). |
-| Arrival time | USART3 stamps every byte with TIM2, but only realtime bytes keep the stamp. The DIN RX FIFO (64 B) and the USB RX ring (256 × 4 B `MidiMsg`) carry none. USB computes `packetTimestampUs` per packet and drops it for channel messages. LiveRecord places a hit from a snapshot taken when it is processed (`seq_captureTrackTime()`, `deltaQ8`). | §3.11 (S083 Q6). |
+| Arrival time | USART3 stamps every byte with TIM2, but only realtime bytes keep the stamp. The DIN RX FIFO (64 B) and the USB RX ring (256 × 8 B `MidiMsg`; measured at the S083 assessment, D-1) carry none. USB computes `packetTimestampUs` per packet and drops it for channel messages. LiveRecord places a hit from a snapshot taken when it is processed (`seq_captureTrackTime()`, `deltaQ8`). | §3.11 (S083 Q6). |
 | Overlay executor | The S080 BAR overlay repeat state in `buttonHandler.c` is a single slot (`bh_overlayTrack/Note/Vel/Count/Interval/Next`), so a second roll takes over the first. | Per-track (§3.4, S083 Q5). |
 | Dead code | `midiParser_playVoiceMidiNote()`, `midiParser_triggerVoice()` (no callers), `preset_applySoundParameter(…recordAutomation)` and the STEP armed-automation remnant (both left by S081 for this rework), `midi_NoteOverride[7]`, the dead realtime cases in `midiParser_parseMidiMessage()`, ~1,000 lines of `#if 0`. | MEMORY.md "MIDI / Clock Reminders" (BAR1/BAR2 path, default notes 36..42) are stale. |
 
@@ -554,7 +554,7 @@ Non-S082 prep before S083:
 | NRPN TX cache + coalesce, owner `MidiOut` | ~8 | SRAM1, static | **Accepted 2026-10-17** |
 | CC2 state, owner `MidiNotes` | 1 | SRAM1, static | **Accepted 2026-10-17** |
 | DIN RX arrival stamps, 64 × 2 B, owner `MidiBuffer`/`MidiDin` | 128 | SRAM1, static | **Accepted 2026-10-21 (Q13)** |
-| USB RX ring with stamps, `MIDI_USB_RX_RING_SIZE` (config.h, default 128, power of two) × 6 B `MidiMsg` (was 256 × 4 B = 1,024 B), owner `usb_manager` | 768 (net −256) | SRAM1, static | **Accepted 2026-10-21 (Q13 (b))**; a larger value needs a new acknowledgement |
+| USB RX ring with stamps, `MIDI_USB_RX_RING_SIZE` (config.h, default 128, power of two) × 6 B `MidiMsg` (was 256 × 8 B = 2,048 B, measured at the S083 assessment, D-1), owner `usb_manager` | 768 (net −1,280) | SRAM1, static | **Accepted 2026-10-21 (Q13 (b))**; a larger value needs a new acknowledgement |
 | Queued Scene change origin (MIDI PC, for Q9 no-echo), owner `menu` queue state | ≤1 (a spare bit if one exists) | SRAM1, static | **Accepted 2026-10-21 (Q13)** |
 | Retired legacy arrays | −269 | SRAM1 | Release does not authorise reuse |
 | Flash | ~+8..12 KB new (rebuild, executor, timestamps), ~−6 KB legacy map and parser removed | Flash (155,124 B free at S082 close) | OK |
@@ -702,12 +702,12 @@ with the ring size in `config.h`.
 **Q13 (revision 5): RAM for the arrival timestamps (§3.11).** Q6 needs a
 stamp carried from the receiving ISR to the note handler. Today:
 - DIN: the RX FIFO is 64 bytes with no stamps.
-- USB: the RX ring holds 256 × 4 B `MidiMsg` (1,024 B), also without stamps.
+- USB: the RX ring holds 256 × 8 B `MidiMsg` (2,048 B; the plan first said 4 B / 1,024 B, corrected at the S083 assessment, D-1), also without stamps.
 
 | Option | DIN | USB | Net SRAM1 |
 |--------|-----|-----|----------:|
 | (a) Keep the 256-entry USB ring | +128 B (64 × 2 B stamps) | 256 × 6 B = 1,536 B (+512 B) | **+640 B** |
-| (b) USB ring 128 entries | +128 B | 128 × 6 B = 768 B (−256 B) | **−128 B** |
+| (b) USB ring 128 entries | +128 B | 128 × 6 B = 768 B (−256 B as drafted; −1,280 B as measured, the old entries were 8 B, D-1) | **−128 B** drafted (**−1,152 B** measured) |
 | (c) No timestamps | 0 | 0 | 0 (placement stays at processing time) |
 
 - **Recommendation: (b).**

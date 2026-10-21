@@ -1,16 +1,10 @@
 # MIDI Specification
 
-> **STATUS: DRAFT — WORK TO BE IMPLEMENTED (Session 083; updated with the S083 Q1–Q12 answers, 2026-10-21).**
+> **STATUS: CURRENT AS OF SESSION 083 (implemented 2026-10-21).**
 >
-> This document specifies MIDI behaviour that is **not yet built**. As of
-> 2026-10-17 the firmware does **not** behave as described here. For current
-> behaviour, read `Core/MIDI/MidiParser.c`; §15 lists the gaps.
->
-> Until implementation, this document is the agreed **target**, not an
-> as-built reference. The usual rule "where this document and the code
-> disagree, the code wins" does **not** apply yet. When S083 implements it,
-> replace this banner with a "Current as of" line, close §15, and from then
-> on treat the code as authoritative.
+> This document describes the built MIDI behaviour. The usual rule applies:
+> where this document and the code disagree, the code wins. §15 records the
+> implementation close-out; §12 lists the modules that own each part.
 
 The LXR-02 MIDI interface: global MIDI settings, the note-to-track map,
 control changes (NRPN, reserved CCs, MIDI Learn), program and Bank change,
@@ -568,10 +562,14 @@ sends).
 | NRPN TX number cache + coalesce | ~8 | SRAM1 static, `MidiOut` |
 | CC2 state | 1 | SRAM1 static, `MidiNotes` |
 | TX note-off per track (replaces the 16 + 2 B channel cache) | 7 | SRAM1 static, `MidiOut` |
-| DIN RX stamps 64 × 2 B; USB RX ring `MIDI_USB_RX_RING_SIZE` (config.h, 128) × 6 B (was 256 × 4 B); queued-PC origin ≤1 B (accepted 2026-10-21, plan Q13 (b)) | +128 / −256 / ≤1 | SRAM1 static, `MidiBuffer` / `usb_manager` / menu queue |
+| DIN RX stamps 64 × 2 B; USB RX ring `MIDI_USB_RX_RING_SIZE` (config.h, 128) × 6 B (was 256 × 8 B = 2,048 B: the old `MidiMsg` measured 8 B); queued-PC origin ≤1 B (accepted 2026-10-21, plan Q13 (b)) | +128 / −1,280 / ≤1 | SRAM1 static, `MidiBuffer` / `usb_manager` / menu queue |
 | Retired: `midiParser_originalCcValues` 255, `midi_NoteOverride` 7, `midi_MidiChannels[0..6]` 7 | −269 | Release does not authorise reuse |
 
-Record the measured sizes in `STORAGE_SRAM_MANIFEST.md` at implementation.
+Measured at the S083 close (`make all`, DEV configuration): the MIDI rows
+above, with the per-track overlay table measuring 7 x 8 B = 56 B (R-A),
+the TX note-off record 7 x 2 B = 14 B (R-B), and the resume tick 4 B
+(R-C). The complete `bss` is 430,120 B with the USB ring at 128 x 6 B and
+the DIN stamp array at 64 x 2 B. Details in `STORAGE_SRAM_MANIFEST.md`.
 Anything larger than listed needs a new acknowledgement.
 
 ---
@@ -595,23 +593,23 @@ Anything larger than listed needs a new acknowledgement.
 
 ---
 
-## 15. Implementation status (gaps against current code, 2026-10-17)
+## 15. Implementation status (closed at S083, 2026-10-21)
 
-| Spec | Current code |
-|------|--------------|
-| §2 G off; track `chn` unassigned | G has no off. Track channel getter falls back to track+1. Legacy `midi_MidiChannels[0..6]` mirror. |
-| §2 MRT values | `off U2M M2M A2M M2U M2A`. |
-| §3 consume then route | Every message is forwarded before parsing. |
-| §4 note map | G plays the menu-active voice. Exact (channel, note) matches stack. Default note 36+track. |
-| §5.2 CC1 | Implemented (global and per-voice); per-voice recording not wired. |
-| §5.3 CC2 | Not implemented. |
-| §5.4 NRPN | 14-bit number truncated to 8 bits into the legacy LXR CC2 map. |
-| §5.6 fan-out, recording, display | No fan-out. `liveRec_paramIn(0xFFFF)` stub. LCD updates at the next repaint. |
-| §6 Learn | Not implemented. The legacy LXR CC map is active on G. |
-| §7 PC / CC0 | PC RX is a no-op; CC0 ignored. PC TX on Scene change exists. |
-| §8 | Continue = Start; no SPP framing. |
-| §9 | Note-off cache per channel; no parameter TX; USB re-framing of system-common/sysex wrong (`usb_sendMidi()` CIN = status >> 4). |
-| §10 | Built in S082: Scene 17, the background load, the MIDI deferral (D33), the drop filter and the result byte. Not built: CC0 RX (S083 Phase D calls the request API). |
+| Spec | Built |
+|------|-------|
+| §2 G off; track `chn` unassigned | `ch` stores 0..16 (0 = off); `chn` stores 0..16 (0 = `glb`). The legacy per-voice mirror is retired; Scene settings are the only source. |
+| §2 MRT values | `off UtD DtD DtU bth DtA AtD all`, decided in `midiDefs_routeMask()`; USB -> USB is never routed. |
+| §3 consume then route | `midiIn_dispatch()` offers a message to its consumers first and forwards only what was not consumed. Dropped Bank-load messages count as not consumed (S082 13.2 item 4). |
+| §4 note map | `MidiNoteMap` implements N1-N5 and the Q4 inverse-range rule; host test `tools/midi_test/` PASS. |
+| §5.2 CC1 | G: `menu_commitGlobalMorphFromMidi()` (no recording, G-1). Voice channel: per-voice Morph edits through the shared commit and recorded. |
+| §5.3 CC2 | `MidiNotes` state on G; the per-track overlay executor applies it, a held PERF BAR wins (C-9). |
+| §5.4 NRPN | 9-bit number per (port, channel) context; CC6 value, CC38 ignored, CC96/97 step, RPN deselects. |
+| §5.6 fan-out, recording, display | `menu_commitTargetEdit()` is the single commit used by panel and MIDI: R12/R13, Scene-target clears, edit-mask fan-out, LiveRecord, target-ID LCD repaint. |
+| §6 Learn | 128-entry type-tagged table, SHIFT+PLAY+REC, `LRN`/`FUL`, `learn=` lines in `settings.cfg`. |
+| §7 PC / CC0 | PC 0..15 on G = whole Scene (origin-aware, no echo); per-track PC; CC0 on G requests the S082 background Bank load. |
+| §8 | Continue resumes (`seq_continueRunning()`), SPP framed and applied while stopped, `snc` gates Start/Stop/Continue/SPP. |
+| §9 | Inverse-mapped note TX with the Q4 range rule, per-track note-off record, parameter TX (learned CC else NRPN, coalesced/throttled), correct USB CIN framing, no echo. |
+| §10 | Scene 17, the background load, the drop filter and the result byte (S082); CC0 RX and CC0 TX on a Menu-origin load are built in S083. |
 
 ---
 

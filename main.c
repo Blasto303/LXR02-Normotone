@@ -64,8 +64,8 @@
 #include "EuklidGenerator.h"
 #include "SomGenerator.h"
 
-#include "Uart.h"
-#include "MidiParser.h"
+#include "MidiDin.h"
+#include "MidiIn.h"
 #include "MidiVoiceControl.h"
 #include "usb_manager.h"
 #include "filesystem.h"
@@ -263,16 +263,14 @@ static void main_serviceBackgroundLoadIdle(void)
 
 static void midi_service(void)
 {
-	uint8_t budget = 8;
-	MidiMsg msg;
-
-	uart_processMidi();
-
-	while (budget-- && usb_getMidi(&msg)) {
-		midiParser_parseMidiMessage(msg);
-    }
-
-    usb_tick();
+	/*
+	 * MIDI receive/transmit service (S083: body moved to MidiIn).
+	 *
+	 * What: frames DIN input, takes USB input, dispatches consume-then-
+	 * route, runs MidiOut's foreground service and flushes USB.
+	 * Context: main loop only. Affiliates: midiIn_service().
+	 */
+	midiIn_service();
 }
 
 static uint8_t prevBtn;
@@ -608,7 +606,7 @@ int main(void)
     euklid_init();
     som_init();
 
-    initMidiUart();
+    midiDin_init();
     usb_init();
     adc_checkPots();
 

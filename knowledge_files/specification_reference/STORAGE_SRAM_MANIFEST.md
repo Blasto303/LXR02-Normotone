@@ -4,10 +4,26 @@ Where every byte of the STM32F765VIH6's on-chip storage goes: program flash,
 sample flash, ITCM, DTCM, SRAM1 and SRAM2. It also records the rules for
 changing any of it.
 
-- **Current as of:** Session 082 P3 (2026-10-19), `dev-ph6-midi`. DEV link:
-  `text=598,120`, `data=420`, `bss=430,928`; flash payload 598,540 B of
-  753,664 B (**headroom 155,124 B**), after the S082 P3 work-while-loading
-  changes.
+- **Current as of:** Session 083 (2026-10-21), `dev-ph6-midi`. DEV link:
+  `text=603,896`, `data=424`, `bss=430,120`; flash payload 604,320 B of
+  753,664 B (**headroom 149,344 B**), after the MIDI rebuild.
+- **S083 changes (MIDI):** measured DEV BSS 430,928 -> 430,120 (**-808 B**
+  net), data 420 -> 424, text 598,120 -> 603,896. New static SRAM1, all
+  approved: `MidiLearn` table 128 x 4 B = 512 B + count/state/target/deadline
+  16 B (528 B with alignment); `MidiControl` NRPN contexts 2 x 8 x 3 B =
+  48 B (exact); `buttonHandler` per-track overlay table 7 x 8 B = 56 B
+  replacing the 9 B single slot (R-A, +47 B aligned); `MidiOut` note-off
+  record 7 x 2 B = 14 B replacing the 16 + 2 B channel cache (R-B) and the
+  parameter TX state 8 B; `midiIn_config` 3 B and the 6 B in-progress DIN
+  message replacing the legacy channel/filter/parser state (R-D); DIN RX
+  stamps 64 x 2 B = 128 B; the USB ring is 128 x 6 B = 768 B (the pre-S083
+  ring was 256 x 8 B = 2,048 B: the old `MidiMsg` measured 8 B, not the
+  plan's 4 B). `MidiBits` is one byte of `uint8_t` bitfields so the new
+  `MidiMsg` is 6 B. `seq_resumeTick` 4 B (R-C) and the 1 B PC-origin flag.
+  Retired: `midiParser_originalCcValues[255]`, `midi_NoteOverride[7]`,
+  `midi_MidiChannels[8]`, `midi_chan_notes[16]` + `midi_notes_on` (18 B),
+  the 9 B overlay slot and the parser statics. A release does not
+  authorise reuse (MEMORY.md policy).
 - **S082 P3 changes:** +4 B approved SRAM1 (D47): BankData
   `bank_load_unavailable_mask` 2 B, `ledHandler.c` `led_fastBlinkLed[]`
   +1 B (1 → 2 slots), `menu.c` `menu_bgLoadAvailCount` 1 B. The measured DEV
@@ -554,7 +570,7 @@ byte, including alignment and small variables omitted here.
 | `adcPots.c`: `slider_lut` | 4,096 | 1,024 `float` slider conversion values. |
 | `SampleMemory.c`: resident and install caches | 5,040 | 1,440 B `sample_info_cache`, 1,080 B `sample_name_cache`, 120 B loop flags, 1,440 B `install_info`, and 960 B `install_names`. |
 | `usb_manager.c`: `USB_OTG_dev` | 1,524 | USB core/device handle. |
-| `usb_midi_core.c`: `usb_MidiMessages` | 2,048 | USB MIDI input ring. |
+| `usb_midi_core.c`: `usb_MidiMessages` | 768 | USB MIDI input ring, `MIDI_USB_RX_RING_SIZE` (128) x 6 B `MidiMsg` with arrival stamp (S083 Q13; was 256 x 8 B = 2,048 B). |
 | `sequencer.c`: pending automation + dirty bits | 560 | 128 four-byte pending records (512 B) and six per-voice 64-bit dirty maps (48 B). |
 | `sequencer.c`: R12 menu override (S081) | 48 | `seq_menuOverride[6]` (`u64`): Instrument parameters whose automation a menu edit suppresses until the voice's next resetting trigger. Foreground only. |
 | `sequencer.c`: step reset / deferral (S081) | 15 | `seq_trackShuffleStep[7]`, `seq_trackShuffleRoll[7]` (deferred step index and roll flag), `seq_trackShuffleMuteMask` (1 B, a live hit muted the pending deferral). |
