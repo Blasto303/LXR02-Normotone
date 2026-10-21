@@ -38,7 +38,7 @@ The full Session 082 record is
 
 ## Carry-over from Session 082
 
-1. **Hardware testing (S082):**
+1. **Hardware testing (S082): passed (user, 2026-10-21, S083 Q3).**
    - **P0:**
      - Bank round trips: 4 modes × {all, partial, none} × {empty, Kit-only, full} children;
      - check the active/viewed Scene, the emptied active Scene, the `.hcnames` rows (`-`, `bNNN`, `x`), reboot on both boot paths, and `tools/verify_bank_autosave.py`;
@@ -68,7 +68,7 @@ The full Session 082 record is
      - MIDI CC0 unlock at phase 5;
      - card pull off page;
      - underrun count.
-2. **Decide P3 A1/A2** (both one-liners, not applied):
+2. **P3 A1 decided (S083 Q2, applied in S083 Phase D); A2 still open** (one-liners, not applied):
    - **A1:** skip the whole queued action when the target is unavailable (`menu_serviceDeferredSceneChange()`, before `menu_applyQueuedSceneAction()`). Today a SHIFT+SEQ queue armed before a direct Merge load into a replaced Scene still clears mutes and writes Morph 0.
    - **A2:** repaint the Scene LEDs in the frozen-screen re-press guard of `menu_switchPage()`.
    - **A3:** SHIFT+REC opened from Load/Save mode shows no W1 blink. Leave it unless the user asks.
@@ -95,7 +95,7 @@ LiveRecord). Authorities: `PATTERN_DYNAMIC_STACK.md` §6.1–§6.2b, §6.5, §6.
 §12; `EFFECTS_BUS_REFERENCE.md` §6/§10/§11; `MODULE_INTERCHANGE_SPEC.md`
 "Core/Sequencer/LiveRecord (S081)".
 
-9a. **Hardware testing (S081, none run row by row):**
+9a. **Hardware testing (S081): passed (user, 2026-10-21, S083 Q3).**
    - **Phase A behaviour first** (existing patterns sound different by
      design): step reset at the first trigger (delayed, rolled, carried,
      spilled steps), R12 menu-vs-automation per parameter class, R13 FX

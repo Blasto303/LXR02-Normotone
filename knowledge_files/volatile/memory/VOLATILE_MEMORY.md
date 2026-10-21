@@ -202,7 +202,8 @@ had landed; S082 did not touch LiveRecord.
 - **One UX for one concept** (all pans display and default the same; maths
   may differ).
 - **Automation always wins**, menu edits only set endpoints, MIDI is lowest
-  priority (binding product rule).
+  priority (binding product rule; superseded by S081 R12 and S083 Q1: MIDI
+  is a menu edit).
 - **Hardware feedback arrives as numbered lists;** treat each item as a rule
   to restate in the plan's feedback table, find the root cause in code before
   proposing a change, and keep a verification table per item.
@@ -369,6 +370,10 @@ through `presetMorph_writeRuntimeBase()`, which skips a parameter while
 applies the latest `morph_interpolation[]`. Menu edits call
 `presetMorph_applyParameterNow()` for one parameter only; external MIDI
 stores an endpoint (`preset_setInstrumentParameterFromMidi()`).
+**S083 Q1 (2026-10-21, decided, not yet built):** a MIDI write is a menu
+edit, with the same priority and actions against automation and recording,
+through one shared Menu commit; `preset_setInstrumentParameterFromMidi()` is
+to be retired.
 
 ### Working preference: commits
 

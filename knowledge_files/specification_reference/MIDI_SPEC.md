@@ -1,6 +1,6 @@
 # MIDI Specification
 
-> **STATUS: DRAFT — WORK TO BE IMPLEMENTED (planned for Session 083).**
+> **STATUS: DRAFT — WORK TO BE IMPLEMENTED (Session 083; updated with the S083 Q1–Q12 answers, 2026-10-21).**
 >
 > This document specifies MIDI behaviour that is **not yet built**. As of
 > 2026-10-17 the firmware does **not** behave as described here. For current
@@ -205,11 +205,16 @@ the G rules do not apply and unassigned tracks are unmapped.
   by CC2 §5.3, or by a physically held BAR in PERF), the note performs that
   overlay's action instead (S080 overlay: 12 trigger types). It plays at
   the note's resolved pitch, not the overlay's note setting. Roll types
-  repeat until that note's note-off.
+  repeat until that note's note-off. Each track has its own repeat state
+  (S083 Q5), shared with the panel's VOICE overlay: rolls on several tracks
+  run at once, and a new hit on a track replaces only that track's roll.
 - **Note-off:** stops an overlay roll. A single trigger ignores it.
 - **Recording:** each trigger is reported to LiveRecord (`liveRec_triggerIn()`,
   source MIDI), with the overlay kind where one applies. Note pitch is
-  recorded like an overlay trigger's.
+  recorded like an overlay trigger's. The report carries the note's
+  arrival age, so placement uses the time the note arrived, not the time it
+  was processed (S083 Q6). The sound itself plays when the note is
+  processed.
 
 ---
 
@@ -287,20 +292,24 @@ translation is the Morph amounts (§5.2), which use the 7-bit Morph mapping.
 
 ### 5.6 Write rules
 
-- **Priority:** step automation, then menu edits, then MIDI (S075 F3; since
-  S081 R12 a menu edit of an Instrument parameter beats its automation until
-  the voice's next trigger, and MIDI stays lowest — whether MIDI CC adopts the
-  R12 menu priority is an open MIDI-rework decision, S081 plan §16).
-  Voice parameters store the active Scene's Normal endpoint; the Morph sweep
-  applies it and skips a parameter that automation holds. MIDI never writes
-  the runtime value directly.
+- **A MIDI write is a menu edit (S083 Q1).** Same effect, same priority and
+  same actions against automation and recording as a menu edit of that
+  parameter, through one shared commit used by the menu cells and MIDI:
+  - Instrument parameters: R12, so the move sounds at once and suppresses
+    that parameter's automation until the voice's next trigger, a transport
+    change or a Scene change;
+  - Effect parameters: R13 (menuHold);
+  - Scene targets: their per-target automation clears.
+
+  MIDI always writes the **Normal** endpoint; a panel Morph view does not
+  redirect it.
 - **Scope:** the active Scene, fanned out through the VOICE edit mask
   exactly like a knob edit. A track playing another Scene (per-track
   playback) is not written.
 - **Recording:** each successful store is reported with
   `liveRec_paramIn(targetId, MIDI)`. Global Morph is never recorded.
-- **Display:** a visible parameter changed over MIDI repaints promptly
-  (rate-limited), through `menu_notifyExternalParamChanged()`.
+- **Display:** if the parameter is shown in the menu, its display updates
+  promptly (rate-limited by the existing knob-repaint coalescing).
 - **No echo:** a change that came in over MIDI is never transmitted (§9).
 
 ---
@@ -349,7 +358,9 @@ channel edits.
    flash.
 2. Touch a parameter: turn an RV1–RV4 knob, or edit a cell with the encoder.
    It must have a MIDI address (voice, Scene target, Effect). That
-   parameter becomes the target and shows `LRN` as its value. Touching a
+   parameter becomes the target and shows `LRN` as its value. The touch
+   does not change the value (S083 Q10). In a SHIFT Morph view the target is
+   still the parameter itself: Learn has no Morph endpoint. Touching a
    cell with no address (BPM, settings, step data) is ignored, and learn
    keeps waiting.
 3. Send a CC. A valid CC is not reserved and arrives on G, or (voice
@@ -451,9 +462,9 @@ consumed.
 | Start | Restart from the Pattern start. |
 | Continue | Resume from the current position. |
 | Stop | Stop. |
-| Song Position Pointer | Honoured while stopped only: sets the master position (SPP × 24 internal ticks). Tracks re-project through the master-clock anchors (`PATTERN_DYNAMIC_STACK.md` §6.5). |
+| Song Position Pointer | Honoured while stopped only: sets the master position (SPP × 24 internal ticks). Tracks re-project through the master-clock anchors (`PATTERN_DYNAMIC_STACK.md` §6.5). Gated by `snc` like Start/Stop (S083 Q11). |
 | MTC | Starts the sequencer at 0:0:0:0 and stops on timeout (existing behaviour). |
-| Start/Stop with `snc = off` | Ignored. |
+| Start/Stop/SPP with `snc = off`, or from a source `snc` does not select | Ignored. |
 | MMC | Not supported (later). |
 
 Realtime bytes are timestamped at arrival and handled in TIM3. While slaved
@@ -469,10 +480,10 @@ are never echoed back out.
 
 | Letter | Sent |
 |--------|------|
-| N | Every trigger the LXR plays (sequencer, overlay, preview, and MIDI-in triggers). Channel = the track's effective channel. Note = the inverse of §4.1 (root + internal − 63), so recorded LXR output plays back identically. Note-off is tracked per track, so tracks sharing a channel cannot leave hanging notes. |
+| N | Every trigger the LXR plays (sequencer, overlay, preview, and MIDI-in triggers). Channel = the track's effective channel. Note = the inverse of §4.1 (root + internal − 63), so recorded LXR output plays back identically. Nothing is sent when the pitch cannot be expressed in the track's own range: a stripe track sends only its default pitch (as its root), a ranged track only root..range end (S083 Q4). Note-off is tracked per track, so tracks sharing a channel cannot leave hanging notes. |
 | R | Clock while the LXR is clock master; Start, Continue, Stop on transport changes. |
-| C | Locally made parameter changes (knob/encoder; not step-automation playback). They are sent as the parameter's Learn CC (on G, or the voice channel for kind `v`) if it has one for the current type, else as NRPN (§5.4) on G. *(Proposal: when G is off, voice targets go as NRPN on the voice channel.)* Coalesced per target to the latest value; the NRPN number CCs are resent only when the number changes per port; throttled so DIN clock and notes are not delayed. |
-| P | PC on G on a whole-Scene change. PC on the track's channel on a per-track change. CC0 on G after a Bank load. Scene 17 has no PC number: nothing is sent for it. |
+| C | Locally made parameter changes (knob/encoder; not step-automation playback). They are sent as the parameter's Learn CC (on G, or the voice channel for kind `v`) if it has one for the current type, else as NRPN (§5.4) on G. When G is off, voice targets go as NRPN on the voice channel (S083 Q8). Coalesced per target to the latest value; the NRPN number CCs are resent only when the number changes per port; throttled so DIN clock and notes are not delayed. |
+| P | PC on G on a whole-Scene change. PC on the track's channel on a per-track change. CC0 on G after a Bank load. Scene 17 has no PC number: nothing is sent for it. No echo (S083 Q9): a Scene change started by a MIDI PC (also when its queued change fires later) sends no PC; a MIDI-started Bank load sends no CC0; a Menu Bank load sends CC0 only when it completes successfully. |
 
 ---
 
@@ -519,31 +530,45 @@ No migration of older files (standing project rule).
 
 ---
 
-## 12. Code ownership and contexts *(proposal)*
+## 12. Code ownership and contexts (S083 Q7)
+
+`Core/MIDI/` is rebuilt as single-role modules. The full table, with what
+each one replaces, is in `S083_P1_MIDI_IMPLEMENTATION_PLAN.md` §3.1.
 
 | Module | Owns | Context |
 |--------|------|---------|
-| `MidiParser.c` | DIN framing, entry from both ports, consume-then-route dispatch, realtime handling | Foreground (`midi_service()`); realtime in TIM3 |
-| `MidiNoteMap.c/h` | §4.1 resolver and its TX inverse; stateless | Foreground |
-| `MidiControl.c/h` | NRPN, CC1/CC2, Learn table, Learn capture, MIDI write path | Foreground |
-| `MidiOut.c/h` | TX filters, per-track note-off, coalescing, PC/CC0 TX | Foreground, TIM3 (sequencer notes and clock) |
-| `MidiVoiceControl.c` | Trigger funnel (unchanged by S083; S081 added the per-voice pending-reset mask, `noteOnNoReset()`, `resetOnly()`, `triggerNow(…, reset)`) | Producer any; consumer audio render |
+| `MidiDefs.h` | Status bytes, CC numbers, reserved CCs, `MidiMsg` (source port, 16-bit arrival stamp), filter bits, MRT values | — |
+| `MidiBuffer.c/h` | DIN RX/TX byte buffers, RX arrival stamps (replaces `FIFO.c/h`) | ISR / foreground |
+| `MidiDin.c/h` | USART3 driver (replaces `Uart.c/h`) | USART3 ISR, foreground |
+| `MidiIn.c/h` | DIN framing (incl. SPP, Song Select), entry from both ports, RXF gate, Bank-load drop filter, consume-then-route dispatch, MRT forwarding | Foreground |
+| `MidiTransport.c/h` | Realtime ring, TIM3 realtime handler and `snc` gate, SPP, MTC | TIM3; foreground for SPP/MTC |
+| `MidiNoteMap.c/h` | §4.1 resolver and its TX inverse; stateless; host-tested in `tools/midi_test/` | Foreground (inverse also TIM3) |
+| `MidiNotes.c/h` | Note action: trigger, overlay via the per-track executor, held notes, CC2 state, LiveRecord report with arrival age | Foreground |
+| `MidiControl.c/h` | NRPN, CC1, value clamp and Morph translation, the MIDI write path into the shared menu commit | Foreground |
+| `MidiLearn.c/h` | Learn table, Learn capture, CC → target lookup and dispatch (routes CCs into the other modules), `learn=` line parse/format | Foreground |
+| `MidiProgram.c/h` | PC and CC0 RX | Foreground |
+| `MidiOut.c/h` | TX filters, note TX with per-track note-off, parameter TX coalescing, clock/transport TX, PC/CC0 TX, echo suppression, DIN/USB send framing, forwarding | Foreground, TIM3 (sequencer notes and clock) |
+| `MidiPitch.h` | Default note 63, note-frequency table, detune helper (replaces `MidiNoteNumbers.h`) | — |
+| `MidiVoiceControl.c/h` | Trigger funnel, kept unchanged (S081 added the per-voice pending-reset mask, `noteOnNoReset()`, `resetOnly()`, `triggerNow(…, reset)`) | Producer any; consumer audio render |
 
-Foreground TX into the DIN FIFO and USB must use the existing short
-critical sections (TIM3 also sends).
+`valueShaper.h` (DSP) moves to `Core/DSPAudio/`. Foreground TX into the DIN
+buffer and USB must use the existing short critical sections (TIM3 also
+sends).
 
 ---
 
-## 13. RAM (acknowledged and accepted by the user, 2026-10-17)
+## 13. RAM (acknowledged and accepted by the user, 2026-10-17 and 2026-10-21)
 
 | Item | Bytes | Region / owner |
 |------|------:|----------------|
-| Learn table (128 × 4 B) + count + capture state | ~519 | SRAM1 static, `MidiControl` |
-| Held note per track (overlay rolls) | 7 | SRAM1 static, `MidiControl` |
+| Learn table (128 × 4 B) + count + capture state | ~519 | SRAM1 static, `MidiLearn` |
+| Held note per track (overlay rolls) | 7 | SRAM1 static, `MidiNotes` |
+| Per-track overlay repeat state, 7 × 6 B, replacing the 9 B single slot (accepted 2026-10-21, S083 Q5) | +42 / −9 | SRAM1 static, `buttonHandler` overlay executor |
 | NRPN RX state (8 contexts × 2 ports × 3 B) | ~48 | SRAM1 static, `MidiControl` |
 | NRPN TX number cache + coalesce | ~8 | SRAM1 static, `MidiOut` |
-| CC2 state | 1 | SRAM1 static, `MidiControl` |
+| CC2 state | 1 | SRAM1 static, `MidiNotes` |
 | TX note-off per track (replaces the 16 + 2 B channel cache) | 7 | SRAM1 static, `MidiOut` |
+| DIN RX stamps 64 × 2 B; USB RX ring `MIDI_USB_RX_RING_SIZE` (config.h, 128) × 6 B (was 256 × 4 B); queued-PC origin ≤1 B (accepted 2026-10-21, plan Q13 (b)) | +128 / −256 / ≤1 | SRAM1 static, `MidiBuffer` / `usb_manager` / menu queue |
 | Retired: `midiParser_originalCcValues` 255, `midi_NoteOverride` 7, `midi_MidiChannels[0..6]` 7 | −269 | Release does not authorise reuse |
 
 Record the measured sizes in `STORAGE_SRAM_MANIFEST.md` at implementation.
@@ -553,10 +578,13 @@ Anything larger than listed needs a new acknowledgement.
 
 ## 14. Binding rules
 
-- MIDI is the lowest write priority. It stores the Normal endpoint and never
-  writes a held voice parameter's runtime value (S075 F3).
+- A MIDI write is a menu edit: same priority and actions (R12/R13, Scene
+  target clears, recording), Normal endpoint only (S083 Q1; replaces the
+  S075 F3 "MIDI lowest" rule).
 - Global Morph is never recorded, from any MIDI path (G-1).
 - One note triggers at most one voice.
+- A note is transmitted only when it plays back on the same track at the
+  same pitch (S083 Q4).
 - One parameter has at most one Learn CC.
 - Values are absolute and instrument-agnostic, clamped to the parameter's
   maximum; Morph is the only translation.

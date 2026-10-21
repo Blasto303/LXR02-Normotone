@@ -38,17 +38,24 @@ Scenes) while the load finishes. Next session: **S083 MIDI**
   S081 built live record and live erase (LiveRecord), the step reset rule,
   automation priority R12/R13, the 96-PPQ roll table, `qnt trk`, linear
   automation ramps (`asm`), loop while record, the G-1 global Morph fix and
-  the VOICE bar pulse. Its hardware matrices are almost all unrun
-  (`081_SESSION_HANDOFF_LOG.md` §13). S082 did not change LiveRecord.
+  the VOICE bar pulse. Its hardware checks passed (user, 2026-10-21, S083
+  Q3). S082 did not change LiveRecord.
 - **Build at S082 close (DEV config):** `text=598,120`, `data=420`,
   `bss=430,928`; flash payload 598,540 B of 753,664 (**155,124 B free**).
   S082 SRAM: Scene 17 1,658 B, P0 16 B, P1 93 B, P3 4 B (DEV-only
   diagnostics extra). Production build (`DEV_MODE_LOGGING 0`) last measured
   at S075 F1; needs a rebuild.
-- **Hardware (user):** S082 P2 (audio during a background load) "works
-  fine"; the S082 P0/P1 matrices were never run row by row; P3 is untested;
-  the P0 first-boot freeze was not reproduced; the F5 Scene 2 Case-3
-  invalidation is open (`082_SESSION_HANDOFF_LOG.md` §11, §13).
+- **Hardware (user):** S081 and S082 passed their hardware checks
+  (2026-10-21, S083 Q3). The P0 first-boot freeze was not reproduced; the
+  F5 Scene 2 Case-3 invalidation is open (`082_SESSION_HANDOFF_LOG.md` §11,
+  §13).
+- **Session 083 (MIDI) is planning:** `S083_P1_MIDI_IMPLEMENTATION_PLAN.md`
+  revision 5 (Q1–Q12 answered; Q13 timestamp RAM open). Target spec:
+  `MIDI_SPEC.md`. `Core/MIDI/` is to be rebuilt as new modules (plan §3.1).
+- **Automated Scene changes (user, S083 Q2, 2026-10-21) — binding:**
+  "Scenes or tracks from Scenes are not automatable unless they are changed
+  via a voice edit mask from an active Scene or track." A queued action whose
+  target Scene is unavailable is skipped whole (S082 P3 A1).
 
 Session 082 in one paragraph:
 
@@ -427,7 +434,10 @@ end; durable facts belong in `knowledge_files/log_archive/` or
   `filesystem_patternSnapshotInUse()`
   gates overlap availability.
 - **Automation priority (user, S075 F3, amended by S081 R12) — binding:**
-  step automation, then menu edits, then MIDI — **except that a menu edit of
+  step automation, then menu edits, then MIDI — **[superseded for MIDI by
+  S083 Q1, 2026-10-21: a MIDI write is a menu edit, with the same priority
+  and actions against automation and recording; MIDI_SPEC §5.6, plan §3.5.
+  Not yet built.]** — **except that a menu edit of
   an automated Instrument parameter now sounds at once and suppresses that
   parameter's automation until the voice's next trigger, a transport change
   or a Scene change** (R12: `seq_menuOverrideSet()` clears the held bit and
