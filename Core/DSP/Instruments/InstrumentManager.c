@@ -5,6 +5,8 @@
 #include "HiHatParameters.h"
 #include "PlaitsKickParameters.h"
 #include "PlaitsSnareParameters.h"
+#include "PlaitsModalParameters.h"
+#include "PlaitsHatParameters.h"
 #include "SceneData.h"
 #include "SceneModTargets.h"
 #include "presetManager.h"
@@ -16,6 +18,8 @@
 #include "HiHat.h"
 #include "PlaitsKickVoice.h"
 #include "PlaitsSnareVoice.h"
+#include "PlaitsModalVoice.h"
+#include "PlaitsHatVoice.h"
 #include "mixer.h"
 #include "modulationNode.h"
 #include "menu.h"
@@ -62,6 +66,16 @@ static const instrument_registry_entry_t instrument_registry[] = {
       PLAITS_SNARE_INSTRUMENT_TYPE_FLAGS,
       plaits_snare_param_descriptors, PLAITS_SNARE_PARAM_DESCRIPTOR_COUNT,
       plaits_snare_menu_pages, PLAITS_SNARE_MENU_PAGE_COUNT },
+    /* Plaits modal resonator (Rings-derived ModalVoice, MIT). */
+    { INSTRUMENT_TYPE_PMD, "pmd", plaits_modal_instrument_display_label, ".pmd", "PlModal",
+      PLAITS_MODAL_INSTRUMENT_TYPE_FLAGS,
+      plaits_modal_param_descriptors, PLAITS_MODAL_PARAM_DESCRIPTOR_COUNT,
+      plaits_modal_menu_pages, PLAITS_MODAL_MENU_PAGE_COUNT },
+    /* Plaits hi-hat (C translation of Plaits' HiHat, MIT). */
+    { INSTRUMENT_TYPE_PHT, "pht", plaits_hat_instrument_display_label, ".pht", "PlHat",
+      PLAITS_HAT_INSTRUMENT_TYPE_FLAGS,
+      plaits_hat_param_descriptors, PLAITS_HAT_PARAM_DESCRIPTOR_COUNT,
+      plaits_hat_menu_pages, PLAITS_HAT_MENU_PAGE_COUNT },
 };
 
 #define INSTRUMENT_REGISTRY_COUNT \
@@ -188,6 +202,8 @@ typedef union {
     HiHatVoice hihat;
     PlaitsKickVoice plaits_kick;
     PlaitsSnareVoice plaits_snare;
+    PlaitsModalVoice plaits_modal;
+    PlaitsHatVoice plaits_hat;
     uint8_t reserved[INSTRUMENT_RUNTIME_SLOT_BYTES];
 } InstrumentRuntimeSlot;
 static InstrumentRuntimeSlot runtime_slots[INSTRUMENT_SLOT_COUNT];
@@ -204,6 +220,10 @@ _Static_assert(sizeof(PlaitsKickVoice) <= INSTRUMENT_RUNTIME_SLOT_BYTES,
                "PlaitsKickVoice exceeds tagged slot reserve");
 _Static_assert(sizeof(PlaitsSnareVoice) <= INSTRUMENT_RUNTIME_SLOT_BYTES,
                "PlaitsSnareVoice exceeds tagged slot reserve");
+_Static_assert(sizeof(PlaitsModalVoice) <= INSTRUMENT_RUNTIME_SLOT_BYTES,
+               "PlaitsModalVoice exceeds tagged slot reserve");
+_Static_assert(sizeof(PlaitsHatVoice) <= INSTRUMENT_RUNTIME_SLOT_BYTES,
+               "PlaitsHatVoice exceeds tagged slot reserve");
 _Static_assert(sizeof(InstrumentRuntimeSlot) == INSTRUMENT_RUNTIME_SLOT_BYTES,
                "Tagged slot reserve changed through alignment or member size");
 
@@ -271,6 +291,16 @@ static PlaitsKickVoice *instrumentManager_plaitsKickRuntime(uint8_t slot)
 static PlaitsSnareVoice *instrumentManager_plaitsSnareRuntime(uint8_t slot)
 {
     return (slot < INSTRUMENT_SLOT_COUNT) ? &runtime_slots[slot].plaits_snare : 0;
+}
+
+static PlaitsModalVoice *instrumentManager_plaitsModalRuntime(uint8_t slot)
+{
+    return (slot < INSTRUMENT_SLOT_COUNT) ? &runtime_slots[slot].plaits_modal : 0;
+}
+
+static PlaitsHatVoice *instrumentManager_plaitsHatRuntime(uint8_t slot)
+{
+    return (slot < INSTRUMENT_SLOT_COUNT) ? &runtime_slots[slot].plaits_hat : 0;
 }
 
 static char instrumentManager_lower(char c)
@@ -1322,6 +1352,8 @@ void *instrumentManager_runtimeInstance(uint8_t slot)
     case INSTRUMENT_TYPE_HAT: return instrumentManager_hihatRuntime(slot);
     case INSTRUMENT_TYPE_PBD: return instrumentManager_plaitsKickRuntime(slot);
     case INSTRUMENT_TYPE_PSN: return instrumentManager_plaitsSnareRuntime(slot);
+    case INSTRUMENT_TYPE_PMD: return instrumentManager_plaitsModalRuntime(slot);
+    case INSTRUMENT_TYPE_PHT: return instrumentManager_plaitsHatRuntime(slot);
     default: return 0;
     }
 }
@@ -1346,6 +1378,12 @@ static Lfo *instrumentManager_runtimeLfo(uint8_t slot)
         return voice ? &voice->lfo : 0; }
     case INSTRUMENT_TYPE_PSN: {
         PlaitsSnareVoice *voice = instrumentManager_plaitsSnareRuntime(slot);
+        return voice ? &voice->lfo : 0; }
+    case INSTRUMENT_TYPE_PMD: {
+        PlaitsModalVoice *voice = instrumentManager_plaitsModalRuntime(slot);
+        return voice ? &voice->lfo : 0; }
+    case INSTRUMENT_TYPE_PHT: {
+        PlaitsHatVoice *voice = instrumentManager_plaitsHatRuntime(slot);
         return voice ? &voice->lfo : 0; }
     default:
         return 0;
@@ -1420,6 +1458,12 @@ void instrumentManager_runtimeInit(void)
             break;
         case INSTRUMENT_TYPE_PSN:
             PlaitsSnare_initVoice(instrumentManager_plaitsSnareRuntime(slot), slot);
+            break;
+        case INSTRUMENT_TYPE_PMD:
+            PlaitsModal_initVoice(instrumentManager_plaitsModalRuntime(slot));
+            break;
+        case INSTRUMENT_TYPE_PHT:
+            PlaitsHat_initVoice(instrumentManager_plaitsHatRuntime(slot), slot);
             break;
         default:
             break;
@@ -1558,6 +1602,12 @@ void instrumentManager_resetRuntimeSlotFromScene(uint8_t slot,
     case INSTRUMENT_TYPE_PSN:
         PlaitsSnare_initVoice(instrumentManager_plaitsSnareRuntime(slot), slot);
         break;
+    case INSTRUMENT_TYPE_PMD:
+        PlaitsModal_initVoice(instrumentManager_plaitsModalRuntime(slot));
+        break;
+    case INSTRUMENT_TYPE_PHT:
+        PlaitsHat_initVoice(instrumentManager_plaitsHatRuntime(slot), slot);
+        break;
     default:
         break;
     }
@@ -1679,6 +1729,12 @@ uint8_t instrumentManager_runtimePan(uint8_t slot)
     case INSTRUMENT_TYPE_PSN: {
         PlaitsSnareVoice *voice = instrumentManager_plaitsSnareRuntime(slot);
         return voice ? voice->pan : 64u; }
+    case INSTRUMENT_TYPE_PMD: {
+        PlaitsModalVoice *voice = instrumentManager_plaitsModalRuntime(slot);
+        return voice ? voice->pan : 64u; }
+    case INSTRUMENT_TYPE_PHT: {
+        PlaitsHatVoice *voice = instrumentManager_plaitsHatRuntime(slot);
+        return voice ? voice->pan : 64u; }
     default:
         return 64u;
     }
@@ -1713,6 +1769,12 @@ float instrumentManager_runtimeVolume(uint8_t slot)
         return voice ? voice->vol : 0.0f; }
     case INSTRUMENT_TYPE_PSN: {
         PlaitsSnareVoice *voice = instrumentManager_plaitsSnareRuntime(slot);
+        return voice ? voice->vol : 0.0f; }
+    case INSTRUMENT_TYPE_PMD: {
+        PlaitsModalVoice *voice = instrumentManager_plaitsModalRuntime(slot);
+        return voice ? voice->vol : 0.0f; }
+    case INSTRUMENT_TYPE_PHT: {
+        PlaitsHatVoice *voice = instrumentManager_plaitsHatRuntime(slot);
         return voice ? voice->vol : 0.0f; }
     default:
         return 0.0f;
@@ -1801,6 +1863,12 @@ void instrumentManager_calcSlotAsync(uint8_t slot)
     case INSTRUMENT_TYPE_PSN:
         PlaitsSnare_calcVoiceAsync(instrumentManager_plaitsSnareRuntime(slot));
         break;
+    case INSTRUMENT_TYPE_PMD:
+        PlaitsModal_calcVoiceAsync(instrumentManager_plaitsModalRuntime(slot));
+        break;
+    case INSTRUMENT_TYPE_PHT:
+        PlaitsHat_calcVoiceAsync(instrumentManager_plaitsHatRuntime(slot));
+        break;
     default:
         break;
     }
@@ -1841,6 +1909,14 @@ void instrumentManager_calcSlotSyncBlock(uint8_t slot, int16_t *buf,
     case INSTRUMENT_TYPE_PSN:
         PlaitsSnare_calcVoiceSyncBlock(instrumentManager_plaitsSnareRuntime(slot),
                                        buf, size);
+        break;
+    case INSTRUMENT_TYPE_PMD:
+        PlaitsModal_calcVoiceSyncBlock(instrumentManager_plaitsModalRuntime(slot),
+                                    buf, size);
+        break;
+    case INSTRUMENT_TYPE_PHT:
+        PlaitsHat_calcVoiceSyncBlock(instrumentManager_plaitsHatRuntime(slot),
+                                    buf, size);
         break;
     default:
         memset(buf, 0, size * sizeof(buf[0]));
@@ -1954,6 +2030,14 @@ void instrumentManager_triggerTrack(uint8_t trigger_track, uint8_t note,
     case INSTRUMENT_TYPE_PSN:
         PlaitsSnare_triggerVoice(instrumentManager_plaitsSnareRuntime(slot), slot,
                                  velocity, note);
+        break;
+    case INSTRUMENT_TYPE_PMD:
+        PlaitsModal_triggerVoice(instrumentManager_plaitsModalRuntime(slot), slot,
+                                 velocity, note);
+        break;
+    case INSTRUMENT_TYPE_PHT:
+        PlaitsHat_triggerVoice(instrumentManager_plaitsHatRuntime(slot), slot,
+                               velocity, alternate_slot6, note);
         break;
     default:
         break;
@@ -2166,6 +2250,12 @@ static SlopeEg2 *instrumentManager_ampEg(uint8_t slot)
     case INSTRUMENT_TYPE_PSN: {
         PlaitsSnareVoice *voice = instrumentManager_plaitsSnareRuntime(slot);
         return voice ? &voice->oscVolEg : 0; }
+    case INSTRUMENT_TYPE_PMD: {
+        PlaitsModalVoice *voice = instrumentManager_plaitsModalRuntime(slot);
+        return voice ? &voice->oscVolEg : 0; }
+    case INSTRUMENT_TYPE_PHT: {
+        PlaitsHatVoice *voice = instrumentManager_plaitsHatRuntime(slot);
+        return voice ? &voice->oscVolEg : 0; }
     default:
         return 0;
     }
@@ -2205,6 +2295,12 @@ static Distortion *instrumentManager_distortion(uint8_t slot)
         return voice ? &voice->distortion : 0; }
     case INSTRUMENT_TYPE_PSN: {
         PlaitsSnareVoice *voice = instrumentManager_plaitsSnareRuntime(slot);
+        return voice ? &voice->distortion : 0; }
+    case INSTRUMENT_TYPE_PMD: {
+        PlaitsModalVoice *voice = instrumentManager_plaitsModalRuntime(slot);
+        return voice ? &voice->distortion : 0; }
+    case INSTRUMENT_TYPE_PHT: {
+        PlaitsHatVoice *voice = instrumentManager_plaitsHatRuntime(slot);
         return voice ? &voice->distortion : 0; }
     default:
         return 0;
