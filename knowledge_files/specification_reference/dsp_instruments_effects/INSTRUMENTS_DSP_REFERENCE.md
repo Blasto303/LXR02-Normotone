@@ -126,6 +126,8 @@ tap is foreground-only, like the rest of the funnel.
   | HiHat | `HiHatVoice` | 484 |
   | Plaits kick | `PlaitsKickVoice` | 284 |
   | Plaits snare | `PlaitsSnareVoice` | 376 |
+  | Plaits hi-hat | `PlaitsHatVoice` | 320 |
+  | Plaits modal | `PlaitsModalVoice` | 512 |
 
   Building blocks: `OscInfo` 72 B, `ResonantFilter` 36 B, `Lfo` 124 B,
   `ModulationNode` 44 B, `SlopeEg2` 28 B, `DecayEg` 12 B,
@@ -383,6 +385,43 @@ noise + shell x (1 - snappy) --> x0.8 --> amp EG -> velocity -> distortion
 - **Cost:** coefficients are set once per block; about 165 instructions and
   one `VDIV` per sample (est. 3.5–4 %).
 - **Library:** `SD_CARD/Instrument/PlSnare/*.psn` (six presets).
+
+### 5.4c Plaits hi-hat (`PlaitsHatVoice.c`, Basic + Choke, token `pht`)
+
+A C translation of Plaits' `HiHat`, `SquareNoise`, `RingModNoise` and the
+poly-BLEP `Oscillator` (Emilie Gillet, MIT). `RingMod` off is Plaits' main
+hat (six square oscillators at the 808 ratios, resonant band-pass, swing
+VCA); on is its aux hat (three ring-modulated square/saw pairs, two-stage
+linear VCA). Both add clocked noise (`Noise` = Harmonics) and end in a
+high-pass at the colour cutoff (`Tone` = Timbre); `Decay` = Morph.
+
+- **Open hat:** the type is Choke. `phat_decay_choke` is the sibling of
+  `phat_decay`, so VOICE7 shows it and visible track 7 plays it; any hit
+  restarts the one envelope, so a closed hit chokes an open one.
+- **Rate:** Hz-based frequencies, per-sample envelope factors raised to
+  48000/44108, ring-mod ratio from the 48 kHz fraction. Host comparison
+  (4 settings, both models): RMS within 2 %, decay times matching.
+- **Cost:** the model is an algorithm choice like an oscillator waveform;
+  budget `RingMod` on (six band-limited oscillators). Est. 1–4 %.
+- **Library:** `SD_CARD/Instrument/PlHat/*.pht`.
+
+### 5.4d Plaits modal resonator (`PlaitsModalVoice.c`, Advanced, token `pmd`)
+
+A C translation of Plaits' `ModalVoice` and `Resonator` (the modal synthesis
+Plaits derives from Rings; Emilie Gillet, MIT), with `lut_stiffness`, the
+approximate `CosineOscillator` for mode amplitudes, and the `Limiter` Plaits
+applies to this engine. 24 band-pass modes struck by a filtered impulse.
+
+- **Rows:** `modal_structure` (Harmonics, smoothed per block as the
+  ModalEngine does), `modal_bright` (Timbre), `modal_damping` (Morph),
+  `modal_position` (Rings' strike position: 0 = Plaits' fixed 0.015,
+  127 = 0.5), plus note, fine and the standard rows.
+- **Rate:** each mode's Q and Nyquist attenuation use its 48 kHz fraction.
+  Host comparison (3 settings): RMS within 1 %, spectral centroid within
+  about 10 %.
+- **Cost:** est. 10–13 % (about 3x the Plaits kick on the host bench): one
+  per Scene is comfortable; check two with the `cpu` widget.
+- **Library:** `SD_CARD/Instrument/PlModal/*.pmd`.
 
 ### 5.5 Where each engine's hot code runs
 

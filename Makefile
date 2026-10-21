@@ -42,6 +42,8 @@ CFLAGS  = $(MCU) -O2 -flto -Wall -Wextra -std=gnu11 \
           -ICore/DSP/Effects/DlyVerb \
           -ICore/DSP/Instruments/PlaitsKick \
           -ICore/DSP/Instruments/PlaitsSnare \
+          -ICore/DSP/Instruments/PlaitsHat \
+          -ICore/DSP/Instruments/PlaitsModal \
           -ICore/Bank/Scene \
           -ICore/Bank/Scene/Pattern \
           -ICore/Sequencer \
@@ -123,6 +125,8 @@ SRCS = \
   Core/DSP/Effects/DlyVerb/DlyVerbParameters.c \
   Core/DSP/Instruments/PlaitsKick/PlaitsKickParameters.c \
   Core/DSP/Instruments/PlaitsSnare/PlaitsSnareParameters.c \
+  Core/DSP/Instruments/PlaitsHat/PlaitsHatParameters.c \
+  Core/DSP/Instruments/PlaitsModal/PlaitsModalParameters.c \
   Core/MIDI/FIFO.c \
   Core/MIDI/MidiRealtime.c \
   Core/MIDI/Uart.c \
@@ -156,6 +160,8 @@ DSP_SRCS = \
   Core/DSP/Effects/DlyVerb/DlyVerbEffect.c \
   Core/DSP/Instruments/PlaitsKick/PlaitsKickVoice.c \
   Core/DSP/Instruments/PlaitsSnare/PlaitsSnareVoice.c \
+  Core/DSP/Instruments/PlaitsHat/PlaitsHatVoice.c \
+  Core/DSP/Instruments/PlaitsModal/PlaitsModalVoice.c \
   Core/DSPAudio/lfo.c \
   Core/DSPAudio/mixer.c \
   Core/DSPAudio/modulationNode.c \
@@ -236,6 +242,14 @@ $(BUILD)/Core/DSP/Instruments/PlaitsKick/PlaitsKickVoice.o: Core/DSP/Instruments
 
 # Plaits snare DSP (C translation of Plaits' analog snare drum), -Ofast.
 $(BUILD)/Core/DSP/Instruments/PlaitsSnare/PlaitsSnareVoice.o: Core/DSP/Instruments/PlaitsSnare/PlaitsSnareVoice.c | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(CC) -c $(CFLAGS_DSP) $< -o $@
+
+# Plaits hi-hat and modal resonator DSP (C translations of Plaits), -Ofast.
+$(BUILD)/Core/DSP/Instruments/PlaitsHat/PlaitsHatVoice.o: Core/DSP/Instruments/PlaitsHat/PlaitsHatVoice.c | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(CC) -c $(CFLAGS_DSP) $< -o $@
+$(BUILD)/Core/DSP/Instruments/PlaitsModal/PlaitsModalVoice.o: Core/DSP/Instruments/PlaitsModal/PlaitsModalVoice.c | $(BUILD)
 	@mkdir -p $(dir $@)
 	$(CC) -c $(CFLAGS_DSP) $< -o $@
 
