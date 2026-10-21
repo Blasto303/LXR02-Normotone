@@ -65,7 +65,8 @@
  */
 #define EFFECT_TYPE_STEREO_FILTER        1u
 #define EFFECT_TYPE_CRUMPBIT             2u
-#define EFFECT_TYPE_COUNT                3u
+#define EFFECT_TYPE_DLYVERB              3u
+#define EFFECT_TYPE_COUNT                4u
 
 /* Extra descriptor capability flags used by Effect-specific owners. */
 #define EFFECT_PARAM_FLAG_WIDE8              0x01u

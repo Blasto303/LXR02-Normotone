@@ -4803,7 +4803,8 @@ static void menu_sceneSettingFaderName(uint8_t value, char *dst)
      * are live mixer behavior: pre = fader before both dry and FX taps, pst =
      * fader on the dry/post-FX mix only, fx = fader on the FX send only, and
      * xfd (S074) = fader crossfades from the FX send (bottom) to the dry
-     * output (top). Used by both the compact row and the full edit view.
+     * output (top), d/w = the FX send is an equal-power dry/wet amount
+     * (0 dry, 127 wet). Used by both the compact row and the full edit view.
      */
     if (value == 1u)
         memcpy(dst, "pst", 3);
@@ -4811,6 +4812,8 @@ static void menu_sceneSettingFaderName(uint8_t value, char *dst)
         memcpy(dst, "fx ", 3);
     else if (value == 3u)
         memcpy(dst, "xfd", 3);
+    else if (value == 4u)
+        memcpy(dst, "d/w", 3);
     else
         memcpy(dst, "pre", 3);
 }
@@ -6032,7 +6035,7 @@ static void menu_clampCellValue(const menu_cell_t *cell, uint16_t *value)
          * Clamp Scene-setting cells before generic dtype handling.
          *
          * audio_out uses the six-entry mixer route menu, FX send uses 0..127,
-         * fader mode uses 0..SCENE_FADER_SETTING_MAX (pre/pst/fx/xfd, S074),
+         * fader mode uses 0..SCENE_FADER_SETTING_MAX (pre/pst/fx/xfd/d/w),
          * and Voice Morph uses its full 0..255 domain.
          */
         if (cell->scene_setting == MENU_SCENE_SETTING_AUDIO_OUT) {

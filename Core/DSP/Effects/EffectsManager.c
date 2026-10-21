@@ -22,6 +22,9 @@
 /* S074: CrumpBit (`cbt`), the first buffer-using Effect type. */
 #include "CrumpBitParameters.h"
 #include "CrumpBitEffect.h"
+/* DlyVerb (`dvb`): tempo-synced character delay into a plate reverb. */
+#include "DlyVerbParameters.h"
+#include "DlyVerbEffect.h"
 #include <string.h>
 
 _Static_assert(EFFECT_TYPE_OFF == FXBUF_EFFECT_TYPE_NONE,
@@ -53,6 +56,8 @@ typedef union {
     StereoFilterRuntime stereo_filter;
     /* S074: 56 B. Its audio lives in the FxBuffer share, not in this union. */
     CrumpBitRuntime crump_bit;
+    /* 28 B. Its DSP state and audio live in the FxBuffer share. */
+    DlyVerbRuntime dly_verb;
 } effects_runtime_t;
 
 static INDTCMZ effects_runtime_t effects_runtime;
@@ -117,12 +122,38 @@ static const effect_registry_entry_t effects_registry[EFFECT_TYPE_COUNT] = {
         (uint16_t)sizeof(CrumpBitRuntime),
         CRUMPBIT_BUFFER_BYTES, CRUMPBIT_BUFFER_BYTES
     },
+    /*
+     * DlyVerb (`dvb`): stereo in and out, 100 % wet. State, plate ring and
+     * two delay rings use the whole Effect share (the delay folds a division
+     * that does not fit, so any share >= the minimum works). Lanes 1..15:
+     * division, feedback, model, stereo, width, low-pass, high-pass, drive,
+     * mod depth, age, delay level, reverb level, decay, damping, vol.
+     */
+    {
+        dlyVerb_token3, dlyVerb_abbrev5, dlyVerb_full8,
+        EFFECT_IO_STEREO_IN | EFFECT_IO_STEREO_OUT,
+        dlyVerb_descriptors, DLYVERB_PARAM_COUNT,
+        { EFFECT_LANE_MORPH_SOURCE,
+          DLYVERB_PARAM_DIVISION, DLYVERB_PARAM_FEEDBACK,
+          DLYVERB_PARAM_MODEL, DLYVERB_PARAM_STEREO,
+          DLYVERB_PARAM_WIDTH, DLYVERB_PARAM_LOWPASS,
+          DLYVERB_PARAM_HIGHPASS, DLYVERB_PARAM_DRIVE,
+          DLYVERB_PARAM_MOD_DEPTH, DLYVERB_PARAM_AGE,
+          DLYVERB_PARAM_DLY_LEVEL, DLYVERB_PARAM_RVB_LEVEL,
+          DLYVERB_PARAM_RVB_DECAY, DLYVERB_PARAM_RVB_DAMP,
+          DLYVERB_PARAM_LEVEL },
+        NULL, &dlyVerb_ops, &dlyVerb_ui,
+        (uint16_t)sizeof(DlyVerbRuntime),
+        DLYVERB_BUFFER_MIN_BYTES, DLYVERB_BUFFER_MIN_BYTES
+    },
 };
 
 _Static_assert(sizeof(StereoFilterRuntime) <= sizeof(effects_runtime_t),
                "Effect runtime union must hold StereoFilter");
 _Static_assert(sizeof(CrumpBitRuntime) <= sizeof(effects_runtime_t),
                "Effect runtime union must hold CrumpBit");
+_Static_assert(sizeof(DlyVerbRuntime) <= sizeof(effects_runtime_t),
+               "Effect runtime union must hold DlyVerb");
 /*
  * RAM guard (S074): the DTCM union is 76 B (STORAGE_SRAM_MANIFEST.md). A
  * larger member grows .dtcmz and shrinks the FxBuffer arena by the same
