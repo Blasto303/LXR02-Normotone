@@ -26,7 +26,12 @@ Session 080 made two changes:
 The Pattern-side Loopable flag added in S080 (`track_loop_exclude`) is
 Pattern data and travels in PAT4 (track header byte 4), not in the scalar
 record. The Pattern AutoSave snapshot (`pat_background_region`) grew with the
-region type to 10,527 B.
+region type to 10,527 B, and to 10,528 B in S081 with the `asm` flag
+(`track_auto_smooth`, PAT4 track header byte 5), which is likewise Pattern
+data in PAT4, not a scalar cell. Live record gates Pattern AutoSave only while
+it is writing (armed **and** running, `liveRec_patternWriting()`), not merely
+while armed; a held recording-target override also keeps `patSvc_idle()`
+false (S081).
 
 Session 078 made one change:
 
@@ -178,17 +183,26 @@ quiet window scheduling, and shared background CPU budget):
   `fs_autosave_page_suppressed` set while suspended, so its first drain
   afterwards uses the 250 ms continuation deadline. Dirty marks are made at
   every change and are written afterwards.
-- Bank load drain abort (Session 082 P1 R6, D1): every Bank load (Menu and
-  MIDI) sets `fs_autosave_yield`, which now also aborts an in-flight scalar
-  or Pattern drain at its next tick through its error close-down.
-  **Scalar drain:** every phase except the HCNAMES publication (70–77) and
-  the error close-down itself (40–46) routes through
-  `filesystem_autosaveWriterFinishError()`. **Pattern drain:** phases 0–1
-  (no handle) finish ERROR at once; phases 3–8 (streaming) jump to the
-  close at phase 9 with ERROR status; phase 2 (open pending) waits for its
-  callback. Phases 9–10 (closing) and the HCNAMES Pattern follow-on are
-  never cut (an abort between the live remove and temp rename would lose
-  `/.hcnames`). After abort the writer's five-second retry re-arms, but the
+- Bank load drain abort (Session 082 P1 R6, D1, fixed by assessment A1/A2):
+  every Bank load (Menu and MIDI) sets `fs_autosave_yield`, which also aborts
+  an in-flight scalar or Pattern drain through its own error close-down — but
+  **only at a phase with no AsyncFATFS callback outstanding.** **Scalar
+  drain:** `filesystem_autosaveDrainAbortSafe(op_phase)` is an allow-list of
+  the action phases 0, 1, 3, 5, 10, 13, 16, 17, 19, 21, 30, 32, 34, 36, 38,
+  39, 44, 50, 52, 54, 56, 62, 64, 65, 66, 67 (16 and 38 are polled syncs; 19,
+  52 and 62 start a seek and move to its cursor-polled wait). Every open,
+  close, remove or seek wait phase, the error close-down (40–46) and the
+  HCNAMES publication (70–77) run on, so the abort fires a few ms later at the
+  next allowed phase. **Pattern drain:** phases 0–1 (no handle) finish ERROR
+  at once; phases 3–8 except 7 jump to the close at phase 9 with ERROR status;
+  phase 7 (a seek possibly in progress) and phase 2 (open pending) wait.
+  Phases 9–10 (closing) and the HCNAMES Pattern follow-on are never cut (an
+  abort between the live remove and temp rename would lose `/.hcnames`).
+  **Why the allow-list:** aborting while an open or remove callback is due
+  lets that callback write `op_file`/`op_file_ready`/`op_remove_done` inside
+  the Bank load that starts next (wrong handle, leak); aborting while a close
+  is due issues a second `fclose()` on a closing handle, and the close-down
+  retries forever. After abort the writer's five-second retry re-arms, but the
   yield and the Scene 17 gate prevent it from running until the load is
   over. A Replace discards the dirty mask on every path (D25); a Merge keeps
   it and re-marks the whole Bank. Recovery writes may leave both A/B files
@@ -566,11 +580,31 @@ endpoints. Hidden temporary `kit` restore, failed loads, and HCNAMES names
 remain excluded; source bytes are included only when the committed operation
 changes or owns that provenance. The reversible InstrumentMrp `kit` restore
 uses a Morph-only hidden snapshot and likewise marks only restored Morphable
-Morph endpoint cells. `autosave_markSceneWithPatternDirty()` is presently the
-non-Pattern alias and must not be described as Pattern persistence. Copy/paste
-and less common Load/Save transitions remain explicit regression targets in
-`autosave_markSceneWithPatternDirty()` additionally sets the Scene's separate
-Pattern dirty bit; the without-Pattern form remains the scalar-only boundary.
+Morph endpoint cells. `autosave_markSceneWithPatternDirty()` additionally sets
+the Scene's separate Pattern dirty bit; the without-Pattern form remains the
+scalar-only boundary.
+
+**Whole-Scene marks are one range (Session 082 P2).**
+`autosave_markSceneWithoutPatternDirty()` ORs one contiguous mask range, from
+the Scene source field to the end of the Scene section (`[base + 8, base +
+1,920)`, 239 whole mask bytes; the Scene name bytes 0..7 and Pattern stay
+excluded), through `autosave_maskPayloadRangeDirty()`: whole mask bytes with
+masked edges, inside one short PRIMASK section, adding only fresh bits to
+`autosave_dirty_count` (the exact-population invariant holds). It emits one
+`L` LOAD_MARK witness and no per-byte `D` or nested `I` records. This is exact,
+not an approximation: drain phase 56 keeps a patch only where
+`autosave_getLivePayloadByte()` returns a live value, so the reserved, name and
+non-morphable Morph cells inside the range are taken and dropped, and the
+captured set equals what the per-scope markers produced (every Scene, Effect,
+Kit and Instrument source offset lies inside the range). **Why:** the former
+per-byte form cost one IRQ round trip and one DEV trace record per byte, about
+20,000 of each for a 16-Scene Bank Load completion in one foreground call,
+which underran audio while a background load played from Scene 17. Users:
+Bank/Scene Load completion, whole-Scene paste, the Merge whole-Bank re-mark
+(`autosave_markResidentBankDirty()`) and the filesystem ensure/baseline paths.
+`autosave_markKitDirty()` keeps its per-byte form (Kit Load marks one Scene's
+Kit scope, about 900 marks).
+
 Copy/paste and less common Load/Save transitions remain explicit regression
 targets in `AUTOSAVE_TEST_CASES_LOAD_SAVE_REVISIONS.md`; do not infer coverage
 from a nearby marker.
@@ -834,8 +868,10 @@ epoch via `timebase_tim2Now()` in `autosave_markPatternDirty()`, waits for
 semantic Pattern mutation, and forces admission after
 `AUTOSAVE_PATTERN_MAX_LATENCY_MS` (5000 ms) even if editing continues. It
 rotates the Scene cursor for fairness, admits only while
-policy/runtime/card/Bank/menu gates are open and neither `seq_recordActive`
-nor `seq_eraseActive` is set, and keeps Pattern as the final background
+policy/runtime/card/Bank/menu gates are open and live record is not writing
+(`liveRec_patternWriting()`: armed and running; S081 replaced the old
+`seq_recordActive`/`seq_eraseActive` terms, so arming REC while stopped no
+longer blocks Pattern AutoSave), and keeps Pattern as the final background
 claimant after settings, diagnostic trace, and scalar HCPR work, subject to
 the shared CPU budget. The quiet window applies only to semantic Pattern work;
 physical relocation-only work uses its independent non-semantic maintenance
@@ -1045,7 +1081,7 @@ boot, policy, and SD orchestration use `filesystem.h`.
 | API family | Use | Constraint |
 |---|---|---|
 | `autosave_mark*ParameterDirty()` / `autosave_markSourceDirty()` | Mark one retained scalar/source after its owner commits the value | Producer does no file I/O and never computes a raw wire offset |
-| `autosave_markWholeInstrumentDirty()`, `autosave_markKitDirty()`, `autosave_markSceneWithoutPatternDirty()`, `autosave_markSceneWithPatternDirty()`, `autosave_markResidentBankDirty()` | Mark a completed object/region | Scalar names remain excluded; the WithPattern/Bank forms also set the separate Pattern bit |
+| `autosave_markWholeInstrumentDirty()`, `autosave_markKitDirty()`, `autosave_markSceneWithoutPatternDirty()`, `autosave_markSceneWithPatternDirty()`, `autosave_markResidentBankDirty()` | Mark a completed object/region | Scalar names remain excluded; the WithPattern/Bank forms also set the separate Pattern bit; the whole-Scene forms mark one mask range with one `L` witness (S082 P2) |
 | `autosave_markPatternDirty()`, `autosave_patternDirtyMask()`, `autosave_clearPatternDirty()` | Produce/query/transfer one Scene's semantic Pattern work | Separate 16-bit ownership; never alias it to scalar mask bytes |
 | `autosave_markNonSemanticPatternDirty()`, `autosave_nonSemanticPatternDirtyMask()`, `autosave_clearNonSemanticPatternDirty()` | Produce/query/transfer one Scene's non-semantic (physical relocation) Pattern work | Independent 16-bit mask; lowest-priority scheduler rung |
 | `autosave_mask*()` helpers | Atomic take/merge/restore and writer progress | Filesystem consumes the one canonical mask; no second request mask |

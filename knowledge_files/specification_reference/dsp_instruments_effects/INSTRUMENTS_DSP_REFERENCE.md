@@ -548,11 +548,22 @@ local token in that namespace. Install:
 - **Step automation:** TIM3 queues values; the foreground drain
   (`seq_drainPendingAutomation()`, after trigger processing in the render
   loop) writes voice targets with `instrumentManager_writeRuntime()` and
-  marks them dirty. The voice's next trigger
+  marks them dirty. The voice's next **resetting** trigger
   (`seq_restoreAutomatedParameters()` in the trigger funnel), transport
   restart and Pattern changes restore dirty parameters from
   `morph_interpolation[]` (not from the normal image).
-  Values are stored 7-bit with an identity mapping.
+  Values are stored 7-bit with an identity mapping. Since S081 only a step's
+  first trigger resets (a delayed hit, a roll's first hit or renewal, a live
+  press), carried by the per-voice pending-reset mask; roll retriggers 2+ do
+  not reset, and a deferred step's automation is queued with its delayed
+  trigger (`PATTERN_DYNAMIC_STACK.md` §6.1–§6.2).
+- **Automation ramps (S081 P2):** on a track with `asm` on, numeric
+  descriptor parameters ramp linearly between consecutively played steps
+  that both hold them; `seq_rampService()` writes the samples through the
+  same runtime writer and held bit as the drain (at most 64 ramps, every
+  ~2.2 ms, only on a value change). This is foreground control-rate work
+  whose 64-ramp worst case still has to be measured under the constant-CPU
+  rule (`PATTERN_DYNAMIC_STACK.md` §6.2b).
 - **Morph:** the Morph worker (`presetMorph_tick()`, foreground, one
   parameter per pass) interpolates normal → Morph images and writes
   `morph_interpolation[]` through `instrumentManager_writeRuntime()`. An LFO
@@ -566,7 +577,10 @@ local token in that namespace. Install:
   through `presetMorph_writeRuntimeBase()`, which skips a held parameter
   while still updating `morph_interpolation[]`. A menu edit re-interpolates
   only its own parameter at the resolved Morph amount (it no longer queues
-  the whole voice). External MIDI CC/NRPN stores the active Scene's clamped
+  the whole voice); since S081 R12 the edit also clears the held bit and sets
+  a menu override (`seq_menuOverrideSet()`), so the new value sounds at once
+  and that parameter's automation is suppressed until the voice's next
+  trigger. External MIDI CC/NRPN stores the active Scene's clamped
   Normal endpoint and lets the Morph sweep apply it. Before S075 F3 a menu
   edit, a Morph change, an LFO on Morph, `Nvm` automation or a Kit apply
   reset automated parameters mid-note.

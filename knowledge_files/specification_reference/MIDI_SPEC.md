@@ -20,8 +20,11 @@ who implements it, and later maintains it, in `Core/MIDI/`.
 - **Decided:** 2026-10-16/17, during Session 082 planning. All behaviour
   below is a user decision unless marked *(proposal)*.
 - **Planning record:** `S083_P1_MIDI_IMPLEMENTATION_PLAN.md` (requirements,
-  phases, risks, decision log F1–F51). The background Bank load and Scene 17
-  are in `S082_P1_LOAD_SAVE.md` (D1–D24).
+  phases, risks, decision log F1–F51; §13 lists what S082 changed). The
+  background Bank load and Scene 17 were built in Session 082: decisions
+  D1–D53 in `082_SESSION_HANDOFF_LOG.md` §4–§6; mechanism in
+  `MODULE_INTERCHANGE_SPEC.md` ("Background Bank load") and
+  `FILESYSTEM_SPEC.md` ("Current Bank behavior").
 - **Related documents:**
   - `PATTERN_DYNAMIC_STACK.md` §6.2a (write priority) and §4 (9-bit target
     IDs);
@@ -284,7 +287,10 @@ translation is the Morph amounts (§5.2), which use the 7-bit Morph mapping.
 
 ### 5.6 Write rules
 
-- **Priority:** step automation, then menu edits, then MIDI (S075 F3).
+- **Priority:** step automation, then menu edits, then MIDI (S075 F3; since
+  S081 R12 a menu edit of an Instrument parameter beats its automation until
+  the voice's next trigger, and MIDI stays lowest — whether MIDI CC adopts the
+  R12 menu priority is an open MIDI-rework decision, S081 plan §16).
   Voice parameters store the active Scene's Normal endpoint; the Morph sweep
   applies it and skips a parameter that automation holds. MIDI never writes
   the runtime value directly.
@@ -408,12 +414,27 @@ consumed.
 
 ### 7.2 Bank change (CC0 on G, `RXF P`)
 
-- CC0 value v loads Bank slot v (000..127) with the background Bank load
-  (`S082_P1_LOAD_SAVE.md`). CC32 is ignored.
-- The UI locks and switches to Load/Save → Bank, showing slot v exactly as
-  if it had been selected in the Menu and OK pressed. When the load
-  completes, the UI unlocks and stays on Load/Save, exactly as after a
-  Menu Bank load.
+- CC0 value v loads Bank slot v (000..127) with the background Bank load:
+  `preset_requestBackgroundBankLoad(v, 0, 0, PRESET_BANK_ORIGIN_MIDI)`
+  (built in S082; the masks are ignored for MIDI origin, which is always
+  Replace with all 16 selected, Q15). CC32 is ignored.
+- **When the request starts:** a MIDI request is held as the one pending
+  request (`pm_bg_pending_slot`, latest wins) and starts only when Preset,
+  the filesystem facade and the Menu are idle (D33,
+  `menu_backgroundBankLoadUiIdle()`). It then closes every latched surface
+  and session (D39) and switches the UI to Load/Save → Bank at slot v,
+  exactly as if it had been selected in the Menu; after the slot's preview it
+  acts as OK (phase 6). A missing slot ends FAILED with the page showing the
+  resident Bank slot.
+- **During the load:** as for a Menu load. From phase 5 of a load that runs
+  on Scene 17 (or a running direct load) the panel is unlocked: the user may
+  leave Load/Save while the load finishes (S082 P3, D40). A load started with
+  the transport stopped keeps the UI on Load:[Bank] until it ends. When the
+  load completes with the user on Load/Save, the UI unlocks and stays there,
+  exactly as after a Menu Bank load.
+- **Result for CC0 TX:** `preset_takeBackgroundBankLoadResult()` returns
+  `PRESET_BG_RESULT_DONE` (1) or `FAILED` (2) (code mask 3) with
+  `PRESET_BG_RESULT_MIDI` (0x80) once per load, then NONE.
 - Playback continues through Scene 17 (§10) when the transport is running.
 - **Dropped:** CC0 arriving during a load; CC0 for an empty or invalid slot
   (refused as in the Menu).
@@ -457,13 +478,29 @@ are never echoed back out.
 
 ## 10. Scene 17
 
-Authority: `S082_P1_LOAD_SAVE.md` D1–D24. For MIDI:
+Authority: Session 082 (`082_SESSION_HANDOFF_LOG.md` §4–§6,
+`MODULE_INTERCHANGE_SPEC.md` "Background Bank load"). For MIDI:
 
 - While Scene 17 is active it is the active Scene. The note map, Learn type
   matching, NRPN and CC writes act on it.
 - PC on G leaves it; PC on a voice channel moves only those tracks.
-- PC and CC0 that arrive during the load are dropped.
-- Scene 17 has no PC number, so nothing is transmitted for it.
+- PC and CC0 that arrive during the load are dropped. Since S082 this is
+  enforced by `midiParser_acceptedDuringBankLoad()` while
+  `preset_backgroundBankLoadRunning()`: only realtime (0xF8–0xFF), note
+  on/off and CC (except CC0 and CC32) are acted on; program change, pitch
+  bend, pressure, MTC quarter frame and song position/select are dropped.
+  The filter runs **after** the current thru routing, so dropped messages
+  are still forwarded. S083's consume-then-route dispatcher must keep that:
+  a message dropped by the filter is "not consumed".
+- MIDI writes during a load: CC/NRPN act on the active Scene. While Scene 17
+  is active they fan out to 17 alone. After the user leaves 17 mid-load (P3)
+  the active Scene is a loaded or kept resident Scene and fan-out must go
+  through `bank_editTargetMask()`/`bank_sceneFanoutMask()`, which exclude
+  Scenes the load has not finished (availability).
+- Chain conditions do not fire while a Bank load runs (S082 D50); a PC
+  arriving after the load is a normal whole-Scene change.
+- Scene 17 has no PC number, so nothing is transmitted for it
+  (`seq_sendProgChg()` refuses index ≥ 16).
 - Its track MIDI channel/note settings are copied from each track's played
   Scene at the copy.
 
@@ -490,7 +527,7 @@ No migration of older files (standing project rule).
 | `MidiNoteMap.c/h` | §4.1 resolver and its TX inverse; stateless | Foreground |
 | `MidiControl.c/h` | NRPN, CC1/CC2, Learn table, Learn capture, MIDI write path | Foreground |
 | `MidiOut.c/h` | TX filters, per-track note-off, coalescing, PC/CC0 TX | Foreground, TIM3 (sequencer notes and clock) |
-| `MidiVoiceControl.c` | Trigger funnel (unchanged) | Producer any; consumer audio render |
+| `MidiVoiceControl.c` | Trigger funnel (unchanged by S083; S081 added the per-voice pending-reset mask, `noteOnNoReset()`, `resetOnly()`, `triggerNow(…, reset)`) | Producer any; consumer audio render |
 
 Foreground TX into the DIN FIFO and USB must use the existing short
 critical sections (TIM3 also sends).
@@ -546,7 +583,7 @@ Anything larger than listed needs a new acknowledgement.
 | §7 PC / CC0 | PC RX is a no-op; CC0 ignored. PC TX on Scene change exists. |
 | §8 | Continue = Start; no SPP framing. |
 | §9 | Note-off cache per channel; no parameter TX; USB re-framing of system-common/sysex wrong (`usb_sendMidi()` CIN = status >> 4). |
-| §10 | Scene 17 does not exist (S082). |
+| §10 | Built in S082: Scene 17, the background load, the MIDI deferral (D33), the drop filter and the result byte. Not built: CC0 RX (S083 Phase D calls the request API). |
 
 ---
 

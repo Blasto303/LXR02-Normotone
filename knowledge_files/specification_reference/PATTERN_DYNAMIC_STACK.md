@@ -3,13 +3,39 @@
 ## Authority and status
 
 This is the authoritative live-memory, allocator, PAT4 interchange, Pattern
-Stack Service, and Pattern AutoSave reference, **current as of the Session 080
-close** (2026-10-11, `dev-ph6-cleanup`). Session 073 changed
+Stack Service, and Pattern AutoSave reference, **current as of the Session 081
+close** (2026-10-16 code, `dev-ph6-cleanup`, documented 2026-10-21 after
+Session 082; S082 Scene 17 notes are included where they apply). Session 073 changed
 nothing. Session 074 changed no Pattern storage or allocator code; it added a
 second reader of step automation (the Effect-page underline search reads every
 step of every track of the viewed Pattern through
 `pat_readStepAutomations()`, 4 steps per foreground pass) and saw a torn PAT4
 file repair itself exactly as designed (§9).
+
+**Session 081 changed this area in seven ways** (record:
+`081_SESSION_HANDOFF_LOG.md`; written after S082, whose Scene 17 notes
+appear below where they apply):
+
+- **Step reset rule** (§6.1, §6.2): Instrument automation resets once per
+  step at its first trigger, through a per-voice pending-reset mask;
+  deferred steps queue their automation at the deferred fire; roll steps
+  take shuffle and micro-timing and run their own length.
+- **Automation priority R12** (§6.2a, amends S075 F3): a menu edit beats
+  Instrument automation until the voice's next trigger; other targets take
+  the menu value until their next automation. Effect parameters follow R13
+  (`EFFECTS_BUS_REFERENCE.md` §10); the Effect step markers are gone.
+- **Step roll table** (§6) corrected to 96-PPQ ticks, `64t`/`128` added,
+  `48` dropped; `PAR_ROLL` retired.
+- **`qnt trk`** (§6.5, §6.7): track-grid quantise for recording and
+  per-track loop anchors.
+- **Linear automation ramps `asm`** (§6.2b): per-track Pattern setting
+  `track_auto_smooth`, PAT4 track header byte 5 (§7). Region 10,527 →
+  **10,528 B**.
+- **Live record and live erase** (§6.7): new `LiveRecord` module, Pattern
+  Stack Service `RECORD_STEP`/`ERASE_SPECIALS` operations, staging table and
+  target override (§12.3, §12.12), trace stage `W` (§12.16).
+- **Looping while recording** (§6.5): the looper no longer locks record out;
+  ring jump entries and loop-aware placement.
 
 **Session 080 changed this area in five ways** (record:
 `080_SESSION_HANDOFF_LOG.md`; PERF UI side: `MODULE_INTERCHANGE_SPEC.md`
@@ -78,8 +104,11 @@ file repair itself exactly as designed (§9).
 now `pat_background_region`, an identical-type region outside
 `pat_regions[]`. It serves the AutoSave snapshot, the copy/clear overlap
 paste pool (`pat_backgroundPoolMut()`), and, since S082, Scene 17 (the
-background Scene of a running Bank Load). These uses must never run
-concurrently. The copy/clear overlap path
+background Scene of a running Bank Load: index 16 resolves to this region
+through PatternData's `pat_regionFor()` while `scene_backgroundExists()`).
+These uses must never run concurrently: while Scene 17 exists the Pattern
+AutoSave snapshot cannot run (AutoSave is gated) and an overlapping paste
+drops (`SCENE17`); after the release both return. The copy/clear overlap path
   waits on `filesystem_patternSnapshotInUse()` instead of borrowing name-buffer
   space, and the paste source table is a static `uint16_t[128]` in
   `copyClearService.c` instead of being stored in the name buffer.
@@ -154,15 +183,20 @@ typedef struct __attribute__((packed)) {
     uint8_t  track_shuffle[7];      /* 7 B */
     uint8_t  track_play_mode[7];    /* 7 B, S078: 0 fwd .. 5 1fr */
     uint8_t  track_loop_exclude;    /* 1 B, S080: bit N = track N not loopable */
+    uint8_t  track_auto_smooth;     /* 1 B, S081: bit N = track N asm on */
     uint8_t  pattern_change_bar;    /* 1 B */
     uint8_t  pattern_next;          /* 1 B */
-} pat_scene_region_t;               /* 10,527 B */
+} pat_scene_region_t;               /* 10,528 B */
 ```
 
 The header `_Static_assert` (and its copy in PatternData.c) pins the size as
-address + pool + bitmap + 31 (the parameter tail: four 7-byte track arrays,
-the S080 loop-exclude mask and 2 Pattern bytes; 23 before S078, 30 before
-S080). `track_loop_exclude` is stored inverted so a zero-filled region or an
+address + pool + bitmap + 32 (the parameter tail: four 7-byte track arrays,
+the S080 loop-exclude mask, the S081 `asm` mask and 2 Pattern bytes; 23
+before S078, 30 before S080, 31 before S081). `track_auto_smooth` (bit N =
+track N ramps its automation, zero = `off`) has the accessors
+`pat_setTrackAutoSmooth()` / `pat_trackAutoSmooth()`, is mirrored into
+`PAR_TRACK_AUTO_SMOOTH`, copied with the region and by track copy, and reset
+by track clear (§6.2b). `track_loop_exclude` is stored inverted so a zero-filled region or an
 older PAT4 file means "every track loopable"; accessors
 `pat_setTrackLoopable(scene, track, loopable)` (marks the Pattern dirty only
 on change) and `pat_trackLoopable(scene, track)` (1 for invalid
@@ -173,7 +207,7 @@ copy carries it and track clear sets loopable again. `pattern_change_bar` /
 (S078; 76 = 1/16, §6.4), not the pre-S078 14-entry index.
 `track_play_mode` values ≥ 6 are treated as `fwd`.
 
-`pat_regions[16]` is exactly 168,432 bytes (S080). Pattern storage is not
+`pat_regions[16]` is exactly 168,448 bytes (S081; 168,432 in S080). Pattern storage is not
 embedded in `scene_t`; `scenes[16]` is a separate 26,496-byte SceneData object
 (S080: 1,656 B per Scene after the +4 B Scene chain settings; S078 had added
 the 21 B track Morph endpoints).
@@ -182,9 +216,9 @@ read-only access and `pat_sceneRegionMut(scene)` is reserved for bounded owner
 paths such as validated filesystem application. Ordinary clients use the
 public operations so mutation tracking cannot be bypassed.
 
-One additional `pat_background_region` is exactly 10,527 bytes (S077; it
+One additional `pat_background_region` is exactly 10,528 bytes (S077; it
 replaces the former standalone `pat_autosave_snapshot` at identical size, and
-grew with the region type in S078 and S080). It serves four purposes that
+grew with the region type in S078, S080 and S081). It serves four purposes that
 must never run concurrently: the immutable source for an in-flight Pattern
 AutoSave write (`pat_snapshotScene()` / `pat_autosaveSnapshot()`), the
 copy/clear scratch pool for an overlapping paste
@@ -367,14 +401,47 @@ condition tests its own track's mute state bypasses the mute gate). Condition
 0 (default/absent) always passes. A failed condition suppresses both trigger
 and automation. The sequencer then triggers with the resolved note and
 velocity. If the step has a roll special, `seq_rollBegin()` starts a
-per-step retrigger engine at the specified rate (8 absolute note values,
-independent of track scale), with rhythm-modified velocity via the packed
-byte pattern and a fill percentage that controls how much of the step
-duration the roll occupies. Fill < 100 ducks the voice at the fill boundary
-via `instrumentManager_requestGateDuck()`. If the step has a micro-timing
-delay, the trigger is deferred by `(step_interval * timing_value) / 100`
-ticks, additive with shuffle. Roll carry-over extends across adjacent steps
-with matching rate/rhythm/fill.
+per-step retrigger engine at the specified rate (9 absolute note values,
+independent of track scale; table below), with rhythm-modified velocity via
+the packed byte pattern and a fill percentage that controls how much of the
+step duration the roll occupies. Fill < 100 ducks the voice at the fill
+boundary via `instrumentManager_requestGateDuck()`. If the step has a
+micro-timing delay, the trigger is deferred by
+`(step_interval * timing_value) / 100` ticks, additive with shuffle. Since
+S081 a roll step takes the same deferral (shuffle and micro-timing) as a plain
+trigger, and its first hit fires at the deferred time. Roll carry-over
+extends across adjacent steps with matching rate/rhythm/fill.
+
+**Step roll rate table (S081 P1 §5.4).** `seq_processRollTicks()` runs on the
+96-PPQ tick, and `seq_rollPpq()` returns the retrigger interval in 96-PPQ
+ticks (guard `rate > 9` → 0). Before S081 the table held 24-PPQ values, so
+every step roll played 4× fast on hardware.
+
+| Index | Menu label (`stepRollRateNames`) | Interval (96-PPQ ticks) |
+|---:|---|---:|
+| 0 | `off` | 0 |
+| 1 | `1/8` | 48 |
+| 2 | `8tr` | 32 |
+| 3 | `16` | 24 |
+| 4 | `16t` | 16 |
+| 5 | `32` | 12 |
+| 6 | `32t` | 8 |
+| 7 | `64` | 6 |
+| 8 | `64t` | 4 |
+| 9 | `128` | 3 |
+
+The old `48` entry (the same rate as `32t`) was dropped, so stored indices
+above it moved down by one with no migration (decision F-H: backward
+compatibility is not a constraint). The PAT4 byte format is unchanged. The
+legacy `PAR_ROLL` live-roll parameter and its `rollRateNames` /
+`MENU_ROLL_RATES` table were retired in S081.
+
+**Roll length and the next step (S081 F-R).** A roll runs its own length:
+the step interval × fill, measured from its (possibly delayed) first hit.
+Only the next step's **trigger** cuts it short: a plain hit ends it, a
+matching roll carries it, a different roll replaces it. An empty or
+automation-only next step does not cut it (before S081 any step without a
+roll ended a running roll at its start).
 
 ### 6.1 Step automation playback
 
@@ -392,8 +459,33 @@ appended to the TIM3-to-foreground queue `seq_pending_automation[]`:
 `SEQ_PENDING_BUF_COUNT` (128) four-byte records (identity = step id | type
 bit, payload = the packed entry) plus two publication bytes (+514 B SRAM1).
 There is no coalescing; a full queue drops the entry and records a
-PatternTrace overflow witness (`H`). Effect step markers (identity bit 11)
-share the queue. The ISR is the sole writer.
+PatternTrace overflow witness (`H`). The ISR is the sole writer. (The Effect
+step markers that used identity bit 11 were removed in S081, R13: see
+`EFFECTS_BUS_REFERENCE.md` §10.)
+
+**When a step's entries are queued (S081 §5.8).** Normally at the step start.
+When the step's own trigger is deferred (shuffle or micro-timing, §6.4), the
+entries are queued at the **deferred fire time**, in TIM3, by
+`seq_fireDeferred(track)`, together with the resetting trigger. The
+foreground order `voiceControl_processPending()` →
+`seq_drainPendingAutomation()` then gives reset → trigger → that step's
+automation, exactly as for an on-time step. Before S081 a delayed trigger
+fired after its own step's automation had landed and restored it away.
+
+- A step with automation but no trigger still queues at its step start
+  (the call stays in the step-allowed block; it is skipped only when this
+  step's own trigger was deferred).
+- `seq_fireDeferred()` is the one routine for both the expiry path and an
+  early flush: it queues the step's automation, then starts the roll
+  (`seq_rollBegin()`) or fires the plain hit with reset = 1. A muted
+  deferral (`seq_trackShuffleMuteMask`, set by live record when a live hit
+  replaced the step) queues the automation and returns without a trigger.
+- A deferral still pending from an earlier step is flushed early only when
+  the new step itself queues automation, so entries stay in step order and a
+  long delay is not cut by an empty next step.
+- The deferral state is `seq_trackShufflePending/Delay/Vel/Note[7]` plus,
+  since S081, `seq_trackShuffleStep[7]` (to re-read the block) and
+  `seq_trackShuffleRoll[7]`.
 
 Trigger condition gates the complete step: trigger and automation together,
 for any step that has a condition special set (value 1–40), whether or not the
@@ -431,25 +523,91 @@ expand to 0..255:
   `seq_scene_automation_dirty` (`uint32_t`, 4 B). Scene automation never
   writes retained Scene/Kit setters — this prevents AutoSave thrashing and
   preserves user-set values.
-- **Effect targets (IDs 448..510, Session 072 step 9):** the foreground drain
-  brackets entries with FX step markers (identity bit 11) and calls
-  `effects_applyAutomation(track, local, value7)`. EffectsManager owns the
-  value, owner track, and pending-end mask. An overlay ends when its writing
-  track advances to an automation step that does not rewrite that parameter;
-  a failed-condition or muted step queues no marker and therefore holds it.
-  The common reset latch clears all Effect overlays and `fxm` before the new
-  pass's records apply. `fxm` follows the reset rule rather than the
-  per-parameter end rule.
+- **Effect targets (IDs 448..510, Session 072 step 9; rules rewritten in
+  S081, R13):** the drain calls `effects_applyAutomation(track, local,
+  value7)`, which sets that parameter's track overlay (last writer wins,
+  held) and clears its `menuHold`. The overlay is cleared by an FX-sequence
+  lock on that parameter at its lock step start, by a menu edit, and by the
+  common reset latch (Scene change, reload, realign, transport reset). The
+  former step markers, owner tracks and "a failed-condition or muted step
+  holds it" rule are gone. Full resolution order: `EFFECTS_BUS_REFERENCE.md`
+  §10.
+
+**Drain filters (S081).** Before applying an entry the drain skips it when:
+
+- live record has the target **latched** (any owner track) or **erased**
+  (owner track = the recording track), through the bitmaps LiveRecord
+  registers with `seq_setAutomationFilter()` (§6.7);
+- the entry is an Instrument target whose `seq_menuOverride[slot]` bit is set
+  (R12, §6.2a).
+
+It also ends automation ramps of tracks whose next step has applied and may
+start new ramps (§6.2b).
 
 ### 6.2 Automation reset on voice retrigger and transport restart
 
 All trigger sources funnel through `voiceControl_triggerNow()` in
-`MidiVoiceControl.c`. Before `instrumentManager_triggerTrack()`, it calls
-`seq_restoreAutomatedParameters(voice)`, which iterates set bits in the
-dirty bitmap using `__builtin_ctzll`, writes the `morph_interpolation[]`
-value for each dirty descriptor back to the runtime, and clears the bitmap.
-The dirty bitmap is also cleared on `seq_init()`, transport stop, and
+`MidiVoiceControl.c`. When the trigger carries a **reset**, it calls
+`seq_restoreAutomatedParameters(voice)` before
+`instrumentManager_triggerTrack()`. The restore iterates set bits in the dirty
+bitmap using `__builtin_ctzll`, writes the `morph_interpolation[]` value for
+each dirty descriptor back to the runtime, and clears the bitmap. The dirty
+bitmap is also cleared on `seq_init()`, transport stop, and
 `seq_setStepIndexToStart()`.
+
+**Step reset rule (S081 P1 §5.8, decision F-L).** Before S081 every trigger
+restored, which caused two defects: a shuffled or micro-timed trigger undid
+its own step's automation (the step start had already applied it), and the
+second hit of every roll restored the base values. Now Instrument automation
+(the held bits and the R12 menu override) resets **once per step, at the
+step's first trigger**:
+
+| Step | Reset at |
+|---|---|
+| Plain trigger | its hit |
+| Micro-timed / shuffled trigger | its delayed hit (its automation is queued at the same moment, §6.1) |
+| Roll step | its first hit; later hits of that roll never reset |
+| Roll carried across steps | each step's renewal of the roll, which fires no new first hit (`voiceControl_resetOnly()`) |
+
+- A roll whose hits run into the next step's time does not reset there; the
+  next step's own trigger does.
+- Live triggers (overlay presses, MIDI notes, preview) reset at each new
+  press. Each flam hit counts as a press. Overlay roll repeats from the 1 ms
+  timer do not reset.
+
+**Mechanism: a per-voice pending-reset mask.** `voiceControl_pendingReset`
+(`u8`, bits 0..6, `MidiVoiceControl.c`) records that a voice owes a reset.
+
+- `seq_triggerVoice(voice, vol, note, reset)` passes `reset`: 1 for on-time
+  step hits, deferred fires, `seq_rollBegin()`'s first hit, overlay presses,
+  preview and SOM; 0 for `seq_processRollTicks()` retriggers; the overlay
+  1 ms timer passes `bh_overlayCount != 0xFF` (1 for a flam main, 0 for roll
+  repeats). `voiceControl_noteOn()` (MIDI, preview, overlay) always sets the
+  bit; `voiceControl_noteOnNoReset()` serves roll retriggers 2+;
+  `voiceControl_resetOnly(voice)` sets the bit with no trigger (roll
+  renewal).
+- `voiceControl_popPending()` tests and clears the voice's bit inside its
+  existing PRIMASK section (TIM3 sets bits concurrently) and returns it as
+  `reset`.
+- `voiceControl_triggerNow(voice, note, vel, reset)` keeps the order
+  `preset_applyDeferredSceneSlotForTrigger()` → restore (only if `reset`) →
+  trigger, sidechain, LED. The restore must not move ahead of the deferred
+  Scene-slot apply.
+- After the ring is empty, `voiceControl_processPending()` takes the
+  remaining mask under PRIMASK (copy, store 0) and restores each voice it
+  took: reset-only renewals, and resets whose trigger entry was dropped.
+- **Why a mask and not a flag in the queue entry:** `voiceControl_noteOff()`
+  deletes every queued entry of the voice, and `seq_triggerVoice()` calls it
+  before every `noteOn()`, so a flag stored in an entry is lost whenever a
+  later trigger of the same voice is queued before the foreground drains. A
+  stored step note or velocity byte ≥ 128 is also not range-checked on PAT4
+  load, so it could read as a flag.
+- Accepted edge: if the foreground falls behind, a reset bit set by step N+1
+  can be consumed by a still-queued roll retrigger of step N; both run
+  before the drain, so that retrigger only sounds with the base values.
+
+All of this precedes `seq_drainPendingAutomation()` in `main.c`, so a step's
+own automation always lands after its reset.
 
 On transport restart (Session 070), `seq_setStepIndexToStart()` calls
 `seq_restoreAllAutomation()` (walks all 6 voice dirty bitmaps and restores
@@ -461,23 +619,65 @@ audio routing overrides). Both restore functions run BEFORE
 `seq_running=0` first (preventing TIM3 ISR from advancing during cleanup)
 and start sets `seq_running=1` last (after all initialization).
 
-Effect step markers are queued immediately before the owning track's
-automation entries on the same conditional playback gate. The marker's
-payload-free identity keeps the track/step ID in bits 0..9 and sets identity
-bit 11. Entries after a marker can re-hold a pending parameter; the next
-marker or end-of-drain flush ends candidates not rewritten. This preserves
-last-writer ownership when multiple tracks write the same Effect row.
+(S080 and earlier queued Effect step markers before each track's entries;
+S081 removed them together with the Effect owner state. Effect overlays now
+follow R13, `EFFECTS_BUS_REFERENCE.md` §10.)
 
-### 6.2a Automation priority: automation, then menu edits, then MIDI (S075 F3)
+### 6.2a Automation priority (S075 F3, amended by S081 R12)
 
-**Rule (user):** a voice-parameter automation value written by the drain
-holds until that voice's next trigger. Nothing else may change that
-parameter's runtime value before then.
+**Rule (user, S075 F3):** a voice-parameter automation value written by the
+drain holds until that voice's next trigger. Nothing else may change that
+parameter's runtime value before then — **except a menu edit of that
+parameter (S081 R12, below)**.
+
+**R12 (S081):** a menu edit of an automated Instrument parameter sounds at
+once and suppresses that parameter's automation until the voice's next
+trigger (any source), a transport change or a Scene change. A menu value is
+never reverted by anything (also not when recording or overdub ends).
+
+- `menu_cellCommitValue()`, INSTRUMENT branch (Normal or Morph image), calls
+  `seq_menuOverrideSet(cell->slot, cell->descriptor_index)` once, before the
+  edit-mask Scene loop (the override belongs to the one runtime slot, not to
+  each Scene in the edit mask). It clears the held bit in
+  `seq_automation_dirty[slot]` and sets the bit in `seq_menuOverride[slot]`
+  (6 × `u64`, 48 B, foreground only).
+- The cleared held bit lets the edit's own interpolated write through
+  `presetMorph_writeRuntimeBase()`, so the new value sounds at once.
+- While the override bit is set, `seq_drainPendingAutomation()` skips that
+  target, and an automation ramp on it is cancelled (§6.2b).
+- The override is cleared by any trigger of the voice
+  (`seq_restoreAutomatedParameters()` clears `seq_menuOverride[slot]`
+  **before** its "held mask is zero" early return, because the menu edit has
+  just cleared the held bit), by transport start/stop/reset
+  (`seq_setStepIndexToStart()`), by a Scene change
+  (`seq_selectActivePattern()`, `seq_alignActivePatternToScene()`), by a
+  per-track Scene change of that slot (`seq_setTrackPlayedScene()`; tracks 6
+  and 7 share slot 6) and by realign.
+- The Morph sweep guard is unchanged. MIDI CC keeps the S075 path below
+  (lowest priority) until the MIDI rework decides otherwise.
+
+**Other (non-Instrument) targets: the menu value applies until the next
+automation of that parameter.** A menu edit clears that target's runtime
+override, and the next automation entry applies again:
+
+| Target | Clear on a menu edit |
+|---|---|
+| Voice Morph `Nvm` | (already cleared before S081) |
+| FX send `Nfx` | `preset_clearFxSendStepOverride(slot)` |
+| Audio out `Nou` | `preset_clearAudioOutStepOverride(slot)`, which also re-applies the retained route |
+| Track length/scale/shuffle (405..425) | `presetMorph_clearTrackParamStepOverride(track, param)` + `seq_refreshTrackEffectiveParams()` (Normal and Morph-endpoint commits, `menu_clearTrackTimingOverride()`) |
+| `7dc` | its slot-6/track-7 decay override clear |
+| `fxm` and Effect parameters | `menuHold` in EffectsManager (R13) |
+
+Each clear pairs with `seq_clearSceneAutomationBit(index)`.
+
+The S075 table below is still the rule for every writer other than a menu
+edit:
 
 | Writer | What it does to a held parameter | Mechanism |
 |---|---|---|
 | Morph sweep (`presetMorph_tick()`), synchronous voice apply (`presetMorph_applyVoiceNow()`) | updates `morph_interpolation[local]` only; the runtime value is left alone | every Morph-base runtime write goes through `presetMorph_writeRuntimeBase()`, which skips an inactive Scene and any parameter for which `seq_automationHoldsParameter(slot, local)` is set |
-| Menu edit of any instrument endpoint (`preset_setInstrumentParameter()`) | stores the endpoint; re-interpolates **only that parameter** at the voice's resolved Morph amount (`presetMorph_applyParameterNow()`), so a held parameter changes at its next trigger | no whole-voice queue; the runtime never receives the raw edited value |
+| Menu edit of any instrument endpoint (`preset_setInstrumentParameter()`) | stores the endpoint; re-interpolates **only that parameter** at the voice's resolved Morph amount (`presetMorph_applyParameterNow()`). Since S081 R12 the commit first calls `seq_menuOverrideSet()`, so the parameter is no longer held and the new value sounds at once | no whole-voice queue; the runtime never receives the raw edited value |
 | External MIDI CC/NRPN (`midiParser_enterTaggedParameter()` → `preset_setInstrumentParameterFromMidi()`) | stores the active Scene's clamped Normal endpoint and queues the voice for the Morph sweep (lowest priority) | the sweep's guarded write applies it when it gets there |
 
 At the trigger, `seq_restoreAutomatedParameters()` writes
@@ -490,6 +690,150 @@ Scene targets (`Nfx`, `Nou`, `Nvm`, `fxm`, `7dc`) were never affected: they
 are layered overlays read every block. An Instrument type change while values
 are held is out of scope (a held bit may name the old type's descriptor until
 the next trigger). Details: `075_SESSION_HANDOFF_LOG.md` §11.
+
+### 6.2b Linear automation ramps: `asm` / Automtn (S081 P2)
+
+**What the user gets.** A per-track **Pattern** setting `asm` (long name
+`Automtn`, values `off`/`on`, STEP mode track parameters, SEQ_PAGE sub-page 0
+cell 7, after `lop`). `off`: every step's value is applied as a jump, as
+before. `on`: an Instrument parameter ramps linearly from the current step's
+value to the next played step's value, **only if both steps hold an entry for
+that parameter**. Menu value → automated step and automated step → menu value
+still jump. At most 64 ramps run at once; a pair without a free slot jumps.
+
+**Storage.** `pat_scene_region_t.track_auto_smooth` (bit N = track N `on`;
+zero = `off`), PAT4 track-header byte 5 (§7), `pat_setTrackAutoSmooth()` /
+`pat_trackAutoSmooth()`; the Sequencer reads the region byte directly from
+TIM3. Menu mirror `PAR_TRACK_AUTO_SMOOTH` (plain `DTYPE_ON_OFF`, a no-op in
+`menu_parseGlobalParam()`, committed in `menu_cellCommitValue()` for the
+viewed Pattern and the active track). Copy/clear track settings copy it;
+track clear resets it. It is not a SceneModTarget: not automatable, not
+morphable, not recordable.
+
+**Terms.** Step A is the step whose automation is being applied; step B is
+the step the track plays next in normal (unlooped) play. A ramp runs from A's
+**apply time** (the step start, or the deferred fire time when A's trigger is
+deferred, §6.1) to B's apply time, so it ends exactly where B's value would
+land as a jump.
+
+**Which targets ramp (D2).** Automatable Instrument descriptor parameters of
+the track's slot with a numeric dtype: `DTYPE_0B127`, `DTYPE_PM63` (and
+`DTYPE_0B255`, `0B15`, `1B16`, `1B128` should a descriptor use them),
+valid in the track's played Scene. Never: `DTYPE_MENU` (waveforms, filter
+types), `DTYPE_MIX_FM`, `DTYPE_ON_OFF`, `DTYPE_0b1`, `DTYPE_LFO_POLARITY`,
+LFO/velocity targets, any Scene target (`Nvm`, `Nou`, `Nfx`, `7dc`,
+`len/scl/shf`, `fxm`) and Effect parameters. Their in-between values are
+other choices, not intermediate settings.
+
+**Pieces** (`sequencer.c`, section `S081 P2 automation ramps`, directly after
+`seq_restoreAutomatedParameters()`):
+
+| Piece | Context | Role |
+|---|---|---|
+| `seq_ramps[64]` (`seq_ramp_t`, 10 B: `id` = 0 free or `1 + (track << 9 | target)`, `from`, `to`, `last`, `startQ4`, `endQ4`) | foreground | the running ramps; times in 1/16 master ticks, low 16 bits, wrap-safe |
+| `seq_rampCtx[7]` (`seq_rampCtx_t`, 4 B: `a` = A step + bit 7 "stepped", `b` = B + 1 or 0, `endQ4`) | TIM3 → foreground | per-track hand-off, read under PRIMASK |
+| `seq_rampStepEvent(track, applied, deferred)` | TIM3, every step of an `on` track | applied now → stepped + prediction; deferred → prediction only (`seq_fireDeferred()` sets the stepped flag when the entries queue); neither (condition failed, muted, full-erased) → stepped, no B |
+| `seq_rampPredict()` / `seq_rampNextStep()` / `seq_rampConditionPredict()` | TIM3 | predict B and B's apply time (below) |
+| `seq_rampBreakTrack()` / `seq_rampBreakAll()` | TIM3 or foreground (PRIMASK) | write "stepped, no B" at every position break |
+| `seq_rampConsumeTrack()` / `seq_rampConsumeSteps()` | foreground | consume the stepped flag and free that track's ramps (values stay where they are) |
+| `seq_writeInstrumentAutomation(scene, target, value)` | foreground | the drain's Instrument write (descriptor in the played Scene, `instrumentManager_writeRuntime()`, held bit) — shared by the drain and the ramp service |
+| `seq_rampStartIfPaired()` | foreground, drain | start a ramp for a just-written entry of A |
+| `seq_rampService()` | foreground, `main.c` render loop right after `seq_drainPendingAutomation()` | write running ramps |
+| `seq_rampNowQ4()` | foreground | master position ×16 plus the sub-tick fraction from the PPQ µs stamp |
+
+**Predicting B (TIM3, at A's step start).** `seq_rampNextStep()` mirrors the
+play-mode switch of `seq_advanceTrackStep()` without side effects — **keep
+the two in step**:
+
+| Play mode | B |
+|---|---|
+| `fwd` | next index, wrapping at the effective length |
+| `rev` | previous index, wrapping at 0 |
+| `pip` | next index in the current direction; the boundary step repeats |
+| `onc`, `1fr` | next index; none after the last step |
+| `rnd` | none (always jumps, D7) |
+
+`*repeatInc` is 1 when the advance to B increments the repeat count (wrap or
+pip turn), so B's repeat conditions are evaluated with the count B will see.
+No B (b = 0) when A has no automation, the track is muted or full-erased,
+there is no B, B has no automation, or **B's condition is not predictably
+passing** (D1): predictable are no condition, the repeat counters
+`1:2`..`4:4` and `1:-` (`seq_conditionRepeatPasses()`, shared with playback),
+and `lst`/`!ls` (A's result is already in `seq_trackLastConditionFired`);
+not predictable are `rNN`, `fil`/`!fl`, `lop`/`!lp` and the mute
+conditions, so B jumps. B's start is the next DDA advance,
+`ceil((interval − remainder) / 256)` ticks away; when B holds a trigger its
+automation is deferred like the trigger (shuffle on odd B plus micro-timing,
+the same arithmetic as §6.4). The looper is ignored on purpose (D8).
+
+**Pairing (foreground drain).** Each Instrument entry the drain writes on an
+`on` track goes through `seq_rampStartIfPaired()`: dtype OK; the context
+still describes this A with a B; B holds the same target
+(`pat_findStepAutomation()`, a single-target lookup that copies nothing); the
+predicted end is in the future → take a slot (or reuse the slot of the same
+track/target) with `from` = A's value just written, `to` = B's value,
+`last = from`. No free slot → jump (DEV `seq_rampNoSlotDrops`). The drain
+follows the live producer count, so TIM3 can queue A's entries and set A's
+stepped flag after the drain's top-of-pass consume; pairing therefore
+consumes the flag itself, inside its PRIMASK section, when it still belongs
+to this A, and ends the track's older ramps before starting the new one.
+
+**Running (`seq_rampService()`).** Every DSP block (0.73 ms) it consumes the
+stepped flags; every third block (`SEQ_RAMP_BLOCK_DIV`, ~2.2 ms, D6) it
+computes `from + (to − from) × elapsed / duration`, rounded to the 7-bit
+descriptor value (D9), and **writes only when the value differs from `last`**
+(D11). After the predicted end it holds `to` and sets `from = to` (so a ramp
+held more than 2,048 ticks cannot wrap negative). Elapsed time is master
+ticks, so a tempo change stretches the ramp; `seq_rampNowQ4()` returns 15/16
+of a tick at most past the stamp, so a stalled external clock holds the ramp
+just before the next tick. A ramp is **cancelled** (value stays) when the
+track's `asm` turns off, live record latches or erases the target, an R12
+menu override is set, or the target is no longer valid in the played Scene.
+
+**Ending.** All of a track's ramps end when that track's next played step
+applies (its stepped flag is consumed): at the top of the trigger restore
+for its own track, at the top of the drain for all tracks, and in the ramp
+service. B's own entries then apply its exact values, and any of them that
+pair with the step after B start the next ramps at once. Ending at B's
+arrival (not at the computed time) keeps a late ramp sample from overwriting
+B's value.
+
+**Position breaks** end ramps ("stepped, no B"): `seq_setTrackPlayedScene()`
+(tracks 5 and 6 together), `seq_selectActivePattern()`,
+`seq_alignActivePatternToScene()`, both realigns, `seq_setRunning()`,
+`seq_setStepIndexToStart()`, the loop wrap (`seq_loopProcessTick()`; no ramp
+across the wrap back to the loop start, D8), `seq_loopResumeTrack()`, and the
+chain `stp` freeze. Inside a loop the track ramps as in normal play; the last
+loop step ramps toward the step after the loop end when that step holds the
+parameter.
+
+**Triggers during a ramp (D3).** `seq_restoreAutomatedParameters()` first
+consumes its own track's flag, then neither restores nor un-marks the
+parameters of its slot held by a running ramp, so a live press, MIDI note,
+flam main or roll renewal mid-step does not dip to the menu value. Ramps of
+the other slot-6 track keep running. Ramp samples go through
+`seq_writeInstrumentAutomation()`, so they are held automation values under
+§6.2a: the Morph sweep and menu apply never overwrite them before the next
+trigger.
+
+**Known limits.** A transport reset in TIM3 during a service pass can let
+that pass write one more sample after `seq_restoreAllAutomation()` (it holds
+until the voice's next trigger). B's apply time assumes B's trigger is
+deferred when B is active; if live record suppresses B's trigger, B's
+entries land at its nominal start and the ramp ends there, a little early.
+The two writers that already bypass the priority rule (internal legacy MIDI,
+supplemental parameters) now hold until the ramp value next changes.
+
+**Cost.** TIM3: one prediction per step of an `on` track. Drain: one
+`pat_findStepAutomation()` per paired entry. Service: at most 64 runtime
+writes per pass (worst case 64 × ~450 passes/s); the 64-ramp CPU worst case
+has not been measured yet (DSP CPU policy: budget the worst case; the
+fallback is a 16-per-pass round-robin). RAM: 640 + 28 + 1 B, plus 1 B per
+Pattern region (`STORAGE_SRAM_MANIFEST.md`).
+
+**Live record and ramps.** Recording on an `on` track writes per-step values
+as usual; latched targets play the menu value and erased targets on the
+recording track are filtered, so neither ramps.
 
 ### 6.3 Step-edit automation pages
 
@@ -634,7 +978,11 @@ stores velocity/note in `seq_trackShuffleVel/Note[7]` and sets
 instead of triggering; `seq_processShuffleDelays()` runs each tick **before**
 the DDA advance, decrements and fires at 0 (hence `− 1`). A pending deferral
 is flushed before a new one is set, and fires even if the track then stops.
-28 B ISR-static.
+28 B ISR-static. Since S081 roll steps take the same deferral, the step's
+automation is queued when the deferral fires (§6.1), and the deferral also
+stores the step index and a roll flag (`seq_trackShuffleStep/Roll[7]`, 14 B).
+Live record never uses shuffle for placement; it applies only at playback
+(§6.7).
 
 **Run mode (S078).** `track_play_mode[track]` (Menu cell `run`, category
 `Track`, long name `RunMode`):
@@ -664,10 +1012,11 @@ through `presetMorph_setTrackParamStepOverride()` (mask + value, 24 B in the
 Morph engine) and write the effective cache directly;
 `seq_restoreAllSceneAutomation()` clears them
 (`presetMorph_clearAllTrackParamStepOverrides()`) and
-`seq_setStepIndexToStart()` recomputes the cache. Like all step automation
-the overlay holds until transport stop or a Pattern restore; clearing the
-automation does not undo the last applied value. The run mode is not
-automatable or morphable.
+`seq_setStepIndexToStart()` recomputes the cache. The overlay holds until
+transport stop, a Pattern restore, or (S081 R12) a menu edit of that track's
+length, scale or shuffle (`presetMorph_clearTrackParamStepOverride()`, then
+the next automation applies again); clearing the automation does not undo
+the last applied value. The run mode is not automatable or morphable.
 
 **Adding a per-track timing parameter** (how-to): add the region byte
 (update the size assert and PAT4 track header byte), init/setter/menu apply
@@ -689,7 +1038,7 @@ effective cache and realign mapping of §6.4 and never touches Pattern data.
 
 | Symbol | Meaning |
 |---|---|
-| `seq_loopActive` (extern) | ISR gate: 1 while the looper is engaged (sustained by a SELECT, a looped VOICE or a BAR); may be 1 with an empty mask. Read by `lop`/`!lp` and the chain conditions `lox`/`lob`/`!lx`/`!lb` |
+| `seq_loopActive` (extern) | ISR gate: 1 while the looper is engaged (sustained by any held SELECT, VOICE or BAR since S081 P3; S080: a looped VOICE); may be 1 with an empty mask. Read by `lop`/`!lp` and the chain conditions `lox`/`lob`/`!lx`/`!lb` |
 | `seq_loopTrackMask` | tracks currently looping |
 | `seq_loopDivision` / `seq_loopModifier` | SELECT index 0..7 (1 bar..1/128); 0 none, 1 dot ×3/2, 2 triplet ×2/3 |
 | `seq_loopAnchor[7]` | per track, the master tick (`seq_elapsedPpqTicks` units) where its loop window starts |
@@ -727,6 +1076,18 @@ the tick at which the fastest track of the gesture last advanced,
 `now − (accumulator >> 8)` (after an advance the residual is < 256, so the
 whole ticks in the accumulator are the ticks since that step). Before the
 first scheduler tick the anchor is 0.
+
+**`qnt trk` (S081 P1 R16, decision L1).** With `seq_quantisation` =
+`QUANT_TRACK` (5), `seq_loopEventAnchor()` is not used: inside the per-track
+loop of `seq_loopSnapshotTracks()` each looped track gets its **own** anchor,
+its own last step start (`now − (accumulator >> 8)`), and its own `back`
+offset. Every track then catches its current step at the loop start (with
+`off`, a slower track can be anchored mid-step and its current hit is not
+caught). Anchors only choose which window each track replays: all tracks
+share the period L, so steps that sounded together still sound together.
+Existing edge, unchanged: a track whose step is longer than the loop is
+anchored more than one loop length back and replays that step's start every
+loop.
 
 **Snapshot** (`seq_loopSnapshotTracks(mask)`): each track's live state
 (post-advance at `now`) rewound by `now − anchor + 1` ticks = pre-advance at
@@ -855,7 +1216,17 @@ master boundary and before deferred triggers, on every tick after tick 0:
    `((elapsed << 8) % cycle) < 256` (the first tick at or after each cycle
    multiple, exact for fractional scales).
 2. Counters advance on their boundary.
-3. Evaluation is skipped while a direct, queued or chain change is pending.
+3. Evaluation is skipped while a direct, queued or chain change is pending,
+   and (S082 P3 D50/D52) while a background Bank load runs
+   (`preset_backgroundBankLoadRunning()`, a one-byte ISR-safe read): the
+   counters keep advancing, but no condition is evaluated, because a chain
+   target (`sNN`, `nxt`, `prv`, random ranges) could resolve differently
+   depending on which Bank children have loaded. Evaluation resumes at the
+   next bar/repetition boundary after the load with the counts as they stand,
+   so a condition already met can fire at the first boundary. Manual
+   (direct/queued) changes are not suspended; they are limited to available
+   Scenes (`bank_sceneAvailable()`). Scene 17 itself has no chain: its chain
+   fields are cleared at the copy and `seq_chainResolveNext()` refuses cur ≥ 16.
 4. `seq_chainEvaluate()`: weight per condition (`seq_chainConditionWeight()`:
    0 nul; 1 xal / 2 bal = 100 at their boundary; 3..13 / 14..24 = 100 when the
    repetition / bar count equals 1..8, 16, 32, 64; 25..33 / 34..42 = 10..90 at
@@ -887,6 +1258,318 @@ table in MenuText.h (index = stored value, numeric order), the weight or
 resolve switch in sequencer.c, the sceneset parser maximum and the menu clamp.
 Conditions must be ISR-safe single-byte reads.
 
+### 6.7 Live record and live erase (S081)
+
+Live record writes what the user plays and turns while the transport runs
+onto one **recording track** (`rtk`) of one **target Scene**. Live erase
+removes stored content as the playheads pass. Both live in
+`Core/Sequencer/LiveRecord.c/.h` (prefix `liveRec_`); the Sequencer provides
+timing services, the Pattern Stack Service performs the writes. Decision
+history: `081_SESSION_HANDOFF_LOG.md` §2–§8.
+
+**Dependency direction.** buttonHandler, Menu and MidiParser call
+LiveRecord; LiveRecord calls the Sequencer, PatternStackService,
+EffectsManager and SceneData getters. The Sequencer never calls LiveRecord:
+the drain reads bitmaps LiveRecord registers (`seq_setAutomationFilter()`).
+LiveRecord never calls buttonHandler or MidiParser. The one deviation is
+`menu_automationTargetRecorded()` (the automation underline), for which
+LiveRecord includes `menu.h`. Gesture timing (REC hold, SHIFT/CLEAR chord)
+stays in buttonHandler; LiveRecord receives decided events.
+`liveRec_service()` runs in the 500 Hz foreground pass immediately before
+`patSvc_tick()` (`timebase.c`), so an idle-direct write executes in the same
+pass; `liveRec_init(menu_getActiveVoice())` runs at boot after
+`copyClear_init()`.
+
+#### 6.7.1 Modes and gestures
+
+| Mode | Gesture | Meaning |
+|---|---|---|
+| OFF | — | idle |
+| LATCH | REC tap (toggles **on release**, before `DOUBLE_CLICK_TIMEOUT` = 300 ms) | the first adjustment of a parameter latches it for the take; latched parameters own their automation on `rtk` (§6.7.5) |
+| OVERDUB | REC held past 300 ms (`buttonHandler_tick()`); release restores the prior LATCH/OFF state | only adjusted parameters are written; nothing latches or clears |
+| ERASE | SHIFT+CLEAR (either order) while LATCH or OVERDUB; ends when **both** are released | live erase (§6.7.7); ends overdub; REC does nothing while erase is on |
+
+- Arming while stopped is allowed; recording (or erasing) starts with
+  playback. `liveRec_armed()` = mode ≠ OFF; `liveRec_patternWriting()` =
+  armed and running.
+- Every overdub entry and exit, REC off, a track or `rtk` change and any
+  Scene change start a **new take** (latches and dirty bits cleared).
+- REC LED: on in LATCH; **blinks** (`led_pulseLed()`) on overdub entry and
+  exit; **flashes** while the SHIFT+REC menu is open and armed. (User words:
+  *blink* = one transient pulse, *flash* = continuous; the code names are the
+  reverse.)
+- Fill (PERF hold) may be held together with REC: written steps get `fil`.
+- The looper does not lock record out (S081 P3): REC, OVERDUB and erase work
+  while looping (§6.5).
+
+#### 6.7.2 Recording track, target Scene and ownership
+
+- **`rtk`** (`PAR_AUTOM_TRACK`, runtime only, RECORDING_PAGE sub-page 2 cell
+  0, `rtk`/`RecTrk`, shown 1..7) follows every active-track change
+  (`menu_setActiveVoice()` → `liveRec_onActiveTrackChanged()`, only when the
+  track changes). SHIFT+REC can override it until the next track selection.
+- **Target T** = P(rtk), the played Scene of `rtk` (`seq_getTrackPlayedScene()`);
+  A = the active Scene. While writing and T ≠ A, LiveRecord holds a Pattern
+  Stack Service target override (`patSvc_requestTarget(T)`, §12.12); while
+  the target is not open (handover), every write is dropped and counted.
+- **Ownership** (`liveRec_targetOwned()`): a trigger on track t records only
+  if P(t) == T and the slot type in T matches A; an Instrument parameter of
+  slot s only if the track playing s plays T (slot 6: `rtk` when `rtk` is
+  track 6 or 7) and the types match; an Effect or Scene parameter only if
+  T == A; erase on track t only if P(t) == T.
+- **Values come from A**, the Scene the pages display and edit, never from T
+  (under per-track playback the edit writes A's image and the active-Scene
+  runtime write puts A's value on the sounding slot).
+- **Q13 refusal:** while writing into T ≠ A
+  (`liveRec_activePatternLocked()`), edits that write the viewed Pattern
+  (step specials, track timing/run mode/loopable, the step-automation
+  editor, held-step overlays, STEP toggles) are refused silently before the
+  display changes.
+- **Two epochs.** `seq_getSceneEpoch()` changes only when a track's Pattern
+  changes (direct/queued/chain change, per-track reassignment, load
+  alignment): a new take. `seq_getPlaybackEpoch()` changes at every playhead
+  discontinuity (those plus transport start/stop, PC reset, realign): only
+  per-step capture state ends (previous ring step, open roll, pending flam
+  grace); latches and held erase gestures survive, so arming or erasing
+  while stopped carries into playback.
+- A filesystem Pattern replacement (`patSvc_replacePending()`) releases the
+  target and suspends writing.
+
+#### 6.7.3 Step boundaries: the ring
+
+TIM3 tells LiveRecord where each recorded track's steps begin through a
+16-entry `u16` ring, `seq_recRing[16]`:
+
+```
+bits 0..6  step     bits 7..9  track
+bit 10     fired    (the step holds a trigger and its condition passed,
+                     known at its start; a muted rtk evaluates the condition
+                     without side effects and also needs bit 15)
+bit 11     jump     (S081 P3: pushed by a looper wrap mid-step or a resume,
+                     not by a step advance; the step is a partial replay)
+```
+
+- **One producer function**, `seq_recRingPush()`: TIM3 for a step advance
+  and a mid-step wrap; the foreground only inside the looper's PRIMASK
+  sections (resume). It pushes only while writing and only for `rtk` or a
+  live-held track. A full ring drops the entry (DEV: `seq_recRingDrops`,
+  trace `W` cause 5).
+- **One consumer**, `liveRec_drainRing()` via `seq_takeRecBoundary()`. An
+  entry marks the **start** of a step; the track's next entry ends the
+  previous step, and the step-end work runs with the flags stored when that
+  step began (`liveRec_prevFlags[7]`: VALID, FIRED, JUMP). Before S081 P3
+  the drain used the new entry's fired bit, so LATCH treated step N by
+  whether N+1 fired.
+- The 500 Hz drain can lag the playhead by up to 2 ms. Where a decision
+  needs a current view (a roll start, a roll end, the first-change write),
+  LiveRecord first calls `liveRec_syncRing()` (position-epoch check + drain).
+
+#### 6.7.4 Trigger recording
+
+Sources: the BAR VOICE-trigger overlay in PERF (`buttonHandler_overlayReport()`
+→ `liveRec_triggerIn()`; the grace and single hits from
+`buttonHandler_overlayTrigger()`, the flam main and roll hits from
+`buttonHandler_overlayTick()`, releases and rate switches through
+`liveRec_rollRelease()` / `liveRec_rollRateChange()`), and MIDI notes
+(`midiParser_noteOn()`, kind SINGLE). Each hit is reported **when it
+sounds**. Gates: LATCH or OVERDUB, running, ownership.
+
+**Placement** (`seq_captureTrackTime()` + `seq_placeFromSnapshot()`):
+
+1. Capture, in one PRIMASK section, the elapsed tick, the PPQ µs stamp and
+   period, the capture's own µs time, and the track's **live** cursor,
+   accumulator, effective interval/length/shuffle, play mode/state, played
+   Scene and loop state. The sub-tick fraction is `(nowUs − stampUs) /
+   periodUs`.
+2. The shift from the capture: un-quantised = the sub-tick fraction;
+   `qnt` 1/8..1/64 = `seq_quantiseTick()` (nearest 48/24/12/6-tick master
+   grid boundary, half test with the fraction) minus the capture; `qnt trk`
+   (`QUANT_TRACK`, 5) = snap to the nearest step start of the track's own
+   grid (step 4).
+3. Shift the live cursor with `seq_shiftPositionQ8()` (signed Q8, current
+   effective scale and length, run-mode walk). `rnd` never shifts forward. A
+   looped track whose shift crosses a wrap is mapped onto the replayed pass
+   instead (`seq_placeLoopImage()`, §6.5).
+4. `trk`: round to the nearer step start (`snapQ8` records the shift).
+5. `delay = round(off × 100 / interval)` from the step's **nominal** start; a
+   delay that rounds to 100 goes to the run mode's next step at 0. Shuffle is
+   never used: playback adds the step's shuffle as for any step.
+6. `rel` (behind / current / ahead) and `ahead` (ticks to the landed step
+   start) for the echo rule.
+
+Placement follows the track that is actually playing; mapping a tick through
+the canonical master-clock position (the first P1 version) is wrong as soon
+as scale or length changed during playback.
+
+**Commit** (`pat_recordStep()` through `patSvc_recordStep()`): bit 15 on;
+note (`def` → no note special); velocity (100 stored as absent); timing =
+delay; roll/fill (fill 100 stored as absent) or cleared; rhythm cleared;
+condition kept, or `fil` (21) while fill is active; automation kept. A step
+landed **ahead** of the playhead in this pass gets an echo mark
+(`seq_suppressStepOnce(track, step, ahead)`: TIM3 skips that stored trigger
+once — automation still plays — and the mark expires at capture + ahead +
+one interval + 1 ticks, so it can never silence a later hit). A write onto
+the **current** step mutes that step's pending deferral
+(`seq_cancelPendingTrigger(track, step)`: its automation still queues, no
+second hit). Steps behind get nothing. Last write wins in a pass; a grace
+never replaces its own main.
+
+**Flams** (grace velocity 64, main 100, 12 ticks apart): the grace is placed
+from the main's capture. Quantised: main on the snap, grace 1/32 before the
+snapped main; both written if they land on different steps, otherwise the
+main only. Un-quantised: each at its own time; if both land in one step,
+the main.
+
+**Rolls** (overlay `r/8 r16 r32 r64 r6t 128` = step indices 1 3 5 7 8 9):
+
+- A roll whose interval is at least the track's step interval is recorded
+  **hit by hit** as single steps.
+- A faster roll: the start step is placed like a hit and written with the
+  roll; the rolled track is **live-held** (`seq_setLiveHold()`: its stored
+  triggers are skipped while held; automation plays); each later ring entry
+  writes the previous step as a span (trigger + rate + fill 100 + `fil`),
+  never the start step and never a step before a forward-quantised start.
+- Release: before the second hit → the start step becomes a plain trigger
+  at its start delay; on the start step → fill = release − start; on a later
+  step → that step at timing 0, fill = the release offset. Then the live
+  hold ends.
+- Rate switches while held: to slow ends the recorded roll (later hits are
+  singles); to fast (from slow or single) starts a recorded roll at the next
+  hit; fast → fast takes the new rate from the step containing the switch.
+  Toggling the overlay off ends the roll at that step.
+- A Scene change, stop, REC off or `rtk` change ends an open roll without an
+  end write.
+
+#### 6.7.5 Automation recording
+
+**Recordable:** VOICE-page Instrument cells, `Nvm`, `Nou`, `Nfx`, `7dc`;
+Effect AUTOMATABLE rows and the Effect page's Morph cell (the FX Morph,
+labelled `mrp` there); SEQ `scl`, `shf` (only while the viewed Pattern is A);
+PERF Morph cells `1VM`..`6VM` and `fxm`. Resolution uses the pot-clear
+resolver `menu_cellClearTarget()`; the hook `menu_liveRecRecordCell()` runs
+after the pot and encoder commits, also on a detent clamped at min or max.
+**Not recordable:** the master morph `mrp` (`PAR_MORPH`, no target; never
+recorded or automatable, and the voice/FX Morph values a global change writes
+are never recorded through it), RECORDING/global/MIDI/Load/Save pages, step
+editors and held-step overlays, FX lane locks, LFO/velocity targets, `typ`,
+Morph-view edits, `len`, non-automatable targets. MIDI CC calls
+`liveRec_paramIn(0xFFFF)` (stub until the MIDI rework).
+
+**State:** three 512-bit bitmaps over the 9-bit target ID space, indexed
+directly: `latch` (owns its automation this take), `dirty` (adjusted since
+its last write; with the first-change rule, "this step has its value"),
+`erase` (being erased from `rtk`). Plus `liveRec_morphValue[7]`: the value of
+the last individual edit of each voice Morph and the FX Morph, which every
+dirty Morph write uses, so a global Morph change cannot leak into a pending
+write.
+
+**Own vs foreign:** an own Instrument parameter belongs to the slot `rtk`
+plays; everything else is foreign. A **fired step** is a step of `rtk` whose
+first trigger fired this pass (incl. every step a multi-step roll spans, an
+echo-suppressed recorded step, and, on a muted `rtk`, a step that would have
+fired).
+
+**Which value, when (`LIVEREC_AUTOMATION_FIRST_CHANGE`, `config.h`).**
+
+- **1 (default):** the **first change** of a target in a step is written at
+  once into the live step of `rtk` (after `liveRec_syncRing()`), as the menu
+  value just after the commit; later changes in that step are not written.
+  With no step known (stopped, replacement pending, or no ring entry since a
+  break) the change waits as a dirty bit and is written into the next step
+  that starts. Reason: a step's automation plays at its start, so the start
+  of the step's motion belongs there; the step-end rule played every move
+  back up to one step early.
+- **0:** the S081 P1 rule: the value the parameter holds at the step's end
+  is written into that step.
+
+**LATCH step-end table** (end of step N of `rtk`, every latched target):
+
+| End of step N | Own Instrument parameter | Foreign |
+|---|---|---|
+| dirty | written (switch 0) / bit cleared (switch 1) | same |
+| not dirty, N fired | write the menu value (re-stamp) | clear an existing entry |
+| not dirty, N not fired, entry exists | clear | clear |
+| not dirty, N begun by a looper jump | nothing | nothing |
+
+While a parameter is latched its menu value always sounds (the drain skips
+every track's automation of it). **OVERDUB:** dirty targets are written
+(first change or step end); nothing latches, clears or re-stamps; playback
+automation plays and R12 applies to the adjusted parameter.
+
+**Only real changes are written (L3):** one `pat_readStepAutomations()` read
+per ended step answers all targets; a write is queued only when the entry is
+missing or different, a clear only when an entry exists. Writes go through
+`patSvc_writeStepAutomation()`, clears through
+`patSvc_removeStepAutomation()`; a written step gets `fil` while fill is
+active. Each accepted write calls `menu_automationTargetRecorded()` so the
+automation underline appears at once. The menu value is never reverted when
+recording ends; R12 then applies as after any menu edit.
+
+#### 6.7.6 Linked Scenes
+
+Menu edits fan out at commit as outside record. Pattern data (recorded
+triggers, automation writes and clears, Pattern erase) never fans out. The
+FX-sequence part of live erase fans out (§6.7.7).
+
+#### 6.7.7 Live erase
+
+| Gesture | Duration | As the playhead passes |
+|---|---|---|
+| Knob over an automatable target (selection; works in the Morph view and on PERF Morph cells) | until erase ends | the target joins `erase`; the drain skips it on `rtk`; each passed step of `rtk` loses its entry. In FX mode (and `fxm` in PERF) it also erases that FX lane's locks |
+| SEQ hold, VOICE/STEP mode | while held | the active track's triggers and specials are removed and not played; the condition is kept on steps with automation; automation still plays (TIM3 clears bit 15, `patSvc_enqueueEraseSpecials()`) |
+| SEQ hold, FX mode | while held (counted per button) | every lock of each FX step the FX playhead reaches is removed before it applies |
+| TRACK hold (VOICE, STEP, PERF when not looping, FX) | while held | that track: trigger, specials, condition and automation removed, not played (TIM3 clears bit 15, `patSvc_enqueueErase()`, skips the step's automation) |
+
+- SEQ in PERF (Scenes), Load/Save, global settings and SOM_GEN: presses are
+  consumed and nothing is erased. All erase presses are consumed (no step
+  toggle, voice select, mute, overlay trigger, Scene change); each release
+  ends exactly the gesture its press started.
+- While erase is enabled: PLAY is a plain transport toggle (never the chain
+  chord) and SEQ never opens the chain menu. A MODE change keeps erase but
+  drops held SEQ/TRACK gestures (`liveRec_eraseReleaseHeld()`); the knob
+  targets stay until erase ends.
+- Erase masks are pushed through the ownership gate on every pass
+  (`seq_setEraseMasks()` for tracks playing T; FX lanes only when T == A).
+- **FX-sequence erase:** LiveRecord publishes a 16-bit lane mask
+  (`effects_setLiveEraseLanes()`: knob lanes OR all lanes while an FX SEQ
+  hold is down). At each FX step start EffectsManager excludes those lanes'
+  locks from resolution (they never sound) and records them per step
+  (`effects_erasedLanes[16]`); `liveRec_service()` drains one step at a time
+  (`effects_takeErasedLocks()`) into `effects_clearSeqLanes(origin, step,
+  lanes)`, which clears the retained locks in the origin Scene and every
+  linked same-type Scene. The flush also runs when erase or recording ends.
+
+#### 6.7.8 Service pass (`liveRec_service()`)
+
+1. Scene epoch changed → new take.
+2. Playback epoch changed → end per-step capture state.
+3. Replacement pending → release the target, writing off, filters off.
+4. Target and publication: T, the override, `seq_setRecordTarget(rtk,
+   writing)`, `seq_setAutomationFilter()` while armed, erase masks.
+5. Ring drain: span writes, the step-end tables, pending first-change
+   writes.
+6. FX-erase drain.
+
+#### 6.7.9 Invariants and risks
+
+- LiveRecord never runs in TIM3, never writes a Scene other than T (Pattern)
+  or the origin Scene's fan-out set (FX sequence).
+- TIM3 never touches pool bytes for live record or erase; it uses the
+  service's TIM3-safe enqueues. Every TIM3-shared live-record field is a byte
+  or a PRIMASK-published pair, and `volatile`.
+- Recording is best effort; playback always has priority. Drops are
+  counted in DEV builds (`liveRec_drops[]`, trace `W`, §12.16). Many latched
+  parameters on a fast `rtk` can exceed the busy drain (one event per 2 ms,
+  64-entry queue); a composite per-step op is the fallback if measured.
+- The side-effect-free condition path (`seq_conditionPassesPure()`) must
+  stay in step with `seq_evaluateStepCondition()` when conditions are added.
+- Every Scene-change entry point must reach the FX-erase flush, or linked
+  Scenes diverge.
+- Known open items: the first ring entry after arming REC while running ends
+  a stale step from an earlier take (harmless with first-change 1); a
+  Pattern Load during recording loses a change made while the replacement
+  is pending.
+
 ## 7. PAT4 wire format
 
 All current Scene/Bank/root Pattern Save operations write PAT4. Legacy text
@@ -898,7 +1581,7 @@ One PAT4 file is exactly 10,656 bytes:
 | --- | ---: | ---: | --- |
 | Fixed header | 0 | 32 | magic/version/stack/generation/CRC/reserved |
 | Pattern parameters | 32 | 16 | change-bar, next, 14 reserved |
-| Track parameters | 48 | 112 | 7 × (length, scale CC, shuffle, run mode, loop exclude, 11 reserved) |
+| Track parameters | 48 | 112 | 7 × (length, scale CC, shuffle, run mode, loop exclude, `asm`, 10 reserved) |
 | Address array | 160 | 1,792 | 7 × 128 little-endian encoded entries |
 | Bitmap | 1,952 | 512 | exact bit-packed allocator state |
 | Pool | 2,464 | 8,192 | dynamic blocks/padding |
@@ -927,10 +1610,17 @@ Track header bytes per track (16 each, base = 48 + 16 × track): 0 length,
 not migrated on device), 2 shuffle, 3 run mode (S078; pre-S078 files carry
 0 = `fwd`), 4 looper exclusion (S080: 1 = track not loopable; written
 0/1 from bit N of `track_loop_exclude`, read back nonzero → bit set; older
-files carry 0 = loopable), 5..15 reserved zero. The writer
+files carry 0 = loopable), 5 automation ramps `asm` (S081 P2: 1 = `on`,
+written 0/1 from bit N of `track_auto_smooth`, read back nonzero → bit set;
+older files carry 0 = `off`), 6..15 reserved zero. The writer
 (`filesystem_patternBuildHeader()`) and all three readers (Scene load, root
-Pattern Load, AutoSave Pattern boot read) handle byte 4. The file size, CRC
-rules and version (2) are unchanged.
+Pattern Load, AutoSave Pattern boot read) handle bytes 4 and 5. The file
+size, CRC rules and version (2) are unchanged: byte 5 was reserved and zero
+in every card file, the same precedent as byte 4 (S081 decision F1).
+`tools/convert_pattern_autosmooth.py` normalises byte 5 to 0 in every PAT4
+file of a card tree (validates header and CRC32C, rewrites the CRC at
+offset 14, `--dry-run`, skips non-PAT4 `.pat` files such as the legacy text
+`SD_CARD/Bank/*/*/pattern.pat`, nonzero exit on any failure).
 
 Scene directories contain exactly one `<Pattern name>.pat`, not a fixed
 `pattern.pat`. The root library uses `Pattern/NNN <name>.pat`. Pattern Load
@@ -1145,19 +1835,38 @@ Session 069 Pass 2) — the repair section checks budget before proceeding:
 
 ### 12.3 Queue format
 
-64-entry volatile `uint32_t` ring buffer (256 bytes SRAM1). Each entry packs:
+64-entry volatile `uint32_t` SPSC ring (`service_queue[64]`, 256 B SRAM1,
+plus the producer and consumer bytes). Each event packs
+(`patSvc_packEvent()` / `patSvc_eventOperation()` / `patSvc_eventStepId()` /
+`patSvc_eventPayload()`, `PatternStackService.c`):
 
 ```text
-bits 31..29   operation code (3 bits)
-bits 28..25   scene (4 bits)
-bits 24..22   track (3 bits)
-bits 21..15   step (7 bits)
-bits 14..6    target (9 bits) — instrument_param_id_t
-bits 5..0     value (7 bits) — 0..127 instrument_param_value_t
+bits 5..0     operation (6 bits, patSvc_operation_t)
+bits 15..6    track/step identity (10 bits): track * NUM_STEPS + step
+bits 31..16   operation payload (16 bits): target and value for automation
+              writes, the note/volume/condition/... byte for specials, a
+              record-staging slot index for RECORD_STEP (S081)
 ```
 
-Enqueue uses `__disable_irq()`/`__enable_irq()` (PRIMASK) to protect
-head/tail consistency. Dequeue is foreground-only. Queue full is a silent drop.
+The event carries **no Scene**: every queued event applies to the service's
+one mutation Scene (`service_scene`, §12.5), which since S081 follows
+`patSvc_desiredScene()` (§12.12). This section corrects an older description
+(3-bit operation, 4-bit Scene, 3/7/9/7 fields) that never matched the code
+(S081 plan §3.3-7).
+
+Operations: `NONE`, `DELETE_DYNAMIC`, `WRITE_AUTOMATION`,
+`REMOVE_AUTOMATION`, `SET_NOTE`, `SET_VOLUME`, `SET_CONDITION`, `SET_ROLL`,
+`SET_TIMING`, `SET_RHYTHM`, `SET_FILL`, `CLEAR_TRACK_BARRIER`,
+`REMOVE_TRACK_TARGET_BARRIER`, `CLEAR_PATTERN`, and (S081) `RECORD_STEP`,
+`ERASE_SPECIALS`. The 16-bit payload cannot hold a full live-record spec, so
+`RECORD_STEP` carries the index of a slot in the service-owned 4-slot staging
+table (`patSvc_recordStage[4]`, each a `pat_record_spec_t` plus scene, track,
+step and a used flag); `patSvc_recordStep()` copies the spec in (a full table
+rejects), execution frees the slot, and a dropped event releases it.
+
+Enqueue uses PRIMASK to protect head/tail consistency (TIM3 and foreground
+producers). Dequeue is foreground-only. Queue full is a silent drop (counted
+by the caller where it matters).
 
 ### 12.4 Bulk barriers
 
@@ -1258,6 +1967,13 @@ void     patSvc_clearTrack(scene, track);
 void     patSvc_clearPattern(scene);
 void     patSvc_removeTrackAutomationByTarget(scene, track, target9);
 void     patSvc_enqueueErase(scene, track, step);
+/* S081 live record (§6.7) */
+uint8_t  patSvc_recordStep(scene, track, step, const pat_record_spec_t *spec);
+void     patSvc_enqueueEraseSpecials(scene, track, step);   /* TIM3-safe */
+uint8_t  patSvc_requestTarget(scene);    /* 0 = refused */
+void     patSvc_releaseTarget(void);
+uint8_t  patSvc_targetOpen(scene);
+uint8_t  patSvc_replacePending(void);
 uint8_t  patSvc_isChunkReserved(chunk);
 void     patSvc_consumeReservation(chunk);
 /* S075 copy/clear holder (§12.17) */
@@ -1267,6 +1983,45 @@ uint8_t  patSvc_exclusiveCompactStep(scene);
 uint8_t  patSvc_exclusiveEvacuateSwapStep(scene);
 ```
 
+**Live-record operations (S081).**
+
+- `patSvc_recordStep()` stages the spec and submits `RECORD_STEP` (direct
+  when idle). Execution calls `pat_recordStep(scene, track, step, spec)`
+  (PatternData): it reads the existing specials and automation, applies
+  note/velocity/timing/roll/fill, clears rhythm, keeps the condition or sets
+  `fil`, keeps automation, and publishes with **trigger ON** in the same
+  PRIMASK publish (`pat_writeDynamic()`'s `trigger_policy` KEEP/ON/OFF, the
+  `PAT_RAW_TRIGGER_*` values; every older caller passes KEEP). Velocity 100
+  and fill 100 are stored as absent; with no specials and no automation it
+  only sets bit 15 (`pat_setStepActive()`). Returns success for the
+  service's failure classification.
+- `patSvc_enqueueEraseSpecials()` (modelled on `patSvc_enqueueErase()`; TIM3
+  calls it during a live SEQ-hold erase after clearing bit 15) queues
+  `ERASE_SPECIALS` → `pat_eraseSpecials()`: with automation present it keeps
+  the condition and the automation and drops the other specials; otherwise it
+  releases the block (trigger KEEP).
+- `patSvc_requiredChunks()` sizes record ≤ the current block plus the new
+  specials, erase-specials ≤ the current block.
+
+**Target override (S081).** `service_target_request` (`0xFF` = none) and
+`patSvc_desiredScene()` = the request, else `seq_activePattern`. It replaced
+the eight direct `seq_activePattern` comparisons (submit, the three submit
+variants, both `patSvc_tick()` checks, `patSvc_idle()`,
+`patSvc_finishSceneReplace()`, `patSvc_endExclusive()`), so the service can
+mutate a track's per-track Scene while it is not the active one.
+
+- `patSvc_requestTarget(scene)` returns 0 when refused: an exclusive claim
+  or a filesystem replacement is pending, the Scene is not resident, or the
+  queue is busy. A change of target drains the old work first (handover,
+  §12.5); actions in that window are dropped.
+- `patSvc_targetOpen(scene)` is true when the service is open on that Scene
+  and it is the desired Scene. `patSvc_replacePending()` is true while a
+  filesystem Pattern replacement is prepared or applied (LiveRecord's Load
+  suspend; it must not call Menu).
+- `patSvc_idle()` returns false while an override is held, so Pattern
+  AutoSave never snapshots the overridden Scene mid-take. One target at a
+  time; publish-before-free still holds.
+
 ### 12.13 Integration points
 
 | Location | Call |
@@ -1275,6 +2030,7 @@ uint8_t  patSvc_exclusiveEvacuateSwapStep(scene);
 | `timebase.c` | `patSvc_tick()` after `endlessPots_tick()` |
 | `filesystem.c` | `patSvc_idle()` at 5 replacement boundary points |
 | `timebase.c` | `ccSvc_tick()` (copy/clear service) right after `patSvc_tick()` (S075) |
+| `timebase.c` | `liveRec_service()` immediately **before** `patSvc_tick()` (S081), so a live-record write submitted while idle executes in the same pass |
 
 ### 12.14 Binding constraints
 
@@ -1313,7 +2069,8 @@ accounting.
 
 ### 12.16 PatternTrace stage codes
 
-Eleven stage codes in `PatternTrace.h` for service diagnostics:
+Twelve stage codes in `PatternTrace.h` for service and live-record
+diagnostics:
 
 | Code | Meaning |
 |------|---------|
@@ -1328,6 +2085,7 @@ Eleven stage codes in `PatternTrace.h` for service diagnostics:
 | `V` | Repair created an in-place trailing reservation |
 | `L` | Repair relocated a block to create a reservation |
 | `D` | Direct-path mutation retained for reactive recovery |
+| `W` | Live-record drop (S081, `PAT_TRACE_STAGE_LIVEREC_DROP`, DEV only): cause in flags, `track << 8 | step` in value. Causes: 1 handover (target not open), 2 ownership, 3/4 refused write (the code uses 4 for every refused record or automation write), 5 boundary ring full (pushed from `seq_recRingPush()`, also counted in `seq_recRingDrops`). `liveRec_drops[7]` counts causes. `tools/decode_devlogs.py` does not decode `W` yet |
 
 These are PatternTrace codes in `PatternTrace.h`, distinct from the
 AutoSaveTrace codes in `AutosaveTrace.h` that use the same single-letter

@@ -1,8 +1,9 @@
 # Helicase SD Card Filesystem Specification
 
 This is the authoritative product-level filesystem and instrument-file
-reference through Session 080 (Session 069 for every phase before Phase 5;
-the Session 072, 073, 074, 075, 078 and 080 additions are noted below). It includes the Session 058 Bank
+reference through Session 082 (Session 069 for every phase before Phase 5;
+the Session 072, 073, 074, 075, 078, 080, 081 and 082 additions are noted
+below). It includes the Session 058 Bank
 I/O and stopped-playback speedups, the Session 059 typed Instrument-index
 repair, and Session 060's `.hcnames` atomic safe-write/refreshed flag, the boot
 Instrument `.hcindex` generation fix, and system-wide macOS AppleDouble
@@ -84,6 +85,27 @@ performance surface"):
 - PAT4 track header **byte 4 carries the looper exclusion** (1 = track not
   loopable; older files carry 0 = loopable). Version, size, layout and CRC are
   unchanged; no card conversion is needed.
+
+Session 081 (live record, automation ramps; `081_SESSION_HANDOFF_LOG.md`;
+`PATTERN_DYNAMIC_STACK.md` §6.2b, §6.7, §7):
+
+- PAT4 track header **byte 5 carries the automation-ramp flag `asm`** (1 =
+  ramp, written 0/1 per track from `track_auto_smooth`, any nonzero byte
+  reads as `on`; older files carry 0 = `off`). Version stays 2; size, layout
+  and CRC unchanged. `tools/convert_pattern_autosmooth.py` normalises byte 5
+  to 0 in every PAT4 file of a card tree (header + CRC32C validation, CRC
+  rewritten at offset 14, `--dry-run`, non-PAT4 `.pat` files skipped); the
+  card's 194 PAT4 files were already zero there, and the 229 legacy text
+  `Bank/*/*/pattern.pat` files are not PAT4 and are left alone.
+- `settings.cfg` `quantisation` may now be **5 = `trk`** (track-grid
+  quantise, `QUANT_TRACK`); the parser does not clamp it, the Sequencer
+  clamps 0..5.
+- Stored step roll indices changed meaning (96-PPQ table: 1..9 =
+  `1/8 8tr 16 16t 32 32t 64 64t 128`, the old `48` entry dropped); bytes are
+  not migrated.
+- The recording track `rtk` is runtime only; nothing new is saved for live
+  record. Pattern AutoSave is gated only while live record is writing
+  (armed and running), not merely armed.
 
 - AsyncFATFS stores a cluster-rounded size while a file is open for writing,
   so an interrupted write leaves an overlong file;
@@ -499,9 +521,22 @@ supplies the namespace for a numeric slot. The 161-by-`uint16_t`
 filesystem-owned source register follows Instrument -> Kit -> Scene -> Bank
 until it finds a direct
 source or reaches ordinary boot fallback. S082 adds two Scene-row-only source
-tokens: bNNN (this row's child NN of root Bank NNN) and x (intentionally
-empty). The boot reader treats x as an empty Scene with no notice and resolves
-bNNN through Bank/NNN/<row index>. A legacy name-only line remains
+tokens (rows 1..16 only):
+
+| Token | Register value | Meaning |
+|-------|----------------|---------|
+| `bNNN` | `FS_RESIDENT_SOURCE_BANK_CHILD_BASE` (0x1000) + NNN, up to `…_END` 0x13E8 | This Scene's content is child NN (the row's own Scene index) of root Bank NNN, a Bank other than row 0's. Written for Scenes a Merge Load kept and for resident Scenes a Bank Save did not write. |
+| `x` | `FS_RESIDENT_SOURCE_EMPTY` (0x1ffb) | The Scene was intentionally emptied (Replace Load, or non-present at a Replace Save). |
+
+Both values sit in the 13-bit value field, above the direct slots 0..999 and
+below the specials 0x1ffc..0x1fff, so the REFRESHED (0x2000) and DIRTY
+(0x8000) flags are untouched. The resolver treats them as terminal sources.
+The boot reader treats `x` as an empty Scene with no Case-3 notice and enters
+`Bank/NNN <name>/NN <scene>/` for `bNNN` through the boot-resident Bank
+`.hcindex` (unresolvable → Case 3). The HCNAMES-authoritative boot loader
+extends the effective present mask from Scene rows (`b` sets the bit, `x`
+clears it except for the active Scene). AutoSave carries the values as
+ordinary `uint16_t` source fields. A legacy name-only line remains
 readable as unknown; malformed extended records fail the read rather than
 silently inheriting. The name cache remains space-padded and NUL-terminated.
 
@@ -670,7 +705,8 @@ The current writer emits keyed text with:
     active_bank=<0..999>
     autosave=<0|1>
 
-The remaining accepted/written keys are bpm, ext_sync, quantisation,
+The remaining accepted/written keys are bpm, ext_sync, quantisation (0..5;
+5 = `trk` since S081),
 midi_chan_global, midi_filt_tx, midi_filt_rx, midi_routing,
 screensaver_on_off, bar_reset_mode, prescaler_clock_in,
 prescaler_clock_out1, prescaler_clock_out2, follow, and osc_wave_interp, and
@@ -901,47 +937,205 @@ scene_mask_voice_edit=0x0001
 the file. The Bank name is never stored in `bankset.bcg`; it comes only from
 the `Bank/NNN <bank name>/` directory.
 
-Current behavior (S082):
+### Current Bank behavior (Session 082)
 
-Bank Load takes explicit act/empty masks. Replace (the default) acts on all
-16 Scenes: a selected Scene with a child is loaded exactly as it is, and every
-other Scene is emptied (settings, Effect and Kit defaults, Pattern reset,
-present bit off except for the active Scene). Merge acts only on selected
-Scenes with pattern content and leaves every other Scene unchanged. A child
-that vanished after the preview is emptied by Replace and kept by Merge. The
-runtime path never applies the manifest active_scene and never realigns the
-active or viewed Scene; only the boot load (BOOT flag) does.
+This is the authoritative description of Bank Load and Bank Save since S082
+(`082_SESSION_HANDOFF_LOG.md` §2–§6 holds the decision history). Terms:
+- **present**: `bank_scenePresent()`, a resident Scene with state;
+- **content**: present and at least one active trigger step (`pat_sceneHasActiveSteps()`, the PERF lit rule);
+- **available**: present and not pending in a running background load (`bank_sceneAvailable()`).
 
-Bank Save takes act/empty masks too. A selected present resident Scene is
-written exactly as it is; an empty-mask child is deleted from the slot; Scenes
-in neither mask are untouched. A Save never changes the resident present mask.
-A Merge Save reads the slot's existing bankset.bcg so untouched children drop
-every written Scene from their voice-edit entry. A Replace Save writes a
-present Scene with only default content as a full default child, and the
-active Scene always stays present (S17).
+#### Outcome per Scene and the two masks
 
-Bank Load/Save LEDs use pattern content (active trigger steps), not presence.
-The Menu selection is 16 bits with a default of all 16, and the Bank page's
-COPY button toggles Merge (tap) or shows the other side (hold).
+Menu turns the Bank page selection (16 bits, default `0xFFFF`) and the mode
+into two masks at OK: `act_mask` (load/write) and `empty_mask` (Replace only:
+empty/remove).
 
-**Progressive Bank Load (S082 P3).** The background loader passes
-`FS_BANK_FLAG_PROGRESSIVE` (0x10, equal to
-`PRESET_BANK_LOAD_PROGRESSIVE`). On acceptance,
-`bank_beginLoadAvailability(act | empty)` marks the affected resident Scenes
-unavailable in BankData. Phase 17/98 first calls
-`bank_mergeVoiceEditMasksAfterLoad()` with the new Bank's entries, so a child
-that lands is usable and fans out at once; failed children are stripped from
-every entry at the end instead of re-running the merge. Phase 20 calls
-`bank_noteLoadChildDone()` for each successful child: that sets the child's
-present bit immediately, clears its unavailable bit and revalidates layouts
-among the Scenes now available. The final present-mask commit keeps the live
-mask for a progressive load and only clears the emptied Scenes (so a mid-load
-`clear scene` stays cleared); non-progressive loads keep the original outcome
-formula. `filesystem_bankLoadDisplayName()` exposes the name captured at
-request for the frozen Load:[Bank] screen, and `NN.` progress is displayed
-1-based (`cursor + 1`) for Bank Load and Bank Save. See
-`BANK_PRESET_ARCHITECTURE.md` for the availability rule and
-`S082_P3_WORK_WHILE_BG_LOAD.md` for the panel behavior.
+| Mode | Acted on when | Action | Otherwise |
+|------|---------------|--------|-----------|
+| Load Replace (default) | selected ∧ source child present | load the child exactly as it is (with or without triggers) | resident Scene **emptied** |
+| Load Merge (COPY tap) | selected ∧ source child has content | load the child | resident Scene unchanged |
+| Save Replace | selected ∧ resident Scene present | write the child exactly (Kit, partial Kit, Effect, settings) | slot child **removed** |
+| Save Merge | selected ∧ resident Scene has content | write the child | slot child unchanged |
+
+Rules:
+- **Vanished child:** the filesystem intersects `act_mask` with the children it discovers. A child that vanished after the preview is emptied by Replace and kept by Merge.
+- **Empty Replace and empty Merge:** a Replace of an empty Bank, or with nothing selected, is valid and empties all 16 Scenes. A Merge with nothing to act on is refused by Menu.
+- **The active and viewed Scene never change** because of a runtime load or save (S9, S10, D26). Only a boot load (`FS_BANK_FLAG_BOOT`) applies the manifest `active_scene` and realigns playback and the view.
+- **`active_scene` is legacy:** read only at boot without a usable AutoSave record; Bank Save still writes it (the home Scene while Scene 17 is active).
+- **The active Scene is always present (S17):** a stopped Replace that empties it leaves it present with default content.
+- **Re-apply:** Menu re-applies the active Scene (`menu_startSoundApply()`) only when its content was replaced, and never for a progressive (unlocked) load. A Merge that kept Scenes re-marks the whole Bank for AutoSave (`autosave_markResidentBankDirty()`). `bank_revalidateVoiceEditMasks()` runs after every Bank Load.
+
+#### Requests and flags
+
+- `preset_loadBank(slot, act, empty, flags)` →
+  `filesystem_requestLoadBank(slot, act, empty, flags, cb)`;
+  `preset_saveBank(slot, act, empty)` →
+  `filesystem_requestSaveBank(slot, source, name, save_mask, empty_mask, ...)`.
+- `op_bank_flags` (operation scratch, reset by `filesystem_start()`):
+
+| Flag | Value | Meaning |
+|------|------:|---------|
+| `FS_BANK_FLAG_BOOT` | 0x01 | Boot load: apply the manifest `active_scene` and realign. |
+| `FS_BANK_FLAG_REPLACE` | 0x02 | Replace: missing requested children are emptied. Passed explicitly (`PRESET_BANK_LOAD_REPLACE`) because a Replace of all 16 has `empty_mask = 0`. |
+| `FS_BANK_FLAG_AUTOSAVE_YIELD` | 0x04 | Reserved; the yield itself is the persistent `fs_autosave_yield`. |
+| `FS_BANK_FLAG_PREVIEW_CANCEL` | 0x08 | Child preview scan only: cancel request. |
+| `FS_BANK_FLAG_PROGRESSIVE` | 0x10 | Progressive (unlocked) background Bank Load, below. |
+
+The Preset flag values equal the filesystem ones; `_Static_assert`s in
+`filesystem.c` enforce it.
+
+#### Bank Load phases
+
+1. **Request:** validate the slot (`filesystem_librarySlotExists()`) and masks, then start the Bank-name repair hand-off.
+   - Capture `op_bank_display_name` and copy it to `preset_currentName`.
+   - `op_bank_scene_empty_mask = empty & ~act`.
+   - A progressive load starts the availability session (`bank_beginLoadAvailability(act | empty)`) here, synchronously with the acceptance.
+2. **Repair, then the Bank container:** `bankset.bcg` is parsed and finalised into `op_bankset_state`, including the new Bank's per-Scene edit masks, before any child.
+3. **Child discovery** (phases 15/16): one scan of the 00..15 children records presence and the lexical-winning display names (`op_bank_child_scratch.bank_child_display[]`).
+4. **Phase 17:** Replace turns requested-but-missing children into empties; a BOOT-only active-Scene re-pick; route to phase 98 when the empty mask is set, else to the first child (phase 27) or the empty-Bank branch.
+5. **Phase 98 (S082):** wait for `filesystem_patternServiceReady(empty)`, then `filesystem_bankEmptyScenes()`.
+   - Each empty-mask Scene goes through the shared empty-Scene primitive `scene_resetResidentToEmpty()`: settings, Effect and Kit defaults, Pattern region init.
+   - Its HCNAMES rows are staged by `filesystem_stageEmptySceneRows()`: Scene row `x`, Kit/six Instrument/Pattern/Effect rows inherit with blank names, all refreshed.
+   - Then `filesystem_patternServiceFinish(empty)`, and on to the children or the empty-Bank branch. Boot's `filesystem_bootReaderEmptyScene()` reuses the same helpers.
+6. **Children** (phases 27 → Scene loader → 72 → 20), in ascending slot order:
+   - each child runs through the shared Scene loader, which commits settings and Kit (`filesystem_commitSceneStage()`) **before** its Pattern and Effect I/O;
+   - a child is complete only when the loader returns DONE to phase 20;
+   - a failed child is removed from `op_bank_scene_load_mask` and added to `op_bank_scene_failed_mask` (`filesystem_lastBankLoadFailedSceneMask()`; Menu shows the error overlay once);
+   - successful children keep the Bank directory as parent CWD (S058 Option 1B).
+7. **Metadata commit** after the last child (and in the two empty-Bank branches):
+   - capture the old row-0 source;
+   - Bank display name and row 0 = this slot;
+   - kept Scenes whose Scene row inherits become `b<old Bank>` (`filesystem_stageKeptSceneSources()`);
+   - present mask (below), edit masks (below);
+   - `bank_setRestoreBankSlot()`, `settings.cfg` marked (`active_bank`), `bank_setHasResidentBank(1)`;
+   - BOOT-only realign;
+   - then the HCNAMES rewrite (phases 83 → 84 → 97 → 85, streamed from the dedicated mirror).
+8. **Completion:** `on_bank_load_complete()` (Preset):
+   - ends any availability session;
+   - marks every completed child as a whole Scene with Pattern (range marking, `AUTOSAVE.md`);
+   - publishes the card-clean authority for the completed mask;
+   - records the background result;
+   - Menu then applies the rules above.
+
+#### Present mask after a Bank Load
+
+The resident present mask is **assigned**, not OR-ed (changed in S082):
+
+- non-progressive load:
+  `present = (old & ~(load | empty)) | (load & ~failed)`, then the active Scene's bit;
+- progressive load (each loaded child already set its bit when it completed):
+  `present = live & ~empty`, then the active Scene's bit. So a Scene the user cleared mid-load stays cleared.
+
+Failed children keep their previous bit in both forms. The setter marks the
+AutoSave present-mask field when it changes, and the commit marks it
+explicitly when the value is equal (B-stage witness).
+
+#### Voice edit masks after a Bank operation
+
+Scenes in one edit mask must stay equal, so a partial operation makes the masks
+mutually exclusive (`BankData.c`):
+
+- `bank_mergeVoiceEditEntry(entry, keep, n)` = `(entry & keep) | bit(n)`.
+- **After a Load** (`bank_mergeVoiceEditMasksAfterLoad(src, seen, loaded, emptied)`):
+  - a loaded Scene takes its source entry (or self if not seen) restricted to the loaded set;
+  - an emptied Scene becomes self;
+  - a kept Scene drops every loaded or emptied Scene.
+- **Progressive load:** the merge runs **before the first child** (`filesystem_bankLoadMergeEditMasksEarly()` at the phase 17/98 first-child exits), so a child is usable at once.
+  - Each completed child revalidates layouts among the available Scenes (`bank_revalidateVoiceEditMasksIn()`).
+  - The end only removes failed children from every entry (`bank_stripFailedFromVoiceEditMasks()`), so mask edits made during the load survive.
+
+#### Bank Save
+
+- **Request** (`filesystem_requestSaveBank()`):
+  - Save mask: the save mask is filtered against the present mask (empty Scenes never overwrite a slot child). `op_bank_save_written_mask` = the written set W; `op_bank_scene_empty_mask` = `empty & ~W` (the children to remove).
+  - Staged edit-mask entries: a written Scene's is `(ram & W) | self`; a removed child's is self; untouched entries are completed after reading the slot (Merge).
+  - Manifest `active_scene`: the RAM active Scene (the home Scene while Scene 17 is active, D20), or the first written child when the active Scene is removed.
+- **Phases 61–64** (Merge with untouched children and an existing slot directory):
+  - read the slot's old `bankset.bcg` with `storage_banksetParseLineMasked(state, line, protect = W | E)`, which ignores the protected entries and `active_scene`;
+  - each untouched entry becomes `bank_mergeVoiceEditEntry(old_or_self, W | E, n)`;
+  - a missing or malformed manifest counts as "every untouched entry = self".
+- **Per-child loop** (phases 11, 12, 20, 21):
+  - visits written | removed children in slot order;
+  - a removed child runs only the exact-object delete (`filesystem_deleteBankChildSlotDirectoryStart()`) and advances;
+  - a written child is deleted and rewritten in place (S057); untouched children are never scanned, deleted or written;
+  - the S058 clean-Scene skip still applies to written children.
+- **Phase 45** publishes the slot and never changes the resident Bank:
+  - row 0 and `active_bank` = the target slot;
+  - written Scene rows inherit (`-`);
+  - resident Scenes not written keep explicit provenance (`stageKeptSceneSources()`);
+  - non-present removed Scenes get `x`;
+  - each removed child loses its clean bit;
+  - **no change** to the resident present mask, the active Scene or the RAM edit masks.
+- **Index:** after the loop the root Bank directory is rescanned and `/Bank/.hcindex` rewritten before the callback.
+- **Replace Save of an empty Scene:** a present Scene with only default content is written as a full default child (S23).
+
+#### Bank child preview (Load source view, Save slot view)
+
+`filesystem_requestScanBankScenes(slot)` (`FS_INTERNAL_OP_SCAN_BANK_SCENES`,
+op 0x2b) returns two masks for the shown slot:
+- `filesystem_bankChildSceneMask()`: children present;
+- `filesystem_bankChildContentMask()`: children whose PAT4 has a trigger.
+
+How it works:
+1. The child iterator records presence and display names.
+2. Probe phases 11–20 then visit each present child, one per pass:
+   - open the child directory and find its first `.pat`;
+   - seek past `PATTERN_FILE_HEADER_BYTES`;
+   - stream the 1,792-byte address array in 160 B reads through `op_line_buf`;
+   - set the content bit at the first odd byte with `0x80` (address bit 15);
+   - close and go back to the Bank directory.
+
+   Nothing is loaded or validated. `fs_stage_workspace` and `pat_background_region` are not touched.
+3. A zero-byte read at EOF, or with the filesystem not ready, closes the file with no content bit.
+4. The DEV stall observer (site 10, `BkPv`) closes the handles and finishes ERROR.
+
+Cancellation (the Load/Save Slot Scrolling Policy, `MEMORY.md`):
+- `filesystem_cancelScanBankScenes()` sets `FS_BANK_FLAG_PREVIEW_CANCEL` only while a scan runs (`filesystem_scanBankScenesRunning()`).
+- The scan acts on it only at a phase with no callback outstanding: it closes through its own close phases, returns to root and finishes ERROR, so a partial mask is never taken as valid.
+- The Bank folder name is captured at request time (`op_bank_display_name`), because the shared name cache may be cleared while the scan runs.
+- Menu cancels a running preview on every new selection, on the Load/Save exit and on Bank Save OK. The preview never takes `menu_storageBusy`.
+
+DEV trace `b` (`AUTOSAVE_TRACE_STAGE_BANK_PREVIEW`) records `present |
+content << 16`, with the elapsed time in 64 ms units in `flags`.
+
+#### Background Bank Load and Scene 17 (filesystem side)
+
+A Menu or MIDI Bank Load runs through `preset_requestBackgroundBankLoad()`
+(`MODULE_INTERCHANGE_SPEC.md`, "Background Bank load"). For the filesystem:
+
+- **AutoSave gives way.**
+  - Phase 2 of the request sets `filesystem_setAutosaveYield(1)` (`fs_autosave_yield`). Both AutoSave schedulers decline new drains while it is set.
+  - An in-flight drain is **aborted at its next safe phase** through its own error close-down; the record is torn and stale, and the other A/B file keeps the last good record.
+  - The scalar drain aborts only in phases listed by `filesystem_autosaveDrainAbortSafe()` (0, 1, 3, 5, 10, 13, 16, 17, 19, 21, 30, 32, 34, 36, 38, 39, 44, 50, 52, 54, 56, 62, 64, 65, 66, 67). Every open, close, remove or seek wait phase, the error close-down 40–46 and the HCNAMES publication 70–77 run on.
+  - The Pattern drain aborts in phases 3–8 except 7 (a seek may be in progress).
+  - **Never abort a phase whose AsyncFATFS callback is outstanding:** the late callback writes `op_file`/`op_file_ready`/`op_remove_done` into the *next* operation, or a second `fclose()` hangs the close-down.
+- **AutoSave is suspended while Scene 17 exists** (`scene_backgroundExists()` gates both schedulers; D11). `settings.cfg` keeps writing (D24). The yield is released only when the load ends (`preset_bgEnd()`).
+- **Nothing loads into Scene 17:** Bank Load writes `scenes[0..15]` and `pat_regions[0..15]` directly while playback reads Scene 17's own record and `pat_background_region`. Every other load targets the home Scene (`scene_backgroundHomeIndex()`).
+- **Idle-time servicing (S082 P2):** while a background load runs, the codec is live, the facade is BUSY and both audio render slots are full, `main_serviceBackgroundLoadIdle()` calls `filesystem_tickUncounted()` for up to `BG_LOAD_IDLE_FS_BUDGET_US` (200 µs), re-testing the queue before every step.
+  - Those ticks set `fs_stall_poll_uncounted` (DEV) so the poll-count stall observers neither count nor reset.
+  - SD driver timeouts are time-based, so extra polls cannot shorten them.
+  - Without this, one `filesystem_tick()` per main-loop pass moves one 16 B SPI burst, about a second per child while playing.
+
+#### Progressive Bank Load (Session 082 P3)
+
+A background load running on Scene 17, or a direct load with the transport
+running, is posted with `FS_BANK_FLAG_PROGRESSIVE`. The user may then work
+while it loads:
+
+- **On acceptance:** `bank_beginLoadAvailability(act | empty)` marks every affected Scene unavailable.
+- **Before the first child:** the new Bank's edit masks are merged.
+- **Each successful child** (phase 20): `bank_noteLoadChildDone(cursor)` sets its present bit immediately, clears its unavailable bit and revalidates layouts among the available Scenes.
+- **At the end:** the present mask keeps the live mask minus the emptied Scenes; only failed children are stripped from the edit masks; `on_bank_load_complete()` ends the session.
+- **Frozen screen:** `filesystem_bankLoadDisplayName()` returns the name captured at the request, used by the frozen Load:[Bank] screen after the user left Load/Save (which cleared the browser cache).
+- **Non-progressive loads** (boot, stopped) keep the original end-of-load present formula and merge.
+
+#### Progress indicator
+
+`filesystem_bankChildCursor()` returns the zero-based child slot (0..15)
+while a Bank Load or Save runs, else `0xFF`. It is 0 before the first child
+and stays on the last child after the loop. Menu displays it **1-based** as
+`01.`–`16.` in place of `...` (S082 P3 D51, both Load and Save).
 
 Pre-S082 behavior (historical):
 
@@ -995,9 +1189,11 @@ Pre-S082 behavior (historical):
 Both successful Bank Load and Bank Save commits mark the existing one-second
 debounced `settings.cfg` writer immediately after updating the resident
 restore slot. The writer later serializes `active_bank` from that live slot;
-the completion mark performs no synchronous file I/O. Bank Load's resident
-Scene-present mask is the OR of the retained mask and effective selected-child
-mask, and an equal union is explicitly re-marked for AutoSave capture.
+the completion mark performs no synchronous file I/O. Since S082 Bank Load
+**assigns** the resident Scene-present mask (the outcome formula in "Current
+Bank behavior" above); the pre-S082 rule OR-ed the retained mask with the
+loaded children. An unchanged value is still explicitly re-marked for
+AutoSave capture.
 
 **Session 058 clean-Scene skip (Option 2).** A Bank Save skips a selected child
 only when the target Bank slot equals the retained clean slot and the child's
@@ -1130,8 +1326,11 @@ hold the old 14-entry index (0..13) and play near `1/64` until converted with
 `tools/convert_scene_scale.py`. Byte 3 is the run mode (0..5; ≥ 6 plays as
 `fwd`). Byte 4 is the looper exclusion (S080; written 0/1 per track from
 `track_loop_exclude`, any nonzero byte reads as "not loopable"; older files
-hold 0 = loopable). All three Pattern readers (root Pattern Load, Scene Load
-Pattern, AutoSave Pattern boot) and the writer handle bytes 1, 3 and 4.
+hold 0 = loopable). Byte 5 is the automation-ramp flag `asm` (S081; written
+0/1 from `track_auto_smooth`, nonzero reads as `on`; older files hold 0 =
+`off`). Bytes 6..15 are reserved zero. All three Pattern readers (root
+Pattern Load, Scene Load Pattern, AutoSave Pattern boot) and the writer
+handle bytes 1, 3, 4 and 5.
 
 CRC32C is Castagnoli, computed over the entire file while treating the 4 bytes
 at offset 14 as zero. This matches the HCPR AutoSave record CRC contract.
@@ -2139,15 +2338,23 @@ whitelists `menu_loadSaveLoadTypes[]` and `menu_loadSaveSaveTypes[]` in
   state, not filesystem list caches or musical identity.
 - Scene and Bank load/save use explicit OK/OW confirmation. They do not
   live-load on scroll.
-- An accepted OK/OW request changes the confirmation field to `...`, suppresses
-  every cursor/underline, and locks input until all filesystem, DSP, and
+- An accepted OK/OW request changes the confirmation field to `...` (Bank
+  Load/Save: the 1-based child progress `01.`–`16.`), suppresses every
+  cursor/underline, and locks Load/Save input until all filesystem, DSP, and
   operation-specific terminal work completes. Completion always resets to the
-  bracketed top-level type row and restores `ok` or `OW`. Preparatory index and
-  Bank-child preview work may use the storage gate but never displays `...`.
+  bracketed top-level type row and restores `ok` or `OW` (`mr`/`MR` in
+  Merge). Preparatory index work may use the storage gate but never displays
+  `...`. **Exception (S082 P3):** an unlocked background Bank Load frees every
+  page except Load/Save from phase 5; Load/Save then shows only the frozen
+  Bank Load screen (`MODULE_INTERCHANGE_SPEC.md`, "Background Bank load").
 - Load:Bank entry continues a successful `/Bank/.hcindex` load directly into
-  a child preview of the unchanged highlighted Bank. The preview holds the
-  input gate until its physical `00..15` mask is published, preventing an
-  actionable zero-mask OK state.
+  a child preview of the highlighted Bank. Since S082 P1 the preview **never
+  holds the input gate** (Load/Save Slot Scrolling Policy, `MEMORY.md`): the
+  number and name update at once, the SEQ LEDs stay dark until the preview of
+  the shown slot completes, and every new selection cancels a running
+  preview. Bank Load OK stays refused until a valid preview of the shown slot
+  exists, so a zero-mask OK is still impossible; Bank Save OK during a preview
+  cancels it and needs a second press.
 - Kit and KitMrp keep live-on-scroll load behavior.
 - VOICE press on the Load page enters nested Instrument Load.
 - VOICE press on the Save page enters nested Instrument Save/InstrumentMrp Save.
@@ -2207,9 +2414,15 @@ Implemented:
   v4 Pattern child, and writes `<effect name>.fx` v2 (blank uses `none.fx`).
   Scene and embedded Kit names are directory-owned; the Effect name is its
   independent HCNAMES filename stem.
-- Bank Save writes bankset.bcg version 2 and one local `SS <scene name>/`
-  payload for every selected Scene bit, minus any Option 2 clean-Scene skip
-  (Session 058). A zero child-scene mask is valid and creates an empty Bank.
+- Bank Save writes bankset.bcg version 2, one local `SS <scene name>/`
+  payload for every bit of the write mask (minus any Option 2 clean-Scene
+  skip, Session 058), and since S082 **deletes every child in the empty
+  mask** (Replace: deselected or non-present Scenes are "saved empty");
+  children in neither mask are untouched. A Merge Save reads the slot's old
+  manifest first so untouched children drop the written Scenes from their
+  edit masks (phases 61–64), and Save never changes the resident present
+  mask, active Scene or edit masks (see "Current Bank behavior"). A zero
+  write mask is valid.
   **As of Session 057, the root Bank directory itself
   is scanned and reused (opened directly if the same slot/name already
   exists, renamed-then-opened if the name changed, created only if absent)
@@ -2236,21 +2449,45 @@ Implemented:
 
 Session 082 P1 — Scene 17 name capture and Saves from Scene 17:
 
-- **Name capture** (`fs_background_name[10][9]`): at Scene 17 build time,
-  `filesystem_backgroundNameCapture()` fills 10 rows (Scene, Kit, six
-  Instruments, Pattern, Effect) with the identity names for the tracks that
-  entered Scene 17. `filesystem_backgroundNameCaptureInstrument()` fills
-  one Instrument row during `preset_copyBackgroundSlot()`.
-  `filesystem_backgroundNameRead()` returns the captured name for a given
-  category and slot, used by Menu prefill when the active Scene is 16.
-- **Saves from Scene 17** (scene index 16): Kit, Scene, Instrument and
-  Pattern Save set `op_scene_load_scene_mask` to zero (the ternary
-  `(scene < SCENE_COUNT) ? (1u << scene) : 0u`) so no HCNAMES row is
-  published for the 17th Scene. Instead, the captured name is installed as
-  the display name via `filesystem_backgroundNameSet()` before the HCNAMES
-  update begins. After a Save completes, the capture row for that category
-  is updated so the next prefill shows the saved name. KitMrp and
-  InstrumentMrp Saves from 17 do not rename (same as resident Scenes).
+- **Why a capture:** HCNAMES rows 1..16 describe resident Scenes only and
+  are replaced by the very Bank load that created Scene 17, and the runtime
+  identity block (`fs_identity_name`) holds eight rows and is cleared at
+  every Menu session exit. Without the capture, every save from 17 would
+  prefill and write `Empty` names (D29).
+- **Name capture** (`fs_background_name[10][9]`, 90 B, rows
+  `FS_BACKGROUND_NAME_SCENE`, `_KIT`, `_INSTRUMENT_0..5`, `_PATTERN`,
+  `_EFFECT`): the fresh Scene 17 build calls
+  `filesystem_backgroundNamesCaptureScene(active)`, which copies all ten rows
+  of the active Scene from the **in-RAM HCNAMES mirror** (no card read; an
+  invalid mirror gives `Empty`). Each slot copied on the per-track path (and
+  each slot a rebuild copies) calls
+  `filesystem_backgroundNameCaptureInstrument(dst_slot, src_scene, src_slot)`
+  so the name follows the voice's data. The capture is valid while
+  `scene_backgroundExists()`, left stale after the release and overwritten by
+  the next build.
+- **Reads for index 16:** `filesystem_residentInstrumentName()`,
+  `filesystem_residentKitName()`, `filesystem_residentSceneName()`,
+  `filesystem_residentPatternName()` and
+  `filesystem_sceneComponentNameRaw(16, ...)` return the capture, never
+  HCNAMES. Menu name scratch keyed to 16 is dropped after every build/rebuild
+  (`menu_backgroundNamesChanged()`).
+- **Saves from Scene 17** (Scene, Kit, KitMrp, Instrument, InstrumentMrp,
+  Pattern): the HCNAMES publication mask is zero
+  (`(scene < SCENE_COUNT) ? (1u << scene) : 0u`), so no resident row
+  changes; the Scene Save writer names its Pattern child, `.fx` child and
+  member files from the capture. After a successful **normal** save the
+  matching capture row is renamed with `filesystem_backgroundNameSet(row,
+  name)` so the next prefill shows the saved name; KitMrp and InstrumentMrp
+  saves are identity-neutral, as for resident Scenes. Scene Save still runs
+  `filesystem_prepareResidentNamesCache()` before its HCNAMES update on both
+  paths (F9 ordering rule).
+- **Register reset ordering (S082 F9, binding):** every HCNAMES request
+  function calls `filesystem_prepareResidentNamesCache()` (which turns every
+  non-dirty source UNKNOWN while keeping the refreshed witness) **only after
+  `filesystem_start()` accepted the operation**. A refused start that had
+  already reset the register would leave a `?` + R image for the next writer
+  to persist, which boot then treats as Case 3 (the probable route of the
+  S082 F5 Scene 2 invalidation).
 
 Still future:
 
@@ -2300,10 +2537,11 @@ enforced at this save layer, not only by the SEQ LED selection UI.
 never trusted) before the state machine starts and before active-scene
 relocation; empty Scenes are silently excluded rather than causing a refusal.
 Root Scene Save's `case 0` additionally refuses (`FS_STATUS_ERROR`) outright
-if the source Scene itself is not present. Both gates depend on the Bank Save
-present-mask union fixed in Session 057: Bank Save now preserves the current
-resident mask and ORs in the selected saved children, so a partial Save cannot
-make unselected resident Scenes appear absent. The overwrite guards still need
+if the source Scene itself is not present. Both gates depend on Bank Save
+never shrinking the resident present mask: Session 057 made Save OR in the
+saved children, and since S082 Save does not touch the resident present mask
+at all (phase 45), so a partial Save cannot make unselected resident Scenes
+appear absent. The overwrite guards still need
 a dedicated hardware acceptance matrix; that forward work is tracked under
 LS-SAVE-01 in `AUTOSAVE_TEST_CASES_LOAD_SAVE_REVISIONS.md`.
 
@@ -2421,8 +2659,9 @@ instrument runtime propagation:
   parsing uses the independent 2,048-byte stage, and dirty family exit performs
   one preserve/overlay/rewrite.
 - Confirm entering Load:Bank without turning the initially highlighted number
-  chains index completion into its selected-Bank child preview, gates input
-  until the physical mask is resident, and never submits a zero-mask request.
+  chains index completion into its selected-Bank child preview and never
+  submits a zero-mask request; scrolling Bank slots never blocks (number,
+  then name, then LEDs; the next detent cancels the running preview).
 - Confirm explicit root Scene/Bank Load ordering is payload -> HCNAMES ->
   completed Preset result -> shared Scene DSP clear/image/all-source rebind ->
   read-only root-index reload -> terminal facade acknowledgement -> command
@@ -2443,9 +2682,16 @@ instrument runtime propagation:
   restart; the current Save slot display must also refresh.
 - Confirm root Bank boot reloads `/Bank/.hcindex` after Instrument index
   generation and checks BankData's restore slot before fallback.
-- Confirm mask-selective Bank Load changes only the selected/present child
-  payload and its eight HCNAMES rows. A mask with no present child must not load
-  all children or erase unselected resident names.
+- Confirm the S082 Bank outcome table for the four modes × {all, partial,
+  none selected} × {empty, Kit-only, full} children: Replace empties every
+  Scene it does not load (`x` rows), Merge leaves them (kept Scenes get
+  `b<old Bank>`), the active and viewed Scene never change, the emptied active
+  Scene stays present, and reboot (HCNAMES-authoritative and AutoSave paths)
+  reproduces the result. `tools/verify_bank_autosave.py` must pass.
+- Confirm a running Bank Load that replaces a played Scene switches to Scene
+  17 with no audible change (Effect included), loads progressively (PERF fill,
+  loaded Scenes selectable), and finishes without an underrun or a second
+  activation.
 - Confirm the cold-boot selected Scene and a manual Scene return construct the
   same six runtime types/images and install both LFO target pairs plus velocity
   only after all incoming tagged members are valid.

@@ -6,9 +6,22 @@ follow-ups (decision log §11). The background Bank load now has its own
 plan, `S082_P1_LOAD_SAVE.md`; §4 here keeps only what MIDI needs from it.
 No questions remain open (§12).*
 
+*Update 2026-10-21 (Session 082 close): the background Bank load, Scene 17,
+the MIDI deferral, the drop filter and the result byte are built (code
+`b25ffbe`, `8a83df0`). §13 lists what S082 changed for this plan; the inline
+notes marked "S082" below point to it. `S082_P1_LOAD_SAVE.md` is superseded
+by `knowledge_files/log_archive/082_SESSION_HANDOFF_LOG.md`.*
+
+*Update 2026-10-21 (S081 close-out): Session 081 is now logged in
+`knowledge_files/log_archive/081_SESSION_HANDOFF_LOG.md`, which supersedes
+the `S081_*` root documents cited below. §14 lists what S081 changed for
+this plan, and §12 has one open question (Q1, MIDI write priority under
+R12).*
+
 Scope: `SCOPING_TARGETS.md` Phase 6 §6.1 (MIDI and External Control
 Cleanup), deferred item A20 (MIDI mapping), and the MIDI items deferred
-from S081 (`S081_P1_LIVE_RECORD.md` §16).
+from S081 (`S081_P1_LIVE_RECORD.md` §16; now `081_SESSION_HANDOFF_LOG.md`
+§4.13 and §16).
 
 Terms: **track** T1..T7; **voice** (instrument slot) V1..V6. T6 and T7 both
 play V6 (closed/open HiHat). **G** is the global MIDI channel. "Consumed"
@@ -57,7 +70,7 @@ recordable range is clamped (§3.3).
 | P1 | A program change is a Scene change. Only PC 0..15 is data. |
 | P2 | PC on G changes the whole Scene, exactly like a PERF SEQ press (`scd` division, `pcr`), in any state. |
 | P3 | PC on a track's assigned channel changes only that track, like hold VOICE + SEQ. No queue. |
-| P4 | CC0 on G loads Bank 000..127 through the background Bank load (`S082_P1_LOAD_SAVE.md`). The UI goes to Load/Save and stays there afterwards, exactly as if the load had been made from the Menu. PC and CC0 arriving during a load are dropped. |
+| P4 | CC0 on G loads Bank 000..127 through the background Bank load (`S082_P1_LOAD_SAVE.md`). The UI goes to Load/Save and stays there afterwards, exactly as if the load had been made from the Menu. PC and CC0 arriving during a load are dropped. *(S082 P3 amendment: once the load unlocks, the user may leave Load/Save; §13.2 item 1.)* |
 
 ### 1.5 Control
 
@@ -71,7 +84,7 @@ recordable range is clamped (§3.3).
 | C6 | Reserved, never learnable: CC0 (Bank), CC1 (Morph), CC2 (overlay), 6/38/96..101 (NRPN/RPN), 32 (bank LSB), 120..127 (channel mode). |
 | C7 | CC1: global Morph on G (never recorded, G-1). On a voice channel it is that voice's Morph for every voice on the channel (recorded as an individual Morph edit). |
 | C8 | CC2 on G only, in any UI mode: 0 = single trigger, 1 = BAR `<` overlay, 2 = BAR `>` overlay; other values ignored. Overlays use the incoming note's pitch. |
-| C9 | MIDI value writes go to the active Scene and fan out through the VOICE edit mask like knob edits, at the lowest priority (automation, then menu, then MIDI). |
+| C9 | MIDI value writes go to the active Scene and fan out through the VOICE edit mask like knob edits, at the lowest priority (automation, then menu, then MIDI). *S081 R12 lets a menu edit beat Instrument automation until the voice's next trigger; whether MIDI follows is §12 Q1.* |
 
 ---
 
@@ -94,8 +107,8 @@ recordable range is clamped (§3.3).
 | Realtime | Continue = Start. No SPP. Clock out only while internal. | T1. |
 | TX | Always both ports. Note-off cache is one note per channel (`midi_chan_notes[16]`). | Per-track note-off cache. |
 | `settings.cfg` | Streamed one line at a time (`filesystem_nextSettingsLine()`, no file buffer). 1 s debounce, temp + sync + promote. The `lines=N` terminator is checked only by the `settings.tmp` boot recovery; normal load ignores it. | Learn lines fit the existing writer. |
-| Bank Load | Foreground UI command. `pat_background_region` (10,526 B) is shared by the Pattern AutoSave snapshot and the overlap paste pool (Bank Load staging is listed as a future use only). Resident `scenes[16]` at 1,656 B each. | Background load + Scene 17 (`S082_P1_LOAD_SAVE.md`). |
-| Dead code | `midiParser_playVoiceMidiNote()`, `midiParser_triggerVoice()` (no callers), `midi_NoteOverride[7]`, the dead realtime cases in `midiParser_parseMidiMessage()`, ~1,000 lines of `#if 0`. | MEMORY.md "MIDI / Clock Reminders" (BAR1/BAR2 path, default notes 36..42) are stale. |
+| Bank Load | **Built in S082:** `preset_requestBackgroundBankLoad()` (Menu and MIDI origin), Scene 17 (`scene_background` + `pat_background_region`), progressive load with the panel unlocked from phase 5, MIDI deferral and drop filter, result byte (§13). | CC0 RX → the request API (Phase D). |
+| Dead code | `midiParser_playVoiceMidiNote()`, `midiParser_triggerVoice()` (no callers), `preset_applySoundParameter(…recordAutomation)` and the STEP armed-automation remnant (both left by S081 for this rework), `midi_NoteOverride[7]`, the dead realtime cases in `midiParser_parseMidiMessage()`, ~1,000 lines of `#if 0`. | MEMORY.md "MIDI / Clock Reminders" (BAR1/BAR2 path, default notes 36..42) are stale. |
 
 ---
 
@@ -110,7 +123,10 @@ recordable range is clamped (§3.3).
 | `MidiControl.c/h` (new) | NRPN state machine, CC1/CC2, Learn table and Learn capture, the MIDI parameter write path. |
 | `MidiOut.c/h` (new, or kept in Sequencer) | TX filters, per-track note-off cache, parameter TX coalescing, PC/CC0 TX, echo suppression. |
 
-`MidiVoiceControl.c` is unchanged (trigger funnel, S081 §19.15).
+`MidiVoiceControl.c` is unchanged by S083 (trigger funnel, S081 §19.15).
+S081 changed its API: the per-voice pending-reset mask
+`voiceControl_pendingReset`, `voiceControl_noteOnNoReset()`,
+`voiceControl_resetOnly()` and `voiceControl_triggerNow(…, reset)` (§14).
 
 ### 3.2 Message flow
 
@@ -156,7 +172,11 @@ output plays back identically.
 ### 3.4 Triggers, overlays and recording
 
 - A single trigger goes through `voiceControl_noteOn()` then
-  `liveRec_triggerIn()`.
+  `liveRec_triggerIn()`. Each MIDI note-on is a resetting trigger: it
+  restores the voice's held automation and ends an R12 override (S081 step
+  reset rule, F12). Roll repeats must not reset (`noteOnNoReset()`); the BAR
+  overlay executor already passes reset only for the first hit and the flam
+  main (§14).
 - Overlay actions reuse the S080 BAR overlay executor. Rolls repeat until
   note-off, which needs a 7 B held-note record per track.
 - CC2 state is 1 B.
@@ -175,8 +195,14 @@ output plays back identically.
     endpoint, Morph sweep), with the menu's edit-mask fan-out added;
   - Scene and Effect targets: equivalent MIDI entries through SceneData and
     the EffectsManager edit API (which already fans out).
-- **Recording:** `liveRec_paramIn(id, MIDI)` after each store. Global Morph
-  is never recorded (G-1).
+- **Priority (S081):** today a MIDI write stores the Normal endpoint and sets
+  no override, so a parameter that automation holds stays inaudible until
+  the voice's next trigger. A menu edit now calls `seq_menuOverrideSet()`
+  and sounds at once (R12). Which rule MIDI follows is §12 Q1.
+- **Recording:** `liveRec_paramIn(id, MIDI)` after each store. It carries no
+  value: LiveRecord reads the stored value, so the store must come first.
+  Global Morph is never recorded (G-1). Ownership, the first-change rule and
+  the CC1 capture are in §14.
 - **LCD:** `menu_notifyExternalParamChanged()` with a rate limit. This
   closes the S075 open item.
 
@@ -319,10 +345,12 @@ Effect and Scene target tables.
 
 ---
 
-## 4. What MIDI needs from S082 (`S082_P1_LOAD_SAVE.md`)
+## 4. What MIDI needs from S082 (built; see §13)
 
-The background Bank load and Scene 17 are specified and decided in
-`S082_P1_LOAD_SAVE.md` (D1–D16). For MIDI:
+The background Bank load and Scene 17 were decided in S082 (D1–D53) and are
+**built**; the decisions are in `082_SESSION_HANDOFF_LOG.md` §4–§6, the
+mechanism in `MODULE_INTERCHANGE_SPEC.md` "Background Bank load (S082)". For
+MIDI (status per row in §13.1):
 
 | Need | Where |
 |------|-------|
@@ -335,8 +363,9 @@ The background Bank load and Scene 17 are specified and decided in
 | `settings.cfg` (Learn lines) keeps writing while on 17 | S082 Q8 |
 
 Non-S082 prep before S083: answers to §12 (done); RAM approvals (Learn ~519 B,
-held-note 7 B, NRPN state ~48 B, TX caches ~8 B, CC2 1 B); S081 P3/P4
-hardware checks passing (MIDI recording builds on LiveRecord).
+held-note 7 B, NRPN state ~48 B, TX caches ~8 B, CC2 1 B); the S081
+hardware lists passing (`081_SESSION_HANDOFF_LOG.md` §13.2, R21; MIDI
+recording builds on LiveRecord).
 
 ---
 
@@ -355,7 +384,7 @@ hardware checks passing (MIDI recording builds on LiveRecord).
 
 ---
 
-## 6. Resource estimate (MIDI only; Scene 17 is in `S082_P1_LOAD_SAVE.md` §6)
+## 6. Resource estimate (MIDI only; S082's Scene 17 allocations are in `082_SESSION_HANDOFF_LOG.md` §7)
 
 | Item | Bytes | Region | Status |
 |------|------:|--------|--------|
@@ -366,7 +395,7 @@ hardware checks passing (MIDI recording builds on LiveRecord).
 | NRPN TX cache + coalesce, owner `MidiOut` | ~8 | SRAM1, static | **Accepted 2026-10-17** |
 | CC2 state, owner `MidiControl` | 1 | SRAM1, static | **Accepted 2026-10-17** |
 | Retired legacy arrays | −269 | SRAM1 | Release does not authorise reuse |
-| Flash | ~+6..10 KB new, ~−4 KB legacy map removed | Flash (197 KB free) | OK |
+| Flash | ~+6..10 KB new, ~−4 KB legacy map removed | Flash (155,124 B free at S082 close) | OK |
 
 The user acknowledged and accepted these SRAM allocations on 2026-10-17,
 under the MEMORY.md RAM Allocation Approval Policy. Record the measured
@@ -379,19 +408,19 @@ than listed here needs a new acknowledgement.
 
 | Id | Risk | Mitigation |
 |----|------|-----------|
-| R1 | Scene 17 is a 17th Scene in code that assumes 16 everywhere. This is the largest S082 risk, and the MIDI note map, Learn and writes depend on it resolving correctly. | The S082 §5 audit before coding. |
+| R1 | Scene 17 is a 17th Scene in code that assumes 16 everywhere. This is the largest S082 risk, and the MIDI note map, Learn and writes depend on it resolving correctly. | **S082:** the index-16 audit was done (every site has a rule) and a missed class was found and fixed (cached Scene indices, EffectsManager). Not hardware-verified for MIDI paths. New MIDI code that caches a Scene index must follow playback onto 17 (§13.3). |
 | R2 | While Scene 17 exists, AutoSave is off (S082 D11), so edits are not protected against power loss until a Scene change. | Accepted by design. |
 | R3 | A stray CC0 from a DAW replaces all 16 Scenes. Unsaved edits are discarded by design. | Accepted: turn `RXF P` off to block both PC and CC0 (F37). |
 | R4 | The note map is per Scene, so a Scene change can remap a DAW drum track. | Accepted (F12); edit-mask fan-out keeps Scenes equal. |
 | R5 | DIN bandwidth with NRPN TX during knob sweeps. | Coalescing, number cache, throttle. |
 | R6 | Feedback loops with DAW echo (CC/NRPN fights, PC re-sends). | Never echo MIDI-originated changes; document DAW setup. |
 | R7 | NRPN numbers are instrument-agnostic by design (C3): the same NRPN means a different parameter on another type. Learn avoids this through its type tag. | Publish one NRPN chart per instrument and Effect type. |
-| R8 | Foreground latency delays MIDI notes and LiveRecord placement. | Measure in Phase B (F25). |
+| R8 | Foreground latency delays MIDI notes and LiveRecord placement. | Measure in Phase B (F25). S081 Q3 left MIDI note timestamps (processing time today) and queue-skip priority for realtime MIDI to this rework (§14). |
 | R9 | A note-on forwarded, then its note-off consumed after a map change (or the reverse), leaves a hanging note downstream. | Accept. |
 | R10 | Per-track playback: MIDI writes and Learn type matching use the active Scene, while a track may play another Scene. | Accepted (F5). |
 | R11 | The settings writer index and the `lines` count grow (≤152), and a learn line is the longest settings line. | Check the `op_line_buf` size and the writer's index width in Phase F. |
-| R12 | Removing the legacy map may expose hidden internal callers (`preset_applySoundParameter()` → `midiParser_ccHandler()`). | Phase A caller audit first. |
-| R13 | P4 cannot be verified until S082 is hardware-proven. | Phase D after the RX phases. |
+| R12 | Removing the legacy map may expose hidden internal callers (`preset_applySoundParameter()` → `midiParser_ccHandler()`). | Phase A caller audit first. Include `preset_applySoundParameter(…recordAutomation)` and the STEP armed-automation remnant left by S081. |
+| R13 | P4 cannot be verified until S082 is hardware-proven. | Phase D after the RX phases. **S082 status:** audio during a background load confirmed by the user (P2); the P1 matrix and all of P3 are untested, so run those checks before Phase D. |
 
 ---
 
@@ -409,7 +438,7 @@ All resolved; the remaining questions are in §12 and in `S082_P1_LOAD_SAVE.md` 
 | Values | Absolute 7-bit, instrument-agnostic; Morph translation only. |
 | Learn | Global, 128 type-tagged entries in `settings.cfg`; no fan-out, no Scene storage, no UI remove. |
 | Note map | Per Scene, resolved on the fly. |
-| MIDI writes | Active Scene, edit-mask fan-out, lowest priority. |
+| MIDI writes | Active Scene, edit-mask fan-out, lowest priority (§12 Q1: under S081 R12). |
 | Bank change | Background load through Scene 17; UI stays on Load/Save. |
 | Routing | Consume first, then forward; realtime always forwarded per MRT. |
 
@@ -478,3 +507,172 @@ Third round (2026-10-17):
 ## 12. Open questions
 
 None at revision 4. Questions that come up during implementation go here.
+
+**Q1 (from the S081 close-out, 2026-10-21): does a MIDI parameter write take
+the R12 menu priority?** C9 and `MIDI_SPEC.md` §14 put MIDI last. S081 R12
+moved menu edits ahead of Instrument automation until the voice's next
+trigger, so "automation, then menu, then MIDI" no longer describes one
+order.
+
+- (a) **Keep MIDI lowest.** MIDI stores the Normal endpoint only. On a
+  parameter that automation holds, a CC or NRPN move is inaudible until the
+  voice's next trigger, and the next automated step overwrites it.
+- (b) **MIDI acts like a menu edit.** For Instrument targets, MIDI also
+  calls `seq_menuOverrideSet()`, so the move sounds at once and holds until
+  the voice's next trigger, a transport change or a Scene change. Scene and
+  Effect targets already behave this way (R12/R13: the value applies until
+  their next automation).
+
+Recommendation: (b). A Learned CC is a remote knob, and (b) makes it sound
+like the knob. It needs no RAM; the override bitmap exists. It changes the
+`MIDI_SPEC.md` §14 binding rule, so it needs the user's decision before
+Phase E.
+
+---
+
+## 13. S082 outcome notes (2026-10-21)
+
+What Session 082 built, and how it changes this plan. Nothing here reopens
+a decision; it records facts, API names and new constraints.
+
+### 13.1 Status of the §4 needs
+
+| Need | Status |
+|------|--------|
+| Non-blocking request returning accepted/refused | Built: `preset_requestBackgroundBankLoad(slot, act, empty, origin)`. For `PRESET_BANK_ORIGIN_MIDI` the masks are ignored (Replace, all 16, Q15). A MIDI request is **dropped** while a load is in flight (D13); otherwise it becomes the one pending request (latest wins) and starts when Preset, the facade and the Menu are idle (D33). A Menu Bank OK discards a pending MIDI request. |
+| MIDI origin switches the UI to Load/Save → Bank | Built: closes every latched surface and session (D39), enters Load:[Bank] at the slot, waits for its preview, then acts as OK; a missing slot ends FAILED. |
+| Completion/failure signal for CC0 TX | Built: `preset_takeBackgroundBankLoadResult()` returns `PRESET_BG_RESULT_DONE` (1) / `FAILED` (2) (code mask 3) with `PRESET_BG_RESULT_MIDI` (0x80) once per load. Child failures inside a DONE load still count as DONE. Phase G polls it. |
+| "Load running" query | Built: `preset_backgroundBankLoadRunning()` (phases 1–6), plus `preset_backgroundBankLoadUnlocked()` / `Locked()` (§13.2). |
+| PC/CC0 dropped during a load | **Already enforced** by `midiParser_acceptedDuringBankLoad()`: while a load runs only realtime, note on/off and CC except CC0/CC32 act; PC, pitch bend, pressure, MTC QF and song position/select are dropped. |
+| Scene index 16 resolves through the accessors | Built (`scene_get*()`, `pat_regionFor()`); Scene 17's edit mask is itself only (`bank_editTargetMask()` = bit 16). |
+| No PC TX for Scene 17 | Built: `seq_sendProgChg()` refuses index ≥ 16. |
+| `settings.cfg` keeps writing on 17 | Unchanged (D24): Learn lines are safe during a load. |
+
+### 13.2 Changes to the plan's assumptions
+
+1. **P4 "the UI stays on Load/Save afterwards" is amended (S082 P3, D40).**
+   - From phase 5 of a load that runs on Scene 17, or of a direct load with the transport running, the panel unlocks: the user may leave Load/Save while the load finishes.
+   - The "stays there" completion applies only when the user is on Load/Save at completion. A MIDI-origin load follows the same rule.
+   - A load started with the transport stopped keeps the UI on Load:[Bank] until it ends.
+2. **The active Scene can change during a load.** After the unlock the user may switch from Scene 17 to any loaded (available) Scene, and between loaded Scenes. The note map (§3.3), Learn type matching (§3.6) and MIDI writes (§3.5) must therefore read the active Scene at the time of each message, never a value cached at load start.
+3. **Fan-out during a load (C9, §3.5):** MIDI writes must fan out through `bank_editTargetMask()` (or `bank_sceneFanoutMask32()`), not the raw edit-mask entry.
+   - Those helpers return Scene 17 alone while 17 is active.
+   - During an unlocked load they exclude Scenes the load has not finished (`bank_load_unavailable_mask`).
+   - `preset_setInstrumentParameterFromMidi()` has no fan-out today; Phase E adds it through these helpers.
+4. **Consume-then-route (§3.2, Phase A).** The S082 drop filter sits **after** the current thru routing in `midiParser_parseMidiMessage()`, so a dropped message is still forwarded. In the new dispatcher a message dropped by the filter must count as "not consumed" and be forwarded per MRT. Keep the filter's message classes exactly.
+5. **PC on G during and after a load (§3.7):**
+   - dropped during the load by the filter;
+   - afterwards it is a normal whole-Scene change (and releases Scene 17);
+   - chain conditions do not evaluate during any Bank load (S082 D50), so a PC is the only external Scene change then.
+6. **Per-track PC (P3) while 17 is active:** a voice-channel PC moves those tracks to a resident Scene without releasing 17 (D10). During an unlocked load the target must be available; S082's panel gesture refuses unavailable Scenes, so the MIDI path should use `bank_sceneAvailable()` too.
+7. **MIDI-origin request timing (Phase D):** CC0 RX calls the request and returns; nothing blocks. A CC0 burst is coalesced by the pending slot (latest wins) and dropped while a load runs.
+8. **The CC2 overlay, note triggers and live record keep working during a load.** Notes and CCs pass the filter; live record follows the played Scene (Scene 17 included, D35).
+
+### 13.3 New risks and constraints
+
+| Id | Risk / constraint | Mitigation |
+|----|-------------------|-----------|
+| R14 | A MIDI module that caches a Scene index (for example the note map's resolved Scene, or a Learn lookup cache) would keep reading the home Scene after the Scene 17 switch, or a Scene the user left. This is the class S082 P2-1 found in EffectsManager. | Resolve the active Scene per message; if anything is cached, rebind it at the switch (pattern: `effects_rebindSourceScene()`). |
+| R15 | NRPN/Learn writes into a Scene the load is replacing would be lost or race the loader. | Fan out only through the availability-aware helpers (§13.2 item 3); the active Scene is always available. |
+| R16 | S082 P3 A1 (open): a queued Scene change armed before a direct (Merge, running) load whose target the load replaces still applies its qac mute/morph parts when it fires, although the change itself is dropped. A MIDI-driven queue would inherit it. | Decide/apply the one-line A1 fix before Phase D. |
+| R17 | Hardware: S082 P1 (Scene 17 build, rebuild, MIDI-origin entry, the AutoSave abort allow-list) and all of P3 are untested. | Run the S082 checks (`082_SESSION_HANDOFF_LOG.md` §11.2) before Phase D. |
+| R18 | The DEV trace flush is suppressed while a Load/Save command runs, so a MIDI-started load's records stay in RAM until the next flush. | Copy the card only after the command ends; P2-5 runtime Bank Load records are still unbuilt. |
+
+### 13.4 Resources
+
+S082 used Scene 17 1,658 B, P0 16 B, P1 93 B and P3 4 B of SRAM1. Flash
+headroom at the S082 close is 155,124 B. The §6 MIDI allocations (Learn
+~519 B, held note 7 B, NRPN ~48 B, TX ~8 B, CC2 1 B) remain as approved on
+2026-10-17; re-check them against the S082 close numbers in
+`STORAGE_SRAM_MANIFEST.md` when Phase F/G lands.
+
+---
+
+## 14. S081 outcome notes (2026-10-21)
+
+What Session 081 (live record, logged in `081_SESSION_HANDOFF_LOG.md`)
+changed for this plan. Nothing here reopens a decision except §12 Q1.
+
+### 14.1 Recording hooks (§3.4, §3.5)
+
+- **Two call sites (R11).** `midiParser_noteOn()` builds a
+  `liveRec_trigger_t` (SINGLE, `LIVEREC_SRC_MIDI`) and calls
+  `liveRec_triggerIn()`. `midiParser_enterTaggedParameter()` calls
+  `liveRec_paramIn(0xFFFF, LIVEREC_SRC_MIDI)`, which is a stub. Phase E
+  passes the real 9-bit ID (the CC → target mapping is this session's job).
+- **`liveRec_paramIn()` has no value argument.** It reads the stored value:
+  the Instrument Normal endpoint, `scene_get*()` for Scene targets, and the
+  retained Normal through `effects_storeValue7()` for Effect rows. Call it
+  only after the store, on the Scene the store wrote.
+- **Ownership** (`liveRec_targetOwned()`; T = the played Scene of `rtk`,
+  A = the active Scene):
+  - **Instrument parameter of slot s:** recorded only if the track playing s
+    plays T and the type in A equals the type in T.
+  - **Scene and Effect targets:** recorded only if T == A.
+  - With per-track playback (R10), a MIDI write lands on A but may not be
+    recorded. That is accepted; the drop is silent.
+- **First-change rule.** `LIVEREC_AUTOMATION_FIRST_CHANGE` (default 1)
+  writes a parameter's first change in a step at once. LATCH latches and
+  dirty bits work as for knob edits.
+  - A dense CC stream costs one `liveRec_paramIn()` call per message.
+  - Measure this in Phase E against a fast controller sweep.
+- **Morph (C7, G-1).**
+  - CC1 on G goes through `preset_morph()` and must never call
+    `liveRec_paramIn()`.
+  - CC1 on a voice channel is an individual Morph edit. It stores the
+    voice's Morph amount, then calls `liveRec_paramIn()` with
+    `sceneModTarget_voiceMorphId(slot)`. LiveRecord captures that value in
+    `liveRec_morphValue[]`, so a later global Morph change cannot leak into
+    the take.
+  - S081 G-1 hardware check 4 (CC1 on G during LATCH records nothing)
+    belongs in the Phase E tests.
+- **Loop while record (Q2).** A MIDI hit recorded onto a replayed step
+  sounds again on the next loop pass. Accepted in S081.
+
+### 14.2 Triggers and reset (§3.1, §3.4)
+
+- **Reset at each press.** A MIDI note is a live trigger, so each note-on
+  resets the voice's held automation and ends its R12 override. Scheduled
+  steps reset only at their first trigger. The reset travels in the
+  per-voice mask `voiceControl_pendingReset`, not in the queue entry.
+  The reset therefore survives `voiceControl_noteOff()`, which deletes the
+  voice's queued entries.
+- **Ramps (S081 P2 D3).** A resetting trigger, MIDI included, does not
+  restore a parameter that an active `asm` ramp holds.
+- **Legacy writes during a ramp.** With writes-on-change, an internal legacy
+  MIDI write holds until the ramp's value next changes. Removing the legacy
+  map in Phase A also removes that bypass of the priority rule.
+- **Roll table.** CC2 overlay rolls use the S081 96-PPQ roll table
+  (`off 1/8 8tr 16 16t 32 32t 64 64t 128`). `PAR_ROLL` is retired.
+
+### 14.3 Scene changes, takes and per-track PC (§3.7, P3)
+
+- **New take.** A whole-Scene change starts a new live-record take and
+  clears every R12 override. It goes through `seq_selectActivePattern()`
+  or `seq_alignActivePatternToScene()`, which bump `seq_sceneEpoch`. A MIDI
+  PC on G is such a change.
+- **Per-track PC (P3) must realign.** The per-track epoch bump is in
+  `seq_realignTrackToMasterClock()`, not in `seq_setTrackPlayedScene()`. The
+  code comment there says to move the bump if a second caller appears
+  without a realign. The MIDI per-track PC is that second caller. It must
+  call `seq_setTrackPlayedScene()` then `seq_realignTrackToMasterClock()`,
+  as the panel does, or move the bump. Otherwise LiveRecord keeps the old
+  take across the change.
+- **Scene 17.** The switch keeps the epochs, so a take continues onto 17
+  (S082 D35). Recorded steps on 17 are lost at its release unless the
+  Scene is saved from 17 (`082_SESSION_HANDOFF_LOG.md` §13 item 8).
+
+### 14.4 Risks and constraints
+
+| Id | Risk / constraint | Mitigation |
+|----|-------------------|-----------|
+| R19 | §12 Q1 is undecided, so the write path's override call cannot be finalised. | Decide before Phase E. |
+| R20 | A MIDI per-track PC without a realign starts no new take (§14.3). | Use the panel sequence, or move the epoch bump into `seq_setTrackPlayedScene()`. |
+| R21 | S081 hardware lists are unrun: the live-record matrix, G-1 checks, ramps and the 64-ramp CPU worst case (`081_SESSION_HANDOFF_LOG.md` §13.2). MIDI recording builds on them. | Run the S081 lists before Phase E. |
+| R22 | A MIDI note's recorded position uses processing time (S081 Q3), not arrival time. | Phase B timestamps (R8). |
+
+### 14.5 Resources
+
+S081 closed at text 573,296, data 416, bss 429,112, which is the baseline
+S082 built on. S081 itself used +7 B of SRAM1 for G-1
+(`liveRec_morphValue[7]`). None of the §6 MIDI allocations changes.

@@ -347,6 +347,16 @@ Parameters change through these paths:
    - Before S075 F3 a menu edit queued the whole voice and the worker
      overwrote held automation mid-note (also on Morph changes, LFO on
      Morph, `Nvm` and Kit/Instrument applies).
+   - **S081 R12 amendment (user):** a menu edit of an automated Instrument
+     parameter sounds at once and suppresses that parameter's automation
+     until the voice's next trigger, a transport change or a Scene change
+     (`seq_menuOverrideSet()` clears the held bit and sets
+     `seq_menuOverride[slot]`; the drain skips the target). Other targets
+     take the menu value until their next automation: a menu edit clears
+     that FX send, audio out, `7dc` or track length/scale/shuffle override.
+     Effect parameters follow R13 (menuHold > lock > overlay > menu,
+     `EFFECTS_BUS_REFERENCE.md` §6). A menu value is never reverted.
+     Details: `PATTERN_DYNAMIC_STACK.md` §6.2a.
 
 6. **Kit/Instrument/Scene/Bank Load:** Commits validated data from staging
    into resident storage. Scene/Bank loads stage the Effect atomically with
@@ -669,7 +679,8 @@ applied to DSP runtime through the normal descriptor writer.
 S075 F3 priority is explicit at the runtime boundary: step automation holds
 the current runtime value until the next trigger; a menu endpoint edit
 re-interpolates only the edited descriptor at the voice's resolved Morph
-amount; an external MIDI CC stores the active Scene's Normal endpoint and is
+amount and (S081 R12) overrides that descriptor's automation until the next
+trigger; an external MIDI CC stores the active Scene's Normal endpoint and is
 applied by the bounded worker, which skips automation-held descriptors.
 
 ### Track timing Morph (S078)

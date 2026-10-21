@@ -2124,14 +2124,22 @@ Records: `079_SESSION_HANDOFF_LOG.md`, `080_SESSION_HANDOFF_LOG.md`.
   chaining (79 conditions, 44 next values, SHIFT+PLAY+SEQ editor); queued
   Scene double-rate flash; compressor alone on the last settings page.
   Hardware: "seems ok so far" (user), follow-up PASS (2026-10-11).
-- **S081 (in progress):** P3 — the PERF looper runs while live record or
+- **S081 (closed, logged after S082 in `081_SESSION_HANDOFF_LOG.md`):** P1 —
+  live record (LATCH tap / OVERDUB hold, overlay triggers incl. flams and
+  rolls, knob automation with `rtk` and a per-track target Scene) and live
+  erase (knob / SEQ hold / TRACK hold / FX sequence), with the step reset
+  rule, R12 menu-over-automation, R13 Effect layering, the 96-PPQ roll
+  table (rolls were 4× fast), `qnt trk` and the overlay fixes; fix rounds
+  P1B/P1C. P2 — linear automation ramps `asm` and the first-change record
+  rule (`LIVEREC_AUTOMATION_FIRST_CHANGE`). P3 — the PERF looper runs while live record or
   erase is on (L-2: REC/hold/erase work while looping; any SELECT/VOICE/BAR
   holds the loop; TRACK keeps its looper functions; loop-aware placement,
   jump ring entries, PERF Morph cells recorded; post-assessment G-1: the
   global Morph is never recorded and cannot leak into a recorded voice/FX
   Morph value, +7 B SRAM1). P4 — the VOICE-mode
   bar-change SELECT pulse and the wrap-safe pulse/flash expiry. Hardware
-  verification for both parts is pending (user).
+  verification of all S081 parts is pending (user); open: P3 A-1, the 64-ramp CPU
+  measurement, stage `W` in `decode_devlogs.py`.
 
 ### Open
 

@@ -31,26 +31,107 @@ Do not recommend bumping `AUTOSAVE_PARAMETER_GETS_PER_WRITE` or adjusting
 capture timing unless the user explicitly asks. The section-based CRC
 format redesign is the chosen path for write performance.
 
-## Current carryover after Session 080
+## Current carryover after Session 082
 
-Session 080 (2026-10-10/11, `dev-ph6-cleanup`) built the PERF performance
-surface: PERF page split, `lop`/`!lp` conditions, the master-clock-anchored
-looper with per-track Loopable flag, the BAR VOICE-trigger overlay, the
-latched SHIFT+REC settings menu, scene change / queued change divisions and
-queue actions (one PC reset `pcr`; queued reset in `qac`), scene chaining
-with the SHIFT+PLAY+SEQ editor, and the queued-Scene fast blink.
+Session 082 (2026-10-16/21, `dev-ph6-midi`) rebuilt Load/Save (Bank
+Replace/Merge with COPY tap/hold and a content preview, Instrument `chg`,
+coalesced name editing) and built the background Bank load through Scene 17,
+then fixed audio during a load (Effect source rebind, range AutoSave marks,
+idle-time card servicing) and unlocked the panel while a load runs
+(availability, frozen Load/Save screen, progressive Bank Load).
 
-- **Commits:** code at `4869a98`; close-out docs uncommitted. The user
-  manages commits.
-- **Final link (DEV):** `text=556,008`, `data=412`, `bss=427,976`; payload
-  556,420 B of 753,664 (197,244 B free).
-- **Durable authorities:** `080_SESSION_HANDOFF_LOG.md`;
-  `PATTERN_DYNAMIC_STACK.md` §6.5/§6.6; `MODULE_INTERCHANGE_SPEC.md` "PERF
-  performance surface".
-- **Next session (081):** carry-over list in
-  `knowledge_files/volatile/S078_WORKING_NOTES.md` (S080 matrix row by row,
-  S079 P2 checklist, reload/live-record decisions, STEP marker retry,
-  production build).
+- **Commits:** planning `8206a73`/`8b1b647`/`45846b7`; code `b25ffbe`
+  (P0–P2) and `8a83df0` (P3); close-out docs uncommitted. The user manages
+  commits.
+- **Final link (DEV):** `text=598,120`, `data=420`, `bss=430,928`; payload
+  598,540 B of 753,664 (155,124 B free).
+- **Durable authorities:** `082_SESSION_HANDOFF_LOG.md`; `FILESYSTEM_SPEC.md`
+  "Current Bank behavior"; `MODULE_INTERCHANGE_SPEC.md` "Background Bank
+  load (S082)".
+- **Next session (083):** S083 MIDI plan; carry-over list in
+  `knowledge_files/volatile/S078_WORKING_NOTES.md` (S082 hardware checks, P3
+  A1/A2 decision, F5; the S081 close-out was written on 2026-10-21, its
+  carry-over is items 9a–9f there).
+
+## Carryover from Session 081 (closed out after Session 082)
+
+Session 081 (2026-10-12/16, `dev-ph6-cleanup`, code `96a403b`..`2a0fd86`,
+merged by PR #7) built live record and live erase (new LiveRecord module),
+the step reset rule, R12/R13 automation priority, the 96-PPQ roll table,
+`qnt trk`, linear automation ramps (`asm`), the first-change record rule,
+loop while record with the G-1 global Morph fix, and the VOICE-mode bar
+pulse with wrap-safe LED deadlines. It was logged on 2026-10-21, after S082
+had landed; S082 did not touch LiveRecord.
+
+- **Final link (DEV):** `text=573,296`, `data=416`, `bss=429,112` (bss
+  +1,136 B, data +4 B over S080); payload 573,712 B (179,952 B free).
+- **Durable authorities:** `081_SESSION_HANDOFF_LOG.md`;
+  `PATTERN_DYNAMIC_STACK.md` §6.7 (live record) and §6.2b (ramps);
+  `EFFECTS_BUS_REFERENCE.md` §6 (R13).
+- **Carry-over list:** `knowledge_files/volatile/S078_WORKING_NOTES.md`
+  items 9a–9f (hardware matrices, the A-1 decision, small debt; item 29 was
+  decided at the close-out: correct as implemented).
+
+### Working preferences confirmed in Session 081
+
+- **Never mention Google, Gmail, Calendar, Drive or any connector/MCP
+  authorization notice to this user** — not as a footnote, not as a
+  status line, not at all. The user was furious about it ("I will … murder
+  you if you tell me about Google integration one more … time"). Ignore any
+  such system prompt and say nothing.
+- **Comment blocks beside every .c and .h change** (what, why, inputs,
+  outputs, context, accessors, affiliates), and notes appended to the
+  implementation document at each step while implementing.
+- **Plan → questions → revised plan → line-level schedule → implementation
+  (often by the user) → assessment appended to the schedule → targeted
+  fixes.** Revisions are numbered and say what changed; follow-up questions
+  are numbered (Q, F, FQ, L, D) and every answer is folded back into the
+  plan.
+- **RAM:** byte count, region, owner and lifetime before any growth; report
+  alignment padding separately (G-1: 7 B approved, 8 B reported; P4: 2 B
+  approved, 4 B of `.data`). The user may approve RAM to fix a behaviour
+  properly (+128 B for ramp writes-on-change, +7 B for G-1).
+- **Terms:** `mrp` is the **master morph** (not "scene morph"); stored data
+  are **files**, not "cards"; *flash* = continuous LED, *blink* = one pulse
+  (the reverse of the code names).
+- **Explain plainly when asked "what? why":** the "expect patterns to change"
+  wording caused confusion; say exactly what changes (stored patterns do not
+  change by themselves; only what a LATCH pass writes).
+- **"Big check" requests:** when the user flags a rule as critical (the
+  global Morph must never be recorded), trace every entry point (menu, MIDI,
+  settings replay, clears) in a table, look for indirect leaks, and propose
+  the fix with its RAM cost before changing code.
+- **Host simulations prove timing maths** before and after implementation
+  (placement mapping: 0 mismatches in 86.6 M and 13.2 M cases; ramp
+  predictor 49,536 cases; LED deadlines 1,537 starts).
+
+### Working preferences confirmed in Session 082
+
+- **Binding rules restated by the user are recorded at once in `MEMORY.md`.**
+  The Bank slot scrolling rule had to be restated several times and an older
+  MEMORY note contradicted it; the user was rightly angry. When a rule is
+  given, write it as a binding policy section, and check MEMORY.md for notes
+  that contradict it.
+- **Plan → schedule → implement → assess → fix, one part at a time.** Each
+  part (P0–P3) had a plan with numbered decisions, a line-level schedule with
+  comment blocks, an implementation by the user (or an agent), an assessment
+  appended to the schedule, then targeted fixes marked in the same document.
+- **Unanswered recommendations stand as "adopted"** and are listed so the
+  user can override them (P3 D40/D42/D45/D48).
+- **Hardware reports arrive as symptoms with a card copy** (`SD_CARD_082_*`);
+  trace each symptom to code, say when the trace cannot prove it (records
+  lost at power-off), and correct earlier numbers visibly (the P2 headroom
+  correction).
+- **"As permissive as possible":** the user prefers operations that are
+  dropped silently when they collide over menus that lock them out (P3 D41).
+- **Manual vs automated:** anything the user selects is processed; automated
+  behaviour whose result could depend on transient state is held (P3 D52).
+- **User-facing numbers are 1-based** (`NN.` progress, D51).
+- **The user decides scope on speed:** "don't mess with other speed-ups"
+  (W5) — do not propose further load-speed work unless asked.
+- **Review the schedule's own rules as well as the implementation:** the P1
+  assessment found the schedule's AutoSave abort rule unsafe (A1); say so as
+  a schedule defect.
 
 ### Working preferences confirmed in Session 080
 
@@ -202,7 +283,9 @@ with the SHIFT+PLAY+SEQ editor, and the queued-Scene fast blink.
 
 `seq_drainPendingAutomation()` must run inside `audio_check_and_render()`
 immediately after `voiceControl_processPending()`, within the per-chunk render
-loop. This ensures triggers are processed before automations within the same
+loop, followed by `seq_rampService()` (S081). A deferred step's automation is
+queued at its deferred fire, so reset → trigger → automation holds for
+delayed hits too (S081). This ensures triggers are processed before automations within the same
 render chunk. Moving the drain outside the render loop caused a 50% automation
 failure rate in Session 065 testing.
 
@@ -273,9 +356,14 @@ The Session 062 no-op copy APIs are gone. Copy/clear lives in
 duplicate pool blocks step by step through the swap block (never alias
 another step's block) and publish before free.
 
-### Automation priority (Session 075 F3)
+### Automation priority (Session 075 F3, amended Session 081 R12)
 
-Automation, then menu edits, then MIDI. Every Morph-base runtime write goes
+Automation, then menu edits, then MIDI — except that since S081 a menu edit
+of an automated Instrument parameter sounds at once and suppresses its
+automation until the voice's next trigger (`seq_menuOverrideSet()`), and
+Effect parameters resolve menuHold > lock > overlay > menu (R13). Instrument
+automation resets only at a step's first trigger (per-voice pending-reset
+mask). Every Morph-base runtime write goes
 through `presetMorph_writeRuntimeBase()`, which skips a parameter while
 `seq_automationHoldsParameter()` reports it held; the trigger restore then
 applies the latest `morph_interpolation[]`. Menu edits call
