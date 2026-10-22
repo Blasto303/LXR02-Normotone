@@ -3,12 +3,23 @@
 ### Introduction
 The LXR02 is a digital drum synthesizer produced in collaboration with Sonic Potions and Erica Synths. It is based on a 32-bit Cortex-M7 processor. The 'Helicase' firmware is a complete rewrite of the firmware from the bare cortex register definitions up, using the native bootloader so that it can be loaded without a debugger and can be freely swapped with the stock Erica Synths firmware through the standard update process. If you want to go straight to the firmware and try it, it is './build/LXRV2_lxr02.img'. Put this in the root directory of the SD card and power on while pressing the encoder, as you would for any firmware update. You can switch between this and the Erica Synths firmware any time with this same method. If you use the Helicase firmware, it's recommended to also put the contents of the **'SD_CARD'** directory in the root directory of your micro SD card. This will be the same as my current testing files and it will probably be kinda random, but it will give you some content to start with. I'm not taking bug reports yet, there is still too much missing for that to be useful, but I'm open to general discussion. When I feel like this is good enough to actually use and I want to accept reports, I'll increment to 0.01 :)
 
-### Stuff that's missing, might not work, or should be treated as suspicious:
-- MIDI
-- Live record with the 'rec' button
-- Track scale, shuffle (length in steps works)
-- Chain/repeat patterns
-- If you've used LXR Catalyst, there's no looper yet, no 1-shot lfos, no background bank load, and no per-track switching yet, those will go in later. 
+### Status of the items that used to be listed as missing
+This list was out of date in upstream Helicase; the items are implemented:
+- **MIDI**: implemented in session 083 (`knowledge_files/specification_reference/MIDI_SPEC.md`). Hardware verification of the S083 test matrices is still pending upstream.
+- **Live record** with the 'rec' button, and live erase: session 081 (hardware-checked).
+- **Track scale and shuffle**: per-track step scale, shuffle and run modes, session 078.
+- **Chain/repeat patterns**: Scene chaining with per-Scene conditions and repeats, session 080 (`SHIFT+PLAY+SEQ` chain editor).
+- **Looper**: session 080 (SELECT buttons in PERF).
+- **Background bank load**: session 082 (Scene 17).
+- **Per-track switching**: per-track Scene playback, session 077.
+- **One-shot LFOs**: added in this fork (see below).
+
+Treat everything as beta: Helicase is still at 0.00 upstream.
+
+### Additions in this fork (LXR02-Normotone)
+- **DlyVerb effect** (`dvb`): tempo-synced character delay (dig/bbd/tape, stereo/ping-pong/width) into a Dattorro plate reverb, 100 % wet. Per-voice dry/wet with the `d/w` fader mode.
+- **Plaits instruments** (C translations of Plaits by Emilie Gillet, MIT): analog kick (`PlKick`), analog snare (`PlSnare`), hi-hat with open hat on track 7 (`PlHat`), and the Rings-derived modal resonator with Rings' strike position (`PlModal`). Presets in `SD_CARD/Instrument/`.
+- **One-shot LFOs**: waveforms `si1`..`xd1` play one cycle per retrigger and hold; the LFO offset becomes a delay, as in LXR Catalyst.
 
 ### How to use - Quickstart
 The Helicase firmware uses the LXR UX as a starting point, but is almost entirely new code now. A full manual will be written when things are reasonably complete, but here are some pointers to get you started:
