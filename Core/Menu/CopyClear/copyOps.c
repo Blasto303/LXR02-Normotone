@@ -624,12 +624,12 @@ uint8_t ccCopy_buildStep(uint8_t selection, const uint8_t *src_block,
 
 /* ---- Scene-level executors (spec §9.9) --------------------------------- */
 
-static uint16_t ccCopy_bit(uint8_t scene)
+static uint32_t ccCopy_bit(uint8_t scene)
 {
-    return (uint16_t)(1u << scene);
+    return 1ul << scene;
 }
 
-static uint8_t ccCopy_activeIn(uint16_t mask)
+static uint8_t ccCopy_activeIn(uint32_t mask)
 {
     return (uint8_t)((mask & ccCopy_bit(scene_getActiveIndex())) != 0u);
 }
@@ -677,13 +677,13 @@ static uint8_t ccCopy_runInstrument(const cc_job_t *job)
     uint8_t s_slot = ccCopy_slotOf(src->track);
     uint8_t d_slot = ccCopy_slotOf(job->track);
     instrument_type_t type = ccCopy_slotType(src->scene, s_slot);
-    uint16_t mask;
+    uint32_t mask;
     uint8_t m;
 
     if (run->phase == 2u) {
         if (!ccSvc_namesReady())
             return CC_RUN_WAIT;
-        for (m = 0u; m < SCENE_COUNT; m++)
+        for (m = 0u; m < SCENE_SLOT_TOTAL; m++)
             if ((run->aux & ccCopy_bit(m)) != 0u)
                 (void)ccSvc_nameCopy(
                     filesystem_identityRow(FS_ROW_INSTRUMENT, m, d_slot),
@@ -700,8 +700,8 @@ static uint8_t ccCopy_runInstrument(const cc_job_t *job)
     }
     if (src->scene == job->scene && s_slot == d_slot)
         return CC_RUN_DONE;
-    mask = bank_sceneFanoutMask(job->scene);
-    for (m = 0u; m < SCENE_COUNT; m++)
+    mask = bank_sceneFanoutMask32(job->scene);
+    for (m = 0u; m < SCENE_SLOT_TOTAL; m++)
         if ((mask & ccCopy_bit(m)) != 0u &&
             !instrumentManager_typeSelectableForSceneSlot(m, d_slot, type)) {
             ccSvc_traceDropReason(AUTOSAVE_TRACE_CC_DROP_ADVANCED_LIMIT,
@@ -711,7 +711,7 @@ static uint8_t ccCopy_runInstrument(const cc_job_t *job)
     if (!preset_applyWorkersIdle())
         return CC_RUN_WAIT;
     preset_startInstrumentCopy(src->scene, s_slot, mask, d_slot);
-    for (m = 0u; m < SCENE_COUNT; m++) {
+    for (m = 0u; m < SCENE_SLOT_TOTAL; m++) {
         if ((mask & ccCopy_bit(m)) == 0u)
             continue;
         if (s_slot == INSTRUMENT_SLOT_COUNT - 1u &&
@@ -727,7 +727,7 @@ static uint8_t ccCopy_runInstrument(const cc_job_t *job)
             (1u << 20u) | ((uint32_t)ccCopy_activeIn(mask) << 24u) |
             ((uint32_t)(d_slot & 0xFu) << 25u));
     bank_revalidateVoiceEditMasks();
-    run->aux = mask;
+    run->aux = (uint16_t)mask;
     run->phase = 1u;
     return CC_RUN_WAIT;
 }
@@ -742,13 +742,13 @@ static uint8_t ccCopy_runKit(const cc_job_t *job)
     cc_run_t *run = ccSvc_run();
     const cc_source_t *src = copyClear_source();
     const scene_t *source = scene_getConst(src->scene);
-    uint16_t mask;
+    uint32_t mask;
     uint8_t m;
 
     if (run->phase == 2u) {
         if (!ccSvc_namesReady())
             return CC_RUN_WAIT;
-        for (m = 0u; m < SCENE_COUNT; m++)
+        for (m = 0u; m < SCENE_SLOT_TOTAL; m++)
             if ((run->aux & ccCopy_bit(m)) != 0u)
                 ccCopy_nameKit(m, src->scene);
         return CC_RUN_DONE;
@@ -766,25 +766,41 @@ static uint8_t ccCopy_runKit(const cc_job_t *job)
         ccSvc_traceDropReason(AUTOSAVE_TRACE_CC_DROP_NO_SOURCE, 0u);
         return CC_RUN_DROP;
     }
-    mask = bank_sceneFanoutMask(job->scene);
+    mask = bank_sceneFanoutMask32(job->scene);
     if (ccCopy_activeIn(mask) && !preset_applyWorkersIdle())
         return CC_RUN_WAIT;
-    for (m = 0u; m < SCENE_COUNT; m++) {
+    for (m = 0u; m < SCENE_SLOT_TOTAL; m++) {
         uint8_t was_present;
 
         if ((mask & ccCopy_bit(m)) == 0u || m == src->scene)
             continue;
         was_present = bank_scenePresent(m);
         (void)scene_commitKit(m, &source->kit);
-        (void)bank_setScenePresentMask(
-            (uint16_t)(bank_scenePresentMask() | ccCopy_bit(m)));
-        if (!was_present)
-            autosave_markSceneWithPatternDirty(m);
+        /*
+         * Scene 17 is never Bank-present (S082 C3, S082 P1 D15).
+         *
+         * What: a Kit copy into Scene 17 commits the kit image but does not
+         * set a present bit; the 16-bit Bank mask cannot represent index 16
+         * anyway.
+         * Why: Scene 17 owns no Bank child and is never AutoSaved; setting a
+         * truncated bit would corrupt a resident Scene's presence.
+         * Inputs: fan-out destination m.
+         * Outputs: present mask only for resident Scenes.
+         * Accessors: ccCopy_runKit() phase 0.
+         * Affiliates: bank_setScenePresentMask(),
+         * autosave_markSceneWithPatternDirty().
+         */
+        if (m < SCENE_COUNT) {
+            (void)bank_setScenePresentMask(
+                (uint16_t)(bank_scenePresentMask() | ccCopy_bit(m)));
+            if (!was_present)
+                autosave_markSceneWithPatternDirty(m);
+        }
     }
     if (ccCopy_activeIn(mask) && scene_getActiveIndex() != src->scene)
         preset_startDrumsetApply();
     bank_revalidateVoiceEditMasks();
-    run->aux = (uint16_t)(mask & (uint16_t)~ccCopy_bit(src->scene));
+    run->aux = (uint16_t)(mask & ~ccCopy_bit(src->scene));
     ccTrace(AUTOSAVE_TRACE_CC_EVT_FANOUT,
             (uint32_t)run->aux | ((uint32_t)(job->scene & 0xFu) << 16u) |
             (2u << 20u) | ((uint32_t)ccCopy_activeIn(mask) << 24u));
@@ -807,7 +823,7 @@ static uint8_t ccCopy_runEffect(const cc_job_t *job)
     if (run->phase == 1u) {
         if (!ccSvc_namesReady())
             return CC_RUN_WAIT;
-        for (m = 0u; m < SCENE_COUNT; m++)
+        for (m = 0u; m < SCENE_SLOT_TOTAL; m++)
             if ((run->aux & ccCopy_bit(m)) != 0u)
                 (void)ccSvc_nameCopy(
                     filesystem_identityRow(FS_ROW_EFFECT, m, 0u),
@@ -818,7 +834,7 @@ static uint8_t ccCopy_runEffect(const cc_job_t *job)
         ccSvc_traceDropReason(AUTOSAVE_TRACE_CC_DROP_NO_SOURCE, 0u);
         return CC_RUN_DROP;
     }
-    if (ccCopy_activeIn(bank_sceneFanoutMask(job->scene)) &&
+    if (ccCopy_activeIn(bank_sceneFanoutMask32(job->scene)) &&
         !preset_applyWorkersIdle())
         return CC_RUN_WAIT;
     written = effects_pasteRecord(job->scene, record);
@@ -827,7 +843,7 @@ static uint8_t ccCopy_runEffect(const cc_job_t *job)
             (3u << 20u) | ((uint32_t)ccCopy_activeIn(written) << 24u));
     if (ccCopy_activeIn(written))
         menu_repaintAll();
-    run->aux = (uint16_t)(written & (uint16_t)~ccCopy_bit(src->scene));
+    run->aux = (uint16_t)(written & ~ccCopy_bit(src->scene));
     run->phase = 1u;
     return CC_RUN_WAIT;
 }
@@ -970,7 +986,7 @@ static uint8_t ccCopy_runFxSteps(const cc_job_t *job)
     uint8_t hi = (src->start < src->end) ? src->end : src->start;
     uint8_t count = (uint8_t)(hi - lo + 1u);
     int8_t dir = (src->start <= src->end) ? 1 : -1;
-    uint16_t mask;
+    uint32_t mask;
     uint8_t i;
 
     if (!s || !d || src->start >= EFFECT_SEQ_STEP_COUNT ||
@@ -991,11 +1007,11 @@ static uint8_t ccCopy_runFxSteps(const cc_job_t *job)
                                    (uint8_t)((job->start + i) %
                                              EFFECT_SEQ_STEP_COUNT),
                                    &snap[i]);
-    mask = bank_sceneFanoutMask(job->scene);
+    mask = bank_sceneFanoutMask32(job->scene);
     ccTrace(AUTOSAVE_TRACE_CC_EVT_FANOUT,
             (uint32_t)mask | ((uint32_t)(job->scene & 0xFu) << 16u) |
             (6u << 20u) | ((uint32_t)ccCopy_activeIn(mask) << 24u));
-    for (i = 0u; i < SCENE_COUNT; i++)
+    for (i = 0u; i < SCENE_SLOT_TOTAL; i++)
         if ((mask & ccCopy_bit(i)) != 0u)
             ccSvc_nameContentChanged(
                 filesystem_identityRow(FS_ROW_EFFECT, i, 0u));
@@ -1033,7 +1049,7 @@ static uint8_t ccCopy_runFxSteps(const cc_job_t *job)
  * Outputs:    CC_RUN_WAIT while the active Scene's apply workers drain, then
  *             CC_RUN_DONE. Side effects: Instrument Morph, FX-send Morph and
  *             Kit Morph-decay AutoSave marks; Morph worker requeue.
- * Accessors:  copyClear_source(), ccCopy_slotOf(), bank_sceneFanoutMask(),
+ * Accessors:  copyClear_source(), ccCopy_slotOf(), bank_sceneFanoutMask32(),
  *             preset_copySlotNormalToMorph(), preset_setVoiceFxSendMorph(),
  *             scene_getVoiceFxSendAmount(),
  *             scene_setSlot6Track7MorphAmpEnvelopeDecay(),
@@ -1046,7 +1062,7 @@ static uint8_t ccCopy_runMorphTrack(const cc_job_t *job)
     const cc_source_t *src = copyClear_source();
     uint8_t s_slot;
     uint8_t d_slot;
-    uint16_t mask;
+    uint32_t mask;
     uint8_t active = scene_getActiveIndex();
     uint8_t m;
 
@@ -1054,10 +1070,10 @@ static uint8_t ccCopy_runMorphTrack(const cc_job_t *job)
         return CC_RUN_DROP;
     s_slot = ccCopy_slotOf(src->track);
     d_slot = ccCopy_slotOf(job->track);
-    mask = bank_sceneFanoutMask(job->scene);
+    mask = bank_sceneFanoutMask32(job->scene);
     if ((mask & ccCopy_bit(active)) != 0u && !preset_applyWorkersIdle())
         return CC_RUN_WAIT;
-    for (m = 0u; m < SCENE_COUNT; m++) {
+    for (m = 0u; m < SCENE_SLOT_TOTAL; m++) {
         if ((mask & ccCopy_bit(m)) == 0u)
             continue;
         /*
@@ -1109,7 +1125,7 @@ static uint8_t ccCopy_runMorphTrack(const cc_job_t *job)
  * endpoints for every matching-type component, fanning out through the edit
  * mask (parallels `copy kit`).
  *
- * What:       for each Scene in bank_sceneFanoutMask(job->scene):
+ * What:       for each Scene in bank_sceneFanoutMask32(job->scene):
  *             (a) for each of the six slots:
  *                 preset_copySlotNormalToMorph() copies the source Scene's
  *                 Normal morphable bytes onto the member's Morph bytes
@@ -1137,7 +1153,7 @@ static uint8_t ccCopy_runMorphTrack(const cc_job_t *job)
  * Outputs:    CC_RUN_WAIT while the active Scene's apply workers drain, then
  *             CC_RUN_DONE. Side effects: Instrument Morph, FX-send Morph, Kit
  *             Morph-decay and Effect AutoSave marks; runtime rebuild.
- * Accessors:  copyClear_source(), bank_sceneFanoutMask(),
+ * Accessors:  copyClear_source(), bank_sceneFanoutMask32(),
  *             preset_copySlotNormalToMorph(), preset_setVoiceFxSendMorph(),
  *             scene_getVoiceFxSendAmount(),
  *             scene_setSlot6Track7MorphAmpEnvelopeDecay(),
@@ -1152,18 +1168,18 @@ static uint8_t ccCopy_runMorphTrack(const cc_job_t *job)
 static uint8_t ccCopy_runSceneMorph(const cc_job_t *job)
 {
     const cc_source_t *src = copyClear_source();
-    uint16_t mask;
+    uint32_t mask;
     uint8_t active = scene_getActiveIndex();
     const effect_record_t *src_fx;
     uint8_t m;
 
     if (!src)
         return CC_RUN_DROP;
-    mask = bank_sceneFanoutMask(job->scene);
+    mask = bank_sceneFanoutMask32(job->scene);
     if ((mask & ccCopy_bit(active)) != 0u && !preset_applyWorkersIdle())
         return CC_RUN_WAIT;
     src_fx = scene_effectConst(src->scene);
-    for (m = 0u; m < SCENE_COUNT; m++) {
+    for (m = 0u; m < SCENE_SLOT_TOTAL; m++) {
         uint8_t slot;
 
         if ((mask & ccCopy_bit(m)) == 0u)

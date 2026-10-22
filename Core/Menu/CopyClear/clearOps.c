@@ -138,17 +138,17 @@ uint8_t ccClear_requestClear(const cc_source_t *object, uint8_t selection)
 
 /* ---- helpers ------------------------------------------------------------ */
 
-static uint16_t ccClear_bit(uint8_t scene)
+static uint32_t ccClear_bit(uint8_t scene)
 {
-    return (uint16_t)(1u << scene);
+    return 1ul << scene;
 }
 
 /* Effect rows of every Scene in a mask lose their refreshed flag. */
-static void ccClear_effectRowsChanged(uint16_t mask)
+static void ccClear_effectRowsChanged(uint32_t mask)
 {
     uint8_t m;
 
-    for (m = 0u; m < SCENE_COUNT; m++)
+    for (m = 0u; m < SCENE_SLOT_TOTAL; m++)
         if ((mask & ccClear_bit(m)) != 0u)
             ccSvc_nameContentChanged(
                 filesystem_identityRow(FS_ROW_EFFECT, m, 0u));
@@ -239,9 +239,9 @@ void ccClear_fxStepNow(uint8_t scene, uint8_t step)
         return;
     changed = effects_clearSeqLanes(scene, (uint16_t)(1u << step), 0xFFFFu);
     if (changed)
-        ccClear_effectRowsChanged(bank_sceneFanoutMask(scene));
+        ccClear_effectRowsChanged(bank_sceneFanoutMask32(scene));
     ccTrace(AUTOSAVE_TRACE_CC_EVT_FX_CLEAR,
-            (uint32_t)bank_sceneFanoutMask(scene) |
+            (uint32_t)bank_sceneFanoutMask32(scene) |
             ((uint32_t)(scene & 0xFu) << 16u) |
             ((uint32_t)(step & 0xFu) << 20u) | (0xFu << 24u) |
             ((uint32_t)(changed ? 1u : 0u) << 28u));
@@ -290,9 +290,9 @@ uint8_t ccClear_potTurned(const cc_pot_target_t *target)
             scene, 0xFFFFu, (uint16_t)(1u << target->fx_lane));
 
         if (changed)
-            ccClear_effectRowsChanged(bank_sceneFanoutMask(scene));
+            ccClear_effectRowsChanged(bank_sceneFanoutMask32(scene));
         ccTrace(AUTOSAVE_TRACE_CC_EVT_FX_CLEAR,
-                (uint32_t)bank_sceneFanoutMask(scene) |
+                (uint32_t)bank_sceneFanoutMask32(scene) |
                 ((uint32_t)(scene & 0xFu) << 16u) | (0xFu << 20u) |
                 ((uint32_t)(target->fx_lane & 0xFu) << 24u) |
                 ((uint32_t)(changed ? 1u : 0u) << 28u));
@@ -321,10 +321,10 @@ static uint8_t ccClear_runSend(const cc_job_t *job)
     uint8_t slot = (job->track < INSTRUMENT_SLOT_COUNT)
                        ? job->track
                        : (uint8_t)(INSTRUMENT_SLOT_COUNT - 1u);
-    uint16_t mask = bank_sceneFanoutMask(job->scene);
+    uint32_t mask = bank_sceneFanoutMask32(job->scene);
     uint8_t m;
 
-    for (m = 0u; m < SCENE_COUNT; m++) {
+    for (m = 0u; m < SCENE_SLOT_TOTAL; m++) {
         if ((mask & ccClear_bit(m)) == 0u)
             continue;
         (void)preset_setVoiceFxSendAmount(m, slot, 0u);
@@ -390,7 +390,7 @@ static uint8_t ccClear_runScene(const cc_job_t *job)
         } else {
             scene_resetKitToDefaults(scene);
             (void)bank_setScenePresentMask(
-                (uint16_t)(bank_scenePresentMask() & (uint16_t)~ccClear_bit(scene)));
+                (uint16_t)(bank_scenePresentMask() & ~ccClear_bit(scene)));
             ccSvc_nameContentChanged(
                 filesystem_identityRow(FS_ROW_KIT, scene, 0u));
             for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++)
@@ -422,7 +422,7 @@ static uint8_t ccClear_runFx(const cc_job_t *job)
 {
     uint16_t written;
 
-    if ((bank_sceneFanoutMask(job->scene) &
+    if ((bank_sceneFanoutMask32(job->scene) &
          ccClear_bit(scene_getActiveIndex())) != 0u &&
         !preset_applyWorkersIdle())
         return CC_RUN_WAIT;
@@ -442,9 +442,9 @@ static uint8_t ccClear_runFxSequence(const cc_job_t *job)
     uint8_t changed = effects_clearSeqLanes(job->scene, 0xFFFFu, 0xFFFFu);
 
     if (changed)
-        ccClear_effectRowsChanged(bank_sceneFanoutMask(job->scene));
+        ccClear_effectRowsChanged(bank_sceneFanoutMask32(job->scene));
     ccTrace(AUTOSAVE_TRACE_CC_EVT_FX_CLEAR,
-            (uint32_t)bank_sceneFanoutMask(job->scene) |
+            (uint32_t)bank_sceneFanoutMask32(job->scene) |
             ((uint32_t)(job->scene & 0xFu) << 16u) | (0xFu << 20u) |
             (0xFu << 24u) | ((uint32_t)(changed ? 1u : 0u) << 28u));
     ccClear_effectUi();
@@ -473,7 +473,7 @@ static uint8_t ccClear_runFxSequence(const cc_job_t *job)
  * Outputs:    CC_RUN_WAIT while the active Scene's apply workers drain, then
  *             CC_RUN_DONE. Side effects: Instrument Morph, FX-send Morph and
  *             Kit Morph-decay AutoSave marks; Morph worker requeue.
- * Accessors:  bank_sceneFanoutMask(), preset_resetSlotMorphToNormal(),
+ * Accessors:  bank_sceneFanoutMask32(), preset_resetSlotMorphToNormal(),
  *             preset_setVoiceFxSendMorph(), scene_getVoiceFxSendAmount(),
  *             scene_setSlot6Track7MorphAmpEnvelopeDecay(),
  *             scene_getSlot6Track7AmpEnvelopeDecay(), preset_rebuildMorph().
@@ -485,13 +485,13 @@ static uint8_t ccClear_runResetMorphTrack(const cc_job_t *job)
     uint8_t slot = (job->track < INSTRUMENT_SLOT_COUNT)
                        ? job->track
                        : (uint8_t)(INSTRUMENT_SLOT_COUNT - 1u);
-    uint16_t mask = bank_sceneFanoutMask(job->scene);
+    uint32_t mask = bank_sceneFanoutMask32(job->scene);
     uint8_t active = scene_getActiveIndex();
     uint8_t m;
 
     if ((mask & ccClear_bit(active)) != 0u && !preset_applyWorkersIdle())
         return CC_RUN_WAIT;
-    for (m = 0u; m < SCENE_COUNT; m++) {
+    for (m = 0u; m < SCENE_SLOT_TOTAL; m++) {
         if ((mask & ccClear_bit(m)) == 0u)
             continue;
         (void)preset_resetSlotMorphToNormal(m, slot);
@@ -534,7 +534,7 @@ static uint8_t ccClear_runResetMorphTrack(const cc_job_t *job)
  * the whole Scene's morph endpoints to Normal, fanning out through the edit
  * mask (parallels `clear fx`).
  *
- * What:       for each Scene in bank_sceneFanoutMask(job->scene):
+ * What:       for each Scene in bank_sceneFanoutMask32(job->scene):
  *             (a) for each of the six slots:
  *                 preset_resetSlotMorphToNormal() resets the morphable
  *                 instrument descriptors (each member uses its OWN Normal
@@ -561,7 +561,7 @@ static uint8_t ccClear_runResetMorphTrack(const cc_job_t *job)
  * Outputs:    CC_RUN_WAIT while the active Scene's apply workers drain, then
  *             CC_RUN_DONE. Side effects: Instrument Morph, FX-send Morph,
  *             Kit Morph-decay and Effect AutoSave marks; runtime rebuild.
- * Accessors:  bank_sceneFanoutMask(), preset_resetSlotMorphToNormal(),
+ * Accessors:  bank_sceneFanoutMask32(), preset_resetSlotMorphToNormal(),
  *             preset_setVoiceFxSendMorph(), scene_getVoiceFxSendAmount(),
  *             scene_setSlot6Track7MorphAmpEnvelopeDecay(),
  *             scene_getSlot6Track7AmpEnvelopeDecay(),
@@ -572,13 +572,13 @@ static uint8_t ccClear_runResetMorphTrack(const cc_job_t *job)
  */
 static uint8_t ccClear_runResetSceneMorph(const cc_job_t *job)
 {
-    uint16_t mask = bank_sceneFanoutMask(job->scene);
+    uint32_t mask = bank_sceneFanoutMask32(job->scene);
     uint8_t active = scene_getActiveIndex();
     uint8_t m;
 
     if ((mask & ccClear_bit(active)) != 0u && !preset_applyWorkersIdle())
         return CC_RUN_WAIT;
-    for (m = 0u; m < SCENE_COUNT; m++) {
+    for (m = 0u; m < SCENE_SLOT_TOTAL; m++) {
         uint8_t slot;
 
         if ((mask & ccClear_bit(m)) == 0u)
@@ -640,7 +640,7 @@ static uint8_t ccClear_runResetSceneMorph(const cc_job_t *job)
  * Outputs:    CC_RUN_WAIT while the active Scene's apply workers drain, then
  *             CC_RUN_DONE. Side effects: Effect AutoSave marks, Effect row
  *             refreshed flags cleared, runtime reactivated.
- * Accessors:  effects_resetMorphToNormal(), bank_sceneFanoutMask(),
+ * Accessors:  effects_resetMorphToNormal(), bank_sceneFanoutMask32(),
  *             preset_applyWorkersIdle(), ccClear_effectRowsChanged().
  * Affiliates: ccClear_runFx() (model), effects_resetRecord().
  */
@@ -648,7 +648,7 @@ static uint8_t ccClear_runResetFxMorph(const cc_job_t *job)
 {
     uint16_t written;
 
-    if ((bank_sceneFanoutMask(job->scene) &
+    if ((bank_sceneFanoutMask32(job->scene) &
          ccClear_bit(scene_getActiveIndex())) != 0u &&
         !preset_applyWorkersIdle())
         return CC_RUN_WAIT;
@@ -656,7 +656,7 @@ static uint8_t ccClear_runResetFxMorph(const cc_job_t *job)
     if (written)
         ccClear_effectRowsChanged(written);
     ccTrace(AUTOSAVE_TRACE_CC_EVT_FANOUT,
-            (uint32_t)(written ? written : bank_sceneFanoutMask(job->scene)) |
+            (uint32_t)(written ? written : bank_sceneFanoutMask32(job->scene)) |
             ((uint32_t)(job->scene & 0xFu) << 16u) | (9u << 20u));
     if ((written & ccClear_bit(scene_getActiveIndex())) != 0u)
         menu_repaintAll();

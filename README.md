@@ -176,16 +176,20 @@ make all && make img  → build/LXRV2_lxr02.img   (bare `make` can stop at build
     │   ├── copyClearTools.c/h       ← copy/clear UI; pattern mutation through PatternData
     │   ├── menuEffects.c/h          ← SHIFT+PERF Effect page (Phase 5)
     │   └── screensaver.c/h          ← screensaver with explicit LCD off/on phases
-    ├── MIDI/
-    │   ├── Uart.c/h                 ← USART3, 31250 baud, interrupt-driven dual FIFO (realtime + normal)
-    │   ├── MidiRealtime.c/h         ← 32-entry timestamped SPSC ring for MIDI_CLOCK/START/CONTINUE/STOP
-    │   ├── FIFO.c/h
-    │   ├── MidiMessages.h           ← full mainboard version (MIDI_NRPN_* prefix)
-    │   ├── MidiNoteNumbers.h
-    │   ├── MidiParser.c/h
-    │   ├── MidiVoiceControl.c/h
-    │   ├── SeqStep.h
-    │   └── valueShaper.h
+    ├── MIDI/                        ← S083 rebuild, single-role modules
+    │   ├── MidiDefs.h               ← MidiMsg (6 B, arrival stamp), statuses, CCs, filters, MRT
+    │   ├── MidiBuffer.c/h           ← DIN TX lanes and stamped RX buffer
+    │   ├── MidiDin.c/h              ← USART3 driver (PB10/PB11)
+    │   ├── MidiIn.c/h               ← framing, RXF, Bank-load drop filter, consume-then-route, MRT
+    │   ├── MidiTransport.c/h        ← realtime ring, TIM3 handler, Start/Continue/Stop, SPP, MTC
+    │   ├── MidiNoteMap.c/h          ← N1-N5 note map and Q4 TX inverse
+    │   ├── MidiNotes.c/h            ← triggers, overlays, CC2, LiveRecord age
+    │   ├── MidiControl.c/h          ← NRPN, CC1, value rules, menu-edit writes
+    │   ├── MidiLearn.c/h            ← 128-row Learn table, gesture, settings.cfg lines
+    │   ├── MidiProgram.c/h          ← PC and CC0
+    │   ├── MidiOut.c/h              ← all TX, forwarding, framing, no echo
+    │   ├── MidiPitch.h              ← default note 63, frequency table, detune
+    │   └── MidiVoiceControl.c/h     ← trigger funnel (unchanged)
     ├── Scene/
     │   ├── Pattern/
     │   │   ├── PatternData.c/h      ← pattern/track/step storage and edit API

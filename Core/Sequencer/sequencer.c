@@ -40,16 +40,17 @@
 #include "DrumVoice.h"
 #include "Snare.h"
 #include "HiHat.h"
-#include "Uart.h"
-#include "MidiMessages.h"
+#include "MidiDefs.h"
+#include "MidiIn.h"
+#include "MidiOut.h"
+#include "MidiTransport.h"
 #include "MidiVoiceControl.h"
 #include "CymbalVoice.h"
 #include "sequencer.h"
 #include <string.h>
 #include "usb_manager.h"
 #include "clockSync.h"
-#include "MidiParser.h"
-#include "MidiNoteNumbers.h"
+#include "MidiPitch.h"
 #include "SomGenerator.h"
 #include "triggerJacks.h"
 #include "timebase.h"
@@ -85,6 +86,19 @@
 uint8_t seq_masterStepCnt=0;				/** compatibility mirror of the low 8 bits of seq_masterStepClock */
 static uint16_t seq_masterStepClock = 0;    /**< fixed-grid sixteenth-note clock */
 static uint32_t seq_elapsedPpqTicks = 0;    /**< 96 PPQ ticks elapsed since the current pattern/start reset */
+/*
+ * Resume position for MIDI Continue and Song Position Pointer (S083 T1).
+ *
+ * What: the master tick (96 PPQ) that a Continue plays first. Written at
+ * every stop (the tick after the last one played, so nothing is played
+ * twice; 0 when no tick was played yet), by an SPP while stopped
+ * (SPP x 24, the next position), and cleared by Start. Why: a stop resets seq_elapsedPpqTicks
+ * to 0, so without this Continue could only restart. RAM: 4 B SRAM1
+ * (R-C). Writers: seq_setRunningEx() (stop/start), seq_setResumeTick()
+ * (SPP), seq_continueRunning() (consumes). Context: TIM3 and foreground
+ * (single aligned 32-bit word; Cortex-M7 reads/writes it atomically).
+ */
+static uint32_t seq_resumeTick = 0u;
 static uint8_t seq_initialSchedulerTick = 1;/**< nonzero until the immediate step at PPQ tick 0 has been processed */
 static uint8_t seq_internalMidiClockPhase = 0;
 
@@ -400,6 +414,24 @@ static uint8_t seq_chainRepCount    = 0u;
 static uint8_t seq_previousScene    = 0xFFu;
 static uint8_t seq_chainStopped     = 0u;
 static uint8_t seq_pendingChainFire = 0u;
+
+/*
+ * Origin of the next whole-Scene change (S083 Q9; RAM approved Q13).
+ *
+ * What: 1 while the pending or executing whole-Scene change came from a
+ * received MIDI PC; seq_sendProgChg() then sends nothing and clears it.
+ * Why: MIDI-originated changes are never echoed (plan 3.9 P), also when a
+ * deferred change fires at the next boundary. Writers:
+ * seq_setSceneChangeOrigin() (menu_perfModeSceneChangeFrom(), panel or
+ * MIDI), seq_chainEvaluate() (a chain fire is LXR-generated: cleared),
+ * seq_sendProgChg() (consumed). RAM: 1 B SRAM1.
+ */
+static uint8_t seq_sceneChangeFromMidi = 0u;
+
+void seq_setSceneChangeOrigin(uint8_t origin)
+{
+	seq_sceneChangeFromMidi = (uint8_t)(origin == MIDI_ORIGIN_MIDI);
+}
 
 /*
  * Convert a scene change division to master 1/16-note units (S080 F8).
@@ -742,10 +774,6 @@ static uint8_t seq_loadPendigFlag = 0;
 // the purpose of pattern changes
 uint8_t seq_resetBarOnPatternChange=0;
 
-// --AS keep track of which midi notes are playing
-static uint8_t midi_chan_notes[16];		    /**< what note is playing on each channel */
-static uint16_t midi_notes_on=0;		    /**< which channels have a note currently playing */
-
 uint8_t seq_newPatternAvailable = 0; //indicate that a new pattern has loaded in the background and we should switch
 
 /*
@@ -810,7 +838,7 @@ static uint64_t seq_automation_dirty[INSTRUMENT_SLOT_COUNT];
 static uint64_t seq_menuOverride[INSTRUMENT_SLOT_COUNT];
 
 /*
- * Automation ramp state (S081 P2, asm; +669 B SRAM1, +2 B DEV-only).
+ * Automation ramp state (S081 P2, rmp; +669 B SRAM1, +2 B DEV-only).
  *
  * What: seq_ramps[64] are the running linear ramps. Each slot holds the
  * track and Instrument target, the from/to 7-bit values, the last value the
@@ -1446,7 +1474,6 @@ static void seq_restoreAllSceneAutomation(void)
     }
 }
 
-static void seq_sendMidi(MidiMsg msg);
 static void seq_sendRealtime(const uint8_t status);
 static void seq_sendProgChg(const uint8_t ptn);
 static void seq_processSchedulerTick(void);
@@ -1723,36 +1750,11 @@ void seq_sync()
 	sync_tick();
 }
 //------------------------------------------------------------------------------
-void seq_setNextPattern(const uint8_t patNr)
-{
-	/*
-	 * Deprecated pattern-chain entry point.
-	 *
-	 * Scene expansion removed standalone Pattern switching: a musical switch must
-	 * select the Scene, its Pattern, and Scene-owned parameters together through
-	 * menu_perfModeSceneButtonPressed()/seq_selectActivePattern(). Inputs from
-	 * legacy MIDI program-change paths are therefore ignored instead of queuing a
-	 * Pattern-only change that would desynchronize playback from the active Scene.
-	 */
-	(void)patNr;
-}
-//------------------------------------------------------------------------------
 void seq_armActivePatternReload(void)
 {
 	seq_loadPendigFlag = 1;
 }
 //------------------------------------------------------------------------------
-static void seq_sendMidi(MidiMsg msg)
-{
-	//send to usb midi
-	usb_sendMidi(msg);
-
-	//send to hardware midi out jack
-	uart_sendMidi(msg);
-
-}
-
-
 //------------------------------------------------------------------------------
 /*
  * Assign one track to play from a specific Scene (S077 P2 §1.3).
@@ -1894,6 +1896,52 @@ uint8_t seq_getTrackPlayedScene(uint8_t track)
     return seq_perTrackPattern[track];
 }
 
+/*
+ * Move tracks to play another Scene (S077 P2 4.1; S083 P3).
+ *
+ * What: for each track in trackMask: seq_setTrackPlayedScene(),
+ * seq_realignTrackToMasterClock() (which also advances the Scene epoch, so
+ * LiveRecord starts a new take, S081 14.3 / R20), ends the track's MIDI
+ * note (the new Scene may map it to another channel or note), and arms the
+ * slot's instrument apply once per slot (tracks 6 and 7 share slot 5).
+ * The HiHat pair (track indices 5 and 6) always moves together: if either
+ * bit is set both are processed (assessment F-7), because
+ * seq_setTrackPlayedScene() moves the partner anyway and the partner must
+ * also be realigned and have its MIDI note ended.
+ * Why: one implementation for the panel gesture (hold VOICE + SEQ) and a
+ * MIDI PC on a voice channel; the MIDI path must not skip the realign
+ * (plan R20). Inputs: trackMask (bit per track), Scene 0..15, already
+ * validated available by the caller. Context: foreground.
+ * Accessors: buttonHandler_perfVoiceHeldSeqPressed(),
+ * midiProgram_programChange(). Affiliates: preset_startSingleVoiceApply(),
+ * midiOut_trackNoteOff().
+ */
+void seq_assignTracksToScene(uint8_t trackMask, uint8_t scene_index)
+{
+	uint8_t applied = 0u;
+	uint8_t track;
+
+	/* F-7: the HiHat choke pair moves as one (see the contract above). */
+	if (trackMask & 0x60u)
+		trackMask |= 0x60u;
+
+	for (track = 0u; track < NUM_TRACKS; track++) {
+		uint8_t slot;
+
+		if ((trackMask & (uint8_t)(1u << track)) == 0u)
+			continue;
+		seq_setTrackPlayedScene(track, scene_index);
+		seq_realignTrackToMasterClock(track);
+		midiOut_trackNoteOff(track);
+		slot = (track >= INSTRUMENT_SLOT_COUNT)
+		       ? (uint8_t)(INSTRUMENT_SLOT_COUNT - 1u) : track;
+		if ((applied & (uint8_t)(1u << slot)) == 0u) {
+			applied |= (uint8_t)(1u << slot);
+			preset_startSingleVoiceApply(slot, scene_index);
+		}
+	}
+}
+
 //------------------------------------------------------------------------------
 /*
  * Trigger a voice with optional automation reset (S081 §5.8).
@@ -1912,9 +1960,6 @@ uint8_t seq_getTrackPlayedScene(uint8_t track)
  */
 void seq_triggerVoice(uint8_t voiceNr, uint8_t vol, uint8_t note, uint8_t reset)
 {
-	uint8_t midiChan; // which midi channel to send a note on
-	uint8_t midiNote; // which midi note to send
-
 	if(voiceNr > 6) return;
 
 	/*
@@ -1923,7 +1968,7 @@ void seq_triggerVoice(uint8_t voiceNr, uint8_t vol, uint8_t note, uint8_t reset)
 	 * Inputs: valid voice plus caller-selected velocity/note. Outputs: synth,
 	 * trigger jack, and MIDI note-on are driven. seq_advanceTrackStep() resolves
 	 * PatternData defaults/specials before calling this owner; this function
-	 * retains responsibility for the track MIDI-note override and voice trigger.
+	 * sends the internal note through the track's inverse note map (S083 C-2).
 	 */
 
 	//turn the trigger off before sending the next one
@@ -1946,31 +1991,18 @@ void seq_triggerVoice(uint8_t voiceNr, uint8_t vol, uint8_t note, uint8_t reset)
 		voiceControl_noteOnNoReset(voiceNr, note, vol);
 
 	/*
-	 * Per-track MIDI output (S077 P2 §6.5).
+	 * Track MIDI output (S077 P2 6.5; S083 C-2, C-6, Q4).
 	 *
-	 * What: MIDI output uses the track's played Scene's channel, not the global
-	 * active Scene's. Why: each track sends MIDI on the channel configured in
-	 * the Scene it is playing from. Inputs: seq_perTrackPattern[voiceNr].
-	 * Output: MIDI note-on uses the correct Scene's channel. When no per-track
-	 * override is set this equals seq_activePattern and behaviour is unchanged.
+	 * What: the internal note goes out as the note that plays it back on
+	 * this track (inverse note map of the Scene the track plays); a pitch
+	 * the track's range cannot express sends nothing. Inputs:
+	 * seq_perTrackPattern[voiceNr], note, vol. Affiliates:
+	 * midiOut_trackTrigger(), MidiNoteMap.
 	 */
-	midiChan = (uint8_t)(scene_getTrackMidiChannel(seq_perTrackPattern[voiceNr], voiceNr) - 1u);
-
-	/*
-	 * MIDI output note/channel are PatternData-owned track settings now. A note
-	 * value of 0 preserves the old "use the triggered note" behavior; nonzero
-	 * values override the outgoing MIDI note for this pattern track.
-	 */
-	midiNote = scene_getTrackMidiNote(seq_perTrackPattern[voiceNr], voiceNr);
-	if(midiNote == 0)
-		midiNote = note;
-
-	//send the new note to midi/usb out
-	seq_sendMidiNoteOn(midiChan, midiNote, vol);
+	midiOut_trackTrigger(voiceNr, seq_perTrackPattern[voiceNr], note, vol);
 }
 void seq_previewVoice(uint8_t voiceNr)
 {
-	uint8_t midiChan;
 	uint8_t note;
 
 	/*
@@ -1982,24 +2014,20 @@ void seq_previewVoice(uint8_t voiceNr)
 	 * cannot depend on seq_stepIndex[] or write automation side effects.
 	 *
 	 * Input voiceNr is the 0-based UI track/voice. Outputs: trigger jack, synth
-	 * voice, and MIDI note-on follow the same channel/note ownership as normal
-	 * playback. Confederates: PatternData supplies the optional track MIDI note
-	 * override, MidiVoiceControl owns note-on/off, and triggerJacks owns trigger
-	 * pulse state. Invalid voices and running transport are ignored.
+	 * voice play the default pitch and MIDI note-on uses the same inverse map as
+	 * normal playback (S083 C-1). Confederates: MidiVoiceControl owns
+	 * note-on/off, and triggerJacks owns trigger pulse state. Invalid voices and
+	 * running transport are ignored.
 	 */
 	if (voiceNr > 6u || seq_running)
 		return;
 
 	/*
-	 * Preview uses the track's played Scene for MIDI identity (S077 P2 §6.5).
-	 *
-	 * What: stopped-transport voice preview auditions through the MIDI
-	 * channel/note of whichever Scene the track is playing from. Inputs:
-	 * seq_perTrackPattern[voiceNr].
+	 * Preview plays the default pitch (S083 C-1): a track's MIDI note is the
+	 * root of its receive range, not a pitch. MIDI output goes through the
+	 * inverse map like any trigger.
 	 */
-	note = scene_getTrackMidiNote(seq_perTrackPattern[voiceNr], voiceNr);
-	if (note == 0u)
-		note = MIDI_DEFAULT_TRIGGER_NOTE;
+	note = MIDI_DEFAULT_TRIGGER_NOTE;
 
 	if (voiceNr >= 5u) {
 		trigger_triggerVoice(5, TRIGGER_OFF);
@@ -2011,8 +2039,8 @@ void seq_previewVoice(uint8_t voiceNr)
 	voiceControl_noteOff(voiceNr);
 	voiceControl_noteOn(voiceNr, note, ROLL_VOLUME);
 
-	midiChan = (uint8_t)(scene_getTrackMidiChannel(seq_perTrackPattern[voiceNr], voiceNr) - 1u);
-	seq_sendMidiNoteOn(midiChan, note, ROLL_VOLUME);
+	midiOut_trackTrigger(voiceNr, seq_perTrackPattern[voiceNr], note,
+	                     ROLL_VOLUME);
 }
 //------------------------------------------------------------------------------
 static void seq_resetStepScheduler(void)
@@ -2139,9 +2167,27 @@ void seq_selectActivePattern(uint8_t pattern)
 		seq_loopRefreshSceneSnapshots();
 		__set_PRIMASK(primask);
 	}
+	/*
+	 * Release Scene 17 on the first whole-Scene change (S082 C8, D9a, D10).
+	 *
+	 * What: once every track points at a resident Scene, Scene 17's storage
+	 * becomes invalid and can never be selected again; AutoSave and overlap
+	 * paste return because their Scene 17 gates fall away.
+	 * Why: Scene 17 owns the sounding Effect and Scene-level state until a
+	 * whole-Scene change replaces them; per-track moves never release it.
+	 * Inputs: new Scene p < 16 and an existing Scene 17.
+	 * Outputs: scene_backgroundRelease().
+	 * Accessors: seq_selectActivePattern() (SEQ press, MIDI PC, queued/chain).
+	 * Affiliates: scene_backgroundRelease(), pat_regionFor(), the C9 gates.
+	 */
+	if (pattern < SCENE_COUNT && scene_backgroundExists())
+		scene_backgroundRelease();
 	led_notifyPatternChanged(seq_activePattern);
 	seq_sendProgChg(seq_activePattern);
 	voiceControl_noteOff(0xFF);
+	/* S083: end every track's MIDI note; the new Scene may map tracks to
+	** other channels and notes. Affiliate: midiOut_trackNoteOff(). */
+	midiOut_trackNoteOff(0xFFu);
 	/*
 	 * S076 Rule B: clear the Scene-target automation dirty bitmap.
 	 *
@@ -2248,6 +2294,96 @@ void seq_alignActivePatternToScene(uint8_t scene_index)
 	 * Same rationale as seq_selectActivePattern() — see Change 15.
 	 */
 	seq_clearSceneAutomationDirty();
+}
+
+/*
+ * Move playback to Scene 17 without a sound change (D5, D16).
+ *
+ * What: points the active, pending and every per-track Scene at index 16 in
+ * one PRIMASK section and re-snapshots the looper for the new Scene, keeping
+ * step positions, DDA accumulators, rolls, conditions, epochs and looper
+ * anchors; cancels pending direct/queued Scene changes. No program change,
+ * note-off or LED notify is sent (Scene 17 has no number).
+ * Why: Scene 17 is an exact copy of what played, so the switch must change the
+ * read address only; seq_selectActivePattern() would reset rolls/conditions,
+ * realign and send PC (audible), and seq_alignActivePatternToScene() also
+ * realigns.
+ * Inputs: Scene 17 built (scene_backgroundExists()).
+ * Outputs: seq_activePattern = seq_perTrackPattern[] = 16.
+ * Context: foreground.
+ * Accessors: preset_requestBackgroundBankLoad() tick.
+ * Affiliates: seq_loopRefreshSceneSnapshots() (S080 looper invariants: under
+ * PRIMASK, anchors kept), seq_clearPendingSceneChange(),
+ * seq_refreshTrackEffectiveParams(), LiveRecord (follows the played Scene).
+ */
+void seq_switchToBackgroundScene(void)
+{
+	uint32_t primask;
+	uint8_t track;
+
+	if (!scene_backgroundExists() || !pat_patternValid(SCENE_BACKGROUND_INDEX))
+		return;
+	primask = __get_PRIMASK();
+	__disable_irq();
+	seq_previousScene = seq_activePattern;
+	seq_activePattern = SCENE_BACKGROUND_INDEX;
+	seq_pendingPattern = SCENE_BACKGROUND_INDEX;
+	for (track = 0u; track < NUM_TRACKS; track++)
+		seq_perTrackPattern[track] = SCENE_BACKGROUND_INDEX;
+	seq_perTrackActive = 0u;
+	seq_loadPendigFlag = 0u;
+	seq_newPatternAvailable = 0u;
+	seq_loopRefreshSceneSnapshots();
+	__set_PRIMASK(primask);
+	/*
+	 * A background load owns the transport now: drop every pending Scene
+	 * change (direct, queued and chain-fired) so nothing fires mid-load.
+	 */
+	seq_clearPendingSceneChange();
+	seq_chainBarCount = 0u;
+	seq_chainRepCount = 0u;
+	seq_chainStopped = 0u;
+	seq_refreshTrackEffectiveParams();
+}
+
+/*
+ * Move selected tracks onto Scene 17 without a sound change (S082 P1 D31).
+ *
+ * What: under PRIMASK, points seq_perTrackPattern[t] at index 16 for each
+ * track in track_mask, recomputes seq_perTrackActive and re-snapshots the
+ * looper; then cancels pending Scene changes and refreshes the effective
+ * track cache. Active Scene, step positions, DDA accumulators, rolls,
+ * conditions, epochs, the live-record take (D35) and looper anchors are kept.
+ * Why: a rebuild in place copies only the tracks whose resident Scene the
+ * load replaces; only those may move, because tracks on unaffected Scenes
+ * stay where they are (D31). Each moved track's data and slot were just
+ * copied from the Scene it was playing, so the move changes the read address
+ * only (D4).
+ * Inputs: track_mask (bit t = track t), Scene 17 exists.
+ * Outputs: seq_perTrackPattern[], seq_perTrackActive.
+ * Context: foreground.
+ * Accessors: preset_tickBackgroundBankLoad() phase 3 (rebuild).
+ * Affiliates: seq_switchToBackgroundScene() (fresh build),
+ * seq_recomputePerTrackActive(), seq_loopRefreshSceneSnapshots(),
+ * seq_clearPendingSceneChange(), seq_refreshTrackEffectiveParams().
+ */
+void seq_moveTracksToBackgroundScene(uint8_t track_mask)
+{
+	uint32_t primask;
+	uint8_t track;
+
+	if (!scene_backgroundExists() || !pat_patternValid(SCENE_BACKGROUND_INDEX))
+		return;
+	primask = __get_PRIMASK();
+	__disable_irq();
+	for (track = 0u; track < NUM_TRACKS; track++)
+		if (track_mask & (uint8_t)(1u << track))
+			seq_perTrackPattern[track] = SCENE_BACKGROUND_INDEX;
+	seq_recomputePerTrackActive();
+	seq_loopRefreshSceneSnapshots();
+	__set_PRIMASK(primask);
+	seq_clearPendingSceneChange();
+	seq_refreshTrackEffectiveParams();
 }
 
 /*
@@ -2560,16 +2696,25 @@ static uint8_t seq_rollPpq(uint8_t rate)
  * floors at 1; doubled clamps at 127. Byte 0x00 and any full >= cycle decode as
  * off (no velocity change: every retrigger at step velocity). Inputs:
  * seq_rollVelPos, seq_rollStepVel, seq_rollLastRhythm. Output: velocity
- * 1..127.
+ * 1..127. S083 follow-up: the decode moved unchanged into the pure
+ * seq_rollRhythmVelocity() (contract in sequencer.h) so the PERF BAR
+ * overlay rolls (`pv<`/`pv>`, buttonHandler) use the identical rule; this
+ * wrapper only supplies the step roll's per-track state.
  */
 static uint8_t seq_rollComputeVelocity(uint8_t track)
 {
-    uint8_t r = seq_rollLastRhythm[track];
+    return seq_rollRhythmVelocity(seq_rollLastRhythm[track],
+                                  seq_rollStepVel[track],
+                                  seq_rollVelPos[track]);
+}
+
+/* Contract in sequencer.h (the former body of seq_rollComputeVelocity()). */
+uint8_t seq_rollRhythmVelocity(uint8_t rhythm, uint8_t vel, uint8_t pos)
+{
+    uint8_t r = rhythm;
     uint8_t cycle = (uint8_t)((r >> 4u) & 0x0Fu);
     uint8_t dir = (uint8_t)((r >> 3u) & 1u);
     uint8_t full = (uint8_t)(r & 0x07u);
-    uint8_t vel = seq_rollStepVel[track];
-    uint8_t pos;
 
     if (cycle == 0u)
         cycle = 1u;
@@ -2579,7 +2724,7 @@ static uint8_t seq_rollComputeVelocity(uint8_t track)
         full = 1u;
         cycle = 1u;
     }
-    pos = (uint8_t)(seq_rollVelPos[track] % cycle);
+    pos = (uint8_t)(pos % cycle);
     if (pos < full)
         return vel;
     if (dir == 0u) {
@@ -3337,7 +3482,7 @@ static uint8_t seq_applySceneAutomation(uint16_t target, uint8_t value)
  * resets only after no append raced the drain. Affiliate: main.c's pre-audio
  * foreground sequence.
  * S081 P2: before applying entries it ends the ramps of tracks whose next
- * step has applied; each written Instrument entry of an asm track may start a
+ * step has applied; each written Instrument entry of an rmp track may start a
  * ramp toward the same target on the predicted next step
  * (seq_rampStartIfPaired()).
  */
@@ -3445,7 +3590,7 @@ void seq_drainPendingAutomation(void)
                      * Write the value and mark it held for the next trigger's
                      * restore (seq_writeInstrumentAutomation(), shared with
                      * the S081 P2 ramp service). A successful write of an
-                     * asm track's entry may start a ramp toward the same
+                     * rmp track's entry may start a ramp toward the same
                      * target on the predicted next step.
                      */
                     {
@@ -3687,7 +3832,7 @@ static uint8_t seq_rampConditionPredict(const pat_step_specials_t *sp,
 /*
  * Predict B and its apply time for step A (S081 P2 §5.2).
  *
- * What: at A's step start on an asm track, fills the context's B (+1) and
+ * What: at A's step start on an rmp track, fills the context's B (+1) and
  * B's apply time, or leaves b = 0 when no ramp may start because:
  *  - A has no automation, or the track is muted / full-erased;
  *  - there is no predictable B (rnd, once end);
@@ -3750,7 +3895,7 @@ static void seq_rampPredict(uint8_t track, const pat_scene_region_t *region,
 /*
  * TIM3 ramp hand-off at a step (S081 P2 §5.1/§5.5).
  *
- * What: on an asm track only, records what happened at this step for the
+ * What: on an rmp track only, records what happened at this step for the
  * foreground:
  *  - applied (automation queued now): stepped flag + prediction of B;
  *  - deferred (automation queues at the deferred fire): prediction only;
@@ -3758,7 +3903,7 @@ static void seq_rampPredict(uint8_t track, const pat_scene_region_t *region,
  *    the ramps into this step run until its value actually lands;
  *  - neither (condition failed, muted, full-erased, no automation block):
  *    stepped flag with no B, so ramps toward this step end at its start.
- * Tracks with asm off write nothing; the ramp service cancels any ramp left
+ * Tracks with rmp off write nothing; the ramp service cancels any ramp left
  * on them. Why: ramps end at the next played step's apply time, and that
  * step's own value then takes over. Context: TIM3. Accessors:
  * seq_advanceTrackStep(). Affiliates: seq_rampPredict(), seq_fireDeferred(),
@@ -3954,7 +4099,7 @@ static uint8_t seq_rampDtypeOk(const ParamDescriptor *descriptor)
 }
 
 /*
- * Is the track's asm mode on in its played Scene? (S081 P2)
+ * Is the track's rmp mode on in its played Scene? (S081 P2)
  *
  * What: reads pat_scene_region_t.track_auto_smooth of
  * seq_perTrackPattern[track]. Why: ramps start and keep running only while
@@ -4004,7 +4149,7 @@ static const ParamDescriptor *seq_writeInstrumentAutomation(
 /*
  * Start a ramp for a just-written entry of step A (S081 P2 §5.4).
  *
- * What: when A's entry was written on an asm track for a rampable target,
+ * What: when A's entry was written on an rmp track for a rampable target,
  * and TIM3's context for this track still describes this A with a
  * predicted B that holds the same target, takes a slot that ramps from A's
  * value (just written) to B's value, from now to B's predicted apply time.
@@ -4088,7 +4233,7 @@ static void seq_rampStartIfPaired(uint8_t track, uint8_t scene, uint8_t step,
  * written value (user decision; the held bit keeps every other writer off the
  * parameter, so an unchanged value is still in the runtime). A ramp is
  * cancelled (its value stays) when:
- *  - the track's asm turned off;
+ *  - the track's rmp turned off;
  *  - live record latches or erases the target (the drain's filters);
  *  - an R12 menu override is set;
  *  - the target is no longer valid in the track's played Scene.
@@ -4227,6 +4372,8 @@ static uint8_t seq_handleMasterBoundary(void)
 			led_notifyPatternChanged(seq_activePattern);
 			seq_sendProgChg(seq_activePattern);
 			voiceControl_noteOff(0xFF);
+			/* S083: end every track's MIDI note on this boundary too. */
+			midiOut_trackNoteOff(0xFFu);
 			return 1u;
 		}
 	}
@@ -5489,6 +5636,13 @@ static uint8_t seq_chainResolveNext(uint8_t next, uint8_t cur)
 	uint8_t target;
 	uint16_t rnd = (uint16_t)GetRngValue() & 0x7FFFu;
 
+	/*
+	 * S082 C9: Scene 17 has no chain number. Its chain fields are cleared when
+	 * it is built, so this is a defensive guard against a stale condition
+	 * evaluating while a background Bank load runs; never wrap (cur + 1) to 0.
+	 */
+	if (cur >= SCENE_COUNT)
+		return 0xFFu;
 	if (next == 0u)
 		target = cur;
 	else if (next == 1u)
@@ -5568,17 +5722,25 @@ static void seq_chainEvaluate(uint8_t at_bar, uint8_t at_rep)
 	seq_pendingSceneDiv = 0u;
 	seq_pendingSceneChange = 1u;
 	seq_pendingChainFire = 1u;
+	/* S083: a chain fire is LXR-generated; its PC is sent. */
+	seq_sceneChangeFromMidi = 0u;
 	seq_sceneFireFlag = 1u;         /* published last */
 }
 
 /*
- * Per-tick chain boundary service (S080 G7).
+ * Per-tick chain boundary service (S080 G7; S082 P3 D50, D52).
  *
  * What: on each master tick after the first, detects bar and repetition
- * boundaries, advances the counters, and evaluates the chain unless a direct,
+ * boundaries and advances the counters; evaluates the chain unless a direct,
  * queued or chain change is already pending (a manual or queued switch
- * cancels conditional changes, plan §4.5). Inputs: seq_elapsedPpqTicks,
- * pending flags. Outputs: counters, seq_chainEvaluate(). Context: TIM3 ISR via
+ * cancels conditional changes, plan §4.5), or a background Bank load runs.
+ * Why: counters keep running during a load (D50); evaluation is suspended
+ * because a chain target (`sNN`, `nxt`, `prv`, random range) could resolve
+ * differently depending on which children have loaded (D52). After the load
+ * the next boundary evaluates with the counts as they stand.
+ * Inputs: seq_elapsedPpqTicks, pending flags,
+ * preset_backgroundBankLoadRunning() (one-byte read, ISR-safe).
+ * Outputs: counters, seq_chainEvaluate(). Context: TIM3 ISR via
  * seq_processSchedulerTick().
  */
 static void seq_chainServiceTick(void)
@@ -5597,6 +5759,8 @@ static void seq_chainServiceTick(void)
 	if (at_rep && seq_chainRepCount < 255u)
 		seq_chainRepCount++;
 	if (seq_pendingSceneChange || seq_pendingSceneQueue || seq_sceneFireFlag)
+		return;
+	if (preset_backgroundBankLoadRunning())
 		return;
 	seq_chainEvaluate(at_bar, at_rep);
 }
@@ -5803,7 +5967,7 @@ static void seq_processSchedulerTick(void)
 		if (seq_handleMasterBoundary()) {
 			/* Pattern switching must not suppress the independent FX boundary. */
 			seq_fxClockTick();
-			midiParser_checkMtc();
+			midiTransport_checkMtc();
 			return;
 		}
 	} else {
@@ -5815,7 +5979,7 @@ static void seq_processSchedulerTick(void)
 			if (seq_handleMasterBoundary()) {
 				/* Pattern switching must not suppress the independent FX boundary. */
 				seq_fxClockTick();
-				midiParser_checkMtc();
+				midiTransport_checkMtc();
 				return;
 			}
 		}
@@ -5894,7 +6058,7 @@ static void seq_processSchedulerTick(void)
 
     /* FX sequencer follows the same master PPQ clock, independent of Pattern. */
     seq_fxClockTick();
-    midiParser_checkMtc();
+    midiTransport_checkMtc();
 }
 //------------------------------------------------------------------------------
 uint8_t seq_getExtSync()
@@ -6077,22 +6241,28 @@ uint8_t seq_isRunning() {
  * restore are complete; the first enabled tick therefore cannot process a
  * premature step zero and then be reset by the foreground path.
  *
- * Inputs: isRunning — nonzero starts transport, zero stops it.
- * Outputs: stop halts transport, sends MIDI_STOP, silences notes/triggers,
- * and restores automation; start resets scheduler state, sends MIDI_START,
- * and enables transport only after the common grid reset is complete.
+ * Inputs: isRunning — nonzero starts transport, zero stops it. sendRealtime
+ * (S083) = 0 when the change came from received MIDI transport (C-11: MRT
+ * forwarding already carries the received message; the LXR must not send a
+ * second copy); 1 for the panel, MTC and menu paths.
+ * Outputs: stop halts transport, sends MIDI_STOP when sendRealtime is set,
+ * silences notes/triggers, and restores automation; start resets scheduler
+ * state, sends MIDI_START when sendRealtime is set, and enables transport
+ * only after the common grid reset is complete. A stop also records
+ * seq_resumeTick (the next unplayed tick) for a later Continue (R-C); a
+ * start clears it.
  * Common callers: front-panel transport, MIDI realtime, clockSync, and the
  * Menu audio-suspend path. Affiliates: seq_processSchedulerTick() consumes
  * seq_running; seq_resetStepScheduler() prepares the first tick;
  * seq_setStepIndexToStart() performs the restore-before-clear operation;
  * voiceControl_noteOff(), trigger_reset()/trigger_allOff(), and
- * midiParser_checkMtc() finish stop-side hardware/MTC cleanup.
+ * midiTransport_checkMtc() finish stop-side hardware/MTC cleanup.
  *
  * The stop-branch seq_clearAutomationDirty() call intentionally lives only in
  * seq_setStepIndexToStart(). A separate early clear would erase the dirty bits
  * before the restore and recreate the missed-automation defect.
  */
-void seq_setRunning(uint8_t isRunning)
+void seq_setRunningEx(uint8_t isRunning, uint8_t sendRealtime)
 {
 	/* S081 §19.1 item 6: a transport change is a take boundary. */
 	seq_playbackEpoch++;
@@ -6100,6 +6270,16 @@ void seq_setRunning(uint8_t isRunning)
 	seq_rampBreakAll();
 	if (!isRunning)
 	{
+		/*
+		 * S083 R-C: remember where playback continues (assessment F-1).
+		 * seq_elapsedPpqTicks is the tick already processed, so the resume
+		 * position is the next one; storing the processed tick made Continue
+		 * replay it (a step on that tick fired twice). Before the first
+		 * scheduler tick nothing was played: resume at 0.
+		 */
+		if (seq_running)
+			seq_resumeTick = seq_initialSchedulerTick
+			                 ? 0u : (seq_elapsedPpqTicks + 1u);
 		seq_running = 0u;
 
 		seq_barCounter = 0;
@@ -6126,14 +6306,17 @@ void seq_setRunning(uint8_t isRunning)
 		seq_chainRepCount = 0u;
 		seq_chainStopped = 0u;
 		seq_previousScene = 0xFFu;
-		seq_sendRealtime(MIDI_STOP);
+		if (sendRealtime)
+			seq_sendRealtime(MIDI_STOP);
 
 		voiceControl_noteOff(0xFF);
+		/* S083: Stop ends every transmitted track note as well. */
+		midiOut_trackNoteOff(0xFFu);
 
 		trigger_reset(0);
 		trigger_allOff();
 
-		midiParser_checkMtc();
+		midiTransport_checkMtc();
 
 		/*
 		 * Queue the foreground chase drain after publishing seq_running = 0.
@@ -6143,7 +6326,10 @@ void seq_setRunning(uint8_t isRunning)
 		seq_ledState.dirty |= SEQ_LED_DIRTY_CHASE;
 	} else {
 		seq_resetStepScheduler();
-		seq_sendRealtime(MIDI_START);
+		/* S083 T1: Start restarts from the Pattern start. */
+		seq_resumeTick = 0u;
+		if (sendRealtime)
+			seq_sendRealtime(MIDI_START);
 		trigger_reset(1);
 		/* S080 G7: counts start at zero with the transport. */
 		seq_chainBarCount = 0u;
@@ -6155,6 +6341,70 @@ void seq_setRunning(uint8_t isRunning)
 
 	if (isRunning)
 		seq_running = 1u;
+}
+
+/* Front panel, MTC, menu: transport change with LXR transport output. */
+void seq_setRunning(uint8_t isRunning)
+{
+	seq_setRunningEx(isRunning, 1u);
+}
+
+/*
+ * Resume playback at seq_resumeTick (S083 T1, MIDI Continue).
+ *
+ * What: the start sequence of seq_setRunningEx() (scheduler reset, trigger
+ * reset, chain counts, automation restore through
+ * seq_setStepIndexToStart()), then, for a non-zero resume tick, places the
+ * master clock one tick before it and realigns every track and the FX
+ * sequence to it through the master-clock anchors (the same mapping as the
+ * per-track realign, PATTERN_DYNAMIC_STACK.md 6.5), so the next scheduler
+ * tick plays position `resume` (the first tick not yet played: a stop
+ * stores processed + 1, an SPP the located position), so no tick is
+ * processed twice. A zero resume tick is a plain start.
+ * Why: Continue must resume, not restart (plan 3.8). Inputs:
+ * sendRealtime (0 when the Continue was received, C-11), seq_resumeTick.
+ * Outputs: transport running at the resume position; seq_resumeTick
+ * cleared. Context: TIM3 (sync_midiContinue()); the realign helpers are
+ * context-safe (pat_sceneRegion() SRAM reads, FX realign under PRIMASK).
+ * Affiliates: seq_realignActivePatternToMasterClock(), clockSync.c.
+ */
+void seq_continueRunning(uint8_t sendRealtime)
+{
+	uint32_t resume = seq_resumeTick;
+
+	if (seq_running)
+		return;
+	seq_playbackEpoch++;
+	seq_rampBreakAll();
+	seq_resetStepScheduler();
+	if (sendRealtime)
+		seq_sendRealtime(MIDI_CONTINUE);
+	trigger_reset(1);
+	seq_chainBarCount = 0u;
+	seq_chainRepCount = 0u;
+	seq_chainStopped = 0u;
+	seq_setStepIndexToStart();
+	if (resume != 0u) {
+		seq_elapsedPpqTicks = resume - 1u;
+		seq_masterStepClock = (uint16_t)(seq_elapsedPpqTicks /
+		                                 SEQ_INTERNAL_TICKS_PER_DEFAULT_STEP);
+		seq_masterStepCnt = (uint8_t)seq_masterStepClock;
+		seq_initialSchedulerTick = 0u;
+		seq_realignActivePatternToMasterClock();
+	}
+	seq_resumeTick = 0u;
+	seq_running = 1u;
+}
+
+/*
+ * Song Position Pointer while stopped (S083 T1).
+ * What: stores `tick` (SPP x 24) as the resume position; ignored while the
+ * transport runs. Accessor: midiTransport_handleSystemCommon().
+ */
+void seq_setResumeTick(uint32_t tick)
+{
+	if (!seq_running)
+		seq_resumeTick = tick;
 }
 //------------------------------------------------------------------------------
 void seq_setMute(uint8_t trackNr, uint8_t isMuted)
@@ -6168,8 +6418,17 @@ void seq_setMute(uint8_t trackNr, uint8_t isMuted)
 		if(isMuted) {
 			//mute track
 			seq_mutedTracks |= (1<<trackNr);
-			// --AS turn off the midi note that may be playing on that track
-			voiceControl_noteOff(midi_MidiChannels[trackNr]);
+			/*
+			 * End the muted track's sound and MIDI note (S083 fix).
+			 *
+			 * What: stops the track's voice and sends its MIDI note-off.
+			 * Why: the old call passed midi_MidiChannels[trackNr] (a zero-
+			 * based channel) as a voice index, so it stopped the wrong voice
+			 * or none. Affiliates: voiceControl_noteOff(),
+			 * midiOut_trackNoteOff().
+			 */
+			voiceControl_noteOff(trackNr);
+			midiOut_trackNoteOff(trackNr);
 		} else {
 			//unmute track
 			seq_mutedTracks &= ~(1<<trackNr);
@@ -6221,108 +6480,30 @@ void seq_markRecordedStep(uint8_t track, uint8_t scene, uint8_t step)
 	seq_ledState.dirty |= SEQ_LED_DIRTY_REC_MAIN;
 }
 
-void seq_midiNoteOff(uint8_t chan)
-{
-	uint8_t i;
-	MidiMsg msg;
-
-	// we are not filtering according to tx filter because they might have turned that
-	// setting on while a note was sustaining
-
-	msg.bits.length=2;
-	msg.data2=0;
-
-	if(chan==0xff) { // all notes off
-		for(i=0; i<16; i++)
-			if((1<<i) & midi_notes_on) {
-				msg.status=	NOTE_OFF | i;
-				msg.data1=midi_chan_notes[i];
-				seq_sendMidi(msg);
-			}
-		// reset all
-		midi_notes_on=0;
-		return;
-	}
-	/*
-	 * Mirror the note-on channel guard for the note-off cache.
-	 *
-	 * Inputs: chan is either 0xff for all-notes-off or a zero-based MIDI
-	 * channel. Output: invalid channels are ignored before bit shifts or
-	 * midi_chan_notes[] indexing. This keeps live MIDI recording and sequencer
-	 * playback from touching memory outside the 16-channel cache if stale
-	 * settings or future Scene routing accidentally pass a sentinel value.
-	 */
-	if(chan >= 16u)
-		return;
-	// The proper way to do a note off is with 0x80. 0x90 with velocity 0 is also used, however I think there is still
-	// synth gear out there that doesn't recognize that properly.
-	if((1<<chan) & midi_notes_on) {
-		msg.status=	NOTE_OFF | chan;
-		msg.data1=midi_chan_notes[chan];
-		seq_sendMidi(msg);
-		// turn off our knowledge of that note playing
-		midi_notes_on &= (~(1<<chan));
-	}
-}
-
+/* LXR-generated realtime (Clock, Start, Stop; S083: TXF in MidiOut). */
 static void seq_sendRealtime(const uint8_t status)
 {
-	MidiMsg msg = {0,0,0, {0,0,0}};
-	// --AS FILT filter out realtime msgs if appropriate
-	if((midiParser_txRxFilter & 0x20)==0)
-		return;
-	msg.status=status;
-	seq_sendMidi(msg);
+	midiOut_realtime(status);
 }
 
-/* Send a note on message. This will filter out these messages if appropriate
- */
-void seq_sendMidiNoteOn(const uint8_t channel, const uint8_t note, const uint8_t veloc)
-{
-	MidiMsg msg = {0,0,0, {0,0,2}};
-	// --AS FILT filter out note msgs if appropriate
-	if((midiParser_txRxFilter & 0x10)==0)
-		return;
-	/*
-	 * Guard the note-on bookkeeping table before composing/sending MIDI.
-	 *
-	 * Inputs: channel is a zero-based MIDI channel derived from Scene track
-	 * settings. Output: valid 0..15 channels send and update midi_chan_notes[];
-	 * invalid values are ignored instead of indexing past the 16-channel note
-	 * cache. Why this must exist: Scene expansion exposed more paths where a
-	 * stale/corrupt pattern or sentinel value can reach playback during a live
-	 * trigger; a bad channel here can hard-fault on the second note when the
-	 * note-on cache is written.
-	 */
-	if(channel >= 16u)
-		return;
-
-	msg.status=NOTE_ON | channel;
-	msg.data1=note;
-	msg.data2=veloc;
-	seq_sendMidi(msg);
-
-	// keep track of which notes are on so we can turn them off later
-	midi_chan_notes[channel]=note;
-	midi_notes_on |= (1 << channel);
-
-}
-
-/* This will send a prog change on the global channel and will filter
- * out the message if appropriate
+/*
+ * Program change for a whole-Scene change (S080; S083 Phase A).
+ *
+ * What: sends the Scene number as a PC on G under TXF P. Scene 17 has no
+ * PC number (S082 C9/D8). G off sends nothing. Phase D adds the MIDI-origin
+ * suppression (no echo, D-8). Inputs: Scene index. Affiliates:
+ * midiOut_programChange(), midiIn_globalChannel().
  */
 static void seq_sendProgChg(const uint8_t ptn)
 {
-	MidiMsg msg = {0,0,0, {0,0,1}};
-
-	// --AS FILT filter out PC msgs if appropriate
-	if((midiParser_txRxFilter & 0x80)==0)
+	/* S083 Q9: a MIDI-originated change is not echoed. */
+	if (seq_sceneChangeFromMidi) {
+		seq_sceneChangeFromMidi = 0u;
 		return;
-
-	msg.status = PROG_CHANGE | midi_MidiChannels[7];
-	msg.data1=ptn;
-	msg.bits.length=1;
-	seq_sendMidi(msg);
+	}
+	if (ptn >= SCENE_COUNT)
+		return;
+	midiOut_programChange(midiIn_globalChannel(), ptn);
 }
 
 static void seq_setStepIndexToStart()

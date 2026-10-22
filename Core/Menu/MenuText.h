@@ -45,6 +45,7 @@ static const char menuText_fm[]    = "fm ";
 static const char menuText_dash[]  = "---";
 static const char menuText_blank[] = "   ";
 static const char menuText_any[]   = "any";
+static const char menuText_glb[]   = "glb";
 
 /* Each table: [0]=count, [1..n]=entries, 3+1 chars each */
 static const char ppqNames[][4] = {
@@ -133,8 +134,13 @@ static const char outputNames[][7] = {
 static const char filterTypes[][8] = {
     {8}, {"LP"},{"HP"},{"BP"},{"UBP"},{"Nch"},{"Pek"},{"LP2"},{"off"},
 };
+/*
+ * MRT routing names (S083 F22, MIDI_SPEC 3.3).
+ * Order matches midiDefs_routeMask(): off UtD DtD DtU bth DtA AtD all.
+ * Stored values change meaning (no migration, standing rule).
+ */
 static const char midiRoutingNames[][6] = {
-    {6}, {"off"},{"U2M"},{"M2M"},{"A2M"},{"M2U"},{"M2A"},
+    {8}, {"off"},{"UtD"},{"DtD"},{"DtU"},{"bth"},{"DtA"},{"AtD"},{"all"},
 };
 static const char midiFilterNames[][16] = {
     {16},
@@ -178,8 +184,11 @@ static const char shortNames[][4] = {
     {"cn1"},{"nx1"},{"cn2"},{"nx2"},
     /* S080 P2 Defect 8a: per-track loopable. */
     {"lop"},
-    /* S081 P2: per-track automation ramp. */
-    {"asm"},
+    /* S081 P2: per-track automation ramp; label `rmp` since the S083
+     * follow-up (user 2026-10-22; was `asm`). */
+    {"rmp"},
+    /* S083 follow-up: overlay roll velocity rhythm. */
+    {"pv<"},{"pv>"},
 };
 
 static const char catNames[][16] = {
@@ -202,6 +211,9 @@ static const char catNames[][16] = {
     {"Prfrmnc"},
     /* S080 G10: scene chain settings category. */
     {"Chain"},
+    /* S083 follow-up (user 2026-10-22): CAT_AUTOMATION for the track
+     * automation ramp cell `rmp` ("Automtn  Ramp"). */
+    {"Automtn"},
 };
 
 static const char longNames[][16] = {
@@ -239,8 +251,11 @@ static const char longNames[][16] = {
     {"Conditn1"},{"NxtScn1"},{"Conditn2"},{"NxtScn2"},
     /* S080 P2 Defect 8a. */
     {"Loopable"},
-    /* S081 P2. */
-    {"Automtn"},
+    /* S081 P2; "Ramp" since the S083 follow-up (was "Automtn", which is
+     * now the cell's category). */
+    {"Ramp"},
+    /* S083 follow-up: overlay roll velocity rhythm (Prfrmnc Rhythm</>). */
+    {"Rhythm<"},{"Rhythm>"},
 };
 
 /*

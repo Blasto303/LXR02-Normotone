@@ -34,10 +34,12 @@
 #include "LiveRecord.h"
 #include "presetManager.h"
 #include "MidiVoiceControl.h"
-#include "MidiNoteNumbers.h"
+#include "MidiPitch.h"
+#include "MidiOut.h"
+#include "MidiLearn.h"
+#include "MidiNotes.h"
 #include <string.h>
 #include <stdint.h>
-#include "MidiParser.h"
 #include "AutosaveTrace.h"
 
 /* -----------------------------------------------------------------------
@@ -168,6 +170,8 @@ static volatile struct {
 /* S081 G-5: SHIFT/CLEAR hold state for the live-erase chord. */
 static uint8_t bh_shiftHeld;
 static uint8_t bh_clearHeld;
+/* Press tick of a Bank-page COPY (+2 B SRAM1, S082 B2.13). */
+static uint16_t bh_bankCopyPressTick;
 
 /*
  * Buttons holding a live-erase gesture (S081 §10.2, P1C items 10/16).
@@ -195,10 +199,6 @@ static uint8_t selectedStepLed = LED_STEP1;
 static uint16_t buttonHandler_buttonTimer = 0;
 #define TIMER_ACTION_OCCURED -2
 static int8_t buttonHandler_buttonTimerStepNr = NO_STEP_SELECTED;
-
-uint16_t buttonHandler_originalParameter = 0;
-uint8_t buttonHandler_originalValue = 0;
-uint8_t buttonHandler_resetLock = 0;
 
 static uint8_t buttonHandler_mutedVoices = 0;
 static int8_t buttonHandler_armedAutomationStep = NO_STEP_SELECTED;
@@ -358,32 +358,50 @@ static uint8_t bh_chainPlayArmed = 0u;
  * an overlay is active and SHIFT is not held, PERF VOICE buttons fire triggers
  * instead of toggling mutes. Why: the overlay converts the VOICE row into a
  * performance trigger row; it is runtime-only (not saved) and is suppressed by
- * the looper. Inputs: BAR1/BAR2 presses in PERF mode. Outputs: VOICE trigger
- * dispatch (E12) and BAR LED state. RAM: +1 byte SRAM1.
+ * the looper. Inputs: BAR1/BAR2 presses in PERF mode, and CC2 on the global
+ * MIDI channel G in any mode (S083 follow-up: 0 off, 1 `<`, 2 `>`, through
+ * buttonHandler_setOverlay()). It is the ONE overlay state: received MIDI
+ * notes use it too, in any mode (MidiNotes). Outputs: VOICE trigger dispatch
+ * (E12), MIDI-note overlays and BAR LED state. RAM: +1 byte SRAM1.
  */
 static uint8_t bh_overlayActive = 0u;
 
 /*
- * BAR overlay trigger runtime state (S080 E12).
+ * Per-track overlay repeat state (S083 Q5; was the S080 E12 single slot).
  *
- * What: bh_overlayVoiceMask marks VOICE buttons currently firing an overlay
- * trigger (for release/note-off). bh_overlayTrack/Note/Vel describe the track
- * and payload of the active repeat (roll) or pending second flam hit.
- * bh_overlayInterval is the repeat period in 1 ms time_sysTick units;
- * bh_overlayNext is its deadline; bh_overlayCount is the remaining repeat count
- * (0 = idle, 0xFF = held roll). Why: rolls repeat while the VOICE is held and
- * flams need one delayed second hit; a single foreground 1 ms timer slot is
- * enough because only the most recent overlay track can be repeating. RAM: +8
- * bytes SRAM1 (runtime-only). Affiliates: handleVoiceButton(),
- * buttonHandler_tick(), processRelease().
+ * What: one entry per track. heldMidiNote: the MIDI note whose note-off
+ * ends this track's roll, stored as note + 1 (0 = panel or none, so the
+ * zero-initialised table needs no init code). note: internal note, bit 7
+ * set when it came from `def` (records no note special, S081 Q12). pos:
+ * roll hit position for the velocity rhythm (S083 follow-up; replaced the
+ * former `vel`, which was always 100): 0 = the first hit, counted up per
+ * repeat; flam and roll hits play at BH_OVERLAY_VEL, roll hits shaped by
+ * `pv<`/`pv>` through seq_rollRhythmVelocity(). count: remaining repeats (0 idle, 1 = flam main pending,
+ * 0xFF = held roll). interval: repeat period in ms (time_sysTick). next:
+ * next deadline. Why: MIDI notes on several tracks (and several held
+ * VOICE buttons) roll at the same time; the S080 single slot let the
+ * latest overlay take over the only timer. RAM: 7 x 8 B = 56 B SRAM1,
+ * static (Q5 approved; R-A +7 B), replaces 9 B. Writers: overlay start,
+ * release, switch and tick below (all foreground). Affiliates:
+ * buttonHandler_tick(), MidiNotes.
  */
-static uint8_t  bh_overlayVoiceMask = 0u;
-static uint8_t  bh_overlayTrack     = 0u;
-static uint8_t  bh_overlayNote      = 0u;
-static uint8_t  bh_overlayVel       = 0u;
-static uint8_t  bh_overlayCount     = 0u;
-static uint16_t bh_overlayInterval  = 0u;
-static uint16_t bh_overlayNext      = 0u;
+typedef struct {
+	uint8_t  heldMidiNote;
+	uint8_t  note;
+	uint8_t  pos;
+	uint8_t  count;
+	uint16_t interval;
+	uint16_t next;
+} bh_overlay_track_t;
+
+#define BH_OVERLAY_NOTE_DEFAULT  0x80u
+#define BH_OVERLAY_VEL           100u /* flam main and roll base velocity */
+#define BH_OVERLAY_NO_MIDI_NOTE  0u   /* heldMidiNote stores note + 1 */
+
+static bh_overlay_track_t bh_overlay[NUM_TRACKS];
+
+/* Voice mask of the panel-held overlay triggers (S083 keeps this). */
+static uint8_t bh_overlayVoiceMask = 0u;
 
 /*
  * Held overlay trigger type (S081 §5.7, R19, F-B/F-O).
@@ -396,18 +414,6 @@ static uint16_t bh_overlayNext      = 0u;
  */
 static uint8_t bh_overlayHeldType = 0xFFu;
 
-/*
- * Overlay note is "default" (S081 Q12, P1B item 15).
- *
- * What: 1 when the active overlay's note parameter is 0 (`def`): the hit
- * plays the track's MIDI note, and a recording stores no note special.
- * Why: Q12. Without the flag LiveRecord could not tell `def` from an
- * explicit note. RAM: 1 B. Affiliates: buttonHandler_overlayReport(),
- * liveRec_triggerIn().
- */
-static uint8_t bh_overlayNoteDefault;
-
-
 #define DBLCLICK_FIRST  0u
 #define DBLCLICK_DOUBLE 1u
 
@@ -416,8 +422,6 @@ static uint8_t bh_overlayNoteDefault;
 ** ----------------------------------------------------------------------- */
 uint8_t buttonHandler_getMode(void)  { return bh_state.selectButtonMode; }
 uint8_t buttonHandler_getShift(void) { return (uint8_t)(btn_held[BUT_SHIFT]); }
-int8_t buttonHandler_getArmedAutomationStep(void) { return buttonHandler_armedAutomationStep; }
-
 /*
  * Return the raw physical held-state mask for the sixteen SEQ buttons.
  *
@@ -794,53 +798,18 @@ static void buttonHandler_armTimerActionStep(int8_t stepNr)
 static void buttonHandler_disarmTimerActionStep(void)
 {
     /*
-     * Clears any long-press automation editor state and restores reset-lock UI.
+     * Stop the long-press STEP blink (S083: reset-lock remnant removed).
      *
-     * Caller context: step button release, a completed timer action, or any
-     * path that must cancel the currently armed automation step.
-     *
-     * Why it lives here: buttonHandler owns the blink LEDs and the temporary
-     * reset-lock snapshot. PatternData owns the actual armed automation state,
-     * so disarming must update both places explicitly now that the parser has
-     * been removed.
-     *
-     * Inputs: buttonHandler_armedAutomationStep chooses which visible STEP LED
-     * to stop blinking. buttonHandler_originalParameter/originalValue describe
-     * the value that must be restored when reset-lock was active.
-     *
-     * Outputs: no return value. The selected blink LED is stopped,
-     * pat_armAutomationStep(0, 0, 0) disables PatternData automation arming,
-     * and reset-lock restoration is applied either through Preset APIs or
-     * menu_parseGlobalParam depending on the parameter range.
-     *
-     * Risk: this keeps the historical parameter-range split. Sound parameters
-     * must go through Preset so DSP state changes with parameter_values; global
-     * menu parameters must go through menu_parseGlobalParam so their side
-     * effects remain intact.
+     * What: clears the armed step and stops its STEP LED blink. Why: the
+     * reset-lock restore that followed (S028 parser bridge) could never run
+     * (buttonHandler_resetLock was never set) and routed through the retired
+     * legacy MIDI CC map (plan R12). Inputs: buttonHandler_armedAutomationStep.
+     * Outputs: blink stopped, step disarmed. Callers: step release, timer
+     * actions. Affiliates: buttonHandler_armTimerActionStep().
      */
     if (buttonHandler_armedAutomationStep != NO_STEP_SELECTED) {
         led_setBlinkLed((uint8_t)(LED_STEP1 + ((uint8_t)buttonHandler_armedAutomationStep % NUM_STEPS_PER_BAR)), 0);
-
-        if (buttonHandler_resetLock == 1) {
-            parameter_values[buttonHandler_originalParameter] = buttonHandler_originalValue;
-        }
-
         buttonHandler_armedAutomationStep = NO_STEP_SELECTED;
-
-        if (buttonHandler_resetLock == 1) {
-            buttonHandler_resetLock = 0;
-            if (buttonHandler_originalParameter < 128) {
-                preset_applySoundParameter(buttonHandler_originalParameter,
-                                           buttonHandler_originalValue, 1);
-            } else if (buttonHandler_originalParameter < END_OF_SOUND_PARAMETERS) {
-                preset_applySoundParameter(buttonHandler_originalParameter,
-                                           buttonHandler_originalValue, 1);
-            } else {
-                menu_parseGlobalParam(buttonHandler_originalParameter,
-                                      parameter_values[buttonHandler_originalParameter]);
-            }
-            menu_repaintAll();
-        }
         return;
     }
 
@@ -944,7 +913,8 @@ static uint16_t buttonHandler_overlayDivisionMs(uint8_t idx)
 static void buttonHandler_overlayReport(uint8_t voiceNr, uint8_t note,
                                         uint8_t noteIsDefault,
                                         uint8_t velocity, uint8_t kind,
-                                        uint8_t roll)
+                                        uint8_t roll, uint8_t source,
+                                        uint16_t ageUs)
 {
     liveRec_trigger_t t;
 
@@ -953,83 +923,125 @@ static void buttonHandler_overlayReport(uint8_t voiceNr, uint8_t note,
     t.velocity = velocity;
     t.kind = kind;
     t.roll = roll;
-    t.source = LIVEREC_SRC_OVERLAY;
+    /* S083: LIVEREC_SRC_OVERLAY for panel overlays, LIVEREC_SRC_MIDI for
+    ** MIDI-started ones; ageUs is the first MIDI hit's arrival age (0 for
+    ** repeats and panel hits). */
+    t.source = source;
     t.note_is_default = noteIsDefault;
+    t.age_us = ageUs;
     liveRec_triggerIn(&t);
 }
 
-static void buttonHandler_overlayTrigger(uint8_t voiceNr)
+/*
+ * Start an overlay action on one track (S080 E12; S083 Q5 per-track).
+ *
+ * What: reads the trigger type of overlay `which` (1 = BAR <, 2 = BAR >),
+ * fires the first hit (single: one trigger at the type's velocity; flam:
+ * soft lead hit now, main 1/32 later; roll: first hit now at
+ * BH_OVERLAY_VEL as rhythm position 0, repeats until release shaped by
+ * `pv<`/`pv>` (S083 follow-up)) and fills the track's entry. Inputs: track, which, internal
+ * note (bit 7 = `def`), heldMidiNote (MIDI note + 1 that ends a roll, or
+ * BH_OVERLAY_NO_MIDI_NOTE), source and age for LiveRecord. Outputs:
+ * seq_triggerVoice(), LiveRecord report, bh_overlay[track]. Callers:
+ * buttonHandler_overlayTrigger() (panel), buttonHandler_overlayMidiNoteOn()
+ * (MidiNotes). Affiliates: buttonHandler_overlayTick(), _Release().
+ */
+static void buttonHandler_overlayStart(uint8_t track, uint8_t which,
+                                       uint8_t note, uint8_t heldMidiNote,
+                                       uint8_t source, uint16_t ageUs)
 {
-    uint8_t type;
-    uint8_t note;
-    uint8_t vel;
-    uint8_t count;
+    bh_overlay_track_t *e = &bh_overlay[track];
+    uint8_t type = (which == 1u) ? parameter_values[PAR_PERF_BTN_LT]
+                                 : parameter_values[PAR_PERF_BTN_RT];
+    uint8_t pitch = (uint8_t)(note & 0x7Fu);
+    uint8_t isDef = (uint8_t)((note & BH_OVERLAY_NOTE_DEFAULT) != 0u);
     uint16_t interval;
-    if (bh_overlayActive == 1u) {
-        type = parameter_values[PAR_PERF_BTN_LT];
-        note = parameter_values[PAR_PERF_NOTE_LT];
-    } else {
-        type = parameter_values[PAR_PERF_BTN_RT];
-        note = parameter_values[PAR_PERF_NOTE_RT];
-    }
+
     if (type > 11u)
         type = 0u;
-    /* P1B item 15: `def` note (param 0) records no note special. */
-    bh_overlayNoteDefault = (uint8_t)(note == 0u);
-    if (note == 0u)
-        note = scene_getTrackMidiNote(seq_getTrackPlayedScene(voiceNr), voiceNr);
-    if (note == 0u)
-        note = MIDI_DEFAULT_TRIGGER_NOTE;
-
-    bh_overlayVoiceMask |= (uint8_t)(1u << voiceNr);
-    /* Remember the held overlay's type for a BAR switch while held (A3-4b). */
-    bh_overlayHeldType = type;
-
     if (type <= 3u) {
-        /* Single trigger at vmx/v10/v64/v32. */
         static const uint8_t singleVel[4] = {127u, 100u, 64u, 32u};
 
-        seq_triggerVoice(voiceNr, singleVel[type], note, 1);
-        buttonHandler_overlayReport(voiceNr, note, bh_overlayNoteDefault,
-                                    singleVel[type],
-                                    LIVEREC_HIT_SINGLE, 0u);
+        seq_triggerVoice(track, singleVel[type], pitch, 1);
+        buttonHandler_overlayReport(track, pitch, isDef, singleVel[type],
+                                    LIVEREC_HIT_SINGLE, 0u, source, ageUs);
+        e->count = 0u;
+        e->heldMidiNote = BH_OVERLAY_NO_MIDI_NOTE;
         return;
     }
     if (type == 4u || type == 5u) {
-        /* Flam: soft leading hit now, main hit one 1/32 later. */
-        seq_triggerVoice(voiceNr, 64u, note, 1);
-        buttonHandler_overlayReport(voiceNr, note, bh_overlayNoteDefault,
-                                    64u, LIVEREC_HIT_FLAM_GRACE, 0u);
+        seq_triggerVoice(track, 64u, pitch, 1);
+        buttonHandler_overlayReport(track, pitch, isDef, 64u,
+                                    LIVEREC_HIT_FLAM_GRACE, 0u, source, ageUs);
         interval = buttonHandler_overlayDivisionMs(5u);
-        vel = 100u;
-        count = 1u;
+        e->pos = 0u;
+        e->count = 1u;
     } else {
-        /* Held roll: r/8, r16, r32, r64, r6t, 128. */
         static const uint8_t rollDiv[6] = {3u, 4u, 5u, 6u, 6u, 7u};
+        static const uint8_t rollIdx[6] = {1u, 3u, 5u, 7u, 8u, 9u};
         uint8_t idx = (uint8_t)(type - 6u);
 
         interval = buttonHandler_overlayDivisionMs(rollDiv[idx]);
         if (idx == 4u)                                  /* r6t triplet */
             interval = (uint16_t)((interval * 2u) / 3u);
-        seq_triggerVoice(voiceNr, 100u, note, 1);       /* first repeat now */
-        /* S081 §8.8: type r/8..128 maps to step roll indices 1,3,5,7,8,9. */
-        {
-            static const uint8_t rollIdx[6] = {1u, 3u, 5u, 7u, 8u, 9u};
-
-            buttonHandler_overlayReport(voiceNr, note, bh_overlayNoteDefault,
-                                        100u, LIVEREC_HIT_ROLL_START,
-                                        rollIdx[idx]);
-        }
-        vel = 100u;
-        count = 0xFFu;                                  /* repeat while held */
+        /* Roll hit 0 is inside every rhythm's full window: base velocity. */
+        seq_triggerVoice(track, BH_OVERLAY_VEL, pitch, 1);
+        buttonHandler_overlayReport(track, pitch, isDef, BH_OVERLAY_VEL,
+                                    LIVEREC_HIT_ROLL_START, rollIdx[idx],
+                                    source, ageUs);
+        e->pos = 1u;
+        e->count = 0xFFu;
     }
+    e->note = note;
+    e->heldMidiNote = heldMidiNote;
+    e->interval = (interval != 0u) ? interval : 1u;
+    e->next = (uint16_t)(time_sysTick + e->interval);
+}
 
-    bh_overlayTrack = voiceNr;
-    bh_overlayNote = note;
-    bh_overlayVel = vel;
-    bh_overlayInterval = (interval != 0u) ? interval : 1u;
-    bh_overlayNext = (uint16_t)(time_sysTick + bh_overlayInterval);
-    bh_overlayCount = count;
+/*
+ * Panel VOICE overlay press (S080 E12; S083 C-1 `def` note).
+ *
+ * What: the held VOICE fires the active BAR overlay. A `def` note
+ * (perf_note_lt/rt = 0) plays the default pitch (internal 63); before
+ * S083 it played the track's MIDI note as a pitch, which made `nte` mean
+ * two things (C-1). Inputs: voiceNr, bh_overlayActive, overlay params.
+ * Outputs: bh_overlayVoiceMask, bh_overlayHeldType, the track's entry.
+ */
+static void buttonHandler_overlayTrigger(uint8_t voiceNr)
+{
+    uint8_t note = (bh_overlayActive == 1u)
+                   ? parameter_values[PAR_PERF_NOTE_LT]
+                   : parameter_values[PAR_PERF_NOTE_RT];
+    uint8_t type = (bh_overlayActive == 1u)
+                   ? parameter_values[PAR_PERF_BTN_LT]
+                   : parameter_values[PAR_PERF_BTN_RT];
+
+    if (note == 0u)
+        note = (uint8_t)(MIDI_DEFAULT_TRIGGER_NOTE | BH_OVERLAY_NOTE_DEFAULT);
+    bh_overlayVoiceMask |= (uint8_t)(1u << voiceNr);
+    bh_overlayHeldType = (type > 11u) ? 0u : type;
+    buttonHandler_overlayStart(voiceNr, bh_overlayActive, note,
+                               BH_OVERLAY_NO_MIDI_NOTE,
+                               LIVEREC_SRC_OVERLAY, 0u);
+}
+
+/*
+ * End one track's overlay gesture (S080 E12; S083 per-track).
+ *
+ * What: stops the track's repeats, sends the voice and MIDI note-off, and
+ * ends any recorded roll. Panel: only for a VOICE that fired an overlay
+ * (bh_overlayVoiceMask). Inputs: voiceNr. Outputs: entry idle, masks.
+ * Callers: processRelease() (VOICE up), the looper engage, MIDI note-off
+ * (through buttonHandler_overlayEndTrack()). Affiliates: liveRec_rollRelease(),
+ * midiOut_trackNoteOff().
+ */
+static void buttonHandler_overlayEndTrack(uint8_t track)
+{
+    bh_overlay[track].count = 0u;
+    bh_overlay[track].heldMidiNote = BH_OVERLAY_NO_MIDI_NOTE;
+    voiceControl_noteOff(track);
+    midiOut_trackNoteOff(track);
+    liveRec_rollRelease(track);
 }
 
 static void buttonHandler_overlayRelease(uint8_t voiceNr)
@@ -1039,119 +1051,13 @@ static void buttonHandler_overlayRelease(uint8_t voiceNr)
     if ((bh_overlayVoiceMask & bit) == 0u)
         return;
     bh_overlayVoiceMask = (uint8_t)(bh_overlayVoiceMask & ~bit);
-    if (voiceNr == bh_overlayTrack) {
-        bh_overlayTrack = 0u;
-        bh_overlayCount = 0u;
-    }
     if (bh_overlayVoiceMask == 0u)
         bh_overlayHeldType = 0xFFu;
-    /* Drum voices are one-shots, but a note-off keeps MIDI-out correct. */
-    voiceControl_noteOff(voiceNr);
-    /* S081 E-2c: an overlay release ends any recorded roll. */
-    liveRec_rollRelease(voiceNr);
+    buttonHandler_overlayEndTrack(voiceNr);
 }
 
 /*
- * Re-configure a held overlay after a BAR switch or toggle-off
- * (S081 §5.7, R19, F-B, F-O).
- *
- * What: when a BAR press changes bh_overlayActive while a VOICE overlay is held
- * (bh_overlayVoiceMask != 0):
- *  - overlay toggled off (F-O): bh_overlayCount = 0 (repeats stop, no extra
- *    hit); the recorded roll ends at that step (liveRec_rollRelease, added with
- *    the module in Phase E).
- *  - roll -> roll: bh_overlayInterval = the new division (same rollDiv[] and
- *    r6t triplet rule as buttonHandler_overlayTrigger()); bh_overlayNext =
- *    previous hit time + new interval, so the next hit follows the new rate;
- *    liveRec_rollRateChange().
- *  - single/flam -> roll: bh_overlayCount = 0xFF and bh_overlayNext = now + new
- *    interval (no hit at the switch itself; the first new hit is one interval
- *    later); liveRec_rollRateChange().
- *  - roll -> single/flam: bh_overlayCount = 0 (no extra hit);
- *    liveRec_rollRateChange(track, 0) ends the recorded roll.
- *  - single -> single: nothing.
- * Why: previously the type switched but the held trigger kept the old timing.
- * Inputs: bh_overlayVoiceMask, bh_overlayTrack, bh_overlayHeldType, the new
- * overlay parameters. Outputs: bh_overlay* repeat state. Affiliates:
- * buttonHandler_overlayTrigger(), buttonHandler_overlayTick(),
- * buttonHandler_overlayRelease().
- */
-static void buttonHandler_overlaySwitchHeld(void)
-{
-    uint8_t type;
-    uint8_t note;
-    uint16_t interval;
-    uint8_t oldRoll;
-    uint8_t newRoll;
-
-    if (bh_overlayVoiceMask == 0u)
-        return;
-    if (bh_overlayActive == 0u) {
-        /* Toggled off (F-O): repeats stop, no extra hit. */
-        bh_overlayCount = 0u;
-        bh_overlayHeldType = 0xFFu;
-        /* S081 E: the recorded roll ends at this step (F-O). */
-        liveRec_rollRelease(bh_overlayTrack);
-        return;
-    }
-    type = (bh_overlayActive == 1u) ? parameter_values[PAR_PERF_BTN_LT]
-                                    : parameter_values[PAR_PERF_BTN_RT];
-    note = (bh_overlayActive == 1u) ? parameter_values[PAR_PERF_NOTE_LT]
-                                    : parameter_values[PAR_PERF_NOTE_RT];
-    if (type > 11u)
-        type = 0u;
-    /* P1B item 15: track the `def` flag across an overlay switch. */
-    bh_overlayNoteDefault = (uint8_t)(note == 0u);
-    if (note == 0u)
-        note = scene_getTrackMidiNote(
-            seq_getTrackPlayedScene(bh_overlayTrack), bh_overlayTrack);
-    if (note == 0u)
-        note = MIDI_DEFAULT_TRIGGER_NOTE;
-    oldRoll = (uint8_t)(bh_overlayHeldType != 0xFFu && bh_overlayHeldType >= 6u);
-    newRoll = (uint8_t)(type >= 6u);
-    bh_overlayNote = note;
-    bh_overlayHeldType = type;
-    if (!newRoll) {
-        /* roll -> single/flam (or single -> single): stop repeating. */
-        bh_overlayCount = 0u;
-        /* S081 E: roll -> single ends the recorded roll. */
-        liveRec_rollRateChange(bh_overlayTrack, 0u);
-        return;
-    }
-    {
-        static const uint8_t rollDiv[6] = {3u, 4u, 5u, 6u, 6u, 7u};
-        uint8_t idx = (uint8_t)(type - 6u);
-
-        interval = buttonHandler_overlayDivisionMs(rollDiv[idx]);
-        if (idx == 4u)                                  /* r6t triplet */
-            interval = (uint16_t)((interval * 2u) / 3u);
-        if (interval == 0u)
-            interval = 1u;
-        if (oldRoll) {
-            /* roll -> roll: keep the last hit time, apply the new interval. */
-            uint16_t lastHit =
-                (uint16_t)(bh_overlayNext - bh_overlayInterval);
-
-            bh_overlayInterval = interval;
-            bh_overlayNext = (uint16_t)(lastHit + interval);
-        } else {
-            /* single/flam -> roll: no hit at the switch; one interval later. */
-            bh_overlayVel = 100u;
-            bh_overlayInterval = interval;
-            bh_overlayNext = (uint16_t)(time_sysTick + interval);
-            bh_overlayCount = 0xFFu;
-        }
-        /* S081 E: roll -> roll / single -> roll take the new rate. */
-        {
-            static const uint8_t rollIdx[6] = {1u, 3u, 5u, 7u, 8u, 9u};
-
-            liveRec_rollRateChange(bh_overlayTrack, rollIdx[idx]);
-        }
-    }
-}
-
-/*
- * Start live erase from the key-press paths (S081 §10.1, P1C item 16).
+ * Start live erase from the key-press paths (S081 10.1, P1C item 16).
  *
  * What: enables erase (LiveRecord ends an overdub and keeps the prior
  * LATCH/OFF) and lights SHIFT and CLEAR. Entering from off also clears the
@@ -1174,6 +1080,101 @@ static void buttonHandler_liveEraseBegin(void)
 }
 
 /*
+ * Re-configure active overlay entries after an overlay change (S081 5.7
+ * R19/F-B/F-O; S083 per-track).
+ *
+ * What: for every held entry (panel-held or MIDI-held; after a BAR press,
+ * a CC2 change or an event-ring overflow) applies the S081 rules per track,
+ * judging "was a roll" by the entry's own count (0xFF):
+ *  - overlay off: repeats stop, no extra hit, recorded roll ends;
+ *  - roll -> roll: new interval from the last hit time;
+ *  - single/flam -> roll: repeats start one interval from now, at rhythm
+ *    position 1 (the hit already played was hit 0; S083 follow-up);
+ *  - roll -> single/flam: repeats stop, recorded roll ends.
+ * Inputs: which (0 off, 1 <, 2 >). Outputs: entries, LiveRecord rate
+ * changes. Callers: buttonHandler_overlaySwitchHeld() (BAR press, CC2), the
+ * event-ring overflow recovery in buttonHandler_processEvents().
+ */
+static void buttonHandler_overlayReconfigure(uint8_t which)
+{
+    uint8_t track;
+
+    for (track = 0u; track < NUM_TRACKS; track++) {
+        bh_overlay_track_t *e = &bh_overlay[track];
+        uint8_t midiHeld = (uint8_t)(e->heldMidiNote != BH_OVERLAY_NO_MIDI_NOTE);
+        uint8_t panelHeld = (uint8_t)((bh_overlayVoiceMask >> track) & 1u);
+        uint8_t type;
+        uint8_t oldRoll = (uint8_t)(e->count == 0xFFu);
+
+        if (!(midiHeld || panelHeld))
+            continue;
+        if (which == 0u) {
+            e->count = 0u;
+            liveRec_rollRelease(track);
+            continue;
+        }
+        type = (which == 1u) ? parameter_values[PAR_PERF_BTN_LT]
+                             : parameter_values[PAR_PERF_BTN_RT];
+        if (type > 11u)
+            type = 0u;
+        if (type < 6u) {
+            e->count = 0u;
+            liveRec_rollRateChange(track, 0u);
+            continue;
+        }
+        {
+            static const uint8_t rollDiv[6] = {3u, 4u, 5u, 6u, 6u, 7u};
+            static const uint8_t rollIdx[6] = {1u, 3u, 5u, 7u, 8u, 9u};
+            uint8_t idx = (uint8_t)(type - 6u);
+            uint16_t interval = buttonHandler_overlayDivisionMs(rollDiv[idx]);
+
+            if (idx == 4u)
+                interval = (uint16_t)((interval * 2u) / 3u);
+            if (interval == 0u)
+                interval = 1u;
+            if (oldRoll) {
+                uint16_t lastHit = (uint16_t)(e->next - e->interval);
+
+                e->interval = interval;
+                e->next = (uint16_t)(lastHit + interval);
+            } else {
+                /* single/flam -> roll: the hit already played was hit 0. */
+                e->pos = 1u;
+                e->interval = interval;
+                e->next = (uint16_t)(time_sysTick + interval);
+                e->count = 0xFFu;
+            }
+            liveRec_rollRateChange(track, rollIdx[idx]);
+        }
+    }
+}
+
+/*
+ * Overlay changed: re-configure the active entries (S081 5.7; S083 Q5).
+ *
+ * What: the panel-held type follows the new overlay, and every held entry
+ * (panel and MIDI) takes it; overlay off stops them. Since the S083
+ * follow-up BAR and CC2 set the same state (bh_overlayActive), so there is
+ * no BAR-versus-CC2 priority any more (C-9 and the F-3 split retired): the
+ * last BAR press or CC2 wins. Inputs: bh_overlayActive,
+ * bh_overlayVoiceMask. Outputs: entries via
+ * buttonHandler_overlayReconfigure(). Callers: the BAR press in
+ * processPress(), buttonHandler_setOverlay() (CC2).
+ */
+static void buttonHandler_overlaySwitchHeld(void)
+{
+    /* Panel BAR change: the held type follows the new overlay (S081). */
+    if (bh_overlayVoiceMask != 0u) {
+        uint8_t type = (bh_overlayActive == 1u)
+                       ? parameter_values[PAR_PERF_BTN_LT]
+                       : parameter_values[PAR_PERF_BTN_RT];
+        bh_overlayHeldType = (bh_overlayActive == 0u) ? 0xFFu
+                             : ((type > 11u) ? 0u : type);
+    }
+    buttonHandler_overlayReconfigure(bh_overlayActive);
+}
+
+/*
  * End live erase from the key-release paths (S081 §10.1, P1B items 12/27).
  *
  * What: ends erase (LiveRecord restores the prior LATCH/OFF state), turns
@@ -1193,30 +1194,136 @@ static void buttonHandler_liveEraseEnd(void)
     menu_patternContentChanged();
 }
 
+/*
+ * Fire due overlay repeats on every track (S080 E12; S083 per-track).
+ *
+ * What: for each entry with count != 0 whose deadline passed (signed
+ * 16-bit distance, S081 P4 rule), fires the flam main (resetting) or a
+ * roll repeat (non-resetting) and reports it (age 0; source MIDI when the
+ * entry is MIDI-held). S083 follow-up: a roll repeat's velocity is
+ * BH_OVERLAY_VEL shaped by the active overlay's rhythm (`pv<` =
+ * PAR_PERF_VEL_LT, `pv>` = PAR_PERF_VEL_RT) at the entry's hit position
+ * `pos`, through seq_rollRhythmVelocity() (the step `rtm` rule); the rhythm
+ * is read live, so a `pv` edit or a BAR/CC2 overlay change applies from the
+ * next hit. The flam main stays at BH_OVERLAY_VEL. The reported velocity is
+ * the played one. Context: buttonHandler_tick(), foreground.
+ */
 static void buttonHandler_overlayTick(void)
 {
-    if (bh_overlayCount == 0u)
+    uint8_t track;
+
+    for (track = 0u; track < NUM_TRACKS; track++) {
+        bh_overlay_track_t *e = &bh_overlay[track];
+        uint8_t pitch = (uint8_t)(e->note & 0x7Fu);
+        uint8_t isDef = (uint8_t)((e->note & BH_OVERLAY_NOTE_DEFAULT) != 0u);
+        uint8_t source = (e->heldMidiNote != BH_OVERLAY_NO_MIDI_NOTE)
+                         ? LIVEREC_SRC_MIDI : LIVEREC_SRC_OVERLAY;
+        uint8_t vel;
+
+        if (e->count == 0u)
+            continue;
+        if ((uint16_t)(time_sysTick - e->next) >= 32768u)
+            continue;
+        if (e->count == 0xFFu) {
+            /*
+             * Roll repeat: the active overlay's velocity rhythm (`pv<` /
+             * `pv>`, S083 follow-up) shapes BH_OVERLAY_VEL by hit position,
+             * the step-roll rule (seq_rollRhythmVelocity()). Every held
+             * entry follows bh_overlayActive (re-configured on change).
+             */
+            vel = seq_rollRhythmVelocity(
+                parameter_values[(bh_overlayActive == 1u) ? PAR_PERF_VEL_LT
+                                                          : PAR_PERF_VEL_RT],
+                BH_OVERLAY_VEL, e->pos);
+            if (e->pos < 0xFFu)
+                e->pos++;
+            else
+                e->pos = 16u;   /* 256 mod 60: same phase in cycles 2..5 */
+        } else {
+            vel = BH_OVERLAY_VEL;
+        }
+        seq_triggerVoice(track, vel, pitch, (uint8_t)(e->count != 0xFFu));
+        buttonHandler_overlayReport(track, pitch, isDef, vel,
+                                    (e->count == 0xFFu)
+                                        ? LIVEREC_HIT_ROLL_HIT
+                                        : LIVEREC_HIT_FLAM_MAIN,
+                                    0u, source, 0u);
+        if (e->count != 0xFFu) {
+            e->count--;
+            if (e->count == 0u) {
+                e->heldMidiNote = BH_OVERLAY_NO_MIDI_NOTE;
+                continue;
+            }
+        }
+        e->next = (uint16_t)(e->next + e->interval);
+    }
+}
+
+/* Contracts in buttonHandler.h. */
+uint8_t buttonHandler_overlayActive(void)
+{
+    return bh_overlayActive;
+}
+
+void buttonHandler_setOverlay(uint8_t which)
+{
+    /*
+     * CC2 on G sets the BAR overlay (S083 follow-up; MIDI_SPEC §5.3).
+     *
+     * What: the same state change as a BAR `<`/`>` press: bh_overlayActive,
+     * the BAR LEDs, and the held entries re-configured. LEDs: only in PERF
+     * and while the looper does not own the BAR LEDs (mode entry and loop
+     * disengage restore them from bh_overlayActive). A repeated value does
+     * nothing. Inputs: which 0..2 (MidiNotes already rejected others).
+     * Caller: midiNotes_setNoteAction(). Affiliates: the BAR press in
+     * processPress(), buttonHandler_overlaySwitchHeld().
+     */
+    if (which > 2u || which == bh_overlayActive)
         return;
-    if ((uint16_t)(time_sysTick - bh_overlayNext) >= 32768u)
+    bh_overlayActive = which;
+    if (bh_state.selectButtonMode == SELECT_MODE_PERF && !seq_loopActive) {
+        led_setValue((uint8_t)(which == 1u), LED_BAR1);
+        led_setValue((uint8_t)(which == 2u), LED_BAR2);
+    }
+    buttonHandler_overlaySwitchHeld();
+}
+
+void buttonHandler_overlayMidiNoteOn(uint8_t track, uint8_t which,
+                                     uint8_t internal, uint8_t midiNote,
+                                     uint16_t ageUs)
+{
+    if (track >= NUM_TRACKS || which == 0u || which > 2u)
         return;
-    /* reset = 1 for the flam main (count 1); 0 for roll repeats (0xFF). */
-    seq_triggerVoice(bh_overlayTrack, bh_overlayVel, bh_overlayNote,
-                     (uint8_t)(bh_overlayCount != 0xFFu));
-    /* S081 E-2b: the flam main / a roll repeat, reported when it sounds. */
-    if (bh_overlayCount == 0xFFu)
-        buttonHandler_overlayReport(bh_overlayTrack, bh_overlayNote,
-                                    bh_overlayNoteDefault, bh_overlayVel,
-                                    LIVEREC_HIT_ROLL_HIT, 0u);
-    else
-        buttonHandler_overlayReport(bh_overlayTrack, bh_overlayNote,
-                                    bh_overlayNoteDefault, bh_overlayVel,
-                                    LIVEREC_HIT_FLAM_MAIN, 0u);
-    if (bh_overlayCount != 0xFFu) {
-        bh_overlayCount--;
-        if (bh_overlayCount == 0u)
+    buttonHandler_overlayStart(track, which,
+                               (uint8_t)(internal & 0x7Fu),
+                               (uint8_t)((midiNote & 0x7Fu) + 1u),
+                               LIVEREC_SRC_MIDI, ageUs);
+}
+
+void buttonHandler_overlayMidiNoteOff(uint8_t track, uint8_t midiNote)
+{
+    uint8_t key = (uint8_t)((midiNote & 0x7Fu) + 1u);
+    uint8_t t;
+
+    /*
+     * The resolved track first; if it does not hold this note (the map
+     * changed between note-on and note-off), the first track that does.
+     * A roll ends; a flam keeps its pending main hit (B-12).
+     */
+    if (track < NUM_TRACKS && bh_overlay[track].heldMidiNote == key) {
+        t = track;
+    } else {
+        for (t = 0u; t < NUM_TRACKS; t++) {
+            if (bh_overlay[t].heldMidiNote == key)
+                break;
+        }
+        if (t >= NUM_TRACKS)
             return;
     }
-    bh_overlayNext = (uint16_t)(bh_overlayNext + bh_overlayInterval);
+    if (bh_overlay[t].count == 0xFFu)
+        buttonHandler_overlayEndTrack(t);
+    else
+        bh_overlay[t].heldMidiNote = BH_OVERLAY_NO_MIDI_NOTE;
 }
 
 void buttonHandler_tick(void)
@@ -1251,6 +1358,18 @@ void buttonHandler_tick(void)
         liveRec_overdubBegin();
         led_pulseLed(LED_REC);
     }
+
+    /*
+     * COPY hold promotion for Bank pages (S082 P0, B2.13d).
+     *
+     * What: promotes a held Bank-page COPY to the other view at the common
+     * hold threshold. Why: S1 tap/hold split. Inputs: press tick, Menu armed
+     * state. Outputs: the Menu peek. Affiliates: BUTTON_TIMEOUT,
+     * menu_bankCopyHoldReached().
+     */
+    if (menu_bankCopyArmed() &&
+        (uint16_t)(time_sysTick - bh_bankCopyPressTick) >= BUTTON_TIMEOUT)
+        menu_bankCopyHoldReached();
 
     /*
      * Foreground long-press poll using the wrapping 16-bit millisecond clock.
@@ -1347,8 +1466,9 @@ static void buttonHandler_setRemoveStep(uint8_t ledNr, uint8_t seqButtonPressed)
      * removes. Keeping the name avoids unrelated call-site churn during the
      * FrontPanelParser removal.
      */
-    /* S081 H-2b (Q13): silently refuse STEP toggles while T != A. */
-    if (liveRec_activePatternLocked())
+    /* S081 H-2b (Q13): silently refuse STEP toggles while T != A.
+     * S082 P3 D45: also while the viewed Scene is still being loaded. */
+    if (liveRec_activePatternLocked() || menu_viewedSceneLoadPending())
         return;
     uint8_t trackNr;
     uint8_t patternNr;
@@ -1409,30 +1529,21 @@ static void buttonHandler_perfRefreshHeldSceneLeds(void);
  * instrument apply armed, perf_voiceActionOccurred set so the subsequent VOICE
  * release does not toggle mute, and the double-click window cancelled. HiHat
  * link: tracks 5 and 6 always switch together inside seq_setTrackPlayedScene()
- * and share slot 5. Validation: the Scene must be resident (bank_scenePresent).
+ * and share slot 5. Validation: the Scene must be available (resident, and
+ * not pending in a background Bank load, S082 P3).
  * Affiliates: seq_setTrackPlayedScene(), seq_realignTrackToMasterClock(),
  * preset_startSingleVoiceApply().
  */
 static void buttonHandler_perfVoiceHeldSeqPressed(uint8_t seqButtonPressed)
 {
-    uint8_t track;
-
+    /* S082 P3 D52: per-track moves only to available Scenes (manual change). */
     if (seqButtonPressed >= SCENE_COUNT || seqButtonPressed >= 16u ||
-        !bank_scenePresent(seqButtonPressed))
+        !bank_sceneAvailable(seqButtonPressed))
         return;
-
-    for (track = 0u; track < NUM_TRACKS; track++) {
-        uint8_t slot;
-
-        if ((perf_heldVoiceMask & (uint8_t)(1u << track)) == 0u)
-            continue;
-        seq_setTrackPlayedScene(track, seqButtonPressed);
-        seq_realignTrackToMasterClock(track);
-        /* Track 7 (index 6) shares the HiHat slot 5. */
-        slot = (track >= INSTRUMENT_SLOT_COUNT)
-            ? (uint8_t)(INSTRUMENT_SLOT_COUNT - 1u) : track;
-        preset_startSingleVoiceApply(slot, seqButtonPressed);
-    }
+    /* S083 P3: the shared assignment must realign each track (R20). */
+    seq_assignTracksToScene(perf_heldVoiceMask, seqButtonPressed);
+    /* S083 plan 3.9 P: PC on the moved tracks' channels (panel only). */
+    midiOut_trackProgramChange(perf_heldVoiceMask, seqButtonPressed);
     perf_voiceActionOccurred = 1u;
     dblclick_cancel();
     /* Re-blink each held track's (now updated) played Scene (S077 P2 §5.4). */
@@ -1463,8 +1574,9 @@ static void buttonHandler_perfScenePressed(uint8_t seqButtonPressed)
     uint8_t isDouble = (uint8_t)(!dblclick_armed &&
                                  dblclick_button == seqButtonPressed);
 
+    /* S082 P3 D52: Scene and view changes only to available Scenes. */
     if (seqButtonPressed >= SCENE_COUNT || seqButtonPressed >= 16u ||
-        !bank_scenePresent(seqButtonPressed))
+        !bank_sceneAvailable(seqButtonPressed))
         return;
 
     if (parameter_values[PAR_FOLLOW]) {
@@ -1682,8 +1794,11 @@ static void buttonHandler_seqButtonPressed(uint8_t seqButtonPressed)
                 (void)menu_chainMenuOpen(seqButtonPressed);
                 break;
             }
+            /* S082 P3 D52: queue only an available Scene; availability only
+             * grows during a load, so the target is still valid when the
+             * change fires. */
             if (seqButtonPressed < SCENE_COUNT &&
-                bank_scenePresent(seqButtonPressed)) {
+                bank_sceneAvailable(seqButtonPressed)) {
                 seq_queueSceneChange(seqButtonPressed,
                                      parameter_values[PAR_SCENE_QUEUE_DIV]);
             }
@@ -1816,6 +1931,49 @@ static void buttonHandler_seqButtonReleased(uint8_t seqButtonPressed)
 static void buttonHandler_shiftRecMenuEnter(void);
 static void buttonHandler_shiftRecMenuExit(void);
 
+/*
+ * Close every latched front-panel surface before a mode change (S080 P2,
+ * S081, S082 P1 D7/D32).
+ *
+ * What: closes the SHIFT+REC overlay (restoring its saved page only when
+ * restore_page is set), closes the chain editor, ends held live-erase
+ * gestures, and releases the looper when the mode leaves PERF.
+ * Why: one implementation for the MODE press and the MIDI-origin Bank load,
+ * which must leave the panel exactly as a MODE press would (D7); the MIDI
+ * path does not restore the SHIFT+REC page (R8) because the Bank entry
+ * follows at once.
+ * Inputs: restore_page, leaving_perf. Outputs: latches closed, looper and
+ * erase holds released.
+ * Accessors: handleModeButtons(), buttonHandler_enterLoadSaveForBackgroundLoad().
+ * Affiliates: buttonHandler_shiftRecMenuExit(), menu_chainMenuClose(),
+ * liveRec_eraseReleaseHeld(), buttonHandler_loopForceRelease().
+ */
+static void buttonHandler_closeLatchedSurfaces(uint8_t restore_page,
+                                               uint8_t leaving_perf)
+{
+    if (bh_shiftRecMenuActive) {
+        if (restore_page) {
+            buttonHandler_shiftRecMenuExit();
+        } else {
+            bh_shiftRecMenuActive = 0u;
+            led_setBlinkLed(LED_REC, 0u);
+            led_setValue((uint8_t)(liveRec_mode() == LIVEREC_MODE_LATCH),
+                         LED_REC);
+            led_setValue(buttonHandler_getShift(), LED_SHIFT);
+        }
+    }
+    if (menu_chainMenuIsOpen())
+        menu_chainMenuClose();
+    if (liveRec_mode() == LIVEREC_MODE_ERASE) {
+        liveRec_eraseReleaseHeld();
+        bh_eraseSeqMask = 0u;
+        bh_eraseFxSeqMask = 0u;
+        bh_eraseVoiceMask = 0u;
+    }
+    if (leaving_perf)
+        buttonHandler_loopForceRelease();
+}
+
 static void handleModeButtons(uint8_t mode)
 {
     if (menu_loadInstrumentTransactionBusy()) {
@@ -1831,40 +1989,22 @@ static void handleModeButtons(uint8_t mode)
         return;
     }
     /*
-     * S080 P2: a MODE press ends latched PERF surfaces first.
+     * A locked background Bank load owns the panel (S082 P1 R7, D7;
+     * S082 P3 D38, D40).
      *
-     * What: closes the SHIFT+REC settings menu and the chain editor, and, when
-     * the mode is about to leave PERF, releases the looper (tracks resume where
-     * they would have been) and clears the looper hold state. Why: both menus
-     * keep page state that a mode switch would otherwise strand (a later REC
-     * press would "restore" a stale page), and the SELECT/BAR rows change
-     * meaning outside PERF, so their release edges would never reach the
-     * looper. Inputs: bh_shiftRecMenuActive, menu_chainMenuIsOpen(), current
-     * and requested mode. Outputs: menus closed; looper released.
-     * Affiliates: buttonHandler_shiftRecMenuExit(), menu_chainMenuClose(),
-     * buttonHandler_loopForceRelease() (Step 9).
+     * What: every MODE press is dropped while the load is locked (phases 1-4
+     * and 6, or a load requested stopped). Once it is unlocked MODE works
+     * normally; Menu shows the frozen Load:[Bank] screen for Load/Save.
+     * Why: the UI stays on Load:[Bank] until the load ends (D7); a queued exit
+     * would fire right after the load, and an applied one would leave the page
+     * under a running load.
+     * Inputs: preset_backgroundBankLoadLocked(). Outputs: none.
+     * Accessors: MODE button presses.
+     * Affiliates: menu_switchPage() backstop, preset_tickBackgroundBankLoad().
      */
-    if (bh_shiftRecMenuActive)
-        buttonHandler_shiftRecMenuExit();
-    if (menu_chainMenuIsOpen())
-        menu_chainMenuClose();
-    /*
-     * A mode change ends held erase gestures (S081 §10.1, P1B item 8).
-     *
-     * What: SEQ and TRACK buttons change meaning with the mode, so their held
-     * erase gestures stop at a MODE press; erase itself (SHIFT/CLEAR) and the
-     * knob-erase targets stay enabled. Affiliates: liveRec_eraseReleaseHeld().
-     */
-    if (liveRec_mode() == LIVEREC_MODE_ERASE) {
-        liveRec_eraseReleaseHeld();
-        /* The BC-3 masks are cleared with them, so the old buttons' later
-         * releases are consumed as no-ops (P1C item 10). */
-        bh_eraseSeqMask = 0u;
-        bh_eraseFxSeqMask = 0u;
-        bh_eraseVoiceMask = 0u;
-    }
+    if (preset_backgroundBankLoadLocked())
+        return;
     {
-        /* Same mode arithmetic as below; SHIFT+MODE1 stays in VOICE. */
         uint8_t next;
 
         if (buttonHandler_getShift() && mode == SELECT_MODE_VOICE)
@@ -1873,9 +2013,10 @@ static void handleModeButtons(uint8_t mode)
             next = (uint8_t)((mode + 4u) & 0x07u);
         else
             next = (uint8_t)(mode & 0x07u);
-        if (bh_state.selectButtonMode == SELECT_MODE_PERF &&
-            next != SELECT_MODE_PERF)
-            buttonHandler_loopForceRelease();
+        buttonHandler_closeLatchedSurfaces(
+            1u,
+            (uint8_t)(bh_state.selectButtonMode == SELECT_MODE_PERF &&
+                      next != SELECT_MODE_PERF));
     }
     if (!buttonHandler_getShift() &&
         mode == SELECT_MODE_LOAD_SAVE &&
@@ -2296,6 +2437,10 @@ static void buttonHandler_partButtonReleased(uint8_t partNr)
  */
 static void buttonHandler_shiftRecMenuEnter(void)
 {
+    /* SHIFT+REC is dropped while a locked background Bank load owns the
+     * panel (S082 P1 R7); an unlocked load allows it (S082 P3 W3). */
+    if (preset_backgroundBankLoadLocked())
+        return;
     bh_shiftRecSavedPage = menu_getActivePage();
     bh_shiftRecSavedSubPg = menu_getSubPage();
     menu_switchPage(RECORDING_PAGE);
@@ -2321,11 +2466,41 @@ static void buttonHandler_shiftRecMenuExit(void)
     menu_switchPage(bh_shiftRecSavedPage);
     menu_switchSubPage(bh_shiftRecSavedSubPg);
     menu_resetActiveParameter();
-    /* REC returns to its record state; SHIFT reflects whether it is held. */
     led_setBlinkLed(LED_REC, 0u);
     led_setValue((uint8_t)(liveRec_mode() == LIVEREC_MODE_LATCH), LED_REC);
     led_setValue(buttonHandler_getShift(), LED_SHIFT);
     menu_repaintAll();
+}
+
+/*
+ * Put the front panel into Load/Save for a MIDI-origin Bank load
+ * (S082 P1 D7, D32).
+ *
+ * What: closes every latched surface without restoring the SHIFT+REC page
+ * (R8), ends an open COPY/CLEAR session (nothing is applied), cancels the
+ * double-click window, leaves Morph voice mode, and sets the Load/Save mode
+ * with its mode LEDs; BAR LEDs go dark (non-PERF rule). The Menu page change
+ * is Menu's (menu_backgroundBankLoadUiBegin()).
+ * Why: a MIDI Bank load takes the UI exactly as if the user had pressed MODE
+ * to Load/Save and OK (D7), abandoning any Menu state (D32).
+ * Inputs: bh_state, latch flags, copy/clear session.
+ * Outputs: bh_state.selectButtonMode = SELECT_MODE_LOAD_SAVE; LEDs.
+ * Accessors: menu_backgroundBankLoadUiBegin().
+ * Affiliates: buttonHandler_closeLatchedSurfaces(), copyClear_copyReleased(),
+ * dblclick_cancel(), buttonHandler_setMorphVoiceMode().
+ */
+void buttonHandler_enterLoadSaveForBackgroundLoad(void)
+{
+    buttonHandler_closeLatchedSurfaces(
+        0u, (uint8_t)(bh_state.selectButtonMode == SELECT_MODE_PERF));
+    copyClear_copyReleased();
+    dblclick_cancel();
+    buttonHandler_setMorphVoiceMode(0u);
+    bh_state.selectButtonMode = SELECT_MODE_LOAD_SAVE;
+    led_clearAllBlinkLeds();
+    led_setMode2(SELECT_MODE_LOAD_SAVE);
+    led_setValue(0u, LED_BAR1);
+    led_setValue(0u, LED_BAR2);
 }
 
 static void handleVoiceButton(uint8_t voiceNr)
@@ -2655,6 +2830,23 @@ static void processPress(uint8_t buttonNr)
      * gesture by marking the hold as action-occurred.
      */
     (void)dblclick_onPress(buttonNr);
+    /*
+     * Learn cancel (S083 C5): while Learn is active, a press of SHIFT, PLAY
+     * or REC cancels it and is consumed (no transport, record or menu
+     * action). SHIFT keeps its hold flag and its release is consumed, as
+     * for a latched-menu close. Affiliates: midiLearn_cancel(),
+     * bh_shiftReleaseConsume.
+     */
+    if (midiLearn_active() &&
+        (buttonNr == BUT_SHIFT || buttonNr == BUT_START_STOP ||
+         buttonNr == BUT_REC)) {
+        midiLearn_cancel();
+        if (buttonNr == BUT_SHIFT) {
+            bh_shiftHeld = 1u;
+            bh_shiftReleaseConsume = 1u;
+        }
+        return;
+    }
     if (btn_to_seq(buttonNr) < 0)
         dblclick_cancel();
     if (perf_heldVoiceMask != 0u &&
@@ -2798,12 +2990,11 @@ static void processPress(uint8_t buttonNr)
          * call with no serialization boundary.
          */
         /*
-         * S080 G8: SHIFT+PLAY in PERF arms the chain-editor chord and is
-         * consumed - it never toggles the transport. Outside PERF, SHIFT+PLAY
-         * keeps its old meaning.
+         * S080 G8 / S083 F8: SHIFT+PLAY arms the SHIFT+PLAY chord in every
+         * mode and never toggles the transport (MIDI_SPEC 6.3): +SEQ in
+         * PERF opens the chain editor, +REC arms MIDI Learn.
          */
-        if (bh_state.selectButtonMode == SELECT_MODE_PERF &&
-            buttonHandler_getShift()) {
+        if (buttonHandler_getShift()) {
             bh_chainPlayArmed = 1u;
             break;
         }
@@ -2812,6 +3003,19 @@ static void processPress(uint8_t buttonNr)
         break;
 
     case BUT_REC:
+        /*
+         * SHIFT+PLAY+REC arms MIDI Learn (S083 C5, F8).
+         *
+         * What: with SHIFT and PLAY held (the chord armed by F-6a), REC
+         * performs none of its own functions (no record toggle, no SHIFT+REC
+         * menu) and arms Learn; SHIFT, PLAY and REC flash until a valid CC
+         * arrives or Learn is cancelled. Affiliates: midiLearn_arm(),
+         * buttonHandler_setLearnLeds().
+         */
+        if (buttonHandler_getShift() && bh_chainPlayArmed) {
+            midiLearn_arm();
+            break;
+        }
         if (bh_shiftRecMenuActive) {
             /* S080 E7: REC exits the SHIFT+REC settings menu. */
             buttonHandler_shiftRecMenuExit();
@@ -2850,6 +3054,11 @@ static void processPress(uint8_t buttonNr)
         break;
 
     case BUT_COPY:
+        if (bh_state.selectButtonMode == SELECT_MODE_LOAD_SAVE &&
+            menu_bankCopyPressed()) {
+            bh_bankCopyPressTick = time_sysTick;
+            break;
+        }
         /*
          * SHIFT + copy/clear while recording and running keeps its erase
          * meaning. Every other press arms a copy operation, or a clear
@@ -2920,8 +3129,9 @@ static void processPress(uint8_t buttonNr)
     case BUT_BAR2:
         led_setValue(1, LED_BAR2);
         /*
-         * See BAR1 above. BAR2 is insert-space-forward in Load/Save character
-         * entry and ordinary next-bar selection everywhere else.
+         * See BAR1 above. BAR2 is cursor-forward (keeps characters) in
+         * Load/Save character entry and ordinary next-bar selection everywhere
+         * else.
          */
         if (menu_loadSaveBarButtonPressed(1u))
             break;
@@ -3065,9 +3275,34 @@ static void processPress(uint8_t buttonNr)
     }
 }
 
+/*
+ * Learn LED flash (S083 C5).
+ * What: on = SHIFT, PLAY and REC flash (continuous; the code calls this a
+ * blink). off = the three LEDs return to their own state: SHIFT to its
+ * hold, PLAY to the transport, REC to the live-record LATCH state.
+ * Inputs: on/off. Accessor: MidiLearn.c (arm, end). Affiliates:
+ * led_setBlinkLed(), liveRec_mode().
+ */
+void buttonHandler_setLearnLeds(uint8_t on)
+{
+    led_setBlinkLed(LED_SHIFT, on);
+    led_setBlinkLed(LED_START_STOP, on);
+    led_setBlinkLed(LED_REC, on);
+    if (!on) {
+        led_setValue(bh_shiftHeld, LED_SHIFT);
+        led_setValue((uint8_t)bh_state.seqRunning, LED_START_STOP);
+        led_setValue((uint8_t)(liveRec_mode() == LIVEREC_MODE_LATCH), LED_REC);
+    }
+}
+
 static void processRelease(uint8_t buttonNr)
 {
     if (buttonNr == BUT_COPY) {
+        if (bh_bankCopyPressTick) {
+            menu_bankCopyReleased();
+            bh_bankCopyPressTick = 0u;
+            return;
+        }
         /*
          * COPY release (S081 G-5): ends the live-erase chord when SHIFT is no
          * longer held, otherwise the ordinary copy/clear release runs.
@@ -3484,6 +3719,9 @@ void buttonHandler_processEvents(void)
          * Copy/Clear source/row ledger cannot remain half armed.
          */
         (void)copyClear_eventOverflow();
+        /* a lost COPY release must not leave the Bank page held */
+        menu_bankCopyForceRelease();
+        bh_bankCopyPressTick = 0u;
         buttonHandler_voiceSceneSeqPressedMask = 0u;
         buttonHandler_loadSceneSeqPressedMask = 0u;
         /* S075 F2-F: a lost TRACK release must not strand the overlay. */
@@ -3513,6 +3751,8 @@ void buttonHandler_processEvents(void)
          */
         buttonHandler_loopForceRelease();
         bh_overlayActive = 0u;
+        /* S083: per-track entries stop with the overlay. */
+        buttonHandler_overlayReconfigure(0u);
         if (bh_shiftRecMenuActive)
             buttonHandler_shiftRecMenuExit();
         if (menu_chainMenuIsOpen())

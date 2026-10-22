@@ -50,8 +50,7 @@
 #include "Oscillator.h"
 #include "random.h"
 #include "Samples.h"
-#include "MidiParser.h"
-#include "MidiNoteNumbers.h"
+#include "MidiPitch.h"
 #include "modulationNode.h"
 #include <math.h>
 // TODO DSP_PORT
@@ -996,7 +995,7 @@ void osc_setBaseNote(OscInfo* osc, uint8_t baseNote)
 {
 
 	 //get fine tune
-	 const float cent = midiParser_calcDetune(osc->midiFreq&0xff);
+	 const float cent = midiPitch_detune(osc->midiFreq&0xff);
 	 /*
 	  * PatternData owns the default sequencer note value after the 1.3 pattern
 	  * move. Oscillator uses PAT_DEFAULT_NOTE only as the neutral pitch reference:
@@ -1016,7 +1015,7 @@ void osc_setBaseNote(OscInfo* osc, uint8_t baseNote)
 void osc_recalcFreq(OscInfo* osc)
 {
 	 //get fine tune
-	 const float cent = midiParser_calcDetune(osc->midiFreq&0xff);
+	 const float cent = midiPitch_detune(osc->midiFreq&0xff);
 	 /*
 	  * Recompute frequency from the stored base note using PatternData's neutral
 	  * default-note constant. Input/output mirror osc_setBaseNote(), but this path

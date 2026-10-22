@@ -94,6 +94,9 @@ it belongs in the summary or the log, not here.
 | 077 | 2026-10-08 | `dev-ph6-cleanup`, HEAD uncommitted | Background Scene region (17th `pat_background_region`), copy snapshot migration, per-track Scene playback, blank menu after load fix, Scene morph fan-out correction, bar-to-step copy, PERF mode morph automation underline |
 | 078 | 2026-10-08/10 | `dev-ph6-cleanup`, P1 `0c23def`, P2+P3 `b537e6f`, P4 uncommitted | Continuous per-track step scale (Q8.8 DDA), shuffle, run modes, track Morph/automation, STEP multi-step editing, held-step overlay, underline/clear fix, run-mode remediation |
 | 079 | 2026-10-10 | `dev-ph6-cleanup`, HEAD uncommitted | Step trigger conditions (37 → 39 entries), per-step roll/rhythm/fill, micro-timing; P2 remediation: step-button toggle, scroll marker, rhythm presentation, roll fill duck; SD_CARD v1 → v2 conversion |
+| 080 | 2026-10-10/11 | `dev-ph6-cleanup`, `4869a98` | PERF performance surface: looper, BAR VOICE-trigger overlay, SHIFT+REC menu, Scene queue/change division, Scene chaining, loopable tracks |
+| 081 | 2026-10-12/16 | `dev-ph6-cleanup`, `2a0fd86` (logged after S082) | Live record and live erase, step reset rule, R12/R13 automation priority, 96-PPQ roll table, linear automation ramps (`asm`), loop while record, VOICE bar pulse |
+| 082 | 2026-10-16/20 | `dev-ph6-midi`, `8a83df0` | Load/Save cleanup, Bank Replace/Merge, background Bank load through Scene 17, work while loading |
 
 
 ---
@@ -544,6 +547,15 @@ Session 065 delivered the first working end-to-end step automation path: the exi
 | Scene morph copy/reset fans out through `bank_sceneFanoutMask()` like `copy kit`/`clear fx`, NOT like `copy scene`/`clear scene` (which exchange/reset the edit mask) | 077 |
 | `CC_KIND_BAR_TO_STEP` (6): cross-kind paste uses bar source geometry (src×16) with step destination geometry (job->start directly); no identical-paste check | 077 |
 | PERF morph automation underline: `va_searchPerfMorphMask` (7-bit), `menu_applyPerfMarkers()` walks 4 visible compact-view cells; the scan/classify/render pipeline was extended to PERF page | 077 |
+| Instrument automation resets once per step, at the step's **first** trigger (delayed hit, first roll hit, or roll renewal); a per-voice pending-reset mask (`voiceControl_pendingReset`) carries it, and deferred steps queue their automation at fire time | 081 |
+| R12: a menu edit of an Instrument parameter beats its automation until that voice's next trigger, a transport change or a Scene change (`seq_menuOverride[6]`); other targets: the menu value applies until their next automation | 081 |
+| R13: Effect parameter = menuHold > FX lock (its step only) > track overlay > menu; the FX Morph lane is one-step | 081 |
+| Step roll table is 96-PPQ ticks `{0,48,32,24,16,12,8,6,4,3}` (`off 1/8 8tr 16 16t 32 32t 64 64t 128`); stored roll indices shifted with no migration | 081 |
+| LiveRecord never calls buttonHandler or MidiParser, and the Sequencer never calls LiveRecord. One deviation: LiveRecord includes `menu.h` for `menu_automationTargetRecorded()` (Hardware fix 1) | 081 |
+| `asm` (per-track Pattern setting, PAT4 track-header byte 5): linear ramps between consecutively played automated steps; ramp samples are automation writes (`seq_writeInstrumentAutomation()`); keep `seq_rampNextStep()` in step with the play-mode switch | 081 |
+| `LIVEREC_AUTOMATION_FIRST_CHANGE` (`config.h`, default 1): live record writes a parameter's first change in a step, at once | 081 |
+| The master morph `mrp` is never recorded or automatable; individual voice/FX Morph edits are recorded with their captured value (`liveRec_morphValue[7]`) | 081 |
+| LED pulse/flash deadlines compare by signed 16-bit distance (`led_timeReached()`); never `time_sysTick > end` | 081 |
 
 ---
 
@@ -1846,3 +1858,187 @@ Session 080 ran on `dev-ph6-cleanup` from the S079 close (`efcdbe1`; text 544,07
   `PATTERN_DYNAMIC_STACK.md` (§6.5 looper, §6.6 scene change/queue/chain,
   §1/§7 loop exclude), `BANK_PRESET_ARCHITECTURE.md`, `AUTOSAVE.md`,
   `FILESYSTEM_SPEC.md`, `STORAGE_SRAM_MANIFEST.md`, `COPYCLEAR_UTILITIES.md`.
+
+### 081 — Live Record, Live Erase, Automation Ramps (`asm`), Loop While Record, VOICE Bar Pulse (2026-10-12/16)
+
+Session 081 ran on `dev-ph6-cleanup` from the S080 close (`02553df`; text 556,008, data 412, bss 427,976) through the commits `96a403b` and `0a35d8d` (plan and schedule), `a6c96a0` (plan amendments), `d21e245` (P1 code), `b6c7b86` (P1B, P1C and P2 code), `4d5c2c5` (first-change follow-up) and `2a0fd86` (P3, P4 and G-1). PR #7 merged it. The final DEV link is text=573,296, data=416, bss=429,112 (payload 573,712 B of 753,664 B, headroom 179,952 B): bss +1,136 B and data +4 B. **This log was written after S082 landed.** S082 branched from `2a0fd86` and did not change LiveRecord. Four parts:
+
+- **P1 live record (R1–R19; Q1–Q22, F-A..F-S, L1–L3), with fix rounds P1B and P1C:**
+  - **New module `Core/Sequencer/LiveRecord.c/.h`.**
+    - Modes: OFF, LATCH (REC tap, toggles on release), OVERDUB (REC held past 300 ms) and ERASE (SHIFT+CLEAR while armed).
+    - `rtk` is the recording track: it follows the active track, and SHIFT+REC sub-page 2 can override it.
+    - The target Scene is T = P(rtk). Writes go through a Pattern Stack Service target override, and ownership rules apply.
+    - State: latch, dirty and erase bitmaps of 512 bits each.
+    - TIM3 feeds a step-boundary ring of 16 × u16 entries (step, track, fired, and the jump bit added in P3).
+    - Automation is written only on real changes (L3).
+  - **Triggers:** overlay hits are placed on the track's live cursor:
+    - un-quantised, as a micro-timing delay from the nominal step start (shuffle applies only at playback);
+    - `qnt` 1/8..1/64: snapped on the master grid;
+    - the new `qnt trk`: snapped to the track's step grid.
+    - Flams and rolls follow §8.7–§8.8. Echo marks with a deadline stop the live hit from doubling. `fil` is written while PERF is held.
+  - **Live erase:**
+    - knob: the target joins the erase bitmap;
+    - SEQ hold: the active track's triggers and specials, or the FX sequence in FX mode;
+    - TRACK hold: the whole track.
+    - FX-sequence erase fans out to linked Scenes.
+  - **Prerequisite behaviour changes:**
+    - **§5.8 step reset rule:** Instrument automation resets once per step, at its first trigger. A per-voice pending-reset mask carries the reset. Deferred steps queue their automation at fire time. Rolls honour shuffle and micro-timing, and run their own length (F-R).
+    - **R12:** a menu edit beats Instrument automation until the voice's next trigger (`seq_menuOverride`). This amends S075 F3. Per-target Scene clears were added.
+    - **R13:** Effect parameters resolve menuHold > FX lock > track overlay > menu. The step markers and owner state are removed, and the FX Morph lane holds for one step only. Realign also realigns the FX sequence.
+    - **Step roll table:** now 96 PPQ, `off 1/8 8tr 16 16t 32 32t 64 64t 128`. Rolls were 4× fast; `48` was dropped. `PAR_ROLL` is retired.
+    - **Overlay fixes (R19).**
+  - **Reviews:** P1 must-fix 1–13 and should-fix 14–28 were fixed in P1B. The P1B review (must-fix 1–5, minor 6–14) plus items 15/16 were fixed in P1C. P1C review C-1 was fixed with `liveRec_syncRing()`. Shuffle was removed from placement (user). Hardware fix 1 underlines recorded automation.
+- **P2 linear automation ramps (D1–D12):**
+  - Per-track Pattern setting `asm` (`Automtn`, STEP cell 7, PAT4 track-header byte 5, version 2 kept; `tools/convert_pattern_autosmooth.py`).
+  - Instrument parameters with numeric dtypes ramp linearly between two consecutively played steps that both hold the parameter.
+  - TIM3 predicts B (rnd never ramps; B's condition must be predictable).
+  - Up to 64 ramps (`seq_ramps`, 10 B each) are written by `seq_rampService()` every third DSP block, only when the value changes (D11).
+  - Ramps end at the next played step. A trigger restore skips ramped parameters. Nothing ramps across a loop wrap.
+  - **D12 follow-up:** live record writes a parameter's **first change** in a step at once (`LIVEREC_AUTOMATION_FIRST_CHANGE` 1 in `config.h`; 0 = the P1 value at step end).
+- **P3 loop while record (L-2, Q1–Q6, FQ1–FQ7):**
+  - The looper lockout is removed: REC, OVERDUB and erase run while looping.
+  - The loop holds while any SELECT, VOICE or BAR is held. While looping, VOICE is looper-only, and a press with no SELECT held adds its track.
+  - A held overlay roll ends at engage and becomes a TRACK hold.
+  - Ring jump entries are pushed at mid-step wraps and resumes. Each step ends with its own fired bit (FQ4 fixed the P1 off-by-one).
+  - Loop-aware placement (`seq_placeLoopImage()`) was verified with 0 mismatches against a TIM3 simulation.
+  - PERF Morph cells `1VM`..`6VM` and `fxm` are recorded.
+  - **G-1 (+7 B):** the master morph `mrp` is never recorded. Individual Morph edits are captured in `liveRec_morphValue[7]`, so a global change cannot leak into a pending write.
+- **P4 VOICE bar pulse:**
+  - In VOICE mode the SELECT LED of the active track's new bar pulses once. There is no pulse for a single-bar track, `rnd`, or a return to the same bar (`led_updateVoiceBarPulse()`, 2 B).
+  - Pulse and flash expiry are now wrap-safe (`led_timeReached()`). This fixes pulses lost near the 16-bit `time_sysTick` wrap.
+- **Hardware:** mostly untested.
+  - P1 "Hardware fix 1" came from use on the device.
+  - Untested: the P1B F6, P1C C5, P2 Phase E (including the 64-ramp CPU measurement), P3-C rows 1–15, P4 rows 1–10 and G-1 checks 1–4.
+  - Open: P3 A-1, P4 B-1/B-2, and the stale previous step when REC is armed while running. P1 item 29 (FX realign on Scene changes with `pcr` off) was decided at the close-out: correct as implemented.
+
+- **Find here**: [081_SESSION_HANDOFF_LOG.md](081_SESSION_HANDOFF_LOG.md),
+  `PATTERN_DYNAMIC_STACK.md` (§6.1 step reset rule, §6.2a R12, §6.2b ramps,
+  §6.7 live record, §6.5 looping while recording, §12 service ops/target
+  override/stage `W`), `EFFECTS_BUS_REFERENCE.md` (§6/§10/§11 R13),
+  `MODULE_INTERCHANGE_SPEC.md` (LiveRecord, Sequencer live-record and ramp
+  services, PERF surface, LED bar pulse), `STORAGE_SRAM_MANIFEST.md`,
+  `FILESYSTEM_SPEC.md` (PAT4 byte 5, `quantisation` 5), `MEMORY.md`.
+
+### 082 — Load/Save Cleanup: Bank Replace/Merge, Instrument `chg`, Name Editing, Background Bank Load (Scene 17), Audio During Load, Work While Loading (2026-10-16/20)
+
+Session 082 ran on `dev-ph6-midi` from the S081 code commit (`2a0fd86`; S081 was closed out afterwards, see the 081 entry) through the planning commits `8206a73`, `8b1b647`, `45846b7`, the P0–P2 code commit `b25ffbe` and the P3 code commit `8a83df0`. The final DEV link is `text=598,120`, `data=420`, `bss=430,928` (payload 598,540 B of 753,664 B, **headroom 155,124 B**). The S083 MIDI plan was written first; the background Bank load it needs grew into this session. There were four parts (P0–P3), each a plan, an implementation schedule, an implementation and an assessment:
+
+- **P0 Load/Save menu cleanup (S1–S25):**
+  - **Bank pages:**
+    - Bank Load/Save take explicit **act/empty masks**: Replace (the default) acts on all 16 Scenes, Merge (COPY tap) only on selected Scenes with pattern content;
+    - COPY hold peeks at the other view (200 ms threshold);
+    - labels `ok`/`mr`/`OW`/`MR`;
+    - SEQ LEDs show pattern content from a new Bank child **content probe** (PAT4 address-array scan).
+  - **Load semantics:**
+    - shared empty-Scene primitive;
+    - Bank Save deletes empty-mask children;
+    - present mask **assigned**, not OR-ed;
+    - Merge Save reads the slot's old `bankset.bcg`;
+    - edit masks mutually exclusive after partial operations;
+    - new HCNAMES Scene-row tokens `bNNN`/`x`.
+  - **The active and viewed Scene never change** because of a load or save; the manifest `active_scene` is boot-only. This closes the "Bank Load switches the playing Scene" bug.
+  - **Instrument Load `chg` row** for a type change.
+  - **Name editing:** Load/Save pots repaint through the coalesced 20 ms knob path; BAR2 moves without blanking.
+  - **First-boot freeze review (F1–F9 fixed):**
+    - Scene 17 is built only when needed;
+    - Load/Save pots obey the storage gate;
+    - busy-owner restore;
+    - preview probe EOF/stall observer `BkPv`;
+    - nested Instrument retry dispatch;
+    - explicit Merge flag;
+    - HCNAMES register reset only after a request is accepted.
+  - **Still open:** F5, the Scene 2 Case-3 invalidation; `h`/`Q` 0x08 instrumentation was added for it.
+- **P1 background Bank load and Scene 17 (D1–D39):**
+  - **Scene 17** (`scene_background`, `pat_background_region`) is an exact copy of what plays (per-track aware, T1→T7 fit), switched to seamlessly; a rebuild in place moves only affected tracks (D30/D31).
+  - **Scene-index audit:** every index-16 site has a rule; edit fan-out to 17 is 17 only (32-bit masks).
+  - **Names:** a 90 B name capture (`fs_background_name`) lets a Scene, Kit, Instrument or Pattern be saved from 17. Nothing loads into 17; every load targets the home Scene.
+  - **Origin and MIDI:** the MIDI-origin entry closes everything. A MIDI Bank request is deferred while anything is busy and dropped during a load. While a load runs, MIDI other than realtime, notes and CC (CC0/CC32 excluded) is dropped. The result byte gives CC0 TX its answer.
+  - **AutoSave** is aborted at once through an allow-list of callback-free phases.
+  - **Panel:** input is dropped during a load (R7); waits are bounded to 20 s.
+  - **Assessment A1–A8 fixed**, including the identity-block ownership fix A3, which can otherwise empty the home Scene at boot.
+  - **Bank slot scrolling fix:** the preview never holds `menu_storageBusy`, is cancellable, and the Bank name is captured at request. This became a binding policy in `MEMORY.md`.
+- **P2 audio during a background load** (hardware report: volume jump, slow load, end glitch):
+  - `effects_rebindSourceScene()`: the Effect's cached Scene index follows playback onto 17;
+  - whole-Scene AutoSave marks became one contiguous mask range with one `L` witness;
+  - `filesystem_tickUncounted()` idle-time servicing (200 µs while both render slots are full).
+
+  The user confirmed on hardware that this works.
+- **P3 work while a background load runs (W1–W5, D40–D53):**
+  - **Unlock:** from phase 5 of a Scene 17 or running direct load, the panel is free; Load/Save shows a frozen Bank screen with live 1-based `NN.` and PERF-style SEQ LEDs, and `LED_MODE4` fast-blinks elsewhere (second fast-blink slot).
+  - **Availability:** BankData's `bank_load_unavailable_mask` drives availability; a progressive Bank Load sets each child's present bit as it lands, merges edit masks before the first child, and strips only failed children at the end.
+  - **Scene changes:** manual Scene changes go to available Scenes only; chains are suspended during any load.
+  - **Copy/clear** is allowed: jobs on pending Scenes drop with `LOAD_PENDING`, and name publication waits for the command to end.
+  - **Completion:** off-page completion is quiet, with no double activation.
+  - **Assessment:** the implementation conforms; A1 (queued action parts on a dropped target) and A2 (frozen-screen blink loss) remain low-severity open items.
+- **RAM:**
+  - Scene 17 1,658 B;
+  - P0 16 B;
+  - P1 93 B (91 BSS + 2 `.data`);
+  - P3 4 B;
+  - DEV-only diagnostics.
+- **Hardware:**
+  - P0 first boot: a freeze, not reproduced;
+  - P1 report led to P2;
+  - P2 confirmed working by the user;
+  - P0/P1 matrices and all of P3 are untested.
+
+- **Find here**: [082_SESSION_HANDOFF_LOG.md](082_SESSION_HANDOFF_LOG.md),
+  `FILESYSTEM_SPEC.md` (Bank Load/Save, preview probe, HCNAMES tokens,
+  background/progressive load), `MODULE_INTERCHANGE_SPEC.md` (S082 APIs,
+  Load/Save UI, background Bank load), `BANK_PRESET_ARCHITECTURE.md`
+  (availability, edit masks, `active_scene`), `AUTOSAVE.md`,
+  `COPYCLEAR_UTILITIES.md`, `PATTERN_DYNAMIC_STACK.md`, `DEV_MODES.md`,
+  `MIDI_SPEC.md`, `STORAGE_SRAM_MANIFEST.md`.
+
+### 083 — MIDI Implementation: `Core/MIDI/` Rebuild, Note Map, NRPN/Learn, Transport, Transmit; Track `ch`/`nte` `off`, `midilrn.cfg`, CC2 = BAR Overlay, `pv<`/`pv>` (2026-10-21/22)
+
+Session 083 ran on `dev-ph6-midi`: planning commit `f9aaeec`, the implementation commit `d007027`, then follow-ups uncommitted at the close. The final DEV link is `text=608,744`, `data=424`, `bss=430,112` (payload 608,848 B of 753,664 B, **headroom 144,816 B**). The work was the S082-planned MIDI rework (`SCOPING_TARGETS.md` Phase 6 §6.1, A20): plan revision 5 (Q1–Q13), a full code schedule, implementation in phases A–H, an assessment with fixes, and three rounds of hardware follow-ups.
+
+- **Rebuild (Q7):** `Core/MIDI/` was replaced by single-role modules:
+  - `MidiDefs.h`, `MidiBuffer`, `MidiDin`, `MidiIn`, `MidiTransport`;
+  - `MidiNoteMap` (stateless, host-tested in `tools/midi_test/`);
+  - `MidiNotes`, `MidiControl`, `MidiLearn`, `MidiProgram`, `MidiOut`, `MidiPitch.h`;
+  - `MidiVoiceControl` kept.
+
+  `MidiParser`, `FIFO`, `Uart`, `MidiRealtime`, `MidiMessages.h` and `MidiNoteNumbers.h` were deleted, and `valueShaper.h` moved to `Core/DSPAudio/`.
+- **Receive:**
+  - consume-then-route, with the new MRT list `off UtD DtD DtU bth DtA AtD all`; the S082 Bank-load drop filter is kept;
+  - SPP and Song Select are framed, and USB packets use the correct CIN;
+  - the USB ring is 128 × 6 B and drops the newest message when full;
+  - G can be `off`.
+- **Notes:**
+  - N1–N5 note map: a stripe on G, splits on other channels, assigned ranges, root = default pitch 63;
+  - TX goes through the inverse map only inside the track's own range (Q4);
+  - per-track overlay executor shared by panel and MIDI (Q5, rolls run together);
+  - arrival stamps place MIDI hits in LiveRecord (Q6).
+- **Control:**
+  - **A MIDI write is a menu edit (Q1):** one commit (`menu_commitTargetEdit()`) with R12/R13, Scene-target clears, edit-mask fan-out, recording and an LCD repaint by target ID;
+  - NRPN = the 9-bit target ID;
+  - CC1 is global Morph on G (never recorded) and per-voice Morph on a voice channel;
+  - **MIDI Learn:** 128 type-tagged rows; SHIFT+PLAY+REC, `LRN`/`FUL`.
+- **PC/CC0/transport:**
+  - PC 0..15 on G is a whole-Scene change; PC on a voice channel moves that channel's tracks;
+  - CC0 requests the S082 background Bank load;
+  - the S082 A1 queued-action fix (Q2);
+  - Continue resumes, SPP applies while stopped, and both are gated by `snc` (Q11).
+- **Transmit:** per-track note-off record; parameter TX as the learned CC, else NRPN, coalesced and throttled; no echo of MIDI-originated changes (Q9).
+- **Assessment fixes F-1..F-7:** Continue no longer replays a tick; note record under PRIMASK; 7-bit TX mask; Learn cancelled by CC0 on Load/Save; stamp read order; the HiHat pair moves together.
+- **Follow-ups (hardware):**
+  - **Track `ch`/`nte`:** `ch` gains `off` (stored 17); `nte` gains `off` (stored 128); `def` became `on`; `asm` became `rmp` (Automtn, Ramp).
+  - **Learn persistence:** a formatter length bug lost every row. Rows now live in `midilrn.cfg`, safely rewritten after every Learn, with a boot `.tmp` recovery and trace stage `m`.
+  - **Global Morph** sets FX Morph (not recorded).
+  - **SHIFT+REC:** page 2 is `pv< pv> qnt rtk`; `pv<`/`pv>` set the overlay roll velocity rhythm (`settings.cfg` `lines=26`).
+  - **CC2 on G** sets the PERF BAR overlay itself (state and LEDs; last action wins).
+  - **Decoder:** op-list drift fixed.
+- **RAM:**
+  - net about −800 B (the old USB ring was 2,048 B);
+  - new: Learn 518 B, overlay table 56 B, NRPN 48 B, DIN stamps 128 B, TX 22 B, `midilrn.cfg` flag 1 B;
+  - CC2 state retired.
+- **Hardware:** the user tested the P1 build ("seems ok", which led to the follow-ups) and the final build ("hardware checks out").
+
+- **Find here**: [083_SESSION_HANDOFF_LOG.md](083_SESSION_HANDOFF_LOG.md),
+  `MIDI_SPEC.md` (complete use and code reference), `MODULE_INTERCHANGE_SPEC.md`
+  (Core/MIDI modules, overlay entry points, SHIFT+REC page), `FILESYSTEM_SPEC.md`
+  (`settings.cfg`, `midilrn.cfg`, `sceneset.scg` rows 4/5), `PATTERN_DYNAMIC_STACK.md`,
+  `BANK_PRESET_ARCHITECTURE.md`, `DEV_MODES.md` (stage `m`),
+  `STORAGE_SRAM_MANIFEST.md`, `MEMORY.md`.

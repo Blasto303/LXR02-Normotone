@@ -75,7 +75,8 @@
 #define LED_BLINK_TIME_MS      250
 /*
  * Fast blink half-period (S080 P2 Defect 10): double the standard blink rate,
- * used only by the queued-scene indication (LED_LAYER_FAST).
+ * used by the queued-Scene indication and the background Bank load mode LED
+ * (S082 P3 W1, LED_LAYER_FAST).
  */
 #define LED_FAST_BLINK_TIME_MS 125
 #define NUM_OF_FLASHABLE_LEDS  LED_FLASH_GROUP_COUNT
@@ -161,7 +162,7 @@ static uint8_t           led_sw43OriginalState;
 #define LED_LAYER_PULSE  (1u << 3)
 /*
  * S080 P2 Defect 10: fast-blink layer. Priority: pulse > fast > flash >
- * blink/chase > base. It is owned by led_setFastBlinkLed() alone; blink
+ * blink/chase > base. It is owned by led_setFastBlinkSlot() alone; blink
  * start/stop, led_clearAllBlinkLeds() and led_setValue() never clear it.
  */
 #define LED_LAYER_FAST   (1u << 4)
@@ -191,20 +192,22 @@ static volatile uint8_t led_blinkLedNumber[NUM_OF_BLINKABLE_LEDS];
 static volatile uint8_t led_blinkingLeds;
 
 /*
- * Queued-scene fast blink state (S080 P2 Defect 10).
+ * Fast blink state, two slots (S080 P2 Defect 10; S082 P3 W1).
  *
- * What: led_fastBlinkLed is the one logical LED carrying LED_LAYER_FAST
- * (0xFF = none); led_fastBlinkPhase is its current on/off phase;
- * led_fastBlinkNext is the time_sysTick deadline of the next toggle. Why: a
- * queued scene change flashes its SEQ LED at double the normal rate until the
- * change fires (plan §5.3). Only one Scene can be queued, so one LED is
- * enough. A dedicated layer keeps the indication independent of the eight
- * shared blink slots, which the PERF Scene refresh clears on every beat.
- * Inputs: led_setFastBlinkLed(). Outputs: LED phase via led_renderFromStack()
- * and led_tickHandler(). RAM: 4 bytes SRAM1. Affiliates:
- * menu_syncQueuedSceneLed() (the owner), LED_FAST_BLINK_TIME_MS.
+ * What: led_fastBlinkLed[slot] is the logical LED each slot drives with
+ * LED_LAYER_FAST (0xFF = slot free); both slots share led_fastBlinkPhase and
+ * the led_fastBlinkNext toggle deadline. Slot 0 is the queued Scene's SEQ LED;
+ * slot 1 is the Load/Save mode LED while a background Bank load runs.
+ * Why: both indications can be due at once in PERF (a queued change during a
+ * load); one shared phase keeps them in step and costs one byte more than the
+ * former single slot.
+ * Inputs: led_setFastBlinkSlot(). Outputs: LED phase via
+ * led_renderFromStack() and led_tickHandler().
+ * RAM: 5 B SRAM1 (was 4 B; +1 B approved 2026-10-19, S082 P3 D47).
+ * Affiliates: menu_syncQueuedSceneLed() (owner of both slots),
+ * LED_FAST_BLINK_TIME_MS.
  */
-static uint8_t  led_fastBlinkLed   = 0xFFu;
+static uint8_t  led_fastBlinkLed[LED_FAST_SLOT_COUNT] = { 0xFFu, 0xFFu };
 static uint8_t  led_fastBlinkPhase = 0u;
 static uint16_t led_fastBlinkNext  = 0u;
 
@@ -570,7 +573,8 @@ void led_clearAll(void)
     led_sw43OriginalState = 0;
     memset(led_activeLayers, 0, sizeof(led_activeLayers));
     /* S080 P2 Defect 10: the fast-blink owner follows the cleared layers. */
-    led_fastBlinkLed = 0xFFu;
+    led_fastBlinkLed[LED_FAST_SLOT_QUEUED_SCENE] = 0xFFu;
+    led_fastBlinkLed[LED_FAST_SLOT_BANK_LOAD] = 0xFFu;
     dout_setSw43Led(0);
 }
 
@@ -892,23 +896,34 @@ void led_clearAllBlinkLeds(void)
     }
 }
 
+_Static_assert(LED_FAST_SLOT_COUNT == 2u,
+               "the slot-partner index below assumes exactly two slots");
+
 /*
- * Set or clear the fast-blink LED (S080 P2 Defect 10).
+ * Drive one fast-blink slot (S080 P2 Defect 10; S082 P3 W1).
  *
- * What: moves LED_LAYER_FAST to ledNr (0xFF = none). The previous LED drops
- * the layer and re-renders from its remaining layers/base; the new LED starts
- * in the "on" phase. Why: the queued Scene's SEQ LED flashes at double rate
- * until the change fires, independent of the per-beat Scene refresh. Inputs:
- * logical LED id or 0xFF. Outputs: layer bits, fast-blink state, LED output.
- * Accessors: menu_syncQueuedSceneLed(). Affiliates: led_renderFromStack(),
- * led_tickHandler(), led_clearAll().
+ * What: moves slot `slot` to logical LED ledNr (0xFF frees it). The old LED
+ * loses LED_LAYER_FAST and re-renders; the new LED gains it. When no slot was
+ * blinking, the shared phase restarts lit with a fresh deadline; otherwise
+ * the new LED joins the running phase.
+ * Why: the queued-Scene SEQ LED and the Load/Save mode LED flash at double
+ * rate, independent of the eight blink slots, which the PERF refresh clears
+ * every beat, and of led_setMode2(), which resets the mode LEDs on every mode
+ * change.
+ * Inputs: slot < LED_FAST_SLOT_COUNT, logical LED id or 0xFF.
+ * Outputs: layer bits, fast-blink state, LED output.
+ * Accessors: menu_syncQueuedSceneLed().
+ * Affiliates: led_renderFromStack(), led_tickHandler(), led_clearAll().
  */
-void led_setFastBlinkLed(uint8_t ledNr)
+void led_setFastBlinkSlot(uint8_t slot, uint8_t ledNr)
 {
-    uint8_t old = led_fastBlinkLed;
+    uint8_t old;
     uint8_t physLed;
     uint8_t index;
 
+    if (slot >= LED_FAST_SLOT_COUNT)
+        return;
+    old = led_fastBlinkLed[slot];
     if (ledNr != 0xFFu) {
         physLed = led_toPhysicalNumber(ledNr);
         if (physLed >= NUM_OUTS && physLed != LED_BAR1)
@@ -916,7 +931,7 @@ void led_setFastBlinkLed(uint8_t ledNr)
     }
     if (ledNr == old)
         return;
-    led_fastBlinkLed = 0xFFu;
+    led_fastBlinkLed[slot] = 0xFFu;
     if (old != 0xFFu) {
         physLed = led_toPhysicalNumber(old);
         index = (physLed == LED_BAR1) ? 40u : physLed;
@@ -925,21 +940,26 @@ void led_setFastBlinkLed(uint8_t ledNr)
         led_renderFromStack(old);
     }
     if (ledNr != 0xFFu) {
+        uint8_t other = led_fastBlinkLed[slot ^ 1u];
+
         physLed = led_toPhysicalNumber(ledNr);
         index = (physLed == LED_BAR1) ? 40u : physLed;
         if (index < LED_LAYER_COUNT)
             led_activeLayers[index] |= LED_LAYER_FAST;
-        led_fastBlinkPhase = 1u;
-        led_fastBlinkNext = (uint16_t)(time_sysTick + LED_FAST_BLINK_TIME_MS);
-        led_fastBlinkLed = ledNr;
+        if (other == 0xFFu) {
+            led_fastBlinkPhase = 1u;
+            led_fastBlinkNext =
+                (uint16_t)(time_sysTick + LED_FAST_BLINK_TIME_MS);
+        }
+        led_fastBlinkLed[slot] = ledNr;
         led_renderFromStack(ledNr);
     }
 }
 
-/* S080 P2 Defect 10: current fast-blink LED, or 0xFF when none. */
-uint8_t led_getFastBlinkLed(void)
+/* Current LED of one fast-blink slot, or 0xFF (S082 P3). */
+uint8_t led_getFastBlinkSlot(uint8_t slot)
 {
-    return led_fastBlinkLed;
+    return (slot < LED_FAST_SLOT_COUNT) ? led_fastBlinkLed[slot] : 0xFFu;
 }
 
 /*
@@ -1045,17 +1065,23 @@ void led_tickHandler(void)
     }
 
     /*
-     * S080 P2 Defect 10: queued-scene fast blink.
+     * Fast blink, both slots (S080 P2 Defect 10; S082 P3 W1).
      *
-     * What: toggles the fast-blink phase every LED_FAST_BLINK_TIME_MS and
-     * re-renders its LED. Why: double-rate flashing until the queued change
-     * fires. The signed-distance test is wrap-safe on the 16-bit clock.
+     * What: while any slot is in use, toggles the shared phase every
+     * LED_FAST_BLINK_TIME_MS and re-renders each slot's LED. Why: double-rate
+     * flashing of the queued Scene and of the Load/Save mode LED during a
+     * background load. The signed-distance test is wrap-safe on the 16-bit
+     * clock. Affiliates: led_setFastBlinkSlot(), led_renderFromStack().
      */
-    if (led_fastBlinkLed != 0xFFu &&
+    if ((led_fastBlinkLed[0] != 0xFFu || led_fastBlinkLed[1] != 0xFFu) &&
         (uint16_t)(time_sysTick - led_fastBlinkNext) < 0x8000u) {
+        uint8_t s;
+
         led_fastBlinkNext = (uint16_t)(time_sysTick + LED_FAST_BLINK_TIME_MS);
         led_fastBlinkPhase ^= 1u;
-        led_renderFromStack(led_fastBlinkLed);
+        for (s = 0u; s < LED_FAST_SLOT_COUNT; s++)
+            if (led_fastBlinkLed[s] != 0xFFu)
+                led_renderFromStack(led_fastBlinkLed[s]);
     }
 }
 
@@ -1783,7 +1809,10 @@ void led_processSeqLedState(void)
          * the pulse would hold its last value. Affiliates:
          * menu_refreshPerfSceneLeds(), buttonHandler_getMode().
          */
-        if (buttonHandler_getMode() == SELECT_MODE_PERF)
+        /* S082 P3 D49: the frozen Load:[Bank] screen shows the PERF Scene
+         * row too, so it gets the same per-beat refresh. */
+        if (buttonHandler_getMode() == SELECT_MODE_PERF ||
+            menu_bankLoadFrozenPageActive())
             menu_refreshPerfSceneLeds();
         /*
          * What:       update the SELECT-row bar chaselight whenever the beat

@@ -617,6 +617,11 @@ void autosave_markSourceDirty(uint16_t hcnames_row);
  * before any completion handoff makes request-local filesystem state invalid.
  * Affiliates: Preset load completions, copy/paste, SceneData's generated Kit
  * setter, and load-region hooks.
+ * S082 P2 fix 2: the whole-Scene markers publish one contiguous mask range
+ * (Scene source through the end of the Scene section) in one short critical
+ * section with one LOAD_MARK witness, instead of per-byte marks; the drain
+ * keeps only bytes that have a live getter, so the captured set is the
+ * Scene's complete live image.
  */
 void autosave_markWholeInstrumentDirty(uint8_t scene_index, uint8_t slot);
 void autosave_markInstrumentNormalDirty(uint8_t scene_index, uint8_t slot);

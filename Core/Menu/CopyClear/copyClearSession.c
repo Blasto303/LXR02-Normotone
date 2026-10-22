@@ -585,7 +585,11 @@ uint8_t copyClear_copyPressed(uint8_t shift_held)
     /* COPY stays refused while armed (S081 §19.10, F-N); liveRec_armed()
     ** replaces the seq_recordActive/seq_eraseActive terms (B-6a/G-5). */
     if (liveRec_armed())                       refused |= 1u << 0u;
-    if (menu_isStorageBusy())                  refused |= 1u << 2u;
+    /* S082 P3 D41: an unlocked background Bank load does not lock copy/clear
+     * out (menu_backgroundLoadReleasesPanel()); jobs that would collide are
+     * dropped when they run (ccSvc_tick()). */
+    if (menu_isStorageBusy() && !menu_backgroundLoadReleasesPanel())
+        refused |= 1u << 2u;
     if (menu_loadInstrumentTransactionBusy())  refused |= 1u << 3u;
     if (!cc_modeAllowed(mode))                 refused |= 1u << 4u;
     if (ccSvc_jobCount() != 0u)                refused |= 1u << 5u;

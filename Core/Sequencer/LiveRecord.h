@@ -61,11 +61,15 @@ enum {
 };
 
 /*
- * One trigger hit reported when it sounds (S081 §4.2).
+ * One trigger hit reported when it sounds (S081 §4.2; S083 Q6 age).
  *
- * Inputs: track 0..6, note, velocity, kind (LIVEREC_HIT_*), roll (the step roll
- * index for a ROLL_START; 0 otherwise), source (LIVEREC_SRC_*), note_is_default
- * (1 when the note came from the track default, so a 'def' records no special).
+ * Inputs: track 0..6, note, velocity, kind (LIVEREC_HIT_*), roll (the step
+ * roll index for a ROLL_START; 0 otherwise), source (LIVEREC_SRC_*),
+ * note_is_default (1 when the note came from the track default, so a 'def'
+ * records no special), age_us (S083: how long ago the hit actually
+ * happened, in us; 0 = now). A MIDI note's age is its arrival-to-processing
+ * delay, so placement uses the arrival time (Q6). Panel, overlay repeat and
+ * sequencer hits pass 0. Stack only (+2 B per record).
  */
 typedef struct {
     uint8_t track;
@@ -75,6 +79,7 @@ typedef struct {
     uint8_t roll;
     uint8_t source;
     uint8_t note_is_default;
+    uint16_t age_us;
 } liveRec_trigger_t;
 
 /* Lifecycle. */
@@ -100,7 +105,7 @@ uint8_t liveRec_recordTrack(void);
 ** T = P(rtk) differs from the active Scene A (S081 Q13, P1B item 1). */
 uint8_t liveRec_activePatternLocked(void);
 
-/* Triggers (buttonHandler overlay now, MidiParser later). */
+/* Triggers (buttonHandler overlay, MidiNotes). */
 void    liveRec_triggerIn(const liveRec_trigger_t *t);
 void    liveRec_rollRateChange(uint8_t track, uint8_t rollIndex);
 void    liveRec_rollRelease(uint8_t track);

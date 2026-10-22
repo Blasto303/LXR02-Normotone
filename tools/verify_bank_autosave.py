@@ -270,7 +270,14 @@ def main() -> int:
                              f"{slot_text!r}, got {rows[0][1]!r}")
         for scene in range(SCENE_COUNT):
             if scene not in expected_scenes:
-                add_error(errors, f"missing Bank child Scene {scene:02d}")
+                # S082: a Replace Load/Save may intentionally leave a Scene
+                # empty. The Scene row then carries the explicit x token and
+                # there is no child directory to compare against. Any other
+                # missing child is still an error.
+                scene_source = (rows[1 + scene][1]
+                                if 1 + scene < len(rows) else "")
+                if scene_source != "x":
+                    add_error(errors, f"missing Bank child Scene {scene:02d}")
                 continue
             scene_name, kit_name, members, _ = expected_scenes[scene]
             check_row(1 + scene, scene_name, f"Scene {scene:02d}")
@@ -359,9 +366,23 @@ def main() -> int:
                                      f"got 0x{record_voice_masks[scene]:04x}")
         except (OSError, KeyError, ValueError) as exc:
             add_error(errors, f"bankset.bcg: {exc}")
-    if record_mask != child_mask:
-        add_error(errors, f"{winner_name} scene_present_mask: expected "
-                         f"0x{child_mask:04x}, got 0x{record_mask:04x}")
+    # S082: a partial Bank Save leaves resident presence alone, so the record
+    # may contain present Scenes that were not written to this slot. Every
+    # child that does exist must be present; an intentionally empty (x) Scene
+    # must not be present except for the active Scene, which stays present.
+    x_mask = 0
+    for scene in range(SCENE_COUNT):
+        row = 1 + scene
+        if row < len(rows) and rows[row][1] == "x":
+            x_mask |= 1 << scene
+    if (record_mask & child_mask) != child_mask:
+        add_error(errors, f"{winner_name} scene_present_mask: missing "
+                         f"children 0x{child_mask:04x}, got "
+                         f"0x{record_mask:04x}")
+    unexpected_present = record_mask & x_mask & ~(1 << record_active)
+    if unexpected_present:
+        add_error(errors, f"{winner_name} scene_present_mask: empty Scenes "
+                         f"0x{unexpected_present:04x} must not be present")
 
     # Sample the active Scene and the first discovered child against text
     # sources; this keeps the check bounded while still crossing both source
