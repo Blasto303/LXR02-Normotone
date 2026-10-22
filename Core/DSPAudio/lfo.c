@@ -53,6 +53,7 @@ void lfo_init(Lfo *lfo)
 	lfo->phaseInc 		= 1;
 	lfo->phaseOffset	= 0;
 	lfo->retrigger		= 0;
+	lfo->delay			= 0;
 	lfo->waveform		= SINE;
 	lfo->sync			= 0;
 	lfo->freq			= 1;
@@ -71,18 +72,66 @@ float lfo_calc(Lfo *lfo)
 	lfo->phase 			   += incInt;//lfo->phaseInc*lfo->modNodeValue;
 	const uint8_t overflow 	= oldPhase>lfo->phase;
 
+	/*
+	 * One-shots (LXR Catalyst): a wrap either ends the retrigger delay or ends
+	 * the cycle. After the cycle the phase is pinned and the shape holds its
+	 * end value; during the delay it holds its start value.
+	 */
+	if(lfo->waveform>=LFO_SINE_ONE)
+	{
+		if(overflow)
+		{
+			if(lfo->delay)
+			{
+				lfo->delay = 0;
+				if(lfo->waveform==LFO_NOISE_ONE)
+					lfo->rnd = (float)(GetRngValue()) / 32767.0f;
+			}
+			else
+			{
+				lfo->phase = oldPhase;
+				switch(lfo->waveform)
+				{
+				case LFO_EXP_UP_ONE:
+				case LFO_SAW_UP_ONE:
+					return 1.f;
+				case LFO_NOISE_ONE:
+					return lfo->rnd;
+				default:
+					return 0.f;
+				}
+			}
+		}
+		else if(lfo->delay)
+		{
+			switch(lfo->waveform)
+			{
+			case LFO_EXP_DOWN_ONE:
+			case LFO_SAW_DOWN_ONE:
+				return 1.f;
+			case LFO_NOISE_ONE:
+				return lfo->rnd;
+			default:
+				return 0.f;
+			}
+		}
+	}
+
 	switch(lfo->waveform)
 	{
 	//---
 		case LFO_SINE:
+		case LFO_SINE_ONE:
 			return ((sine_table[(lfo->phase>>20)]/32767.f) + 1)/2.f;
 		break;
 	//---
 		case LFO_TRI:
+		case LFO_TRI_ONE:
 			return (1.f-fabsf( (lfo->phase/(float)0xffffffff)*2-1 ) );
 			break;
 	//---
 		case LFO_SAW_UP:
+		case LFO_SAW_UP_ONE:
 		return lfo->phase/(float)0xffffffff ;
 		break;
 	//---
@@ -97,7 +146,11 @@ float lfo_calc(Lfo *lfo)
 		}
 		break;
 	//---
+		case LFO_REC_ONE: /* the one-shot square starts high */
+		return (lfo->phase > 0x7fffffff) ? 0.f : 1.f;
+	//---
 		case LFO_NOISE:
+		case LFO_NOISE_ONE:
 		if(overflow)
 		{
 			// lfo->rnd = (float)(GetRngValue() & 0x7FFF) / 32767.0f;
@@ -107,10 +160,12 @@ float lfo_calc(Lfo *lfo)
 		break;
 	//---
 		case LFO_SAW_DOWN:
+		case LFO_SAW_DOWN_ONE:
 		return (0xffffffff-(lfo->phase)) / (float)0xffffffff;
 		break;
 	//---
 		case LFO_EXP_UP:
+		case LFO_EXP_UP_ONE:
 			{
 				float x = lfo->phase/(float)0xffffffff;
 				return x*x*x;
@@ -118,6 +173,7 @@ float lfo_calc(Lfo *lfo)
 			break;
 	//---
 		case LFO_EXP_DOWN:
+		case LFO_EXP_DOWN_ONE:
 			{
 				float x = (0xffffffff-(lfo->phase)) / (float)0xffffffff;
 				return x*x*x;//valueShaperF2F(x,-0.9f);
@@ -275,3 +331,18 @@ void lfo_retrigger(uint8_t voice)
 	instrumentManager_retriggerRuntimeLfos(voice);
 }
 //-------------------------------------------------------------
+//-------------------------------------------------------------
+void lfo_restart(Lfo *lfo)
+{
+	const uint8_t one_shot = (lfo->waveform >= LFO_SINE_ONE);
+
+	if(!one_shot)
+	{
+		lfo->phase = lfo->phaseOffset;
+		return;
+	}
+	lfo->delay = (lfo->phaseOffset != 0u);
+	lfo->phase = 0u - lfo->phaseOffset;
+	if(lfo->waveform == LFO_NOISE_ONE && !lfo->delay)
+		lfo->rnd = (float)(GetRngValue()) / 32767.0f;
+}

@@ -47,6 +47,21 @@ uint16_t bank_restoreBankSlot(void);
 uint8_t bank_setScenePresentMask(uint16_t mask);
 uint16_t bank_scenePresentMask(void);
 uint8_t bank_scenePresent(uint8_t scene_index);
+/*
+ * Background Bank load availability (S082 P3 D44, W4).
+ * What: a session marks the load's Scenes unavailable until each completes;
+ * available = present and not pending. Zero/equal to presence outside a load.
+ * Inputs: begin (act | empty), child done (0..15), end.
+ * Outputs: masks and tests for selection, fan-out, copy/clear and LEDs.
+ * Accessors: filesystem Bank Load, Preset completion, Menu, ButtonHandler,
+ * copy/clear, EffectsManager.
+ */
+void bank_beginLoadAvailability(uint16_t scope_mask);
+void bank_noteLoadChildDone(uint8_t scene);
+void bank_endLoadAvailability(void);
+uint16_t bank_loadUnavailableMask(void);
+uint16_t bank_sceneAvailableMask(void);
+uint8_t bank_sceneAvailable(uint8_t scene_index);
 void bank_setActiveSceneSlot(uint8_t slot);
 uint8_t bank_activeSceneSlot(void);
 void bank_selectActiveSceneForEditMask(uint8_t slot);
@@ -69,6 +84,11 @@ void bank_toggleSceneMaskVoiceEdit(uint8_t scene_index);
  */
 void bank_revalidateVoiceEditMasks(void);
 /*
+ * Scoped revalidation (S082 P3): only owners and members inside scope.
+ * Accessors: bank_noteLoadChildDone(); the full form uses scope 0xFFFF.
+ */
+void bank_revalidateVoiceEditMasksIn(uint16_t scope);
+/*
  * Read/write one resident Scene's VOICE edit fan-out mask.
  *
  * Inputs: zero-based Scene index and a raw 16-bit mask for the setter. Output:
@@ -86,7 +106,8 @@ uint16_t bank_sceneMaskVoiceEditForScene(uint8_t scene_index);
  *
  * bank_sceneFanoutMask(): the Scenes a paste or clear of a Scene child
  * (Instrument, Kit, Effect, FX sequence, `clear send`) must reach: the Scene
- * itself plus the members of its own directional entry that are present and
+ * itself plus the members of its own directional entry that are available
+ * (present, and not pending in a running background Bank load, S082 P3) and
  * pass scene_editLayoutMatches(scene, member), so fan-out never writes a
  * mismatched Scene. The pressed Scene's own entry is used even when it is not
  * active (user, F5); the active Scene's entry is read through the
@@ -101,8 +122,48 @@ uint16_t bank_sceneMaskVoiceEditForScene(uint8_t scene_index);
  * Clients: copyOps.c, clearOps.c. Foreground only; no SRAM.
  */
 uint16_t bank_sceneFanoutMask(uint8_t scene);
+/*
+ * Edit fan-out targets including Scene 17 (bit 16).
+ *
+ * What: 32-bit Scene masks for edit and copy/clear fan-out. While the active
+ * (viewed/edited) Scene is Scene 17 the target set is Scene 17 alone; for
+ * resident Scenes it is the existing 16-bit entry, unchanged, except that
+ * during a background Bank load the result excludes unavailable Scenes
+ * (S082 P3 D44).
+ * Why: Scene 17's edit mask is itself only (D15) and a 16-bit mask cannot
+ * name it; without this, edits on 17 would fan out to the home Scene's group
+ * or write nothing.
+ * Inputs: active Scene, per-Scene entries. Outputs: uint32_t masks.
+ * Accessors: Menu commit loops, EffectsManager edit API, copy/clear jobs.
+ * Affiliates: bank_sceneMaskVoiceEdit(), bank_sceneFanoutMask(),
+ * scene_backgroundExists(). Foreground only; no SRAM.
+ */
+uint32_t bank_editTargetMask(void);
+uint32_t bank_sceneFanoutMask32(uint8_t scene);
 void bank_exchangeVoiceEditMask(uint8_t src, uint8_t dst);
 void bank_resetVoiceEditMaskToSelf(uint8_t scene);
+/*
+ * Mutually exclusive VOICE edit masks after a partial Bank operation (S082 B3).
+ *
+ * bank_mergeVoiceEditEntry(): restricts one entry to a set of Scenes that
+ * still match it, plus the Scene itself.
+ * bank_mergeVoiceEditMasksAfterLoad(): loaded Scenes take their source entry
+ * restricted to the loaded set, emptied Scenes are reset to self, kept Scenes
+ * drop every loaded or emptied Scene.
+ * Accessors: filesystem Bank Load phase 20, Bank Save request and phase 64.
+ * Affiliates: bank_revalidateVoiceEditMasks(), bank_sceneFanoutMask().
+ */
+uint16_t bank_mergeVoiceEditEntry(uint16_t entry, uint16_t keep_mask,
+                                  uint8_t scene);
+void bank_mergeVoiceEditMasksAfterLoad(const uint16_t *source_entries,
+                                       uint16_t source_seen,
+                                       uint16_t loaded_mask,
+                                       uint16_t emptied_mask);
+/*
+ * Remove failed children from every entry; a failed child's entry becomes
+ * itself (S082 P3). Accessors: progressive Bank Load metadata commit.
+ */
+void bank_stripFailedFromVoiceEditMasks(uint16_t failed_mask);
 void bank_setHasResidentBank(uint8_t present);
 uint8_t bank_hasResidentBank(void);
 

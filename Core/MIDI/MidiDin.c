@@ -1,17 +1,17 @@
 /*
- * Uart.c — MIDI DIN output via USART3 on PB10 (TX) / PB11 (RX)
+ * MidiDin.c - MIDI DIN input/output via USART3 on PB10 (TX) / PB11 (RX)
  *
  * Ported from the original LXR firmware by Julian Schmidt.
  * Adapted for the STM32F765 bare-metal register layout.
  *
  * Hardware (confirmed by board trace):
- *   PB10 → USART3_TX (AF7) → MIDI OUT connector
- *   PB11 → USART3_RX (AF7) ← 74AHCT125 level shifter ← optocoupler ← MIDI IN
+ *   PB10 -> USART3_TX (AF7) -> MIDI OUT connector
+ *   PB11 -> USART3_RX (AF7) <- 74AHCT125 level shifter <- optocoupler <- MIDI IN
  *
- * RX/TX are interrupt-driven through small FIFOs. The main loop drains
- * RX with uart_processMidi(); TXE drains queued output bytes. Realtime
- * MIDI status bytes have their own priority TX FIFO so clock/start/stop
- * can be interleaved ahead of ordinary note/CC traffic.
+ * RX/TX are interrupt-driven through small buffers. MidiIn drains RX; the
+ * TXE interrupt drains queued output. Realtime MIDI status bytes have their
+ * own priority TX lane so clock/start/stop can be interleaved ahead of
+ * ordinary note/CC traffic.
  *
  * MIDI spec: 31250 baud, 8N1, no flow control.
  *
@@ -21,7 +21,7 @@
  */
 
 /*
- *  Modified on: 17.05.2026
+ *  Modified on: 21.10.2026
  * ------------------------------------------------------------------------------------------------------------------------
  *  Modifications Copyright 2026 Brendan Clarke
  *  brendanpaulclarke@gmail.com
@@ -32,11 +32,10 @@
  * ------------------------------------------------------------------------------------------------------------------------
  */
 
-
-#include "Uart.h"
-#include "FIFO.h"
-#include "MidiParser.h"
-#include "MidiRealtime.h"
+#include "MidiDin.h"
+#include "MidiBuffer.h"
+#include "MidiDefs.h"
+#include "MidiTransport.h"
 #include "timebase.h"
 
 /* -----------------------------------------------------------------------
@@ -99,33 +98,39 @@
 #define IRQ_USART3  39
 
 /* -----------------------------------------------------------------------
-** FIFOs — retained from original structure for future ISR-driven port
+** Buffers and diagnostics
+**
+** What: the two transmit lanes and the stamped receive buffer. Why one
+** buffer type for all three: MidiBuffer's SPSC contract is the same, and
+** the receive variant adds the parallel stamp array (Q13). Writers: the
+** USART3 ISR (receive, TX drain) and midiDin_sendBytes() under PRIMASK.
+** Affiliates: MidiIn (receive consumer), MidiOut (transmit producer).
 ** ----------------------------------------------------------------------- */
-static Fifo fifo_midiTx;
-static Fifo fifo_midiRealtimeTx;
-static Fifo fifo_midiRx;
+static midiBuffer_t midiDin_tx;
+static midiBuffer_t midiDin_realtimeTx;
+static midiBuffer_rx_t midiDin_rx;
 
-static volatile uint32_t uart_midiTxDropCount = 0;
-static volatile uint32_t uart_midiRealtimeTxDropCount = 0;
+static volatile uint32_t midiDin_txDrops = 0u;
+static volatile uint32_t midiDin_realtimeTxDrops = 0u;
 
-static uint32_t uart_irqSave(void)
+static uint32_t midiDin_irqSave(void)
 {
 	uint32_t primask;
 	__asm volatile ("mrs %0, primask\ncpsid i" : "=r" (primask) :: "memory");
 	return primask;
 }
 
-static void uart_irqRestore(uint32_t primask)
+static void midiDin_irqRestore(uint32_t primask)
 {
 	__asm volatile ("msr primask, %0" :: "r" (primask) : "memory");
 }
 
-static uint8_t uart_isRealtimeByte(uint8_t data)
+static uint8_t midiDin_isRealtimeByte(uint8_t data)
 {
 	/* MIDI realtime is 0xF8..0xFF and may be inserted between channel
 	** message bytes. Prioritising those single-byte statuses keeps clock
 	** output from waiting behind bursty note or CC streams. */
-	return data >= MIDI_CLOCK;
+	return (uint8_t)(data >= MIDI_CLOCK);
 }
 
 /* -----------------------------------------------------------------------
@@ -144,20 +149,27 @@ void USART3_IRQHandler(void)
 	if (isr & ISR_RXNE) {
 		uint32_t timestampUs = timebase_tim2Now();
 		data = (uint8_t)USART3_RDR;
-		if (midiRealtime_isStatus(data)) {
-			/* MIDI realtime bytes can arrive between data bytes of a running
-			** channel message. Timestamp and enqueue them here, but do not feed
-			** them into the byte parser where they would perturb running status. */
-			midiRealtime_push(data, MIDI_REALTIME_SOURCE_DIN, timestampUs);
-		} else {
-			(void)fifo_bufferIn(&fifo_midiRx, data);
-		}
+		/*
+		 * Receive one DIN byte (S019 realtime path; S083 Q6/Q13 stamps).
+		 *
+		 * What: realtime bytes go to the TIM3 realtime ring with their full
+		 * stamp and never enter the byte framer (running status survives
+		 * them). Every other byte is stored with the low 16 bits of its
+		 * arrival time. Why: live-record placement uses the arrival time of
+		 * a note, not the time the foreground framed it. A full buffer drops
+		 * the byte (as FIFO did). Affiliates: midiTransport_push(),
+		 * midiBuffer_rxIn(), midiIn_service().
+		 */
+		if (midiTransport_isRealtime(data))
+			midiTransport_push(data, MIDI_REALTIME_SOURCE_DIN, timestampUs);
+		else
+			(void)midiBuffer_rxIn(&midiDin_rx, data, (uint16_t)timestampUs);
 	}
 
 	if (isr & ISR_TXE) {
-		if (fifo_bufferOut(&fifo_midiRealtimeTx, &data)) {
+		if (midiBuffer_out(&midiDin_realtimeTx, &data)) {
 			USART3_TDR = data;
-		} else if (fifo_bufferOut(&fifo_midiTx, &data)) {
+		} else if (midiBuffer_out(&midiDin_tx, &data)) {
 			USART3_TDR = data;
 		} else {
 			USART3_CR1 &= ~CR1_TXEIE;
@@ -166,15 +178,15 @@ void USART3_IRQHandler(void)
 }
 
 /* -----------------------------------------------------------------------
-** initMidiUart
+** midiDin_init
 **
 ** USART3 at 31250 baud, PB10 TX / PB11 RX, interrupt-driven RX/TX.
 ** ----------------------------------------------------------------------- */
-void initMidiUart(void)
+void midiDin_init(void)
 {
-	fifo_init(&fifo_midiTx);
-	fifo_init(&fifo_midiRealtimeTx);
-	fifo_init(&fifo_midiRx);
+	midiBuffer_init(&midiDin_tx);
+	midiBuffer_init(&midiDin_realtimeTx);
+	midiBuffer_rxInit(&midiDin_rx);
 
 	/* Clock enables: GPIOB (AHB1 bit 1), USART3 (APB1 bit 18) */
 	RCC_AHB1ENR |= (1UL << 1);
@@ -182,9 +194,9 @@ void initMidiUart(void)
 	RCC_APB1ENR |= (1UL << 18);
 	(void)RCC_APB1ENR;
 
-	/* PB10 — USART3_TX, AF7; PB11 — USART3_RX, AF7
+	/* PB10 - USART3_TX, AF7; PB11 - USART3_RX, AF7
 	**   MODER          = 10 (AF mode)
-	**   OTYPER[10]     = 1  (open-drain — MIDI TX drives a current loop)
+	**   OTYPER[10]     = 1  (open-drain - MIDI TX drives a current loop)
 	**   OSPEEDR        = 10 (50 MHz)
 	**   PUPDR TX       = 01 (pull-up)
 	**   PUPDR RX       = 00 (externally driven by the MIDI input circuit)
@@ -214,62 +226,49 @@ void initMidiUart(void)
 	USART3_CR1 = CR1_RXNEIE | CR1_RE | CR1_TE | CR1_UE;
 }
 
-/* -----------------------------------------------------------------------
-** uart_sendMidiByte — queued TX
-** ----------------------------------------------------------------------- */
-void uart_sendMidiByte(uint8_t data)
+/* Contract in MidiDin.h. */
+uint8_t midiDin_sendBytes(const uint8_t *bytes, uint8_t count)
 {
-	uint32_t primask = uart_irqSave();
+	uint32_t primask;
+	midiBuffer_t *lane;
+	uint8_t i;
 
-	if (uart_isRealtimeByte(data)) {
-		if (fifo_bufferIn(&fifo_midiRealtimeTx, data))
-			USART3_CR1 |= CR1_TXEIE;
+	if (!bytes || count == 0u || count > 3u)
+		return 0u;
+	lane = (count == 1u && midiDin_isRealtimeByte(bytes[0]))
+	           ? &midiDin_realtimeTx : &midiDin_tx;
+	primask = midiDin_irqSave();
+	if (midiBuffer_free(lane) < count) {
+		if (lane == &midiDin_realtimeTx)
+			midiDin_realtimeTxDrops++;
 		else
-			uart_midiRealtimeTxDropCount++;
-		uart_irqRestore(primask);
-		return;
+			midiDin_txDrops++;
+		midiDin_irqRestore(primask);
+		return 0u;
 	}
-
-	if (fifo_bufferIn(&fifo_midiTx, data))
-		USART3_CR1 |= CR1_TXEIE;
-	else
-		uart_midiTxDropCount++;
-	uart_irqRestore(primask);
+	for (i = 0u; i < count; i++)
+		(void)midiBuffer_in(lane, bytes[i]);
+	USART3_CR1 |= CR1_TXEIE;
+	midiDin_irqRestore(primask);
+	return 1u;
 }
 
-/* -----------------------------------------------------------------------
-** uart_sendMidi — identical structure to original
-** ----------------------------------------------------------------------- */
-void uart_sendMidi(MidiMsg msg)
+uint8_t midiDin_txFree(void)
 {
-	uint32_t primask = uart_irqSave();
-
-	uart_sendMidiByte(msg.status);
-	if (msg.bits.length) {
-		uart_sendMidiByte(msg.data1);
-		if (msg.bits.length > 1)
-			uart_sendMidiByte(msg.data2);
-	}
-	uart_irqRestore(primask);
+	return midiBuffer_free(&midiDin_tx);
 }
 
-/* -----------------------------------------------------------------------
-** uart_processMidi — drain pending DIN input into the MIDI parser.
-** ----------------------------------------------------------------------- */
-void uart_processMidi(void)
+uint8_t midiDin_rxPop(uint8_t *byte, uint16_t *stamp)
 {
-	uint8_t budget = 16;
-	uint8_t data;
-	while (budget-- && fifo_bufferOut(&fifo_midiRx, &data))
-		midiParser_parseUartData(data);
+	return midiBuffer_rxOut(&midiDin_rx, byte, stamp);
 }
 
-uint32_t uart_getMidiTxDropCount(void)
+uint32_t midiDin_txDropCount(void)
 {
-	return uart_midiTxDropCount;
+	return midiDin_txDrops;
 }
 
-uint32_t uart_getMidiRealtimeTxDropCount(void)
+uint32_t midiDin_realtimeTxDropCount(void)
 {
-	return uart_midiRealtimeTxDropCount;
+	return midiDin_realtimeTxDrops;
 }

@@ -45,6 +45,7 @@ static const char menuText_fm[]    = "fm ";
 static const char menuText_dash[]  = "---";
 static const char menuText_blank[] = "   ";
 static const char menuText_any[]   = "any";
+static const char menuText_glb[]   = "glb";
 
 /* Each table: [0]=count, [1..n]=entries, 3+1 chars each */
 static const char ppqNames[][4] = {
@@ -95,7 +96,9 @@ static const char retriggerNames[][4] = {
     {8}, {"off"},{"v1"},{"v2"},{"v3"},{"v4"},{"v5"},{"v6"},{"scn"},
 };
 static const char lfoWaveNames[][4] = {
-    {8}, {"sin"},{"tri"},{"sup"},{"sdn"},{"sqr"},{"rnd"},{"xup"},{"xdn"},
+    {16}, {"sin"},{"tri"},{"sup"},{"sdn"},{"sqr"},{"rnd"},{"xup"},{"xdn"},
+    /* One-shots (lfo.h LFO_*_ONE): one cycle per retrigger, offset = delay. */
+    {"si1"},{"tr1"},{"su1"},{"sd1"},{"sq1"},{"rn1"},{"xu1"},{"xd1"},
 };
 /* Three-character display names for the shared LFO polarity selector.
 ** Clients: descriptor ROW("lfo_polarity", ..., DTYPE_LFO_POLARITY), compact
@@ -133,8 +136,13 @@ static const char outputNames[][7] = {
 static const char filterTypes[][8] = {
     {8}, {"LP"},{"HP"},{"BP"},{"UBP"},{"Nch"},{"Pek"},{"LP2"},{"off"},
 };
+/*
+ * MRT routing names (S083 F22, MIDI_SPEC 3.3).
+ * Order matches midiDefs_routeMask(): off UtD DtD DtU bth DtA AtD all.
+ * Stored values change meaning (no migration, standing rule).
+ */
 static const char midiRoutingNames[][6] = {
-    {6}, {"off"},{"U2M"},{"M2M"},{"A2M"},{"M2U"},{"M2A"},
+    {8}, {"off"},{"UtD"},{"DtD"},{"DtU"},{"bth"},{"DtA"},{"AtD"},{"all"},
 };
 static const char midiFilterNames[][16] = {
     {16},
@@ -178,8 +186,11 @@ static const char shortNames[][4] = {
     {"cn1"},{"nx1"},{"cn2"},{"nx2"},
     /* S080 P2 Defect 8a: per-track loopable. */
     {"lop"},
-    /* S081 P2: per-track automation ramp. */
-    {"asm"},
+    /* S081 P2: per-track automation ramp; label `rmp` since the S083
+     * follow-up (user 2026-10-22; was `asm`). */
+    {"rmp"},
+    /* S083 follow-up: overlay roll velocity rhythm. */
+    {"pv<"},{"pv>"},
 };
 
 static const char catNames[][16] = {
@@ -202,6 +213,9 @@ static const char catNames[][16] = {
     {"Prfrmnc"},
     /* S080 G10: scene chain settings category. */
     {"Chain"},
+    /* S083 follow-up (user 2026-10-22): CAT_AUTOMATION for the track
+     * automation ramp cell `rmp` ("Automtn  Ramp"). */
+    {"Automtn"},
 };
 
 static const char longNames[][16] = {
@@ -239,8 +253,11 @@ static const char longNames[][16] = {
     {"Conditn1"},{"NxtScn1"},{"Conditn2"},{"NxtScn2"},
     /* S080 P2 Defect 8a. */
     {"Loopable"},
-    /* S081 P2. */
-    {"Automtn"},
+    /* S081 P2; "Ramp" since the S083 follow-up (was "Automtn", which is
+     * now the cell's category). */
+    {"Ramp"},
+    /* S083 follow-up: overlay roll velocity rhythm (Prfrmnc Rhythm</>). */
+    {"Rhythm<"},{"Rhythm>"},
 };
 
 /*

@@ -81,8 +81,9 @@
 #include "PatternData.h"
 #include "PatternStackService.h"
 #include "PatternTrace.h"
-#include "MidiNoteNumbers.h"
-#include "MidiMessages.h"
+#include "MidiPitch.h"
+#include "MidiDefs.h"
+#include "MidiLearn.h"
 #include "timebase.h"
 #include "random.h"
 #include "globals.h"
@@ -410,6 +411,14 @@ typedef enum {
     FS_INTERNAL_OP_LOAD_INDEX,
     /* Async reader that replaces the shared cache from a root `.hcindex`. */
     FS_INTERNAL_OP_LOAD_LIBRARY_INDEX,
+    /*
+     * MIDI Learn table file midilrn.cfg (S083 §16). LOAD: boot-only, with
+     * the midilrn.tmp recovery prelude. SAVE: the immediate safe rewrite
+     * after every stored Learn row. Appended last so the numeric op codes
+     * in trace records and tools/decode_devlogs.py stay stable.
+     */
+    FS_INTERNAL_OP_LOAD_MIDILEARN,
+    FS_INTERNAL_OP_SAVE_MIDILEARN,
 } fs_internal_op_t;
 
 typedef struct {
@@ -1106,6 +1115,34 @@ static char fs_identity_name[FS_IDENTITY_ROW_COUNT - 1u]
                             [STORAGE_KIT_DISPLAY_NAME_LEN + 1u];
 static uint16_t fs_identity_valid_mask = 0u;
 
+/*
+ * Scene 17 captured names (S082 P1 D29).
+ *
+ * What: ten eight-cell names (plus NUL) for Scene 17: Scene, Kit, six
+ * Instruments, Pattern, Effect, captured from the HCNAMES mirror when Scene 17
+ * is built (and per copied slot when it is rebuilt), and renamed by a
+ * successful normal save from Scene 17.
+ * Why: HCNAMES rows 1..16 describe resident Scenes only and are replaced by the
+ * Bank load that created Scene 17. fs_identity_name cannot hold them: it has
+ * eight rows and is cleared at every Menu session exit. Without this capture,
+ * Scene Save, Kit/KitMrp Save, Instrument Save and Pattern Save from 17 would
+ * prefill and write `Empty` names, and the Kit/Scene Load/Save entry on 17
+ * would fail (D29).
+ * Inputs: filesystem_backgroundNamesCaptureScene(),
+ * filesystem_backgroundNameCaptureInstrument(), filesystem_backgroundNameSet().
+ * Outputs: filesystem_resident*Name(16[, slot]) and
+ * filesystem_sceneComponentNameRaw(16, ...).
+ * SRAM: 90 B, SRAM1 static, owner filesystem (accepted 2026-10-18,
+ * S082 P1 §6). Lifetime: valid while scene_backgroundExists(); stale and
+ * unread after the release; overwritten by the next build.
+ * Accessors: the functions above. Affiliates: hcnames_name_mirror (source),
+ * preset_buildBackgroundScene(), menu_backgroundNamesChanged().
+ */
+static char fs_background_name[FS_BACKGROUND_NAME_ROW_COUNT]
+                              [STORAGE_KIT_DISPLAY_NAME_LEN + 1u];
+
+_Static_assert(sizeof(fs_background_name) == 90u,
+               "S082 P1 D29: Scene 17 name capture is 10 x 9 bytes");
 _Static_assert(sizeof(fs_list_cache_name) ==
                    (FS_LIBRARY_NAME_CACHE_MAX *
                     (STORAGE_KIT_DISPLAY_NAME_LEN + 1u)),
@@ -1302,6 +1339,41 @@ static char op_save_bank_dir_display_name[AFATFS_LONG_FILENAME_MAX + 1u];
 static char op_save_bank_dir_open_name[AFATFS_SHORT_FILENAME_MAX];
 static uint16_t op_bank_child_present_mask = 0u;
 /*
+ * Bank child content mask from the last preview scan (+2 B SRAM1, S082 B1).
+ *
+ * What: bit N set when Bank-local child NN exists AND its PAT4 address array
+ * holds at least one trigger bit - the same rule PERF uses to light a Scene
+ * (pat_sceneHasActiveSteps()).
+ * Why: Bank Load/Save LEDs show the source/slot "as PERF would", and Merge acts
+ * only on Scenes with pattern data (S8, Q7); presence alone cannot tell.
+ * Inputs: filesystem_scanBankScenes_tick() probe phases.
+ * Outputs: filesystem_bankChildContentMask().
+ * Lifetime: static; reset by filesystem_start() with the other op fields.
+ * Owner: filesystem.c. Accessors: Menu Bank preview completion.
+ * Affiliates: op_bank_child_present_mask, PATTERN_FILE_HEADER_BYTES,
+ * PAT_ADDR_TRIGGER_BIT.
+ */
+static uint16_t op_bank_child_content_mask = 0u;
+#if DEV_STALL_DETECTION
+/*
+ * Bank child preview stall observer (S082 review F4; +5 B, diagnostic build).
+ *
+ * What: last observed phase and consecutive-poll count of
+ * filesystem_scanBankScenes_tick(). Why: the preview had no stall observer, so
+ * an open retry or read that never completed held the facade BUSY with Menu
+ * gated and no trace - one candidate route to the S082 first-boot freeze.
+ * Lifetime: static, compiled with DEV_STALL_DETECTION like the other observers.
+ * Owner: filesystem.c. Accessors: filesystem_scanBankScenes_tick(),
+ * filesystem_requestScanBankScenes() (rearm).
+ */
+static uint8_t op_bank_preview_stall_last_phase = 0u;
+static uint32_t op_bank_preview_stall_ticks = 0u;
+#endif
+#if DEV_MODE_LOGGING
+/* Preview start tick for the 'b' elapsed-time field (S082 review F8; 2 B, logging). */
+static uint16_t op_bank_preview_start_tick = 0u;
+#endif
+/*
  * One 144-byte operation scratch with strictly non-overlapping views.
  * `boot_reader_type` is owned from complete HCNAMES parsing (or winner
  * regeneration) through the final Stage-11 Scene evaluation; its 96
@@ -1347,6 +1419,85 @@ static uint8_t op_bank_active_scene = 0u;
 static uint8_t op_bank_child_cursor = 0u;
 static uint8_t op_bank_loaded_scene = 0u;
 static uint8_t op_bank_payload_active = 0u;
+/*
+ * Bank operation outcome masks and flags (+5 B SRAM1, S082 B3; see §9).
+ *
+ * What: op_bank_scene_empty_mask = Scenes emptied by a Bank Load or children
+ * removed by a Bank Save; op_bank_save_written_mask = every child a Bank Save
+ * treats as written (including S058 clean-skipped children), used by the
+ * Merge edit-mask rule; op_bank_flags: BOOT (apply the manifest active_scene),
+ * REPLACE (missing requested children are emptied), AUTOSAVE_YIELD (Scene 17
+ * request: the AutoSave drain closes at its next safe point).
+ * Why: the S082 outcome table needs explicit masks, and boot keeps its own
+ * active-Scene rule (S11).
+ * Lifetime: static, reset by filesystem_start(). Owner: filesystem.c.
+ * Accessors: filesystem_requestLoadBank/SaveBank(), Bank Load/Save ticks.
+ * Affiliates: preset_loadBank(), preset_saveBank(),
+ * bank_mergeVoiceEditEntry().
+ */
+static uint16_t op_bank_scene_empty_mask = 0u;
+static uint16_t op_bank_save_written_mask = 0u;
+static uint8_t op_bank_flags = 0u;
+#define FS_BANK_FLAG_BOOT            0x01u
+#define FS_BANK_FLAG_REPLACE         0x02u
+#define FS_BANK_FLAG_AUTOSAVE_YIELD  0x04u
+/*
+ * Cancel request for the running Bank child preview scan (Bank slot scroll).
+ *
+ * What: set by filesystem_cancelScanBankScenes() while
+ * FS_INTERNAL_OP_SCAN_BANK_SCENES runs; the scan then unwinds through its own
+ * close phases at the next phase with no callback outstanding and finishes
+ * ERROR. Lives in the op-scoped flags, so filesystem_start() clears it for the
+ * next operation. Accessors: filesystem_scanBankScenes_tick().
+ */
+#define FS_BANK_FLAG_PREVIEW_CANCEL  0x08u
+/*
+ * Progressive Bank Load (S082 P3 W4, D44).
+ *
+ * What: set by Preset for an unlocked background Bank load. The request
+ * starts a BankData availability session; each completed child sets its
+ * present bit at once; the new Bank's edit masks are merged before the first
+ * child; the end commit keeps the live present mask and only removes failed
+ * children from the edit masks.
+ * Why: the user may play, edit and select loaded Scenes while later children
+ * load; the old all-at-the-end commit would hide them until completion and
+ * overwrite edits made during the load.
+ * Inputs: filesystem_requestLoadBank() flags (PRESET_BANK_LOAD_PROGRESSIVE).
+ * Outputs: the progressive branches of Bank Load phases 17, 98, 20 and the
+ * metadata commit. Lifetime: op_bank_flags, cleared by filesystem_start().
+ * Affiliates: bank_beginLoadAvailability(), bank_noteLoadChildDone(),
+ * bank_stripFailedFromVoiceEditMasks(), preset_tickBackgroundBankLoad().
+ */
+#define FS_BANK_FLAG_PROGRESSIVE     0x10u
+_Static_assert(FS_BANK_FLAG_PROGRESSIVE == PRESET_BANK_LOAD_PROGRESSIVE,
+               "Preset passes Bank Load flags straight through");
+_Static_assert(FS_BANK_FLAG_BOOT == PRESET_BANK_LOAD_BOOT &&
+               FS_BANK_FLAG_REPLACE == PRESET_BANK_LOAD_REPLACE,
+               "Preset passes Bank Load flags straight through");
+/*
+ * AutoSave drain yield for a background Bank Load (+1 B SRAM1, S082 C7/C9).
+ *
+ * What: one persistent flag. While set, both AutoSave schedulers decline new
+ * drains, and an in-flight scalar or Pattern drain aborts at its next tick
+ * through its error close-down (open handles closed, record left torn and
+ * stale, captured dirty bits restored). The parameter drain's HCNAMES
+ * publication (phases 70-77) and the Pattern drain's follow-on HCNAMES update
+ * are never cut: an abort between the live remove and the temp rename would
+ * lose /.hcnames (S082 P1 R6).
+ * Why: D1/R6: a Bank load drops AutoSave at once instead of waiting for a
+ * record that the load makes stale anyway. The flag survives
+ * filesystem_start(), which resets the per-operation Bank fields.
+ * Inputs: filesystem_setAutosaveYield().
+ * Outputs: scheduler admission gate and drain abort trigger. Lifetime: static.
+ * Owner: filesystem.c. Accessors: preset_requestBackgroundBankLoad(),
+ * preset_tickBackgroundBankLoad().
+ * Affiliates: filesystem_autosaveWriterSchedule_tick(),
+ * filesystem_autosavePatternDrainSchedule_tick(),
+ * filesystem_autosaveParameterDrain_tick(),
+ * filesystem_autosavePatternDrain_tick(),
+ * filesystem_autosaveWriterFinishError().
+ */
+static uint8_t fs_autosave_yield = 0u;
 /*
  * Option 2: Bank Save operation-scoped card-clean bookkeeping.
  *
@@ -1492,10 +1643,27 @@ static uint8_t filesystem_pollPhaseStall(uint8_t phase,
                                          uint8_t *last_phase,
                                          uint32_t *stall_ticks,
                                          uint32_t threshold_ticks);
+/*
+ * Poll-count suppression for idle-time ticks (S082 P2 fix 3).
+ *
+ * What: nonzero only inside filesystem_tickUncounted(); while set, the stall
+ * observers neither count nor reset, so an extra tick is invisible to them.
+ * Why: the observers measure "N polls in one phase", calibrated to one
+ * regular tick per main-loop pass. Extra idle-time ticks would reach N
+ * several times sooner in wall time and could abort a healthy operation
+ * waiting on a slow card.
+ * SRAM: 1 B, DEV_STALL_DETECTION builds only (same class as the observer
+ * statics). Lifetime: set and cleared within one call.
+ * Accessors: filesystem_tickUncounted(), filesystem_pollPhaseStall(),
+ * filesystem_autosaveDrainStalled().
+ */
+static uint8_t fs_stall_poll_uncounted = 0u;
 #endif
 static void filesystem_autosaveTraceFlush_tick(void);
 static void filesystem_settingsWriterSchedule_tick(void);
 static void filesystem_settingsWriterCompleted(void);
+static void filesystem_midiLearnWriterSchedule_tick(void);
+static void filesystem_midiLearnWriterCompleted(void);
 static void filesystem_autosaveWriterSchedule_tick(void);
 static void filesystem_autosaveWriterCompleted(void);
 static void filesystem_autosavePatternDrain_tick(void);
@@ -2053,6 +2221,23 @@ static uint8_t fs_settings_dirty = 0u;
 static uint8_t fs_settings_runtime_ready = 0u;
 static uint8_t op_settings_write_active = 0u;
 /*
+ * midilrn.cfg write request (S083 §16). 1 B, SRAM1 .bss, owner filesystem.
+ *
+ * What: bit 0 PENDING asks the idle scheduler for one full safe rewrite of
+ * midilrn.cfg; bit 1 RETRIED marks that the one automatic retry after a
+ * failed write is used. Why: every stored Learn row must reach the card
+ * without a debounce, a Learn made during a write must cause exactly one
+ * more write, and a failing card must not retry forever (the next Learn
+ * re-arms it). Inputs: filesystem_requestMidiLearnWrite() (sets PENDING,
+ * clears RETRIED). Outputs: filesystem_midiLearnWriterSchedule_tick()
+ * clears PENDING as it starts the write; filesystem_midiLearnWriterCompleted()
+ * sets PENDING|RETRIED once on error. Gate: fs_settings_runtime_ready (the
+ * same boot exit as settings.cfg). Reset on every card mount/facade reset.
+ */
+#define FS_MIDILEARN_WRITE_PENDING 0x01u
+#define FS_MIDILEARN_WRITE_RETRIED 0x02u
+static uint8_t fs_midilearn_write = 0u;
+/*
  * Boot recovery-validation scratch for the settings temp-file prelude.
  *
  * What: tracks validity, line count, and terminator state while the boot
@@ -2066,8 +2251,11 @@ static uint8_t op_settings_write_active = 0u;
  * Affiliates: filesystem_loadGlobals_tick()'s recovery prelude,
  * filesystem_parseSettingsLine(), and the §6 terminator-count check.
  *
- * Lifetime: meaningful only during FS_INTERNAL_OP_LOAD_GLOBALS phases 0-10;
- * not referenced by any other operation. 4 bytes total, normal SRAM .bss.
+ * Lifetime: meaningful only during FS_INTERNAL_OP_LOAD_GLOBALS phases 0-10
+ * and FS_INTERNAL_OP_LOAD_MIDILEARN (S083 §16, which reuses all four for
+ * midilrn.tmp, then valid/line_count as its Pass B format flag and line
+ * counter). The two ops never overlap (one facade). 4 bytes total, normal
+ * SRAM .bss.
  */
 static uint8_t op_settings_recovery_valid = 0u;
 static uint8_t op_settings_recovery_line_count = 0u;
@@ -2602,6 +2790,9 @@ static void filesystem_resetGlobalsToDefaults(void)
     parameter_values[PAR_PERF_NOTE_LT] = 0u;
     parameter_values[PAR_PERF_BTN_RT] = 0u;
     parameter_values[PAR_PERF_NOTE_RT] = 0u;
+    /* S083 follow-up: overlay roll rhythms pv</pv>, 0 = off. */
+    parameter_values[PAR_PERF_VEL_LT] = 0u;
+    parameter_values[PAR_PERF_VEL_RT] = 0u;
     parameter_values[PAR_SCENE_CHANGE_DIV] = 0u;
     parameter_values[PAR_SCENE_QUEUE_DIV] = 0u;
     parameter_values[PAR_SCENE_QUEUE_ACTION] = 0u;
@@ -2610,7 +2801,8 @@ static void filesystem_resetGlobalsToDefaults(void)
 static void filesystem_sanitizeLoadedGlobals(void)
 {
     uint8_t ch = parameter_values[PAR_MIDI_CHAN_GLOBAL];
-    if (ch == 0u || ch > 16u)
+    /* S083: 0 = G off is valid; out of range falls back to 1. */
+    if (ch > 16u)
         parameter_values[PAR_MIDI_CHAN_GLOBAL] = 1u;
     /*
      * S080 P2 Defect 15: qac has nine values (0..8). A hand-edited or corrupt
@@ -2811,6 +3003,10 @@ static uint8_t filesystem_settingsParamForKey(const char *key,
     else if (strcmp(key, "perf_note_lt") == 0) *param = PAR_PERF_NOTE_LT;
     else if (strcmp(key, "perf_btn_rt") == 0) *param = PAR_PERF_BTN_RT;
     else if (strcmp(key, "perf_note_rt") == 0) *param = PAR_PERF_NOTE_RT;
+    /* S083 follow-up: overlay roll rhythms (packed byte; the menu snaps an
+    ** unlisted byte, the roll treats an invalid one as off). */
+    else if (strcmp(key, "perf_vel_lt") == 0) *param = PAR_PERF_VEL_LT;
+    else if (strcmp(key, "perf_vel_rt") == 0) *param = PAR_PERF_VEL_RT;
     /* S080 F6: scene queue / change division globals. */
     else if (strcmp(key, "scd") == 0) *param = PAR_SCENE_CHANGE_DIV;
     else if (strcmp(key, "qcd") == 0) *param = PAR_SCENE_QUEUE_DIV;
@@ -2902,6 +3098,11 @@ static fs_status_t filesystem_parseSettingsLine(const char *line)
         bank_setRestoreBankSlot(parsed);
         return FS_STATUS_DONE;
     }
+    /*
+     * S083 §16: Learn rows live in midilrn.cfg. A `learn=` line left in
+     * settings.cfg by the first S083 build is an unknown key here and is
+     * ignored (no migration); the next settings write drops it.
+     */
     if (strncmp(key, "scene_source_", 13u) == 0) {
         /* Legacy v1 provenance is deliberately ignored: HCNAMES owns it. */
         return FS_STATUS_DONE;
@@ -2914,6 +3115,55 @@ static fs_status_t filesystem_parseSettingsLine(const char *line)
         parameter_values[param] = (uint8_t)parsed;
     }
     filesystem_sanitizeLoadedGlobals();
+    return FS_STATUS_DONE;
+}
+
+/*
+ * Parse one midilrn.cfg line (S083 §16, MIDI_SPEC §6.4).
+ *
+ * What: applies one `learn=` row through midiLearn_parseFileValue() and
+ * checks the `format=helicase.midilearn` / `version=1` guards. Why: the file
+ * is hand-editable, so a malformed or unresolvable row (or a line with no
+ * `=`) is skipped and the rest still loads; only a wrong format or version
+ * marks the whole file as not a Learn file. Inputs: one NUL-terminated line
+ * from filesystem_readTextLine() (CR already dropped). Outputs: DONE for every
+ * accepted or skipped line (blank, `#` comment, `lines=N` terminator, unknown
+ * key); ERROR only for a bad format/version value. Callers:
+ * filesystem_loadMidiLearn_tick() (recovery validation of midilrn.tmp, and the
+ * Pass B load, which empties the table on ERROR).
+ */
+static fs_status_t filesystem_parseMidiLearnLine(const char *line)
+{
+    char key[16];
+    const char *eq;
+    const char *value;
+    uint8_t len = 0u;
+    uint16_t parsed;
+
+    if (!line)
+        return FS_STATUS_ERROR;
+    line = filesystem_trimSettingsText(line);
+    if (*line == '\0' || *line == '#')
+        return FS_STATUS_DONE;
+    eq = strchr(line, '=');
+    if (!eq)
+        return FS_STATUS_DONE;
+    while (line < eq && len < (uint8_t)(sizeof(key) - 1u))
+        key[len++] = *line++;
+    key[len] = '\0';
+    while (len > 0u && (key[len - 1u] == ' ' || key[len - 1u] == '\t'))
+        key[--len] = '\0';
+    value = filesystem_trimSettingsText(eq + 1u);
+    if (strcmp(key, "format") == 0)
+        return (strcmp(value, "helicase.midilearn") == 0)
+            ? FS_STATUS_DONE
+            : FS_STATUS_ERROR;
+    if (strcmp(key, "version") == 0)
+        return (filesystem_parseSettingsU16(value, &parsed) && parsed == 1u)
+            ? FS_STATUS_DONE
+            : FS_STATUS_ERROR;
+    if (strcmp(key, "learn") == 0)
+        (void)midiLearn_parseFileValue(value);
     return FS_STATUS_DONE;
 }
 
@@ -3168,6 +3418,7 @@ static const char *filesystem_bootLogCodeForOperation(
     case FS_INTERNAL_OP_LOAD_SCENE:           return "SCNELOAD";
     case FS_INTERNAL_OP_LOAD_BANK:            return "BANKLOAD";
     case FS_INTERNAL_OP_LOAD_GLOBALS:         return "GLOBLOAD";
+    case FS_INTERNAL_OP_LOAD_MIDILEARN:       return "MLRNLOAD";
     case FS_INTERNAL_OP_SCAN_KITS:            return "KITSCAN ";
     case FS_INTERNAL_OP_SCAN_SCENES:          return "SCNSCAN ";
     case FS_INTERNAL_OP_SCAN_BANKS:           return "BNKSCAN ";
@@ -3660,6 +3911,8 @@ static const char *filesystem_errorPrefix(fs_internal_op_t op)
     case FS_INTERNAL_OP_SAVE_PERFORMANCE:      return "PrfS";
     case FS_INTERNAL_OP_LOAD_GLOBALS:          return "GloL";
     case FS_INTERNAL_OP_SAVE_GLOBALS:          return "GloS";
+    case FS_INTERNAL_OP_LOAD_MIDILEARN:        return "MlrL";
+    case FS_INTERNAL_OP_SAVE_MIDILEARN:        return "MlrS";
     case FS_INTERNAL_OP_SCAN_KITS:             return "KitSc";
     case FS_INTERNAL_OP_SCAN_SCENES:           return "ScnSc";
     case FS_INTERNAL_OP_SCAN_BANKS:            return "BnkSc";
@@ -5832,6 +6085,50 @@ static const char *filesystem_cachedResidentName(uint16_t row)
     return hcnames_name_mirror[row];
 }
 
+/*
+ * Read one raw Scene 17 captured name.
+ *
+ * What: returns the capture row as stored (eight cells, NUL-terminated), or
+ * eight spaces for an out-of-range row.
+ * Why: the Scene Save child-name builders test blankness themselves
+ * (filesystem_residentNameIsBlank()) and must see the raw cells, exactly as
+ * they see filesystem_cachedResidentName() for resident Scenes.
+ * Inputs: FS_BACKGROUND_NAME_* row. Outputs: const pointer into
+ * fs_background_name.
+ * Accessors: filesystem_sceneComponentNameRaw(), the resident-name readers.
+ * Affiliates: fs_background_name.
+ */
+static const char *filesystem_backgroundNameRaw(uint8_t row)
+{
+    if (row >= FS_BACKGROUND_NAME_ROW_COUNT)
+        return "        ";
+    return fs_background_name[row];
+}
+
+/*
+ * Read one Scene component name for a resident Scene or Scene 17.
+ *
+ * What: index 16 while Scene 17 exists returns the capture row bg_row;
+ * every other index returns filesystem_cachedResidentName(row).
+ * Why: Scene Save derives the Pattern child filename and the Effect stem from
+ * the source Scene's rows; for a Scene Save from 17 (D15, D29) those rows are
+ * the capture, because HCNAMES has no row 17.
+ * Inputs: scene index, capture row, resident HCNAMES row for the same
+ * component (the sentinel FS_RESIDENT_NAMES_ROW_COUNT for index 16).
+ * Outputs: raw eight-cell name.
+ * Accessors: filesystem_makePatternChildFilename(),
+ * filesystem_saveSceneDirectory_tick() cases 33 and 82.
+ * Affiliates: filesystem_backgroundNameRaw(), scene_backgroundExists().
+ */
+static const char *filesystem_sceneComponentNameRaw(uint8_t scene_index,
+                                                    uint8_t bg_row,
+                                                    uint16_t row)
+{
+    if (scene_index == SCENE_BACKGROUND_INDEX && scene_backgroundExists())
+        return filesystem_backgroundNameRaw(bg_row);
+    return filesystem_cachedResidentName(row);
+}
+
 /* Validate one unflagged source value against the fixed HCNAMES row class. */
 static uint8_t filesystem_residentSourceValid(uint16_t row, uint16_t source)
 {
@@ -5846,8 +6143,13 @@ static uint8_t filesystem_residentSourceValid(uint16_t row, uint16_t source)
     if (source == FS_RESIDENT_SOURCE_INSTRUMENT_DIRECT)
         return (uint8_t)(row >= FS_RESIDENT_NAMES_INSTRUMENT_BASE &&
                          row < FS_RESIDENT_NAMES_PATTERN_BASE);
-    return (uint8_t)(source == FS_RESIDENT_SOURCE_PATTERN_AUTOSAVE &&
-                     filesystem_residentRowIsPattern(row));
+    if (source == FS_RESIDENT_SOURCE_PATTERN_AUTOSAVE)
+        return (uint8_t)filesystem_residentRowIsPattern(row);
+    if (source == FS_RESIDENT_SOURCE_EMPTY ||
+        (source >= FS_RESIDENT_SOURCE_BANK_CHILD_BASE &&
+         source < FS_RESIDENT_SOURCE_BANK_CHILD_END))
+        return (uint8_t)(row >= 1u && row <= 16u);
+    return 0u;
 }
 
 uint16_t filesystem_residentSource(uint16_t row)
@@ -5883,6 +6185,21 @@ uint8_t filesystem_setResidentSource(uint16_t row, uint16_t source)
     fs_resident_source[row] = (uint16_t)(
         (source & FS_RESIDENT_SOURCE_VALUE_MASK) |
         refreshed | FS_RESIDENT_SOURCE_DIRTY_FLAG);
+#if DEV_MODE_LOGGING
+    /*
+     * Witness every Kit-row provenance staging (S082 review F5 evidence,
+     * 'h' KIT_SOURCE_STAGED). Rows 17..32 only, so rapid Kit browsing costs
+     * one record per committed Kit Load.
+     */
+    if (row >= FS_RESIDENT_NAMES_KIT_BASE &&
+        row < FS_RESIDENT_NAMES_INSTRUMENT_BASE) {
+        autosaveTrace_record(
+            AUTOSAVE_TRACE_STAGE_HCNAMES_PROVENANCE,
+            AUTOSAVE_TRACE_HCN_KIT_SOURCE_STAGED,
+            (uint32_t)row |
+            ((uint32_t)(source & FS_RESIDENT_SOURCE_VALUE_MASK) << 16u));
+    }
+#endif
     return 1u;
 }
 
@@ -5913,7 +6230,10 @@ uint16_t filesystem_resolveResidentSource(uint16_t row,
             return source;
         }
         if (source < FS_RESIDENT_SOURCE_DIRECT_SLOT_LIMIT ||
-            source == FS_RESIDENT_SOURCE_INSTRUMENT_DIRECT) {
+            source == FS_RESIDENT_SOURCE_INSTRUMENT_DIRECT ||
+            source == FS_RESIDENT_SOURCE_EMPTY ||
+            (source >= FS_RESIDENT_SOURCE_BANK_CHILD_BASE &&
+             source < FS_RESIDENT_SOURCE_BANK_CHILD_END)) {
             if (resolved_row)
                 *resolved_row = row;
             return source;
@@ -5960,12 +6280,50 @@ static void filesystem_prepareResidentNamesCache(void)
      * can consume an already-valid mounted-card image (notably Bank Save) must
      * test hcnames_mirror_valid before calling this reload primitive; clearing
      * a valid image here would defeat the persistent-mirror contract.
+     *
+     * Ordering rule (S082 review F9): request functions call this only after
+     * filesystem_start() has accepted their HCNAMES operation. It turns every
+     * non-dirty source into UNKNOWN while keeping the refreshed witness, so a
+     * reset without the read that follows left `?` + R rows in RAM - the
+     * state the boot reader empties as Case 3 if any later writer persists it.
      */
     memset(hcnames_name_mirror, 0, sizeof(hcnames_name_mirror));
     hcnames_mirror_valid = FS_HCNAMES_MIRROR_INVALID;
     /* A short/legacy register cannot retain source words from a prior cache
      * use.  Keep only caller-staged dirty values until this transaction writes
      * them through the normal durable HCNAMES path. */
+#if DEV_MODE_LOGGING
+    {
+        /*
+         * Witness refreshed rows about to become UNKNOWN (S082 review F5
+         * evidence, 'h' REFRESHED_RESET). A following complete register read
+         * restores their sources; if that read does not complete, or a writer
+         * runs first, these rows persist as `?` + R (boot Case 3).
+         */
+        uint8_t count = 0u;
+        uint16_t first = 0u;
+
+        for (row = 1u; row < FS_RESIDENT_NAMES_PATTERN_BASE; row++) {
+            if ((fs_resident_source[row] & FS_RESIDENT_SOURCE_DIRTY_FLAG) == 0u &&
+                (fs_resident_source[row] & FS_RESIDENT_SOURCE_REFRESHED_FLAG) != 0u &&
+                (fs_resident_source[row] & FS_RESIDENT_SOURCE_VALUE_MASK) !=
+                    FS_RESIDENT_SOURCE_UNKNOWN) {
+                if (count == 0u)
+                    first = row;
+                if (count < 0xFFu)
+                    count++;
+            }
+        }
+        if (count != 0u) {
+            autosaveTrace_record(
+                AUTOSAVE_TRACE_STAGE_HCNAMES_PROVENANCE,
+                AUTOSAVE_TRACE_HCN_REFRESHED_RESET,
+                (uint32_t)count | ((uint32_t)(first & 0xFFu) << 8u) |
+                ((uint32_t)(current_op & 0xFFu) << 16u) |
+                ((uint32_t)op_phase << 24u));
+        }
+    }
+#endif
     for (row = 0u; row < FS_RESIDENT_NAMES_ROW_COUNT; row++) {
         if ((fs_resident_source[row] & FS_RESIDENT_SOURCE_DIRTY_FLAG) == 0u) {
             fs_resident_source[row] = (uint16_t)(
@@ -5997,7 +6355,18 @@ static uint8_t filesystem_parseResidentSourceToken(const char *token,
         value = (row >= FS_RESIDENT_NAMES_PATTERN_BASE)
             ? FS_RESIDENT_SOURCE_PATTERN_AUTOSAVE
             : FS_RESIDENT_SOURCE_INSTRUMENT_DIRECT;
-    else {
+    else if (strcmp(token, "x") == 0)
+        value = FS_RESIDENT_SOURCE_EMPTY;
+    else if (token[0] == 'b' &&
+             token[1] >= '0' && token[1] <= '9' &&
+             token[2] >= '0' && token[2] <= '9' &&
+             token[3] >= '0' && token[3] <= '9' &&
+             token[4] == '\0') {
+        value = (uint16_t)(FS_RESIDENT_SOURCE_BANK_CHILD_BASE +
+                           (token[1] - '0') * 100u +
+                           (token[2] - '0') * 10u +
+                           (token[3] - '0'));
+    } else {
         if (token[0] < '0' || token[0] > '9' ||
             token[1] < '0' || token[1] > '9' ||
             token[2] < '0' || token[2] > '9' || token[3] != '\0') {
@@ -6257,8 +6626,25 @@ static void filesystem_setResidentRefreshed(uint16_t row)
      * metadata remain unchanged; invalid rows are ignored. This is RAM-only,
      * and the bit reaches the card through the next safe HCNAMES rewrite.
      */
-    if (row < FS_RESIDENT_NAMES_ROW_COUNT)
+    if (row < FS_RESIDENT_NAMES_ROW_COUNT) {
+#if DEV_MODE_LOGGING
+        /*
+         * Witness R raised on a Scene/Kit/Instrument row whose source is
+         * UNKNOWN (S082 review F5 evidence, 'h' REFRESH_ON_UNKNOWN).
+         * Why: `?` + R is the state the boot reader empties as Case 3.
+         */
+        if (row >= 1u && row < FS_RESIDENT_NAMES_PATTERN_BASE &&
+            (fs_resident_source[row] & FS_RESIDENT_SOURCE_VALUE_MASK) ==
+                FS_RESIDENT_SOURCE_UNKNOWN) {
+            autosaveTrace_record(
+                AUTOSAVE_TRACE_STAGE_HCNAMES_PROVENANCE,
+                AUTOSAVE_TRACE_HCN_REFRESH_ON_UNKNOWN,
+                (uint32_t)row | ((uint32_t)(current_op & 0xFFu) << 16u) |
+                ((uint32_t)op_phase << 24u));
+        }
+#endif
         fs_resident_source[row] |= FS_RESIDENT_SOURCE_REFRESHED_FLAG;
+    }
 }
 
 /*
@@ -8178,8 +8564,12 @@ static uint16_t filesystem_autosaveDrainProgress(void)
  */
 static uint8_t filesystem_autosaveDrainStalled(void)
 {
-    const uint16_t progress = filesystem_autosaveDrainProgress();
+    uint16_t progress;
 
+    /* Idle-time ticks are invisible to the observer (S082 P2 fix 3). */
+    if (fs_stall_poll_uncounted)
+        return 0u;
+    progress = filesystem_autosaveDrainProgress();
     if (op_phase != op_autosave_drain_last_phase ||
         progress != op_autosave_drain_last_progress) {
         op_autosave_drain_last_phase = op_phase;
@@ -8193,6 +8583,40 @@ static uint8_t filesystem_autosaveDrainStalled(void)
                      FS_AUTOSAVE_DRAIN_STALL_POLLS + 1u);
 }
 #endif
+
+/*
+ * Report whether the scalar AutoSave drain may be aborted in this phase
+ * (S082 P1 R6; assessment A1).
+ *
+ * What: nonzero only for phases entered with no AsyncFATFS callback
+ * outstanding and no seek in progress: the action phases that issue the next
+ * open, read, write, seek start, sync poll or close request (0, 1, 3, 5, 10,
+ * 13, 16, 17, 19, 21, 30, 32, 34, 36, 38, 39, 44, 50, 52, 54, 56, 62, 64, 65,
+ * 66, 67). Every wait phase (open: 2, 11, 12, 18, 25, 31, 35, 51; close: 4,
+ * 14, 15, 22, 33, 37, 55; remove: 24; cursor-polled seek: 20, 53, 63), the
+ * error close-down (40-46) and the HCNAMES publication (70-77) return zero.
+ * Why: the shared AsyncFATFS callbacks (on_file_opened(), on_file_closed(),
+ * on_remove_complete(), on_autosave_target_opened()) write operation-global
+ * state. Finishing while one is due would let it land in the next operation,
+ * and closing a handle whose close is already queued would leave the
+ * close-down retrying for ever. Handles are cleared only by their wait
+ * phase, so the action phases always see an accurate op_file/target_file.
+ * Inputs: op_phase. Outputs: boolean.
+ * Accessors: filesystem_autosaveParameterDrain_tick() yield abort.
+ * Affiliates: filesystem_autosaveWriterFinishError(), fs_autosave_yield.
+ */
+static uint8_t filesystem_autosaveDrainAbortSafe(uint8_t phase)
+{
+    switch (phase) {
+    case 0u:  case 1u:  case 3u:  case 5u:  case 10u: case 13u: case 16u:
+    case 17u: case 19u: case 21u: case 30u: case 32u: case 34u: case 36u:
+    case 38u: case 39u: case 44u: case 50u: case 52u: case 54u: case 56u:
+    case 62u: case 64u: case 65u: case 66u: case 67u:
+        return 1u;
+    default:
+        return 0u;
+    }
+}
 
 static void filesystem_autosaveParameterDrain_tick(void)
 {
@@ -8227,6 +8651,41 @@ static void filesystem_autosaveParameterDrain_tick(void)
         return;
     }
 #endif
+
+    /*
+     * Abort the scalar drain for a Bank load (S082 P1 R6, D1; assessment A1).
+     *
+     * What: while fs_autosave_yield is set, a phase with no AsyncFATFS
+     * callback outstanding (filesystem_autosaveDrainAbortSafe()) routes
+     * through filesystem_autosaveWriterFinishError(): open source/target
+     * handles are closed, the transaction's captured dirty bits are restored,
+     * and the operation ends ERROR. A phase that is waiting for an open,
+     * close, remove or seek runs on until that wait completes; the abort then
+     * fires at the next action phase, a few ms later. The HCNAMES publication
+     * (70-77) and the error close-down (40-46) are never aborted. The
+     * writer's completion re-arms its five-second retry, which the yield and
+     * the Scene 17 gate keep from running until the load is over.
+     * Why: the Bank is about to be replaced; the record being written is
+     * stale, and the load must not wait for it (D1). Aborting inside a wait
+     * phase would either finish with a callback still due (it would then
+     * write op_file/op_file_ready/op_remove_done inside the Bank load that
+     * follows) or queue a second fclose() on a handle that is already closing
+     * (phase 40/42 would retry it forever). The A/B scheme keeps the other
+     * file as the last valid record. Recovery writes may leave both files
+     * invalid; that is accepted, because the old Bank's records are ignored
+     * after the load anyway (identity mismatch, D21).
+     * Inputs: fs_autosave_yield, op_phase.
+     * Outputs: close-down phases 40-43 or ERROR; the facade becomes idle.
+     * Accessors: preset_tickBackgroundBankLoad() phase 2 (sets the yield and
+     * waits for the facade).
+     * Affiliates: filesystem_autosaveDrainAbortSafe(),
+     * filesystem_autosaveWriterFinishError(),
+     * filesystem_autosaveWriterCompleted(), autosave_maskRestoreCaptured().
+     */
+    if (fs_autosave_yield && filesystem_autosaveDrainAbortSafe(op_phase)) {
+        filesystem_autosaveWriterFinishError();
+        return;
+    }
 
     switch (op_phase) {
     case 0: /* INITIALIZE ONE OPERATION-LOCAL A/B VALIDATION PASS */
@@ -13723,6 +14182,136 @@ static void filesystem_loadSceneDirectory_tick(void)
     }
 }
 
+/*
+ * Stage the register image of an emptied Scene (S082 B3, B3.9f).
+ *
+ * What: stages the register image of an emptied Scene (`x` Scene row,
+ * inheriting blank child rows, refreshed). Why: S13 accurate provenance; boot
+ * must not resolve an emptied Scene to the source Bank's child (which may
+ * exist when it was deselected). Inputs: Scene index. Outputs: staged rows
+ * in fs_resident_source[] and hcnames_name_mirror[], written by the existing
+ * phase-85 stream. Accessors: filesystem_bankEmptyScenes(), Bank Save phase 45.
+ * Affiliates: filesystem_setResidentSource(), filesystem_cacheResidentName().
+ */
+static void filesystem_stageEmptySceneRows(uint8_t scene_index)
+{
+    uint16_t row;
+    uint8_t slot;
+
+    row = filesystem_residentSceneRow(scene_index);
+    (void)filesystem_setResidentSource(row, FS_RESIDENT_SOURCE_EMPTY);
+    filesystem_setResidentRefreshed(row);
+    filesystem_cacheResidentName(row, "");
+    row = filesystem_residentKitRow(scene_index);
+    (void)filesystem_setResidentSource(row, FS_RESIDENT_SOURCE_INHERIT);
+    filesystem_setResidentRefreshed(row);
+    filesystem_cacheResidentName(row, "");
+    row = filesystem_residentPatternRow(scene_index);
+    (void)filesystem_setResidentSource(row, FS_RESIDENT_SOURCE_INHERIT);
+    filesystem_setResidentRefreshed(row);
+    filesystem_cacheResidentName(row, "");
+    row = filesystem_residentEffectRow(scene_index);
+    (void)filesystem_setResidentSource(row, FS_RESIDENT_SOURCE_INHERIT);
+    filesystem_setResidentRefreshed(row);
+    filesystem_cacheResidentName(row, "");
+    for (slot = 0u; slot < STORAGE_KIT_SLOT_COUNT; slot++) {
+        row = filesystem_residentInstrumentRow(scene_index, slot);
+        (void)filesystem_setResidentSource(row, FS_RESIDENT_SOURCE_INHERIT);
+        filesystem_setResidentRefreshed(row);
+        filesystem_cacheResidentName(row, "");
+    }
+}
+
+/*
+ * Stage explicit provenance for kept Scenes before row 0 moves (S082 B3).
+ *
+ * What: makes a kept Scene's inherited provenance explicit (`b<old Bank>`)
+ * before row 0 moves to the new Bank. Why: a `-` Scene row would otherwise
+ * claim the new Bank's same-numbered child (S4, S13, R14). Inputs: kept mask,
+ * old row-0 source. Outputs: staged Scene-row sources. Accessors: Bank Load
+ * phase 20 / empty branch, Bank Save phase 45. Affiliates:
+ * FS_RESIDENT_SOURCE_BANK_CHILD_BASE.
+ */
+static void filesystem_stageKeptSceneSources(uint16_t kept,
+                                             uint16_t old_bank_source)
+{
+    uint8_t n;
+    uint16_t bank_child;
+
+    if (old_bank_source < STORAGE_BANK_MAX_SLOTS)
+        bank_child = (uint16_t)(FS_RESIDENT_SOURCE_BANK_CHILD_BASE +
+                                old_bank_source);
+    else
+        bank_child = FS_RESIDENT_SOURCE_UNKNOWN;
+
+    for (n = 0u; n < 16u; n++) {
+        uint16_t row;
+        uint16_t src;
+
+        if (!(kept & (uint16_t)(1u << n)))
+            continue;
+        row = filesystem_residentSceneRow(n);
+        src = filesystem_residentSource(row);
+        if (src == FS_RESIDENT_SOURCE_INHERIT) {
+            (void)filesystem_setResidentSource(row, bank_child);
+            filesystem_setResidentRefreshed(row);
+        }
+    }
+}
+
+/*
+ * Empty every Scene in the mask (S082 B3, B3.6).
+ *
+ * What: empties every Scene in the mask (data, Pattern, register rows, clean
+ * bit, AutoSave scope). Why: Replace Bank Load (S7). Inputs: mask. Outputs:
+ * emptied Scenes. Accessors: Bank Load phase 98. Affiliates:
+ * scene_resetResidentToEmpty(), filesystem_stageEmptySceneRows(),
+ * bank_invalidateSdCleanScene(), autosave_markSceneWithPatternDirty().
+ */
+static void filesystem_bankEmptyScenes(uint16_t mask)
+{
+    uint8_t n;
+
+    for (n = 0u; n < 16u; n++) {
+        if (!(mask & (uint16_t)(1u << n)))
+            continue;
+        scene_resetResidentToEmpty(n);
+        pat_initScene(n);
+        filesystem_stageEmptySceneRows(n);
+        bank_invalidateSdCleanScene(n);
+        filesystem_patternAutosaveOnLoad(n);
+        autosave_markSceneWithPatternDirty(n);
+    }
+}
+
+/*
+ * Merge the new Bank's edit masks before the first child (S082 P3 D44).
+ *
+ * What: for a progressive load, applies bank_mergeVoiceEditMasksAfterLoad()
+ * with the request's load and empty sets as soon as bankset.bcg is parsed and
+ * the empties are done, i.e. at the transition into the first child.
+ * Why: a child that completes is usable at once; its fan-out must follow the
+ * new Bank's entry, not the old one. Entries naming Scenes that are still
+ * pending are harmless: fan-out and edit targets exclude unavailable Scenes,
+ * and bank_noteLoadChildDone() revalidates layouts as each child lands.
+ * Failed children are removed at the end (bank_stripFailedFromVoiceEditMasks()).
+ * Inputs: op_bankset_state entries and seen mask, op_bank_scene_load_mask,
+ * op_bank_scene_empty_mask, op_bank_flags.
+ * Outputs: BankData edit-mask entries (AutoSave fields marked; drain held).
+ * Accessors: Bank Load phases 17 and 98 at their "first child" exits.
+ * Affiliates: the metadata commit (F2.5), FS_BANK_FLAG_PROGRESSIVE.
+ */
+static void filesystem_bankLoadMergeEditMasksEarly(void)
+{
+    if ((op_bank_flags & FS_BANK_FLAG_PROGRESSIVE) == 0u)
+        return;
+    bank_mergeVoiceEditMasksAfterLoad(
+        op_bankset_state.scene_mask_voice_edit,
+        op_bankset_state.seen_scene_mask_voice_edit,
+        op_bank_scene_load_mask,
+        op_bank_scene_empty_mask);
+}
+
 #if DEV_STALL_DETECTION
 static uint8_t op_bank_load_entry_stall_last_phase = 0u;
 static uint32_t op_bank_load_entry_stall_ticks = 0u;
@@ -14271,7 +14860,6 @@ static void filesystem_loadBankDirectory_tick(void)
     {
         uint8_t child_slot = 0u;
         uint8_t found = 0u;
-        uint16_t active_bit;
 
         if (!op_close_done)
             return;
@@ -14282,123 +14870,103 @@ static void filesystem_loadBankDirectory_tick(void)
             filesystem_finish(FS_STATUS_ERROR);
             return;
         }
+        /*
+         * Resolve the effective load/empty sets after child discovery (S082 B3).
+         *
+         * What: a Replace request empties every requested Scene whose child is
+         * absent; a Merge request keeps it. The load set is intersected with the
+         * discovered children as before. Emptying runs first (phase 98) so the
+         * per-child loop and the metadata commit see final resident state.
+         * Why: Replace "uses exactly what is there" (S8); the source Bank's
+         * missing child is an empty Scene. The manifest active_scene is applied
+         * only at boot (S11), so the runtime path no longer re-picks it.
+         * Inputs: op_bank_scene_load_mask, op_bank_child_present_mask,
+         * op_bank_flags.
+         * Outputs: op_bank_scene_load_mask, op_bank_scene_empty_mask, next phase.
+         * Accessors: filesystem_loadBankDirectory_tick().
+         * Affiliates: phase 98, phase 20 commit, the empty-Bank branch.
+         */
+        if (op_bank_flags & FS_BANK_FLAG_REPLACE)
+            op_bank_scene_empty_mask = (uint16_t)(op_bank_scene_empty_mask |
+                (op_bank_scene_load_mask &
+                 (uint16_t)~op_bank_child_present_mask));
         op_bank_scene_load_mask =
             (uint16_t)(op_bank_scene_load_mask & op_bank_child_present_mask);
-        /*
-         * Bank Load is strictly mask-selective.
-         *
-         * Inputs: caller's requested resident Scene bits and the discovered
-         * Bank-child presence mask. Output: only their intersection can enter
-         * the payload loop. The former empty-intersection fallback loaded every
-         * present child, overwriting resident Scenes the caller had explicitly
-         * left outside the mask and publishing their names as collateral.
-         * Affiliates: the selected-child HCNAMES overlay and final BankData
-         * presence merge below; neither may expand this request implicitly.
-         */
-        active_bit = (op_bank_active_scene < STORAGE_BANK_SCENE_MAX_SLOTS)
-            ? (uint16_t)(1u << op_bank_active_scene)
-            : 0u;
-        if ((op_bank_scene_load_mask & active_bit) == 0u) {
-            for (child_slot = 0u;
-                 child_slot < STORAGE_BANK_SCENE_MAX_SLOTS;
-                 child_slot++) {
-                if ((op_bank_scene_load_mask &
-                     (uint16_t)(1u << child_slot)) != 0u) {
-                    op_bank_active_scene = child_slot;
-                    active_bit = (uint16_t)(1u << child_slot);
-                    break;
+        if (op_bank_flags & FS_BANK_FLAG_BOOT) {
+            uint16_t active_bit =
+                (op_bank_active_scene < STORAGE_BANK_SCENE_MAX_SLOTS)
+                    ? (uint16_t)(1u << op_bank_active_scene)
+                    : 0u;
+            if ((op_bank_scene_load_mask & active_bit) == 0u) {
+                for (child_slot = 0u;
+                     child_slot < STORAGE_BANK_SCENE_MAX_SLOTS;
+                     child_slot++) {
+                    if ((op_bank_scene_load_mask &
+                         (uint16_t)(1u << child_slot)) != 0u) {
+                        op_bank_active_scene = child_slot;
+                        break;
+                    }
                 }
             }
         }
+        if (op_bank_scene_empty_mask != 0u) {
+            op_phase = 98u;
+            return;
+        }
         if (op_bank_scene_load_mask == 0u) {
             /*
-             * Empty Banks are valid.
+             * Empty Banks are valid (no children to load).
              *
              * Output: BankData keeps the loaded Bank identity and child
-             * presence map, but op_bank_loaded_scene stays zero so Preset/Menu
-             * can initialize audible Scene data from root Scene, root Kit, or
-             * SRAM defaults. The restore slot is still updated because the
-             * Bank itself was successfully loaded.
+             * presence map, but op_bank_loaded_scene stays zero.
              */
             bank_setDisplayName(op_bank_display_name);
-            /* The root Bank directory selected by this completed load is the
-             * direct top-level fallback for every child that inherits upward. */
-            (void)filesystem_setResidentSource(0u, op_slot);
-            /* An empty Bank still replaces the resident Bank metadata. Retain
-             * its refresh witness until the autosave drain captures row-zero
-             * bytes and publishes the matching HCNAMES source pair. */
-            filesystem_setResidentRefreshed(FS_IDENTITY_BANK_ROW);
-            /*
-             * No requested child exists in this Bank. Preserve the existing
-             * resident Scene availability rather than clearing it: the caller
-             * asked for a selective Bank identity/load operation, not a reset
-             * of every unselected playable Scene. HCNAMES rows remain the
-             * preloaded register values for the same reason.
-             */
-            if (!bank_setScenePresentMask(bank_scenePresentMask())) {
-                /*
-                 * Guarantee a fresh present-mask capture for an empty Bank.
-                 *
-                 * Inputs: the preserved resident mask and a setter result of
-                 * zero, meaning the normalized value was unchanged. Output:
-                 * the existing two canonical mask bits are marked for the
-                 * next drain. Why: this branch intentionally preserves the
-                 * mask, so change-aware setters cannot otherwise refresh a
-                 * record whose previous mask bytes are stale or zero.
-                 * Affiliate: autosave_markBankFieldDirty().
-                 */
-                autosave_markBankFieldDirty(
-                    AUTOSAVE_BANK_FIELD_SCENE_PRESENT_MASK);
+            {
+                uint16_t old_bank_source =
+                    filesystem_residentSource(FS_IDENTITY_BANK_ROW);
+                uint16_t kept_mask = (uint16_t)(
+                    ~(op_bank_scene_load_mask | op_bank_scene_empty_mask) &
+                    0xffffu);
+                (void)filesystem_setResidentSource(0u, op_slot);
+                filesystem_setResidentRefreshed(FS_IDENTITY_BANK_ROW);
+                filesystem_stageKeptSceneSources(kept_mask, old_bank_source);
             }
-            /*
-             * Witness the empty-Bank presence boundary in the retained trace.
-             *
-             * Inputs: the deliberately preserved resident mask and the zero
-             * effective load mask. Output: one B record with the drain-site
-             * flag clear; value32 packs both masks for comparison with the
-             * later live-byte capture. Why: an empty Bank's setter is a
-             * deliberate no-op, so this proves which value the commit kept.
-             * Affiliate: autosave_getLivePayloadByte().
-             */
+            {
+                uint16_t present = (uint16_t)(
+                    (bank_scenePresentMask() &
+                     (uint16_t)~(op_bank_scene_load_mask |
+                                 op_bank_scene_empty_mask)) |
+                    (op_bank_scene_load_mask &
+                     (uint16_t)~op_bank_scene_failed_mask));
+                uint8_t active = scene_getActiveIndex();
+                if (active < 16u)
+                    present = (uint16_t)(present |
+                                         (uint16_t)(1u << active));
+                if (!bank_setScenePresentMask(present))
+                    autosave_markBankFieldDirty(
+                        AUTOSAVE_BANK_FIELD_SCENE_PRESENT_MASK);
+            }
             autosaveTrace_record(
                 AUTOSAVE_TRACE_STAGE_BANK_PRESENT, 0u,
                 ((uint32_t)bank_scenePresentMask() <<
                  AUTOSAVE_TRACE_BANK_PRESENT_MASK_SHIFT) |
                     op_bank_scene_load_mask);
-            bank_selectActiveSceneForEditMask(op_bank_active_scene);
-            /*
-             * Commit only the parsed per-Scene VOICE edit masks.
-             *
-             * Inputs: storageTypes.c staging array and one seen bit per
-             * indexed key. Output: each seen entry is normalized into BankData
-             * without changing the active Scene. A legacy single-key file has
-             * all 16 seen bits set by the parser, so it follows the same loop.
-             * Affiliate: bank_init() defaults unseen entries to self only.
-             */
-            {
-                uint8_t mask_i;
-                for (mask_i = 0u; mask_i < BANK_SCENE_SLOT_COUNT; mask_i++) {
-                    if (op_bankset_state.seen_scene_mask_voice_edit &
-                        (uint16_t)(1u << mask_i))
-                        bank_setSceneMaskVoiceEditForScene(
-                            mask_i,
-                            op_bankset_state.scene_mask_voice_edit[mask_i]);
-                }
-            }
+            if (op_bank_flags & FS_BANK_FLAG_BOOT)
+                bank_selectActiveSceneForEditMask(op_bank_active_scene);
+            bank_mergeVoiceEditMasksAfterLoad(
+                op_bankset_state.scene_mask_voice_edit,
+                op_bankset_state.seen_scene_mask_voice_edit,
+                op_bank_scene_load_mask,
+                op_bank_scene_empty_mask);
             bank_setRestoreBankSlot(op_slot);
-            /*
-             * Persist the newly selected boot-restore Bank after a valid
-             * empty-Bank identity load.
-             *
-             * Inputs: the committed restore slot above. Output: the existing
-             * debounced settings writer re-serializes active_bank later; this
-             * call opens no file. Why: an empty Bank is still the new boot
-             * selection authority and must not leave a stale settings value.
-             * Affiliates: filesystem_settingsWriterSchedule_tick() and
-             * filesystem_nextSettingsLine().
-             */
             filesystem_markSettingsDirty();
             bank_setHasResidentBank(1u);
+            if (op_bank_flags & FS_BANK_FLAG_BOOT) {
+                scene_selectActive(op_bank_active_scene);
+                seq_alignActivePatternToScene(op_bank_active_scene);
+                menu_setShownPattern(op_bank_active_scene);
+                menu_setPlayedPattern(op_bank_active_scene);
+            }
             memcpy(preset_currentName, op_bank_display_name, 8u);
             if (!afatfs_chdir(NULL))
                 return;
@@ -14422,12 +14990,116 @@ static void filesystem_loadBankDirectory_tick(void)
             filesystem_finish(FS_STATUS_ERROR);
             return;
         }
+        filesystem_bankLoadMergeEditMasksEarly();
         op_bank_child_cursor = child_slot;
         /*
          * The first selected child's display name is already cached from the
          * phase 15 scan (Option 1A).  Phase 27 copies it directly into
          * op_scene_display_name and proceeds to phase 31 to format/open.
          */
+        op_phase = 27u;
+        return;
+    }
+
+    case 98:
+    {
+        /*
+         * Empty every Replace-only Scene (S082 B3, S7, S17).
+         *
+         * What: waits until the Pattern service released the selected Scenes,
+         * resets each to the empty Scene (settings, Effect and Kit defaults,
+         * Pattern region init), then reopens the service. HCNAMES rows are
+         * staged in the same helper. Why: Replace loads deselected or missing
+         * Scenes empty. The Pattern region is replaced directly, so it uses the
+         * same quiesce/finish bracket as a Pattern load.
+         * Inputs: op_bank_scene_empty_mask.
+         * Outputs: resident Scenes emptied; register rows staged.
+         * Accessors: Bank Load phase 17.
+         * Affiliates: filesystem_bankEmptyScenes(), scene_resetResidentToEmpty(),
+         * pat_initScene(), filesystem_patternServiceReady()/Finish().
+         */
+        uint8_t child_slot;
+        uint8_t found = 0u;
+
+        if (!filesystem_patternServiceReady(op_bank_scene_empty_mask))
+            return;
+        filesystem_bankEmptyScenes(op_bank_scene_empty_mask);
+        filesystem_patternServiceFinish(op_bank_scene_empty_mask);
+        if (op_bank_scene_load_mask == 0u) {
+            /* No children to load — enter the empty-Bank branch. */
+            uint16_t old_bank_source =
+                filesystem_residentSource(FS_IDENTITY_BANK_ROW);
+            uint16_t kept_mask = (uint16_t)(
+                ~(op_bank_scene_load_mask | op_bank_scene_empty_mask) &
+                0xffffu);
+
+            bank_setDisplayName(op_bank_display_name);
+            (void)filesystem_setResidentSource(0u, op_slot);
+            filesystem_setResidentRefreshed(FS_IDENTITY_BANK_ROW);
+            /*
+             * S082 B3.8: a Scene kept by a Replace whose source child is
+             * missing still needs explicit provenance before row 0 moves.
+             */
+            filesystem_stageKeptSceneSources(kept_mask, old_bank_source);
+            {
+                uint16_t present = (uint16_t)(
+                    (bank_scenePresentMask() &
+                     (uint16_t)~(op_bank_scene_load_mask |
+                                 op_bank_scene_empty_mask)) |
+                    (op_bank_scene_load_mask &
+                     (uint16_t)~op_bank_scene_failed_mask));
+                uint8_t active = scene_getActiveIndex();
+                if (active < 16u)
+                    present = (uint16_t)(present |
+                                         (uint16_t)(1u << active));
+                if (!bank_setScenePresentMask(present))
+                    autosave_markBankFieldDirty(
+                        AUTOSAVE_BANK_FIELD_SCENE_PRESENT_MASK);
+            }
+            autosaveTrace_record(
+                AUTOSAVE_TRACE_STAGE_BANK_PRESENT, 0u,
+                ((uint32_t)bank_scenePresentMask() <<
+                 AUTOSAVE_TRACE_BANK_PRESENT_MASK_SHIFT) |
+                    op_bank_scene_load_mask);
+            if (op_bank_flags & FS_BANK_FLAG_BOOT)
+                bank_selectActiveSceneForEditMask(op_bank_active_scene);
+            bank_mergeVoiceEditMasksAfterLoad(
+                op_bankset_state.scene_mask_voice_edit,
+                op_bankset_state.seen_scene_mask_voice_edit,
+                op_bank_scene_load_mask,
+                op_bank_scene_empty_mask);
+            bank_setRestoreBankSlot(op_slot);
+            filesystem_markSettingsDirty();
+            bank_setHasResidentBank(1u);
+            if (op_bank_flags & FS_BANK_FLAG_BOOT) {
+                scene_selectActive(op_bank_active_scene);
+                seq_alignActivePatternToScene(op_bank_active_scene);
+                menu_setShownPattern(op_bank_active_scene);
+                menu_setPlayedPattern(op_bank_active_scene);
+            }
+            memcpy(preset_currentName, op_bank_display_name, 8u);
+            filesystem_cacheResidentName(0u, op_bank_display_name);
+            filesystem_bootLoggingSetDetail("BKHCWRIT");
+            op_phase = 83u;
+            return;
+        }
+        for (child_slot = 0u;
+             child_slot < STORAGE_BANK_SCENE_MAX_SLOTS;
+             child_slot++) {
+            if ((op_bank_scene_load_mask &
+                 (uint16_t)(1u << child_slot)) != 0u) {
+                found = 1u;
+                break;
+            }
+        }
+        if (!found) {
+            if (!afatfs_chdir(NULL))
+                return;
+            filesystem_finish(FS_STATUS_ERROR);
+            return;
+        }
+        filesystem_bankLoadMergeEditMasksEarly();
+        op_bank_child_cursor = child_slot;
         op_phase = 27u;
         return;
     }
@@ -14472,6 +15144,19 @@ static void filesystem_loadBankDirectory_tick(void)
                 (uint16_t)(op_bank_scene_failed_mask |
                           (uint16_t)(1u << op_bank_child_cursor));
             filesystem_makeNamedErrorCode("BKKit", op_phase);
+        } else if (op_bank_flags & FS_BANK_FLAG_PROGRESSIVE) {
+            /*
+             * Publish the completed child at once (S082 P3 W4, D44).
+             *
+             * What: the child's settings, Kit, Pattern and Effect are
+             * committed and its directory is closed; BankData sets its
+             * present bit, makes it available and revalidates layouts among
+             * available Scenes. Why: the user may select it, fan out to it
+             * and see it fill in PERF before the last child (W4).
+             * Inputs: op_bank_child_cursor. Outputs: BankData state.
+             * Affiliates: bank_noteLoadChildDone(), Menu PERF fill observer.
+             */
+            bank_noteLoadChildDone(op_bank_child_cursor);
         }
         for (child_slot = (uint8_t)(op_bank_child_cursor + 1u);
              child_slot < STORAGE_BANK_SCENE_MAX_SLOTS;
@@ -14510,128 +15195,99 @@ static void filesystem_loadBankDirectory_tick(void)
          * always one of the resident payloads just committed.
          */
         bank_setDisplayName(op_bank_display_name);
-        /*
-         * The completed root Bank payload is the direct top-level source for
-         * its selected Bank-local children.  This mirrors the empty-Bank
-         * completion above: both paths publish row zero through the same
-         * HCNAMES close gate, so boot's settings-selected Bank cannot retain
-         * an obsolete UNKNOWN token after a normal child load.
-         */
-        (void)filesystem_setResidentSource(FS_IDENTITY_BANK_ROW, op_slot);
-        /* Bank Load completed its metadata and every selected child. Keep the
-         * root Bank refresh witness with the row-zero source until autosave
-         * captures the Bank-owned bytes and publishes HCNAMES. */
-        filesystem_setResidentRefreshed(FS_IDENTITY_BANK_ROW);
-        /*
-         * Retain availability for resident Scenes outside this Bank request.
-         *
-         * Inputs: the effective selected-child mask and the pre-commit Bank
-         * present mask, which is still intact until this one metadata commit.
-         * Output: selected child slots become available while pre-existing
-         * unselected slots remain available, matching the data and HCNAMES
-         * preservation rules. This is a metadata merge only; the payload loop
-         * above remains the sole writer of selected SceneData.
-         */
-        if (!bank_setScenePresentMask(
-                (uint16_t)((bank_scenePresentMask() | op_bank_scene_load_mask) &
-                           ~op_bank_scene_failed_mask))) {
-            /*
-             * Guarantee a fresh present-mask capture when the Bank Load union
-             * is a no-op against the already-resident mask.
-             *
-             * Inputs: the effective selected-child union and a setter result
-             * of zero. Output: the existing two-byte field is marked without
-             * allocating state or changing the resident mask. Why: the
-             * change-aware setter correctly suppresses equal writes, but a
-             * later AutoSave reader still needs the committed value refreshed
-             * after this successful load boundary. Affiliate:
-             * autosave_markBankFieldDirty().
-             */
-            autosave_markBankFieldDirty(
-                AUTOSAVE_BANK_FIELD_SCENE_PRESENT_MASK);
+        {
+            uint16_t old_bank_source =
+                filesystem_residentSource(FS_IDENTITY_BANK_ROW);
+            uint16_t kept_mask = (uint16_t)(
+                ~(op_bank_scene_load_mask | op_bank_scene_empty_mask) &
+                0xffffu);
+            (void)filesystem_setResidentSource(FS_IDENTITY_BANK_ROW, op_slot);
+            filesystem_setResidentRefreshed(FS_IDENTITY_BANK_ROW);
+            filesystem_stageKeptSceneSources(kept_mask, old_bank_source);
         }
         /*
-         * Witness the post-commit Bank presence boundary in the retained
-         * trace.
+         * Resident availability after the load (S082 B3; S082 P3 progressive).
          *
-         * Inputs: the merged resident mask and effective selected-child mask.
-         * Output: one B record with the drain-site flag clear; value32 packs
-         * the resident mask in bits 16..31 and the effective load mask in
-         * bits 0..15. Why: D records identify marked offsets but cannot prove
-         * the live mask value seen by the later drain. Affiliate: the drain
-         * witness in autosave_getLivePayloadByte().
+         * What: non-progressive loads keep the existing outcome formula.
+         * A progressive load already set each loaded child's present bit as
+         * it completed; it now only clears the emptied Scenes, keeping
+         * whatever the user did to loaded or kept Scenes during the load
+         * (a mid-load `clear scene` removed a bit that must stay removed).
+         * Failed children keep their old bit, exactly as before. The active
+         * Scene always stays present (S17).
+         * Inputs: load/empty/failed masks, live present mask, active Scene,
+         * FS_BANK_FLAG_PROGRESSIVE. Outputs: BankData present mask, with an
+         * explicit AutoSave mark.
+         * Affiliates: bank_setScenePresentMask(), bank_noteLoadChildDone(),
+         * autosave_markBankFieldDirty().
          */
+        {
+            uint16_t present;
+            uint8_t active = scene_getActiveIndex();
+
+            if (op_bank_flags & FS_BANK_FLAG_PROGRESSIVE)
+                present = (uint16_t)(bank_scenePresentMask() &
+                                     (uint16_t)~op_bank_scene_empty_mask);
+            else
+                present = (uint16_t)(
+                    (bank_scenePresentMask() &
+                     (uint16_t)~(op_bank_scene_load_mask |
+                                 op_bank_scene_empty_mask)) |
+                    (op_bank_scene_load_mask &
+                     (uint16_t)~op_bank_scene_failed_mask));
+            if (active < 16u)
+                present = (uint16_t)(present | (uint16_t)(1u << active));
+            if (!bank_setScenePresentMask(present))
+                autosave_markBankFieldDirty(
+                    AUTOSAVE_BANK_FIELD_SCENE_PRESENT_MASK);
+        }
         autosaveTrace_record(
             AUTOSAVE_TRACE_STAGE_BANK_PRESENT, 0u,
             ((uint32_t)bank_scenePresentMask() <<
              AUTOSAVE_TRACE_BANK_PRESENT_MASK_SHIFT) |
                 op_bank_scene_load_mask);
-        bank_selectActiveSceneForEditMask(op_bank_active_scene);
-        /* Restore each parsed Bank-local Scene mask independently. */
-        {
-            uint8_t mask_i;
-            for (mask_i = 0u; mask_i < BANK_SCENE_SLOT_COUNT; mask_i++) {
-                if (op_bankset_state.seen_scene_mask_voice_edit &
-                    (uint16_t)(1u << mask_i))
-                    bank_setSceneMaskVoiceEditForScene(
-                        mask_i,
-                        op_bankset_state.scene_mask_voice_edit[mask_i]);
-            }
-        }
-        bank_setRestoreBankSlot(op_slot);
+        if (op_bank_flags & FS_BANK_FLAG_BOOT)
+            bank_selectActiveSceneForEditMask(op_bank_active_scene);
         /*
-         * Persist the newly selected boot-restore Bank after a complete
-         * non-empty Bank Load.
+         * Edit masks at the end of the load (S082 B3; S082 P3).
          *
-         * Inputs: the committed restore slot above. Output: dirty/revision/
-         * deadline state only; no file is opened here. Why: the Bank Load
-         * changed the boot-selection authority, so a reboot must select this
-         * Bank rather than the stale settings.cfg slot. Affiliates:
-         * filesystem_settingsWriterSchedule_tick() and
-         * filesystem_nextSettingsLine().
+         * What: a progressive load merged the new Bank's entries before its
+         * first child; it now only removes failed children. Other loads run
+         * the full merge here as before.
+         * Why: re-merging would overwrite edit-mask changes made while the
+         * panel was unlocked. Inputs: op_bankset_state, outcome masks, flags.
+         * Outputs: BankData entries. Affiliates:
+         * filesystem_bankLoadMergeEditMasksEarly(),
+         * bank_stripFailedFromVoiceEditMasks().
          */
+        if (op_bank_flags & FS_BANK_FLAG_PROGRESSIVE)
+            bank_stripFailedFromVoiceEditMasks(op_bank_scene_failed_mask);
+        else
+            bank_mergeVoiceEditMasksAfterLoad(
+                op_bankset_state.scene_mask_voice_edit,
+                op_bankset_state.seen_scene_mask_voice_edit,
+                op_bank_scene_load_mask,
+                op_bank_scene_empty_mask);
+        bank_setRestoreBankSlot(op_slot);
         filesystem_markSettingsDirty();
         bank_setHasResidentBank(1u);
-        scene_selectActive(op_bank_active_scene);
         /*
-         * Realign Pattern playback and the STEP view with the Scene just
-         * committed as active.
+         * Runtime Bank Load never moves the active or viewed Scene (S9-S11).
          *
-         * Why: scene_selectActive() is deliberately "identity, never data" and
-         * changes only SceneData's active index. Pattern is the one Scene-owned
-         * payload that playback and the STEP UI do NOT address through
-         * scene_getActiveIndex(): the sequencer reads seq_activePattern and the
-         * LED/button layer reads menu_shownPattern. Both are BSS-zero at boot
-         * and were previously assigned only by a front-panel PERF press, so a
-         * Bank whose manifest selects any Scene other than 0 left them
-         * disagreeing with SceneData for the whole session. A later Scene Load
-         * then wrote its Pattern into the committed active Scene (correctly)
-         * while playback and the STEP LEDs kept reading Scene 0, which
-         * presented as "Scene Load never loads the pattern". Every other Scene
-         * payload resolved through scene_getActiveIndex() and looked fine,
-         * which is why only Pattern appeared broken.
-         *
-         * Inputs: the Bank manifest's committed active Scene. Outputs: the
-         * sequencer's active/pending Pattern indices and Menu's viewed and
-         * played Pattern mirrors follow it. All three callees validate the
-         * index themselves and are pure state realignment — no SD access, no
-         * allocation, no payload change, and no MIDI emission (the reason
-         * seq_alignActivePatternToScene() exists instead of
-         * seq_selectActivePattern(), which would send a program change and
-         * force note-offs during pre-audio boot).
-         *
-         * Repaint is intentionally not triggered here: filesystem.c must not
-         * drive LCD/LED work. Boot repaints via menu_start()/menu_repaintAll()
-         * and runtime Bank Load repaints through menu_startSoundApply() in
-         * Menu's PRESET_OP_BANK_LOAD completion.
-         *
+         * What: only a boot load (FS_BANK_FLAG_BOOT) applies the manifest
+         * active_scene and realigns SceneData, playback and the STEP/PERF
+         * mirrors. A runtime load leaves scene_getActiveIndex(),
+         * seq_activePattern and menu_shownPattern exactly as they were.
+         * Why: the user's Scene is never changed by a load.
          * Affiliates: seq_alignActivePatternToScene(), menu_setShownPattern(),
-         * menu_setPlayedPattern(), menu_perfModeSceneButtonPressed() (the
-         * equivalent front-panel pairing), and SCENE_LOAD_PAT_RESTORE.md.
+         * menu_setPlayedPattern(), SCENE_LOAD_PAT_RESTORE.md.
          */
-        seq_alignActivePatternToScene(op_bank_active_scene);
-        menu_setShownPattern(op_bank_active_scene);
-        menu_setPlayedPattern(op_bank_active_scene);
+        if (op_bank_flags & FS_BANK_FLAG_BOOT) {
+            scene_selectActive(op_bank_active_scene);
+            seq_alignActivePatternToScene(op_bank_active_scene);
+            menu_setShownPattern(op_bank_active_scene);
+            menu_setPlayedPattern(op_bank_active_scene);
+        }
         memcpy(preset_currentName, op_bank_display_name, 8u);
         filesystem_cacheResidentName(0u, op_bank_display_name);
         filesystem_bootLoggingSetDetail("BKHCWRIT");
@@ -15452,6 +16108,24 @@ static void filesystem_savePattern_tick(void)
         if (!op_close_done) return;
         op_file = NULL;
         if (!afatfs_chdir(NULL)) return;
+        /*
+         * Pattern Save from Scene 17 renames its captured Pattern
+         * (S082 P1 R2).
+         *
+         * What: after the `.pat` file is durable, the Scene 17 capture takes
+         * the saved Pattern name; the HCNAMES update that follows has a zero
+         * Scene mask and only rebuilds `/Pattern/.hcindex`.
+         * Why: the saved Pattern becomes Scene 17's Pattern identity (D29).
+         * Inputs: op_pattern_scene, op_pattern_display_name.
+         * Outputs: capture row PATTERN.
+         * Accessors: Pattern Save on 17.
+         * Affiliates: filesystem_backgroundNameSet(),
+         * filesystem_startPatternHcnamesUpdate().
+         */
+        if (op_pattern_scene == SCENE_BACKGROUND_INDEX &&
+            scene_backgroundExists())
+            filesystem_backgroundNameSet(FS_BACKGROUND_NAME_PATTERN,
+                                         op_pattern_display_name);
         filesystem_startPatternHcnamesUpdate();
         return;
     case 14u:
@@ -15487,6 +16161,41 @@ static void filesystem_savePattern_tick(void)
 static void filesystem_autosavePatternDrain_tick(void)
 {
     const pat_scene_region_t *snapshot;
+
+    /*
+     * Abort the Pattern drain for a Bank load (S082 P1 R6, D1).
+     *
+     * What: while fs_autosave_yield is set, phases 0-1 (no handle open)
+     * finish ERROR at once; phases 3-6 and 8 (file open, streaming) jump to
+     * the close at phase 9 with ERROR status. Phase 2 (open pending) waits for
+     * its callback and is aborted from phase 3 on the next tick. Phase 7
+     * polls afatfs_fseek(), which can stay IN_PROGRESS across ticks, so it is
+     * left to finish and the abort fires at phase 8 (assessment A2): a close
+     * must never be queued behind a seek still walking the cluster chain.
+     * Phases 9-10 (closing) and the follow-on HCNAMES Pattern update are not
+     * cut. The
+     * ERROR completion keeps the Scene's dirty bit, and the snapshot is
+     * released (filesystem_patternSnapshotInUse() covers phases 2-6 only).
+     * Why: the record being written is stale once the Bank changes (D1), and
+     * the load must not wait for a full PAT4 stream; the ping-pong partner
+     * keeps the last valid file.
+     * Inputs: fs_autosave_yield, op_phase, op_file.
+     * Outputs: ERROR completion after the handle closes.
+     * Accessors: preset_tickBackgroundBankLoad() phase 2.
+     * Affiliates: filesystem_autosavePatternDrainSchedule_tick(),
+     * filesystem_autosaveNonSemanticPatternDrainSchedule_tick() (same op),
+     * filesystem_patternSnapshotInUse().
+     */
+    if (fs_autosave_yield) {
+        if (op_phase <= 1u) {
+            filesystem_finish(FS_STATUS_ERROR);
+            return;
+        }
+        if (op_phase >= 3u && op_phase <= 8u && op_phase != 7u) {
+            op_close_status = FS_STATUS_ERROR;
+            op_phase = 9u;
+        }
+    }
 
     switch (op_phase) {
     case 0u:
@@ -15735,10 +16444,108 @@ static void filesystem_scanBankScenes_tick(void)
      * user presses OK; it intentionally does not parse bankset.bcg, load Scene
      * payloads, or write BankData.
      */
+#if DEV_STALL_DETECTION
+    /*
+     * Bound every preview wait (S082 review F4).
+     *
+     * What: if one phase is polled 20,000 times without progress, record an X
+     * stall, close any handle the preview still owns (no callback), return to
+     * root and finish with error "BkPv". Why: a preview must never hold the
+     * facade forever; Menu's completion then releases its input gate.
+     * Inputs: op_phase, op_file, op_kit_slot_dir. Outputs: FS_STATUS_ERROR.
+     * Affiliates: filesystem_pollPhaseStall(), menu_bankLoadPreviewComplete().
+     */
+    if (filesystem_pollPhaseStall(op_phase,
+                                  &op_bank_preview_stall_last_phase,
+                                  &op_bank_preview_stall_ticks,
+                                  20000u)) {
+        autosaveTrace_record(
+            AUTOSAVE_TRACE_STAGE_PHASE_STALL,
+            AUTOSAVE_TRACE_PHASE_STALL_SITE_BANK_PREVIEW,
+            ((uint32_t)op_phase << AUTOSAVE_TRACE_PHASE_STALL_PHASE_SHIFT) |
+            ((uint32_t)op_slot << AUTOSAVE_TRACE_PHASE_STALL_SLOT_SHIFT));
+        if (op_file) {
+            (void)afatfs_fclose(op_file, NULL);
+            op_file = NULL;
+        }
+        if (op_kit_slot_dir) {
+            (void)afatfs_fclose(op_kit_slot_dir, NULL);
+            op_kit_slot_dir = NULL;
+        }
+        (void)afatfs_chdir(NULL);
+        filesystem_makeNamedErrorCode("BkPv", op_phase);
+        filesystem_finish(FS_STATUS_ERROR);
+        return;
+    }
+#endif
+    /*
+     * Dispose this preview when a newer selection superseded it
+     * (FS_BANK_FLAG_PREVIEW_CANCEL, Bank slot scroll).
+     *
+     * What: acts only in phases with no AsyncFATFS callback outstanding.
+     * Phases with nothing open finish at once from root; an open directory or
+     * `.pat` is closed through the scan's own close phases (5, 10, 16, 20) and
+     * the scan then finishes ERROR. Open/close/seek/iterate waits (2, 4, 6, 8,
+     * 13, 14, 15, 17, 19, 20) run on; the next action phase finishes the
+     * cancel.
+     * Why: a Bank slot turn must not wait for the preview of a slot already
+     * left; finishing ERROR guarantees Menu never takes a partial mask as a
+     * valid preview, even if the user scrolls back to the same slot.
+     * Inputs: op_bank_flags, op_phase, handles. Outputs: ERROR completion.
+     * Affiliates: filesystem_cancelScanBankScenes(), menu_bankLoadPreviewComplete().
+     */
+    if ((op_bank_flags & FS_BANK_FLAG_PREVIEW_CANCEL) != 0u) {
+        switch (op_phase) {
+        case 0:
+        case 1:
+        case 11:
+        case 12:
+            if (!afatfs_chdir(NULL))
+                return;
+            filesystem_finish(FS_STATUS_ERROR);
+            return;
+        case 3:
+            op_phase = 4u;              /* close the root Bank directory */
+            return;
+        case 5:
+            if (!op_close_done)
+                return;
+            op_kit_root_dir = NULL;
+            if (!afatfs_chdir(NULL))
+                return;
+            filesystem_finish(FS_STATUS_ERROR);
+            return;
+        case 7:
+            op_close_status = FS_STATUS_ERROR;
+            op_phase = 9u;              /* close the Bank slot directory */
+            return;
+        case 9:
+        case 10:
+            op_close_status = FS_STATUS_ERROR; /* phase 10 then finishes */
+            break;
+        case 16:
+            if (!op_close_done)
+                return;
+            op_kit_slot_dir = NULL;
+            if (!afatfs_chdir(NULL))
+                return;
+            filesystem_finish(FS_STATUS_ERROR);
+            return;
+        case 18:
+            op_close_done = false;
+            if (afatfs_fclose(op_file, on_file_closed))
+                op_phase = 20u;         /* then 19 -> 11 finishes */
+            return;
+        default:
+            break;
+        }
+    }
     switch (op_phase) {
     case 0:
+        /* The slot was validated and its name captured at request time, so
+         * a cleared shared cache cannot change this operation. */
         if (op_slot >= STORAGE_BANK_MAX_SLOTS ||
-            !filesystem_librarySlotExists(FS_NAME_CACHE_BANK, op_slot)) {
+            op_bank_display_name[0] == '\0') {
             filesystem_finish(FS_STATUS_DONE);
             return;
         }
@@ -15788,11 +16595,12 @@ static void filesystem_scanBankScenes_tick(void)
         op_kit_root_dir = NULL;
         op_file_ready = false;
         op_file = NULL;
-        /* Reconstruct the selected root key from the shared Bank row. */
+        /* Reconstruct the selected root key from the name captured at
+         * request time (the shared cache may have been cleared since). */
         filesystem_makeNumberedDir(
             op_root_open_name,
             op_slot,
-            filesystem_cachedLibraryName(FS_NAME_CACHE_BANK, op_slot));
+            op_bank_display_name);
         if (!afatfs_opendir_lfn(op_root_open_name,
                                 AFATFS_MATCH_CASE_INSENSITIVE,
                                 op_root_open_name,
@@ -15855,13 +16663,16 @@ static void filesystem_scanBankScenes_tick(void)
             char display[STORAGE_SCENE_DISPLAY_NAME_LEN + 1u];
 
             /*
-             * Convert one directory entry to a child Scene bit.
+             * Convert one directory entry to a child Scene bit and cache
+             * its display name for the content probe (S082 B1).
              *
              * Inputs: FAT display name from the selected Bank folder. Output:
-             * child_slot sets one bit in op_bank_child_present_mask. Why: LED
-             * preview needs occupancy, not child identities; a real Bank Load
-             * rescans its requested child and chooses its lexical winner using
-             * the existing one-name operation scratch.
+             * child_slot sets one bit in op_bank_child_present_mask and one
+             * eight-char display name in
+             * op_bank_child_scratch.bank_child_display[child_slot].
+             * Why: LED preview needs occupancy AND content (phases 11-19);
+             * names are captured here so the probe can open each child by its
+             * lexical winner without a second directory scan.
              */
             if (storage_parseBankSceneFolder(op_object.id.displayName,
                                              &child_slot,
@@ -15869,6 +16680,16 @@ static void filesystem_scanBankScenes_tick(void)
                 op_bank_child_present_mask =
                     (uint16_t)(op_bank_child_present_mask |
                                (uint16_t)(1u << child_slot));
+                display[STORAGE_SCENE_DISPLAY_NAME_LEN] = '\0';
+                if (op_bank_child_scratch.bank_child_display[child_slot][0] ==
+                        '\0' ||
+                    filesystem_displayPrecedesCached(
+                        display,
+                        op_bank_child_scratch.bank_child_display[child_slot])) {
+                    memcpy(op_bank_child_scratch.bank_child_display[child_slot],
+                           display,
+                           STORAGE_SCENE_DISPLAY_NAME_LEN + 1u);
+                }
             }
         }
         return;
@@ -15884,9 +16705,245 @@ static void filesystem_scanBankScenes_tick(void)
         if (!op_close_done)
             return;
         op_kit_slot_dir = NULL;
+        if (op_close_status == FS_STATUS_DONE &&
+            op_bank_child_present_mask != 0u) {
+            op_bank_child_cursor = 0u;
+            op_bank_child_content_mask = 0u;
+            op_phase = 11u;
+            return;
+        }
         if (!afatfs_chdir(NULL))
             return;
         filesystem_finish(op_close_status);
+        return;
+
+    /*
+     * Probe each present Bank child for pattern content (S082 B1).
+     *
+     * What: for every child found by the iterator, opens its one `.pat` file,
+     * streams the 1,792-byte address array (offset PATTERN_FILE_HEADER_BYTES) in
+     * 160-byte reads through op_line_buf and sets op_bank_child_content_mask bit N
+     * at the first trigger bit. A child without a readable `.pat` has no content.
+     * Why: the Bank page lights a Scene only when it has trigger steps (S082 P0
+     * §4.3) and Merge acts only on such Scenes (S8). Reading the address array is
+     * the PERF rule applied to the file; nothing is loaded or validated.
+     * Inputs: op_slot (root Bank), op_bank_child_present_mask, the per-child
+     * display names captured in case 8.
+     * Outputs: op_bank_child_content_mask; CWD returned to root at finish.
+     * Buffers: op_line_buf (existing, 160 B) and op_scene_pattern_open_name
+     * (existing); fs_stage_workspace and pat_background_region are untouched (the
+     * AutoSave writer and Scene 17 own them).
+     * Accessors: filesystem_requestScanBankScenes().
+     * Affiliates: filesystem_loadSceneDirectory_tick() phase 9 (the same `.pat`
+     * discovery rule), storage_formatBankSceneDir(), Menu Bank preview.
+     * Cost: one directory visit and one 1.8 kB read per present child; measured in
+     * B1 (R1). Fallback if too slow: a stored mask in bankset.bcg (A1).
+     */
+
+    case 11: /* PICK next present child */
+        while (op_bank_child_cursor < STORAGE_BANK_SCENE_MAX_SLOTS &&
+               (op_bank_child_present_mask &
+                (uint16_t)(1u << op_bank_child_cursor)) == 0u) {
+            op_bank_child_cursor++;
+        }
+        if (op_bank_child_cursor >= STORAGE_BANK_SCENE_MAX_SLOTS) {
+#if DEV_MODE_LOGGING
+            {
+                /* S082 review F8: elapsed preview time, 64 ms units, saturated. */
+                uint16_t elapsed = (uint16_t)(time_sysTick -
+                                              op_bank_preview_start_tick);
+                uint16_t units = (uint16_t)(elapsed >> 6);
+
+                autosaveTrace_record(
+                    AUTOSAVE_TRACE_STAGE_BANK_PREVIEW,
+                    (uint8_t)(units > 255u ? 255u : units),
+                    (uint32_t)op_bank_child_present_mask |
+                        ((uint32_t)op_bank_child_content_mask << 16u));
+            }
+#endif
+            if (!afatfs_chdir(NULL))
+                return;
+            filesystem_finish(FS_STATUS_DONE);
+            return;
+        }
+        op_phase = 12u;
+        return;
+
+    case 12: /* OPEN child Scene directory */
+        storage_formatBankSceneDir(
+            op_root_open_name,
+            sizeof(op_root_open_name),
+            op_bank_child_cursor,
+            op_bank_child_scratch.bank_child_display[op_bank_child_cursor]);
+        op_file_ready = false;
+        op_file = NULL;
+        if (!afatfs_opendir_lfn(op_root_open_name,
+                                AFATFS_MATCH_CASE_INSENSITIVE,
+                                op_root_open_name,
+                                on_file_opened)) {
+            return;
+        }
+        op_phase = 13u;
+        return;
+
+    case 13: /* WAIT open; chdir into child; start iterator */
+        if (!op_file_ready)
+            return;
+        if (!op_file) {
+            op_bank_child_cursor++;
+            op_phase = 11u;
+            return;
+        }
+        op_kit_slot_dir = op_file;
+        if (!afatfs_chdir(op_kit_slot_dir))
+            return;
+        op_scene_pattern_open_name[0] = '\0';
+        afatfs_findFirstObject(op_kit_slot_dir, &op_object_finder);
+        op_phase = 14u;
+        return;
+
+    case 14: /* ITERATE child directory for a .pat file */
+    {
+        afatfsOperationStatus_e ast =
+            afatfs_findNextObject(op_kit_slot_dir,
+                                  &op_object_finder,
+                                  &op_object);
+        if (ast == AFATFS_OPERATION_IN_PROGRESS)
+            return;
+        if (ast == AFATFS_OPERATION_FAILURE ||
+            op_object.id.kind == AFATFS_OBJECT_NONE) {
+            afatfs_findLastObject(op_kit_slot_dir, &op_object_finder);
+            op_phase = 15u;
+            return;
+        }
+        if (op_object.id.kind == AFATFS_OBJECT_FILE &&
+            filesystem_nameHasExtension(op_object.id.displayName, ".pat")) {
+            filesystem_copyLongComponent(
+                op_scene_pattern_open_name,
+                sizeof(op_scene_pattern_open_name),
+                op_object.id.displayName);
+            afatfs_findLastObject(op_kit_slot_dir, &op_object_finder);
+            op_phase = 15u;
+            return;
+        }
+        return;
+    }
+
+    case 15: /* CLOSE child directory handle */
+        op_close_done = false;
+        if (afatfs_fclose(op_kit_slot_dir, on_file_closed))
+            op_phase = 16u;
+        return;
+
+    case 16: /* WAIT close; open .pat if found */
+        if (!op_close_done)
+            return;
+        op_kit_slot_dir = NULL;
+        if (op_scene_pattern_open_name[0] == '\0') {
+            op_phase = 19u;
+            return;
+        }
+        op_file_ready = false;
+        op_file = NULL;
+        if (!afatfs_fopen_lfn(op_scene_pattern_open_name,
+                              "r", AFATFS_MATCH_CASE_INSENSITIVE,
+                              NULL, on_file_opened))
+            return;
+        op_phase = 17u;
+        return;
+
+    case 17: /* WAIT .pat open; seek past header */
+        if (!op_file_ready)
+            return;
+        if (!op_file) {
+            op_phase = 19u;
+            return;
+        }
+    {
+        afatfsOperationStatus_e seek = afatfs_fseek(
+            op_file, PATTERN_FILE_HEADER_BYTES, AFATFS_SEEK_SET);
+        if (seek == AFATFS_OPERATION_IN_PROGRESS)
+            return;
+        if (seek != AFATFS_OPERATION_SUCCESS) {
+            op_close_done = false;
+            if (afatfs_fclose(op_file, on_file_closed))
+                op_phase = 20u;
+            return;
+        }
+    }
+        op_item_offset = 0u;
+        op_phase = 18u;
+        return;
+
+    case 18: /* READ address array; test trigger bits */
+    {
+        uint32_t n;
+
+        if (op_item_offset >= PATTERN_FILE_ADDRESS_BYTES) {
+            op_close_done = false;
+            if (afatfs_fclose(op_file, on_file_closed))
+                op_phase = 20u;
+            return;
+        }
+        n = afatfs_fread(op_file, (uint8_t *)op_line_buf,
+                         (PATTERN_FILE_ADDRESS_BYTES - op_item_offset) <
+                             FS_TEXT_LINE_MAX
+                             ? (PATTERN_FILE_ADDRESS_BYTES - op_item_offset)
+                             : FS_TEXT_LINE_MAX);
+        if (n == 0u) {
+            /*
+             * End a read that can make no further progress (S082 review F4).
+             *
+             * What: zero bytes at end of file (a short or foreign `.pat`) or
+             * with the filesystem no longer ready closes the file with no
+             * content bit; otherwise zero means the sector is still arriving
+             * and the next poll retries. Why: the former bare return waited
+             * forever at EOF and held the facade BUSY.
+             */
+            if (afatfs_feof(op_file) ||
+                afatfs_getFilesystemState() != AFATFS_FILESYSTEM_STATE_READY) {
+                op_close_done = false;
+                if (afatfs_fclose(op_file, on_file_closed))
+                    op_phase = 20u;
+            }
+            return;
+        }
+        for (uint32_t i = 1u; i < n; i += 2u) {
+            if ((uint8_t)op_line_buf[i] & 0x80u) {
+                op_bank_child_content_mask =
+                    (uint16_t)(op_bank_child_content_mask |
+                               (uint16_t)(1u << op_bank_child_cursor));
+                op_close_done = false;
+                if (afatfs_fclose(op_file, on_file_closed))
+                    op_phase = 20u;
+                return;
+            }
+        }
+        op_item_offset = (uint16_t)(op_item_offset + (uint16_t)n);
+        return;
+    }
+
+    case 19: /* RETURN to Bank directory; advance cursor */
+    {
+        afatfsOperationStatus_e ast = afatfs_chdirParent();
+        if (ast == AFATFS_OPERATION_IN_PROGRESS)
+            return;
+        if (ast != AFATFS_OPERATION_SUCCESS) {
+            if (!afatfs_chdir(NULL))
+                return;
+            filesystem_finish(FS_STATUS_ERROR);
+            return;
+        }
+    }
+        op_bank_child_cursor++;
+        op_phase = 11u;
+        return;
+
+    case 20: /* WAIT .pat file close; then chdirParent */
+        if (!op_close_done)
+            return;
+        op_file = NULL;
+        op_phase = 19u;
         return;
 
     default:
@@ -16549,40 +17606,47 @@ static void filesystem_saveInstrument_tick(void)
                           op_instrument_save_source_slot),
                 display);
             /*
-             * Stage direct Instrument provenance before the HCNAMES merge.
+             * Instrument Save from Scene 17 renames its captured slot
+             * (S082 P1 R2).
              *
-             * What: marks the saved resident voice's row with the '@' source
-             * token and prepares the typed index rebuild that follows the
-             * durable register update. Why: the old path updated only the
-             * ephemeral identity/cache and never requested an Instrument
-             * HCNAMES publication. Inputs: captured resident Scene/slot and
-             * saved Instrument type. Outputs: one dirty source cell, one
-             * source witness, and a deferred index-chain request; no new
-             * SRAM. Affiliates: Instrument Load staging,
-             * filesystem_cacheCurrentResidentInstrumentNames(), and the
-             * FS_NAME_CACHE_INSTRUMENT rebuild branch.
+             * What: the resident path stages HCNAMES provenance as before;
+             * Scene 17 has no HCNAMES row, so the captured Instrument name of
+             * the saved slot takes the saved stem. op_kit_load_scene_mask is 0
+             * (explicitly, no longer a truncated shift).
+             * Why: the saved Instrument becomes Scene 17's identity for that
+             * slot (D29), and Kit/Scene Save from 17 then name the member
+             * file after it.
+             * Inputs: op_instrument_save_source_scene/slot, display.
+             * Outputs: capture row INSTRUMENT_0 + slot.
+             * Accessors: nested Instrument Save on 17.
+             * Affiliates: filesystem_backgroundNameSet(), the typed index
+             * rebuild that follows (unchanged).
              */
-            (void)filesystem_setResidentSource(
-                filesystem_residentInstrumentRow(
-                    op_instrument_save_source_scene,
-                    op_instrument_save_source_slot),
-                FS_RESIDENT_SOURCE_INSTRUMENT_DIRECT);
-            /* Phase C: the saved provenance word has two autosave payload
-             * bytes; pair this source-register mutation with its mask update.
-             */
-            autosave_markSourceDirty(
-                filesystem_residentInstrumentRow(
-                    op_instrument_save_source_scene,
-                    op_instrument_save_source_slot));
-            /* The streamed normal Instrument Save completed its payload
-             * boundary; retain the refresh witness until autosave captures it.
-             * Morph projection remains identity-neutral and is excluded. */
-            filesystem_setResidentRefreshed(
-                filesystem_residentInstrumentRow(
-                    op_instrument_save_source_scene,
-                    op_instrument_save_source_slot));
-            op_kit_load_scene_mask = (uint16_t)(1u <<
-                                                op_instrument_save_source_scene);
+            if (op_instrument_save_source_scene < SCENE_COUNT) {
+                (void)filesystem_setResidentSource(
+                    filesystem_residentInstrumentRow(
+                        op_instrument_save_source_scene,
+                        op_instrument_save_source_slot),
+                    FS_RESIDENT_SOURCE_INSTRUMENT_DIRECT);
+                autosave_markSourceDirty(
+                    filesystem_residentInstrumentRow(
+                        op_instrument_save_source_scene,
+                        op_instrument_save_source_slot));
+                filesystem_setResidentRefreshed(
+                    filesystem_residentInstrumentRow(
+                        op_instrument_save_source_scene,
+                        op_instrument_save_source_slot));
+                op_kit_load_scene_mask = (uint16_t)(1u <<
+                    op_instrument_save_source_scene);
+            } else {
+                if (op_instrument_save_source_scene == SCENE_BACKGROUND_INDEX &&
+                    scene_backgroundExists())
+                    filesystem_backgroundNameSet(
+                        (uint8_t)(FS_BACKGROUND_NAME_INSTRUMENT_0 +
+                                  op_instrument_save_source_slot),
+                        display);
+                op_kit_load_scene_mask = 0u;
+            }
             op_slot = op_instrument_save_source_slot;
             /* op_instrument_index_type is set unconditionally just below,
              * for both the morph and non-morph path; no need to set it here
@@ -16721,8 +17785,8 @@ static void filesystem_initSceneStage(filesystem_scene_stage_t *stage)
     memset(stage, 0, sizeof(*stage));
     scene_effectRecordDefaults(&stage->effect);
     for (track = 0u; track < NUM_TRACKS; track++) {
-        stage->settings.midi_channel[track] = (uint8_t)(track + 1u);
-        stage->settings.midi_note[track] = MIDI_DEFAULT_TRIGGER_NOTE;
+        stage->settings.midi_channel[track] = MIDI_CHANNEL_NONE;
+        stage->settings.midi_note[track] = 0u;
     }
     for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++) {
         /*
@@ -16990,10 +18054,23 @@ static void filesystem_makePatternChildFilename(char *dst, uint16_t capacity,
     if (!dst || capacity == 0u)
         return;
     dst[0] = '\0';
-    name = filesystem_cachedResidentName(
+    /*
+     * Pattern child stem for a resident Scene or Scene 17 (S082 P1 D29).
+     *
+     * What: the Pattern name row, else the Scene name row, else "pattern";
+     * index 16 reads both from the Scene 17 capture.
+     * Why: Scene Save from 17 must name its Pattern child after 17's identity,
+     * not the blank sentinel row.
+     * Inputs: scene_index. Outputs: name for the child filename.
+     * Accessors: filesystem_saveSceneDirectory_tick() case 29.
+     * Affiliates: filesystem_sceneComponentNameRaw().
+     */
+    name = filesystem_sceneComponentNameRaw(
+        scene_index, FS_BACKGROUND_NAME_PATTERN,
         filesystem_residentPatternRow(scene_index));
     if (filesystem_residentNameIsBlank(name)) {
-        name = filesystem_cachedResidentName(
+        name = filesystem_sceneComponentNameRaw(
+            scene_index, FS_BACKGROUND_NAME_SCENE,
             filesystem_residentSceneRow(scene_index));
     }
     if (filesystem_residentNameIsBlank(name))
@@ -17552,23 +18629,67 @@ static uint8_t filesystem_nextSettingsLine(char *dst, uint16_t cap,
         return filesystem_formatAssignmentU16Line(
             dst, cap, "qac", parameter_values[PAR_SCENE_QUEUE_ACTION]);
     case 24u:
+        /* S083 follow-up: SHIFT+REC overlay roll rhythm `pv<`. */
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "perf_vel_lt", parameter_values[PAR_PERF_VEL_LT]);
+    case 25u:
+        /* S083 follow-up: SHIFT+REC overlay roll rhythm `pv>`. */
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "perf_vel_rt", parameter_values[PAR_PERF_VEL_RT]);
+    case 26u:
         /*
          * Self-checking terminator for format expansion.
          *
-         * What: emits "lines=24\n" as the final line, where 24 is the count
-         * of preceding data lines (cases 0u..23u: 17 original + 4 overlay
-         * (S080 E10) + 3 scene globals (S080 F5, P2 Defect 5)). Why: gives
+         * What: emits "lines=26\n" as the final line, where 26 is the count
+         * of preceding data lines (cases 0u..25u: 17 original + 4 overlay
+         * (S080 E10) + 3 scene globals (S080 F5, P2 Defect 5) + 2 overlay
+         * roll rhythms (S083 follow-up; 24 before)). Why: gives
          * consumers a cheap completeness signal that distinguishes a genuine
          * end-of-file from a clean-but-early EOF after a crash. Adding a
          * settings key requires incrementing both its own case and this
          * declared count. The boot recovery prelude validates this count; the
-         * normal load path ignores it as an unknown key. Affiliates: §6 of
-         * S057_SETTINGS_WRITE_SAFE.md.
+         * normal load path ignores it as an unknown key. MIDI Learn rows are
+         * not settings lines: they live in midilrn.cfg (S083 §16). Affiliates:
+         * §6 of S057_SETTINGS_WRITE_SAFE.md.
          */
-        return filesystem_formatAssignmentU16Line(dst, cap, "lines", 24u);
+        return filesystem_formatAssignmentU16Line(dst, cap, "lines", 26u);
     default:
         return 0u;
     }
+}
+
+/*
+ * Stream one midilrn.cfg line (S083 §16).
+ *
+ * What: line 0 `format=helicase.midilearn`, line 1 `version=1`, then one
+ * `learn=` line per Learn row (midiLearn_formatFileLine(); an unresolvable
+ * row is a `#` comment so the count stays exact), then `lines=N` with
+ * N = 2 + rows, the terminator the boot recovery prelude checks. Inputs:
+ * op_write_line_index and the live Learn table. Rows are only appended or
+ * replaced in place at runtime, so a row learned mid-stream is either
+ * written now (the live count keeps `lines=` equal to the lines written) or
+ * by the follow-up write its request queued. Output: line length, 0 at the
+ * end. Size: at most 2 + 128 + 1 = 131 lines of <= ~60 characters
+ * (< FS_TEXT_LINE_MAX). Caller: filesystem_saveMidiLearn_tick() phase 2.
+ */
+static uint8_t filesystem_nextMidiLearnLine(char *dst, uint16_t cap,
+                                            void *raw)
+{
+    uint8_t rows = midiLearn_count();
+
+    (void)raw;
+    if (op_write_line_index == 0u)
+        return filesystem_formatLiteralLine(dst, cap,
+                                            "format=helicase.midilearn\n");
+    if (op_write_line_index == 1u)
+        return filesystem_formatLiteralLine(dst, cap, "version=1\n");
+    if (op_write_line_index < (uint16_t)(2u + rows))
+        return midiLearn_formatFileLine(
+            (uint8_t)(op_write_line_index - 2u), dst, cap);
+    if (op_write_line_index == (uint16_t)(2u + rows))
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "lines", (uint16_t)(2u + rows));
+    return 0u;
 }
 
 static uint8_t filesystem_nextKitsetLine(char *dst, uint16_t cap,
@@ -17786,6 +18907,9 @@ static uint8_t filesystem_pollPhaseStall(uint8_t phase,
                                          uint32_t *stall_ticks,
                                          uint32_t threshold_ticks)
 {
+    /* Idle-time ticks are invisible to the observer (S082 P2 fix 3). */
+    if (fs_stall_poll_uncounted)
+        return 0u;
     if (phase != *last_phase) {
         *last_phase = phase;
         *stall_ticks = 0u;
@@ -18439,55 +19563,57 @@ static void filesystem_saveKitDirectory_tick(void)
             filesystem_setIdentityName(FS_IDENTITY_KIT_ROW,
                                        preset_currentName);
             /*
-             * Stage the saved Kit's direct source and inherited members.
+             * Kit Save from Scene 17 renames its captured Kit (S082 P1 R2).
              *
-             * What: marks the saved Kit row direct to op_slot and its six
-             * Instrument rows inherited from that Kit before Menu's existing
-             * HCNAMES session-exit flush. Why: the LCD identity cache alone
-             * cannot change durable /.hcnames provenance. Inputs: saved root
-             * slot and source Scene. Outputs: seven dirty source cells; no
-             * file I/O. Affiliates: Kit Load staging and
-             * menu_endResidentNameScratchSession().
+             * What: resident sources write HCNAMES provenance as before; the
+             * Scene 17 source has no HCNAMES rows, so its captured Kit name
+             * takes the saved name instead.
+             * Why: the saved Kit becomes Scene 17's Kit identity, matching a
+             * resident Kit Save (D29).
+             * Inputs: op_kit_save_source_scene, preset_currentName.
+             * Outputs: resident provenance cells, or capture row KIT.
+             * Accessors: Kit Save completion.
+             * Affiliates: filesystem_backgroundNameSet(),
+             * filesystem_setIdentityName().
              */
-            (void)filesystem_setResidentSource(
-                filesystem_residentKitRow(op_kit_save_source_scene),
-                op_slot);
-            /* Phase C: mark the Kit source field immediately after staging its
-             * new root-library provenance so the next drain cannot retain the
-             * old source bytes. */
-            autosave_markSourceDirty(
-                filesystem_residentKitRow(op_kit_save_source_scene));
-            for (instrument_slot = 0u;
-                 instrument_slot < STORAGE_KIT_SLOT_COUNT;
-                 instrument_slot++) {
+            if (op_kit_save_source_scene < SCENE_COUNT) {
                 (void)filesystem_setResidentSource(
-                    filesystem_residentInstrumentRow(
-                        op_kit_save_source_scene, instrument_slot),
-                    FS_RESIDENT_SOURCE_INHERIT);
-                /* Each inherited member has its own two-byte source field. */
+                    filesystem_residentKitRow(op_kit_save_source_scene),
+                    op_slot);
                 autosave_markSourceDirty(
-                    filesystem_residentInstrumentRow(
-                        op_kit_save_source_scene, instrument_slot));
-            }
-            /* Normal Kit Save replaces the Kit payload and all six member
-             * Instrument payloads in this resident Scene. Mark those seven
-             * rows refreshed; the Scene settings row is not part of this save.
-             */
-            filesystem_setResidentRefreshed(
-                filesystem_residentKitRow(op_kit_save_source_scene));
-            for (instrument_slot = 0u;
-                 instrument_slot < STORAGE_KIT_SLOT_COUNT;
-                 instrument_slot++) {
+                    filesystem_residentKitRow(op_kit_save_source_scene));
+                for (instrument_slot = 0u;
+                     instrument_slot < STORAGE_KIT_SLOT_COUNT;
+                     instrument_slot++) {
+                    (void)filesystem_setResidentSource(
+                        filesystem_residentInstrumentRow(
+                            op_kit_save_source_scene, instrument_slot),
+                        FS_RESIDENT_SOURCE_INHERIT);
+                    autosave_markSourceDirty(
+                        filesystem_residentInstrumentRow(
+                            op_kit_save_source_scene, instrument_slot));
+                }
                 filesystem_setResidentRefreshed(
-                    filesystem_residentInstrumentRow(
-                        op_kit_save_source_scene, instrument_slot));
+                    filesystem_residentKitRow(op_kit_save_source_scene));
+                for (instrument_slot = 0u;
+                     instrument_slot < STORAGE_KIT_SLOT_COUNT;
+                     instrument_slot++) {
+                    filesystem_setResidentRefreshed(
+                        filesystem_residentInstrumentRow(
+                            op_kit_save_source_scene, instrument_slot));
+                }
+                autosaveTrace_record(
+                    AUTOSAVE_TRACE_STAGE_SAVE_LIFECYCLE,
+                    (AUTOSAVE_TRACE_SAVE_LIFECYCLE_CHECKPOINT_SOURCE_STAGED <<
+                     AUTOSAVE_TRACE_SAVE_LIFECYCLE_CHECKPOINT_SHIFT) |
+                    AUTOSAVE_TRACE_SAVE_LIFECYCLE_TYPE_KIT,
+                    (uint32_t)op_slot <<
+                        AUTOSAVE_TRACE_SAVE_LIFECYCLE_SLOT_SHIFT);
+            } else if (op_kit_save_source_scene == SCENE_BACKGROUND_INDEX &&
+                       scene_backgroundExists()) {
+                filesystem_backgroundNameSet(FS_BACKGROUND_NAME_KIT,
+                                             preset_currentName);
             }
-            autosaveTrace_record(
-                AUTOSAVE_TRACE_STAGE_SAVE_LIFECYCLE,
-                (AUTOSAVE_TRACE_SAVE_LIFECYCLE_CHECKPOINT_SOURCE_STAGED <<
-                 AUTOSAVE_TRACE_SAVE_LIFECYCLE_CHECKPOINT_SHIFT) |
-                AUTOSAVE_TRACE_SAVE_LIFECYCLE_TYPE_KIT,
-                (uint32_t)op_slot << AUTOSAVE_TRACE_SAVE_LIFECYCLE_SLOT_SHIFT);
         }
         /*
          * Defer successful completion until the boot-equivalent Kit rebuild
@@ -19016,9 +20142,127 @@ static void filesystem_saveBankDirectory_tick(void)
 
     case 6:
         op_close_done = false;
-        if (afatfs_fclose(op_kit_slot_dir, on_file_closed))
-            op_phase = 7u;
+        if (afatfs_fclose(op_kit_slot_dir, on_file_closed)) {
+            /*
+             * Route to the old-manifest reader when untouched children exist.
+             *
+             * What: if the save leaves some resident Scenes untouched and the
+             * Bank directory already existed, phase 61 reads its bankset.bcg to
+             * complete the untouched entries before the write at phase 7.
+             * Why: a Merge Save must know the old mask entries for untouched
+             * children so they can be restricted to exclude the written set.
+             * Inputs: written/empty masks, existing-dir flag.
+             * Outputs: phase 61 (read old manifest) or phase 7 (write new).
+             * Affiliates: phases 61-64, storage_banksetParseLineMasked().
+             */
+            if ((uint16_t)~(op_bank_save_written_mask |
+                            op_bank_scene_empty_mask) != 0u &&
+                (op_bank_existing_dir_found & FS_BANK_DIR_SCAN_MATCH_MASK) !=
+                    FS_BANK_DIR_SCAN_NONE)
+                op_phase = 61u;
+            else
+                op_phase = 7u;
+        }
         return;
+
+    /*
+     * Read the slot's existing manifest for a partial (Merge) Bank Save (S24).
+     *
+     * What: parses the existing bankset.bcg of the target Bank, keeps only the
+     * entries of children this save leaves untouched, and removes every written
+     * or removed Scene from them. A missing or malformed manifest counts as
+     * "every untouched entry = self".
+     * Why: the slot keeps those children as they are, but their masks must not
+     * point at children the save replaced (mutual exclusion, S12/S24).
+     * Inputs: op_bank_existing_dir_found, written/removed masks.
+     * Outputs: completed op_bankset_state; then the normal writer (phase 7).
+     * Buffers: op_line_buf and op_bankset_state (existing); no new storage (§0.4).
+     * Accessors: filesystem_saveBankDirectory_tick().
+     * Affiliates: storage_banksetParseLineMasked(), bank_mergeVoiceEditEntry().
+     */
+    case 61:
+        if (!op_close_done)
+            return;
+        op_kit_slot_dir = NULL;
+        op_file_ready = false;
+        op_file = NULL;
+        if (!afatfs_fopen_lfn(STORAGE_BANKSET_FILENAME,
+                              "r",
+                              AFATFS_MATCH_CASE_INSENSITIVE,
+                              NULL,
+                              on_file_opened)) {
+            return;
+        }
+        op_phase = 62u;
+        return;
+
+    case 62:
+        if (!op_file_ready)
+            return;
+        if (!op_file) {
+            op_phase = 64u;
+            return;
+        }
+        op_line_len = 0u;
+        op_phase = 63u;
+        return;
+
+    case 63:
+    {
+        uint8_t line_ready = 0u;
+        uint8_t eof = 0u;
+        storage_status_t st = filesystem_readTextLine(
+            op_file, op_line_buf, &op_line_len, sizeof(op_line_buf),
+            &line_ready, &eof);
+
+        if (st != STORAGE_STATUS_OK && st != STORAGE_STATUS_WAIT) {
+            op_close_done = false;
+            if (afatfs_fclose(op_file, on_file_closed))
+                op_phase = 64u;
+            return;
+        }
+        if (line_ready) {
+            (void)storage_banksetParseLineMasked(
+                &op_bankset_state, op_line_buf,
+                (uint16_t)(op_bank_save_written_mask |
+                           op_bank_scene_empty_mask));
+            op_line_len = 0u;
+        }
+        if (eof) {
+            op_close_done = false;
+            if (afatfs_fclose(op_file, on_file_closed))
+                op_phase = 64u;
+        }
+        return;
+    }
+
+    case 64:
+    {
+        if (!op_close_done)
+            return;
+        op_file = NULL;
+        {
+            uint8_t n;
+            uint16_t replaced =
+                (uint16_t)(op_bank_save_written_mask |
+                           op_bank_scene_empty_mask);
+            for (n = 0u; n < BANK_SCENE_SLOT_COUNT; n++) {
+                uint16_t bit = (uint16_t)(1u << n);
+                if (replaced & bit)
+                    continue;
+                if (op_bankset_state.seen_scene_mask_voice_edit & bit)
+                    op_bankset_state.scene_mask_voice_edit[n] =
+                        bank_mergeVoiceEditEntry(
+                            op_bankset_state.scene_mask_voice_edit[n],
+                            (uint16_t)~replaced, n);
+                else
+                    op_bankset_state.scene_mask_voice_edit[n] = bit;
+                op_bankset_state.seen_scene_mask_voice_edit |= bit;
+            }
+        }
+        op_phase = 7u;
+        return;
+    }
 
     case 7:
         if (!op_close_done)
@@ -19062,10 +20306,29 @@ static void filesystem_saveBankDirectory_tick(void)
         return;
 
     case 11:
+    {
+        /*
+         * Enter the per-child loop over written and removed children (S3, S7).
+         *
+         * What: the visit mask includes both written children (op_bank_scene_save_mask)
+         * and removed children (op_bank_scene_empty_mask). A removed child runs only
+         * the existing exact-object delete (phases 20-21) and advances; a written child
+         * continues to the Scene writer as before.
+         * Why: "saved empty" means the child folder no longer exists in the slot (S3);
+         * reusing the per-child delete keeps one delete path and the handle census.
+         * Inputs: op_bank_scene_save_mask, op_bank_scene_empty_mask.
+         * Outputs: per-child delete/write or delete-only; phase 12 cursor advance.
+         * Accessors: filesystem_saveBankDirectory_tick().
+         * Affiliates: filesystem_deleteBankChildSlotDirectoryStart(),
+         * filesystem_deleteSlotDirectory_tick(), afatfs_countOpenHandles() census.
+         */
+        uint16_t visit_mask =
+            (uint16_t)(op_bank_scene_save_mask | op_bank_scene_empty_mask);
+
         if (!op_close_done)
             return;
         op_file = NULL;
-        if (op_bank_scene_save_mask == 0u) {
+        if (visit_mask == 0u) {
             if (!afatfs_chdir(NULL))
                 return;
             op_phase = 45u;
@@ -19074,32 +20337,26 @@ static void filesystem_saveBankDirectory_tick(void)
         for (op_bank_child_cursor = 0u;
              op_bank_child_cursor < STORAGE_BANK_SCENE_MAX_SLOTS;
              op_bank_child_cursor++) {
-            if ((op_bank_scene_save_mask &
+            if ((visit_mask &
                  (uint16_t)(1u << op_bank_child_cursor)) != 0u) {
-                /*
-                 * Safe-replace one selected Scene child in the Bank folder.
-                 *
-                 * Input: op_bank_child_cursor is both resident Scene index and
-                 * two-digit Bank-local child number. Output: phase 20 prepares
-                 * the per-child Scene writer, deletes any existing child at
-                 * this slot (phases 20-21), then delegates to the Scene payload
-                 * writer (phase 22). Non-masked children are never touched.
-                 */
                 op_phase = 20u;
                 return;
             }
         }
         filesystem_finish(FS_STATUS_ERROR);
         return;
+    }
 
     case 12:
     {
         uint8_t child_slot;
+        uint16_t visit_mask =
+            (uint16_t)(op_bank_scene_save_mask | op_bank_scene_empty_mask);
 
         for (child_slot = (uint8_t)(op_bank_child_cursor + 1u);
              child_slot < STORAGE_BANK_SCENE_MAX_SLOTS;
              child_slot++) {
-            if ((op_bank_scene_save_mask &
+            if ((visit_mask &
                  (uint16_t)(1u << child_slot)) != 0u) {
                 op_bank_child_cursor = child_slot;
                 /*
@@ -19203,19 +20460,20 @@ static void filesystem_saveBankDirectory_tick(void)
     {
         /*
          * Prepare one Bank-local child and delete any existing child at this
-         * slot before writing the replacement.
+         * slot before writing the replacement, or remove a child saved empty.
          *
          * Inputs: current directory is the Bank directory and
          * op_bank_child_cursor selects the resident Scene slot. Output:
-         * prepareBankSceneSaveSource() captures the `SS Name` child directory
-         * display name, then filesystem_deleteBankChildSlotDirectoryStart()
-         * initiates a scan+delete of any existing child directory at the same
-         * two-digit slot. Phase 21 waits for the delete to complete before
-         * phase 22 enters the Scene writer to create the replacement child.
+         * for a written child, prepareBankSceneSaveSource() captures the
+         * `SS Name` child directory display name, then
+         * filesystem_deleteBankChildSlotDirectoryStart() initiates a
+         * scan+delete of any existing child directory at the same two-digit
+         * slot; for a removed child (in op_bank_scene_empty_mask), only the
+         * delete runs — phase 21 routes back to phase 12 instead of the
+         * Scene writer.
          * Why: per-child delete-then-write replaces the old total-tree-delete
-         * that destroyed ALL children including non-masked ones. Each child is
-         * independently deleted and rewritten, so a failure affects only that
-         * one child, not the entire Bank. Affiliates:
+         * that destroyed ALL children including non-masked ones. A removed
+         * child reuses the same delete path and handle census. Affiliates:
          * filesystem_prepareBankSceneSaveSource(),
          * filesystem_deleteBankChildSlotDirectoryStart(),
          * filesystem_deleteSlotDirectory_tick().
@@ -19246,6 +20504,12 @@ static void filesystem_saveBankDirectory_tick(void)
             }
         }
 
+        if (op_bank_scene_empty_mask &
+            (uint16_t)(1u << op_bank_child_cursor)) {
+            filesystem_deleteBankChildSlotDirectoryStart(op_bank_child_cursor);
+            op_phase = 21u;
+            return;
+        }
         if (!filesystem_prepareBankSceneSaveSource(op_bank_child_cursor)) {
             filesystem_finish(FS_STATUS_ERROR);
             return;
@@ -19265,10 +20529,9 @@ static void filesystem_saveBankDirectory_tick(void)
          * Inputs: filesystem_deleteBankChildSlotDirectoryStart() armed the
          * scanner at phase 20. Outputs: FS_STATUS_DONE when no match was found
          * or the match was successfully deleted; FS_STATUS_ERROR on scan or
-         * delete failure. Why: the old child must be removed before the Scene
-         * writer's mkdir_lfn at phase 8 can create a clean replacement
-         * directory at the same name. A delete failure is fatal for this child
-         * and the Bank Save. Affiliates: filesystem_deleteSlotDirectory_tick(),
+         * delete failure. A removal bit (op_bank_scene_empty_mask) advances
+         * directly to phase 12; a write bit continues to phase 22.
+         * Affiliates: filesystem_deleteSlotDirectory_tick(),
          * filesystem_bankChildObjectMatchesSlot().
          */
         fs_status_t delete_status = filesystem_deleteSlotDirectory_tick();
@@ -19276,6 +20539,11 @@ static void filesystem_saveBankDirectory_tick(void)
             return;
         if (delete_status == FS_STATUS_ERROR) {
             filesystem_finish(FS_STATUS_ERROR);
+            return;
+        }
+        if (op_bank_scene_empty_mask &
+            (uint16_t)(1u << op_bank_child_cursor)) {
+            op_phase = 12u;
             return;
         }
         op_phase = 22u;
@@ -19308,70 +20576,78 @@ static void filesystem_saveBankDirectory_tick(void)
         return;
 
     case 45:
-        /* The final directory is already openable through its captured alias. */
+    {
+        /*
+         * Bank Save publishes the slot, never changes the resident Bank (S4, S22, S25).
+         *
+         * What: the saved slot becomes the boot Bank (row 0, active_bank, display
+         * name); written Scenes inherit from it; resident Scenes not written keep
+         * explicit provenance (`b<old Bank>`, a direct slot, `@`, `?`); presence, the
+         * active Scene and the RAM edit masks are untouched.
+         * Why: the former phase applied the staged slot manifest back into RAM (active
+         * slot and masks) and OR-ed presence - harmless for a full save, wrong for a
+         * Merge whose slot masks describe untouched card children.
+         * Inputs: op_slot, written/removed masks, old row-0 source.
+         * Outputs: BankData identity/restore slot, staged HCNAMES sources.
+         * Accessors: filesystem_saveBankDirectory_tick().
+         * Affiliates: filesystem_stageKeptSceneSources(), filesystem_setResidentSource(),
+         * bank_invalidateSdCleanScene().
+         */
+        uint16_t old_bank_source;
+        uint16_t present = bank_scenePresentMask();
+        uint16_t kept;
+
         if (!afatfs_chdir(NULL))
             return;
-        /* Update only an actually retained slot-ordered Bank cache. If another
-         * cache domain replaced it, leave that storage untouched and let the
-         * mandatory phase-86 physical-scan fallback reconstruct Bank rows. */
         if (fs_list_cache_kind == FS_NAME_CACHE_BANK &&
             fs_list_cache_count == STORAGE_BANK_MAX_SLOTS) {
             filesystem_recordSavedBankDirectory(op_save_bank_dir_display_name,
                                                 op_save_bank_dir_open_name);
         }
         bank_setDisplayName(op_bank_display_name);
-        bank_setScenePresentMask((uint16_t)(bank_scenePresentMask() |
-                                             op_bank_scene_save_mask));
-        bank_selectActiveSceneForEditMask(op_bank_active_scene);
-        /* Restore each parsed Bank-local Scene mask independently. */
-        {
-            uint8_t mask_i;
-            for (mask_i = 0u; mask_i < BANK_SCENE_SLOT_COUNT; mask_i++) {
-                if (op_bankset_state.seen_scene_mask_voice_edit &
-                    (uint16_t)(1u << mask_i))
-                    bank_setSceneMaskVoiceEditForScene(
-                        mask_i,
-                        op_bankset_state.scene_mask_voice_edit[mask_i]);
-            }
-        }
         bank_setRestoreBankSlot(op_slot);
-        /*
-         * Persist the boot-restore Bank selected by a successful Bank Save.
-         *
-         * Inputs: the committed restore slot above. Output: the existing
-         * debounced settings writer re-emits active_bank later; this call
-         * opens no file. Why: Bank Save changes the same boot-selection
-         * authority as Bank Load, so the two paths must remain symmetric.
-         * Affiliates: filesystem_settingsWriterSchedule_tick() and
-         * filesystem_nextSettingsLine().
-         */
         filesystem_markSettingsDirty();
         bank_setHasResidentBank(1u);
-        /*
-         * The newly-created final root folder is the authoritative Bank identity.
-         * Update only row zero in the already-read register; selected Scene,
-         * Kit, and Instrument rows were copied from HCNAMES into the just
-         * written Bank tree and remain unchanged in resident memory.
-        */
-        /* The mirror now diverges from the last closed HCNAMES image. Invalidate
-         * it before overlaying row zero and before the write-capable open, so a
-         * reset/error cannot publish the intended-but-uncommitted name image. */
+
+        old_bank_source = filesystem_residentSource(FS_IDENTITY_BANK_ROW);
+
         hcnames_mirror_valid = FS_HCNAMES_MIRROR_INVALID;
         filesystem_cacheResidentName(0u, op_bank_display_name);
-        /*
-         * Stage the newly committed Bank's direct root provenance.
-         *
-         * What: marks HCNAMES row zero direct to the saved root slot before
-         * phase 85 streams the already-read register back to disk. Why: the
-         * direct Bank writer otherwise preserves the prior row-zero source.
-         * Inputs: op_slot, the final numbered Bank directory. Output: one
-         * dirty source cell and one lifecycle witness; no new storage or I/O.
-         * Affiliates: Bank Load's symmetric staging and phase 85.
-         */
         (void)filesystem_setResidentSource(FS_IDENTITY_BANK_ROW, op_slot);
-        /* The saved Bank identity is a refreshed row-zero object; its witness
-         * is cleared only by the post-autosave HCNAMES publication boundary. */
         filesystem_setResidentRefreshed(FS_IDENTITY_BANK_ROW);
+
+        {
+            uint8_t n;
+            for (n = 0u; n < BANK_SCENE_SLOT_COUNT; n++) {
+                uint16_t bit = (uint16_t)(1u << n);
+                if (op_bank_save_written_mask & bit)
+                    (void)filesystem_setResidentSource(
+                        filesystem_residentSceneRow(n),
+                        FS_RESIDENT_SOURCE_INHERIT);
+            }
+        }
+
+        /*
+         * Resident Scenes not written keep their own provenance even when
+         * their slot child is removed: the RAM content still exists, and the
+         * new row 0 belongs to the target Bank. Only non-present resident
+         * Scenes become an explicit empty row below.
+         */
+        kept = (uint16_t)(~op_bank_save_written_mask & present);
+        if (kept)
+            filesystem_stageKeptSceneSources(kept, old_bank_source);
+
+        {
+            uint8_t n;
+            for (n = 0u; n < BANK_SCENE_SLOT_COUNT; n++) {
+                if (op_bank_scene_empty_mask & (uint16_t)(1u << n)) {
+                    if (!(present & (uint16_t)(1u << n)))
+                        filesystem_stageEmptySceneRows(n);
+                    bank_invalidateSdCleanScene(n);
+                }
+            }
+        }
+
         autosaveTrace_record(
             AUTOSAVE_TRACE_STAGE_SAVE_LIFECYCLE,
             (AUTOSAVE_TRACE_SAVE_LIFECYCLE_CHECKPOINT_SOURCE_STAGED <<
@@ -19380,6 +20656,7 @@ static void filesystem_saveBankDirectory_tick(void)
             (uint32_t)op_slot << AUTOSAVE_TRACE_SAVE_LIFECYCLE_SLOT_SHIFT);
         op_phase = 83u;
         return;
+    }
 
     case 83: /* OPEN ROOT HCNAMES FOR DIRECT-REPLACEMENT REGISTER WRITE */
         /* Defensive repetition of phase 45's validity transition: every entry
@@ -20147,14 +21424,23 @@ static void filesystem_saveSceneDirectory_tick(void)
         op_file_ready = false;
         op_file = NULL;
         {
-            const char *fx_stem = filesystem_cachedResidentName(
+            /*
+             * Effect stem for a resident Scene or Scene 17 (S082 P1 D29).
+             *
+             * What: the Effect name row of the source Scene; index 16 reads
+             * the Scene 17 capture. Why: Scene Save from 17 must name its
+             * `.fx` child after 17's Effect, not the blank sentinel row.
+             * Inputs: op_kit_save_source_scene. Outputs: fx_stem.
+             * Accessors: Scene Save Effect child open.
+             * Affiliates: filesystem_sceneComponentNameRaw().
+             */
+            const char *fx_stem = filesystem_sceneComponentNameRaw(
+                op_kit_save_source_scene, FS_BACKGROUND_NAME_EFFECT,
                 filesystem_residentEffectRow(op_kit_save_source_scene));
             uint8_t blank = filesystem_residentNameIsBlank(fx_stem);
 
             storage_makeSavedEffectDisplayFilename(
                 op_scene_effect_open_name, sizeof(op_scene_effect_open_name),
-                /* A blank HCNAMES row may be cached as NUL bytes; explicit
-                 * spaces produce the blank-name file instead of `inst`. */
                 blank ? "        " : fx_stem);
             if (blank) {
                 memset(op_effect_display_name, ' ',
@@ -20246,68 +21532,87 @@ static void filesystem_saveSceneDirectory_tick(void)
              * scan, complete index rewrite, and final flush are durable. This
              * replaces the removed scene_t display-name mirror.
              */
-            op_scene_load_scene_mask =
-                (uint16_t)(1u << op_kit_save_source_scene);
+            /*
+             * Resident Scene rows only (S082 P1 D29): Scene 17 publishes no
+             * HCNAMES row; an explicit 0 replaces the truncated 1u << 16.
+             */
+            op_scene_load_scene_mask = (op_kit_save_source_scene < SCENE_COUNT)
+                ? (uint16_t)(1u << op_kit_save_source_scene) : 0u;
             op_library_index_rebuild_kind = FS_NAME_CACHE_SCENE;
             op_library_index_rebuild_pending = 1u;
             /*
-             * Stage the direct Scene source before the HCNAMES read/merge.
+             * Scene Save from Scene 17 renames its captured Scene (S082 P1 R2).
              *
-             * What: marks the saved Scene direct to op_slot and its embedded
-             * Kit/Instrument rows inherited. Why: the immediately following
-             * register read must preserve the new provenance over the old
-             * on-card values. Inputs: saved root slot/source Scene. Outputs:
-             * dirty source cells and one SOURCE_STAGED trace; no file I/O.
-             * Affiliates: Scene Load's equivalent staging and the shared
-             * HCNAMES updater.
+             * What: Scene 17 has no HCNAMES rows; its captured Scene name takes
+             * the saved name. Kit, Instrument, Pattern and Effect names are
+             * written from the capture and keep their values.
+             * Why: the saved Scene becomes Scene 17's identity (D15, D29).
+             * Inputs: op_kit_save_source_scene, op_scene_display_name.
+             * Outputs: capture row SCENE.
+             * Accessors: Scene Save from 17.
+             * Affiliates: filesystem_backgroundNameSet().
              */
-            (void)filesystem_setResidentSource(
-                filesystem_residentSceneRow(op_kit_save_source_scene),
-                op_slot);
-            /* Phase C: the Scene Save changes all three identity layers; its
-             * source bytes are marked beside the source-register staging. */
-            autosave_markSourceDirty(
-                filesystem_residentSceneRow(op_kit_save_source_scene));
-            (void)filesystem_setResidentSource(
-                filesystem_residentKitRow(op_kit_save_source_scene),
-                FS_RESIDENT_SOURCE_INHERIT);
-            autosave_markSourceDirty(
-                filesystem_residentKitRow(op_kit_save_source_scene));
-            {
-                uint8_t instrument_slot;
-                for (instrument_slot = 0u;
-                     instrument_slot < STORAGE_KIT_SLOT_COUNT;
-                     instrument_slot++) {
-                    (void)filesystem_setResidentSource(
-                        filesystem_residentInstrumentRow(
-                            op_kit_save_source_scene, instrument_slot),
-                        FS_RESIDENT_SOURCE_INHERIT);
-                    autosave_markSourceDirty(
-                        filesystem_residentInstrumentRow(
-                            op_kit_save_source_scene, instrument_slot));
+            if (op_kit_save_source_scene < SCENE_COUNT) {
+                (void)filesystem_setResidentSource(
+                    filesystem_residentSceneRow(op_kit_save_source_scene),
+                    op_slot);
+                autosave_markSourceDirty(
+                    filesystem_residentSceneRow(op_kit_save_source_scene));
+                (void)filesystem_setResidentSource(
+                    filesystem_residentKitRow(op_kit_save_source_scene),
+                    FS_RESIDENT_SOURCE_INHERIT);
+                autosave_markSourceDirty(
+                    filesystem_residentKitRow(op_kit_save_source_scene));
+                {
+                    uint8_t instrument_slot;
+                    for (instrument_slot = 0u;
+                         instrument_slot < STORAGE_KIT_SLOT_COUNT;
+                         instrument_slot++) {
+                        (void)filesystem_setResidentSource(
+                            filesystem_residentInstrumentRow(
+                                op_kit_save_source_scene, instrument_slot),
+                            FS_RESIDENT_SOURCE_INHERIT);
+                        autosave_markSourceDirty(
+                            filesystem_residentInstrumentRow(
+                                op_kit_save_source_scene, instrument_slot));
+                    }
                 }
+                (void)filesystem_setResidentSource(
+                    filesystem_residentEffectRow(op_kit_save_source_scene),
+                    FS_RESIDENT_SOURCE_INHERIT);
+                autosave_markSourceDirty(
+                    filesystem_residentEffectRow(op_kit_save_source_scene));
+                (void)filesystem_setResidentSource(
+                    filesystem_residentPatternRow(op_kit_save_source_scene),
+                    op_pattern_source);
+                filesystem_setResidentSceneRefreshed(op_kit_save_source_scene);
+                autosaveTrace_record(
+                    AUTOSAVE_TRACE_STAGE_SAVE_LIFECYCLE,
+                    (AUTOSAVE_TRACE_SAVE_LIFECYCLE_CHECKPOINT_SOURCE_STAGED <<
+                     AUTOSAVE_TRACE_SAVE_LIFECYCLE_CHECKPOINT_SHIFT) |
+                    AUTOSAVE_TRACE_SAVE_LIFECYCLE_TYPE_SCENE,
+                    (uint32_t)op_slot <<
+                        AUTOSAVE_TRACE_SAVE_LIFECYCLE_SLOT_SHIFT);
+            } else if (op_kit_save_source_scene == SCENE_BACKGROUND_INDEX &&
+                       scene_backgroundExists()) {
+                filesystem_backgroundNameSet(FS_BACKGROUND_NAME_SCENE,
+                                             op_scene_display_name);
             }
-            /* Scene Save replaces the Scene payload, embedded Kit hierarchy,
-             * named Effect child, and named Pattern child. Stage both child
-             * sources in the expanded 161-row HCNAMES register; Pattern
-             * payload bytes remain outside the fixed scalar AutoSave payload
-             * and are handled by the separate Pattern AutoSave file.
+            /*
+             * Prepare the register for the HCNAMES update on both paths
+             * (S082 P1 assessment A4).
+             *
+             * What: clears and invalidates the mirror before the update op
+             * re-reads it, for a resident source and for Scene 17 alike.
+             * Why: the update always runs next (Scene 17 with a zero mask), and
+             * every HCNAMES request follows the F9 ordering rule: the reset
+             * runs only once the operation owns the facade, immediately before
+             * its read. Skipping it for Scene 17 left a VALID mirror being
+             * overwritten in place by the read.
+             * Inputs: none. Outputs: hcnames_name_mirror invalid until the read
+             * completes.
+             * Affiliates: FS_INTERNAL_OP_UPDATE_HCNAMES_SCENE below.
              */
-            (void)filesystem_setResidentSource(
-                filesystem_residentEffectRow(op_kit_save_source_scene),
-                FS_RESIDENT_SOURCE_INHERIT);
-            autosave_markSourceDirty(
-                filesystem_residentEffectRow(op_kit_save_source_scene));
-            (void)filesystem_setResidentSource(
-                filesystem_residentPatternRow(op_kit_save_source_scene),
-                op_pattern_source);
-            filesystem_setResidentSceneRefreshed(op_kit_save_source_scene);
-            autosaveTrace_record(
-                AUTOSAVE_TRACE_STAGE_SAVE_LIFECYCLE,
-                (AUTOSAVE_TRACE_SAVE_LIFECYCLE_CHECKPOINT_SOURCE_STAGED <<
-                 AUTOSAVE_TRACE_SAVE_LIFECYCLE_CHECKPOINT_SHIFT) |
-                AUTOSAVE_TRACE_SAVE_LIFECYCLE_TYPE_SCENE,
-                (uint32_t)op_slot << AUTOSAVE_TRACE_SAVE_LIFECYCLE_SLOT_SHIFT);
             filesystem_prepareResidentNamesCache();
             autosaveTrace_record(
                 AUTOSAVE_TRACE_STAGE_SAVE_LIFECYCLE,
@@ -20378,14 +21683,23 @@ static void filesystem_saveSceneDirectory_tick(void)
         op_file = NULL;
         op_file_ready = false;
         {
-            const char *fx_stem = filesystem_cachedResidentName(
+            /*
+             * Effect stem for a resident Scene or Scene 17 (S082 P1 D29).
+             *
+             * What: the Effect name row of the source Scene; index 16 reads
+             * the Scene 17 capture. Why: Scene Save from 17 must name its
+             * `.fx` child after 17's Effect, not the blank sentinel row.
+             * Inputs: op_kit_save_source_scene. Outputs: fx_stem.
+             * Accessors: Scene Save Effect child open.
+             * Affiliates: filesystem_sceneComponentNameRaw().
+             */
+            const char *fx_stem = filesystem_sceneComponentNameRaw(
+                op_kit_save_source_scene, FS_BACKGROUND_NAME_EFFECT,
                 filesystem_residentEffectRow(op_kit_save_source_scene));
             uint8_t blank = filesystem_residentNameIsBlank(fx_stem);
 
             storage_makeSavedEffectDisplayFilename(
                 op_scene_effect_open_name, sizeof(op_scene_effect_open_name),
-                /* A blank HCNAMES row may be cached as NUL bytes; explicit
-                 * spaces produce the blank-name file instead of `inst`. */
                 blank ? "        " : fx_stem);
             if (blank) {
                 memset(op_effect_display_name, ' ',
@@ -20938,6 +22252,392 @@ static void filesystem_saveGlobals_tick(void)
          * filesystem_complete() where the revision acknowledgment clears
          * fs_settings_dirty if no newer mutation arrived during the write.
          */
+        filesystem_finish(FS_STATUS_DONE);
+        return;
+
+    default:
+        filesystem_finish(FS_STATUS_ERROR);
+        return;
+    }
+}
+
+/* -----------------------------------------------------------------------
+** LOAD MIDI LEARN state machine (S083 §16) — boot-only, with recovery.
+**
+** What: restores the device-wide MIDI Learn table from midilrn.cfg in the
+** card root. Pass A (phases 0-8) mirrors the settings.cfg prelude: a
+** leftover midilrn.tmp (an interrupted safe write) is read and validated
+** (no format/version error, last line `lines=N` with N == lines - 1), then
+** promoted (remove old midilrn.cfg, rename) or discarded (remove the tmp).
+** Pass B (phases 10-14) empties the table and reads midilrn.cfg. A missing
+** file is an empty table (a card has none until its first Learn);
+** malformed rows are skipped by the parser; a wrong format/version line
+** empties the table and stops reading; a read error (e.g. an over-long
+** hand-edited line) keeps the rows read so far. Completion is always DONE:
+** a Learn file problem must never fail the boot ladder.
+**
+** Why: Learn rows moved out of settings.cfg so each Learn can be written at
+** once without rewriting settings.cfg. Inputs: the card root. Outputs: the
+** Learn table (midiLearn_clearAll() + midiLearn_parseFileValue()), one
+** DEV_MODE_LOGGING `m` record per decision. Scratch: the four
+** op_settings_recovery_* bytes (Pass B: valid = format flag, line_count =
+** lines read, saturating). Caller: main.c boot ladder via
+** filesystem_requestLoadMidiLearn(), right after the settings.cfg load,
+** before audio. Affiliates: filesystem_parseMidiLearnLine(),
+** filesystem_isSettingsTerminatorLine(), filesystem_saveMidiLearn_tick().
+** ----------------------------------------------------------------------- */
+#if DEV_MODE_LOGGING
+static void filesystem_traceMidiLearnRecovery(uint8_t outcome)
+{
+    /* `m` 0x02: outcome | lines << 8 | N << 16 | terminator seen << 24. */
+    autosaveTrace_record(AUTOSAVE_TRACE_STAGE_MIDI_LEARN_FILE,
+                         AUTOSAVE_TRACE_MLRN_RECOVERY,
+                         (uint32_t)outcome |
+                         ((uint32_t)op_settings_recovery_line_count << 8u) |
+                         ((uint32_t)op_settings_recovery_terminator_n << 16u) |
+                         ((uint32_t)op_settings_recovery_terminator_seen << 24u));
+}
+
+static void filesystem_traceMidiLearnLoad(uint8_t present, uint8_t result)
+{
+    /* `m` 0x03: rows | present << 8 | result << 16 | lines read << 24. */
+    autosaveTrace_record(AUTOSAVE_TRACE_STAGE_MIDI_LEARN_FILE,
+                         AUTOSAVE_TRACE_MLRN_LOAD,
+                         (uint32_t)midiLearn_count() |
+                         ((uint32_t)present << 8u) |
+                         ((uint32_t)result << 16u) |
+                         ((uint32_t)op_settings_recovery_line_count << 24u));
+}
+#endif
+
+static void filesystem_loadMidiLearn_tick(void)
+{
+    uint8_t line_ready;
+    uint8_t eof;
+    storage_status_t st;
+
+    switch (op_phase) {
+
+    /* Pass A — midilrn.tmp discovery and resolution. */
+    case 0: /* OPEN_TEMP */
+        op_file_ready = false;
+        op_file = NULL;
+        if (!afatfs_fopen(STORAGE_MIDILEARN_TEMP_FILENAME, "r", on_file_opened))
+            return;
+        op_phase = 1;
+        return;
+
+    case 1: /* WAIT_OPEN_TEMP — no temp file is the common case */
+        if (!op_file_ready) return;
+        if (op_file == NULL) {
+            op_phase = 10;
+            return;
+        }
+        op_settings_recovery_valid = 1u;
+        op_settings_recovery_line_count = 0u;
+        op_settings_recovery_terminator_n = 0u;
+        op_settings_recovery_terminator_seen = 0u;
+        op_line_len = 0u;
+        op_phase = 2;
+        return;
+
+    case 2: /* READ_VALIDATE_TEMP */
+        st = filesystem_readTextLine(op_file, op_line_buf, &op_line_len,
+                                     sizeof(op_line_buf), &line_ready, &eof);
+        if (st == STORAGE_STATUS_WAIT)
+            return;
+        if (st != STORAGE_STATUS_OK) {
+            op_settings_recovery_valid = 0u;
+            op_phase = 3;
+            return;
+        }
+        if (line_ready) {
+            /* Saturate: a valid file has at most 131 lines. */
+            if (op_settings_recovery_line_count < 0xFFu)
+                op_settings_recovery_line_count++;
+            op_settings_recovery_terminator_seen =
+                filesystem_isSettingsTerminatorLine(
+                    op_line_buf, &op_settings_recovery_terminator_n);
+            /* Rows applied here are discarded: Pass B clears the table. */
+            if (filesystem_parseMidiLearnLine(op_line_buf) != FS_STATUS_DONE)
+                op_settings_recovery_valid = 0u;
+            return;
+        }
+        if (eof) {
+            if (!op_settings_recovery_valid ||
+                !op_settings_recovery_terminator_seen ||
+                op_settings_recovery_terminator_n !=
+                    (uint8_t)(op_settings_recovery_line_count - 1u)) {
+                op_settings_recovery_valid = 0u;
+            }
+            op_phase = 3;
+        }
+        return;
+
+    case 3: /* CLOSE_TEMP */
+        op_close_done = false;
+        if (afatfs_fclose(op_file, on_file_closed))
+            op_phase = 4;
+        return;
+
+    case 4: /* WAIT_CLOSE_TEMP */
+        if (!op_close_done) return;
+        op_phase = 5;
+        return;
+
+    case 5: /* REMOVE — old midilrn.cfg (promote) or the invalid tmp (discard) */
+        op_remove_done = 0u;
+        op_remove_result = AFATFS_RESULT_OK;
+        if (!afatfs_removeObjects_lfn(
+                op_settings_recovery_valid
+                    ? STORAGE_MIDILEARN_FILENAME
+                    : STORAGE_MIDILEARN_TEMP_FILENAME,
+                AFATFS_MATCH_CASE_INSENSITIVE,
+                AFATFS_REMOVE_FILES_ONLY,
+                on_remove_complete))
+            return;
+        op_phase = 6;
+        return;
+
+    case 6: /* WAIT_REMOVE */
+        if (!op_remove_done) return;
+        if (op_settings_recovery_valid &&
+            op_remove_result == AFATFS_RESULT_OK) {
+            op_phase = 7;
+            return;
+        }
+        /*
+         * Discard path, or a promote whose remove failed: midilrn.cfg (if
+         * any) is untouched and loads in Pass B; a kept tmp is retried at
+         * the next boot.
+         */
+#if DEV_MODE_LOGGING
+        filesystem_traceMidiLearnRecovery(op_settings_recovery_valid ? 3u : 2u);
+#endif
+        op_phase = 10;
+        return;
+
+    case 7: /* RENAME midilrn.tmp -> midilrn.cfg */
+        op_rename_done = 0u;
+        op_rename_result = AFATFS_RESULT_OK;
+        memset(op_repair_rename_open_name, 0,
+               sizeof(op_repair_rename_open_name));
+        if (!afatfs_renameObject_lfn(STORAGE_MIDILEARN_TEMP_FILENAME,
+                                     STORAGE_MIDILEARN_FILENAME,
+                                     AFATFS_MATCH_CASE_INSENSITIVE,
+                                     op_repair_rename_open_name,
+                                     on_rename_complete))
+            return;
+        op_phase = 8;
+        return;
+
+    case 8: /* WAIT_RENAME — on failure Pass B finds no file; tmp kept */
+        if (!op_rename_done) return;
+#if DEV_MODE_LOGGING
+        filesystem_traceMidiLearnRecovery(
+            op_rename_result == AFATFS_RESULT_OK ? 1u : 4u);
+#endif
+        op_phase = 10;
+        return;
+
+    /* Pass B — midilrn.cfg load. */
+    case 10: /* CLEAR + OPEN */
+        midiLearn_clearAll();
+        op_settings_recovery_valid = 1u;
+        op_settings_recovery_line_count = 0u;
+        op_file_ready = false;
+        op_file = NULL;
+        op_line_len = 0u;
+        if (!afatfs_fopen(STORAGE_MIDILEARN_FILENAME, "r", on_file_opened))
+            return;
+        op_phase = 11;
+        return;
+
+    case 11: /* WAIT_OPEN — no file: empty table */
+        if (!op_file_ready) return;
+        if (op_file == NULL) {
+#if DEV_MODE_LOGGING
+            filesystem_traceMidiLearnLoad(0u, 0u);
+#endif
+            filesystem_finish(FS_STATUS_DONE);
+            return;
+        }
+        op_close_status = FS_STATUS_DONE;
+        op_phase = 12;
+        return;
+
+    case 12: /* READ LINES */
+        st = filesystem_readTextLine(op_file, op_line_buf, &op_line_len,
+                                     sizeof(op_line_buf), &line_ready, &eof);
+        if (st == STORAGE_STATUS_WAIT)
+            return;
+        if (st != STORAGE_STATUS_OK) {
+            /* Keep the rows read so far; result 2 in the trace. */
+            op_close_status = FS_STATUS_ERROR;
+            op_phase = 13;
+            return;
+        }
+        if (line_ready) {
+            if (op_settings_recovery_line_count < 0xFFu)
+                op_settings_recovery_line_count++;
+            if (filesystem_parseMidiLearnLine(op_line_buf) != FS_STATUS_DONE) {
+                /* Not a Learn file (format/version): empty the table. */
+                midiLearn_clearAll();
+                op_settings_recovery_valid = 0u;
+                op_phase = 13;
+            }
+            return;
+        }
+        if (eof)
+            op_phase = 13;
+        return;
+
+    case 13: /* CLOSE */
+        op_close_done = false;
+        if (afatfs_fclose(op_file, on_file_closed))
+            op_phase = 14;
+        return;
+
+    case 14: /* WAIT_CLOSE */
+        if (!op_close_done) return;
+#if DEV_MODE_LOGGING
+        filesystem_traceMidiLearnLoad(
+            1u, !op_settings_recovery_valid ? 1u :
+                (op_close_status != FS_STATUS_DONE ? 2u : 0u));
+#endif
+        filesystem_finish(FS_STATUS_DONE);
+        return;
+
+    default:
+        filesystem_finish(FS_STATUS_ERROR);
+        return;
+    }
+}
+
+/* -----------------------------------------------------------------------
+** SAVE MIDI LEARN state machine (S083 §16) — safe write, temp + sync + promote.
+**
+** Phases: 0=open midilrn.tmp, 1=wait_open, 2=write lines, 3=close,
+**         4=wait_close, 5=sync, 6=remove old midilrn.cfg, 7=wait_remove,
+**         8=rename, 9=wait_rename, 10=finish (shared flush).
+**
+** What: writes the whole Learn table (filesystem_nextMidiLearnLine()) to
+** midilrn.tmp, makes it durable, then replaces midilrn.cfg by remove-old +
+** rename — the same method and power-loss argument as
+** filesystem_saveGlobals_tick(): a crash before the sync leaves the old
+** midilrn.cfg; a crash after it leaves a complete tmp that the boot
+** prelude promotes. Why: every Learn is written at once (user rule).
+** Inputs: the live Learn table. Outputs: one durable midilrn.cfg. Errors
+** finish ERROR; filesystem_midiLearnWriterCompleted() retries once.
+** Stall: shares the settings writer's DEV_STALL_DETECTION observer
+** (code `MlWr NN`, site SETTINGS) — the two writers never overlap.
+** Caller: filesystem_midiLearnWriterSchedule_tick() only.
+** ----------------------------------------------------------------------- */
+static void filesystem_saveMidiLearn_tick(void)
+{
+#if DEV_STALL_DETECTION
+    if (filesystem_pollPhaseStall(op_phase,
+                                  &op_settings_stall_last_phase,
+                                  &op_settings_stall_ticks,
+                                  30000u)) {
+        autosaveTrace_record(AUTOSAVE_TRACE_STAGE_PHASE_STALL,
+                             AUTOSAVE_TRACE_PHASE_STALL_SITE_SETTINGS,
+                             (uint32_t)op_phase <<
+                             AUTOSAVE_TRACE_PHASE_STALL_PHASE_SHIFT);
+        filesystem_makeNamedErrorCode("MlWr", op_phase);
+        filesystem_finish(FS_STATUS_ERROR);
+        return;
+    }
+#endif
+
+    switch (op_phase) {
+    case 0: /* OPEN midilrn.tmp (truncate) */
+        op_file_ready = false;
+        op_file = NULL;
+        if (!afatfs_fopen(STORAGE_MIDILEARN_TEMP_FILENAME, "w", on_file_opened))
+            return;
+        op_phase = 1;
+        return;
+
+    case 1: /* WAIT_OPEN */
+        if (!op_file_ready) return;
+        if (op_file == NULL) {
+            filesystem_finish(FS_STATUS_ERROR);
+            return;
+        }
+        op_write_line_index = 0u;
+        op_write_line_len = 0u;
+        op_write_line_offset = 0u;
+        op_phase = 2;
+        return;
+
+    case 2: /* WRITE LINES (header, rows, terminator) */
+        if (filesystem_writeTextLine(filesystem_nextMidiLearnLine, NULL))
+            return;
+        op_phase = 3;
+        return;
+
+    case 3: /* CLOSE */
+        op_close_done = false;
+        if (afatfs_fclose(op_file, on_file_closed))
+            op_phase = 4;
+        return;
+
+    case 4: /* WAIT_CLOSE */
+        if (!op_close_done) return;
+        op_phase = 5;
+        return;
+
+    case 5: /* SYNC — the tmp is durable before the old file is touched */
+        if (!afatfs_sync())
+            return;
+        op_phase = 6;
+        return;
+
+    case 6: /* REMOVE old midilrn.cfg (not-found is OK: first Learn) */
+        op_remove_done = 0u;
+        op_remove_result = AFATFS_RESULT_OK;
+        if (!afatfs_removeObjects_lfn(STORAGE_MIDILEARN_FILENAME,
+                                      AFATFS_MATCH_CASE_INSENSITIVE,
+                                      AFATFS_REMOVE_FILES_ONLY,
+                                      on_remove_complete))
+            return;
+        op_phase = 7;
+        return;
+
+    case 7: /* WAIT_REMOVE — on error the durable tmp waits for boot */
+        if (!op_remove_done) return;
+        if (op_remove_result != AFATFS_RESULT_OK) {
+            filesystem_finish(FS_STATUS_ERROR);
+            return;
+        }
+        op_phase = 8;
+        return;
+
+    case 8: /* RENAME midilrn.tmp -> midilrn.cfg */
+        op_rename_done = 0u;
+        op_rename_result = AFATFS_RESULT_OK;
+        memset(op_repair_rename_open_name, 0,
+               sizeof(op_repair_rename_open_name));
+        if (!afatfs_renameObject_lfn(STORAGE_MIDILEARN_TEMP_FILENAME,
+                                     STORAGE_MIDILEARN_FILENAME,
+                                     AFATFS_MATCH_CASE_INSENSITIVE,
+                                     op_repair_rename_open_name,
+                                     on_rename_complete))
+            return;
+        op_phase = 9;
+        return;
+
+    case 9: /* WAIT_RENAME — on error boot recovery promotes the tmp */
+        if (!op_rename_done) return;
+        if (op_rename_result != AFATFS_RESULT_OK) {
+            filesystem_finish(FS_STATUS_ERROR);
+            return;
+        }
+        op_phase = 10;
+        return;
+
+    case 10: /* FINISH — shared flush makes the rename durable */
         filesystem_finish(FS_STATUS_DONE);
         return;
 
@@ -22233,6 +23933,21 @@ static uint8_t filesystem_formatResidentNameLine(char *dst,
     source = (uint16_t)(source & FS_RESIDENT_SOURCE_VALUE_MASK);
     if (!dst || cap < 4u || !filesystem_residentSourceValid(row, source))
         return 0u;
+#if DEV_MODE_LOGGING
+    /*
+     * Witness a `?` + R identity row being written to the card (S082 review
+     * F5 evidence, 'h' WRITE_UNKNOWN_REFRESHED). This is the durable state the
+     * next boot empties as Case 3; current_op/op_phase name the writer.
+     */
+    if (refreshed && present && source == FS_RESIDENT_SOURCE_UNKNOWN &&
+        row >= 1u && row < FS_RESIDENT_NAMES_PATTERN_BASE) {
+        autosaveTrace_record(
+            AUTOSAVE_TRACE_STAGE_HCNAMES_PROVENANCE,
+            AUTOSAVE_TRACE_HCN_WRITE_UNKNOWN_REFRESHED,
+            (uint32_t)row | ((uint32_t)(current_op & 0xFFu) << 16u) |
+            ((uint32_t)op_phase << 24u));
+    }
+#endif
     dst[0] = '\0';
     if (present && !filesystem_residentNameIsBlank(name)) {
         int8_t last = -1;
@@ -22260,7 +23975,30 @@ static uint8_t filesystem_formatResidentNameLine(char *dst,
     else if (source == FS_RESIDENT_SOURCE_INSTRUMENT_DIRECT ||
              source == FS_RESIDENT_SOURCE_PATTERN_AUTOSAVE)
         token = "@";
-    else {
+    else if (source == FS_RESIDENT_SOURCE_EMPTY)
+        token = "x";
+    else if (source >= FS_RESIDENT_SOURCE_BANK_CHILD_BASE &&
+             source < FS_RESIDENT_SOURCE_BANK_CHILD_END) {
+        uint16_t bank_slot = (uint16_t)(source -
+                                        FS_RESIDENT_SOURCE_BANK_CHILD_BASE);
+        if (len + 5u >= cap)
+            return 0u;
+        dst[len++] = 'b';
+        dst[len++] = (char)('0' + (bank_slot / 100u));
+        dst[len++] = (char)('0' + ((bank_slot / 10u) % 10u));
+        dst[len++] = (char)('0' + (bank_slot % 10u));
+        if (refreshed) {
+            if (len + 4u > cap)
+                return 0u;
+            dst[len++] = '\t';
+            dst[len++] = 'R';
+        }
+        if (len + 1u >= cap)
+            return 0u;
+        dst[len++] = '\n';
+        dst[len] = '\0';
+        return len;
+    } else {
         if (len + 4u >= cap)
             return 0u;
         dst[len++] = (char)('0' + (source / 100u));
@@ -24011,6 +25749,8 @@ static void filesystem_resetFacadeForBootLogRecovery(void)
     fs_settings_change_revision = 0u;
     op_settings_change_revision = 0u;
     op_settings_write_active = 0u;
+    /* A pending midilrn.cfg write dies with the facade (S083 §16). */
+    fs_midilearn_write = 0u;
     memset(fs_error_code, 0, sizeof(fs_error_code));
 }
 
@@ -24035,6 +25775,11 @@ void filesystem_initAfterCardReady(void)
     fs_settings_change_revision = 0u;
     op_settings_change_revision = 0u;
     op_settings_write_active = 0u;
+    /*
+     * No midilrn.cfg write is pending on a fresh mount (S083 §16): the boot
+     * load re-reads the table from this card before any Learn can happen.
+     */
+    fs_midilearn_write = 0u;
     /*
      * Reset hidden-writer policy to its documented cold default.
      *
@@ -24234,6 +25979,34 @@ void filesystem_setAutosaveEnabled(uint8_t enabled)
     fs_autosave_setup_failed = 0u;
     if (fs_autosave_runtime_ready && bank_hasResidentBank())
         fs_autosave_setup_pending = 1u;
+}
+
+/*
+ * Suspend or resume AutoSave drain admission for a background Bank Load
+ * (S082 C7, D1, R6).
+ *
+ * What: sets one persistent flag that makes both AutoSave schedulers decline
+ * new drains, and causes an in-flight scalar or Pattern drain to abort at its
+ * next tick through its error close-down (open handles closed, record left
+ * torn and stale, captured dirty bits restored). The HCNAMES publication
+ * (scalar phases 70-77, Pattern follow-on) is never cut (R6).
+ * Why: D1/R6: the Bank is about to be replaced, so a record written now
+ * would be torn and stale, and the load must not wait for it. The A/B scheme
+ * keeps the other file as the last valid record. The flag must survive
+ * filesystem_start(), which resets the per-operation Bank masks.
+ * Inputs: nonzero to suspend, zero to resume.
+ * Outputs: fs_autosave_yield.
+ * Accessors: preset_requestBackgroundBankLoad() phase 2 and the phase-5
+ * completion.
+ * Affiliates: filesystem_autosaveWriterSchedule_tick(),
+ * filesystem_autosavePatternDrainSchedule_tick(),
+ * filesystem_autosaveParameterDrain_tick(),
+ * filesystem_autosavePatternDrain_tick(),
+ * filesystem_autosaveWriterFinishError().
+ */
+void filesystem_setAutosaveYield(uint8_t yield)
+{
+    fs_autosave_yield = yield ? 1u : 0u;
 }
 
 uint8_t filesystem_initCardAndMountBlocking(void)
@@ -24496,6 +26269,71 @@ static void filesystem_settingsWriterSchedule_tick(void)
     (void)filesystem_start(FS_INTERNAL_OP_SAVE_GLOBALS,
                            FS_FILE_SETTINGS, 0u,
                            filesystem_settingsWriterCompleted);
+}
+
+static void filesystem_midiLearnWriterCompleted(void)
+{
+    /*
+     * Complete an autonomous midilrn.cfg write (S083 §16).
+     *
+     * Inputs: terminal SAVE_MIDILEARN status. Outputs: DONE clears the
+     * RETRIED mark; the first ERROR re-queues one retry (PENDING|RETRIED),
+     * a second ERROR gives up until the next Learn re-arms the request (a
+     * failing card must not hold the facade in a retry loop). A request
+     * made during the write already set PENDING and is kept either way.
+     * Then the private acknowledgement, as the settings writer does.
+     * Affiliates: filesystem_midiLearnWriterSchedule_tick(),
+     * filesystem_requestMidiLearnWrite().
+     */
+    if (status == FS_STATUS_DONE) {
+        fs_midilearn_write &= (uint8_t)~FS_MIDILEARN_WRITE_RETRIED;
+    } else if (!(fs_midilearn_write & FS_MIDILEARN_WRITE_RETRIED)) {
+        fs_midilearn_write |= (uint8_t)(FS_MIDILEARN_WRITE_PENDING |
+                                        FS_MIDILEARN_WRITE_RETRIED);
+    }
+#if DEV_MODE_LOGGING
+    /* `m` 0x01: rows | failed << 8 | request flags after << 16. */
+    autosaveTrace_record(AUTOSAVE_TRACE_STAGE_MIDI_LEARN_FILE,
+                         AUTOSAVE_TRACE_MLRN_WRITE,
+                         (uint32_t)midiLearn_count() |
+                         ((uint32_t)(status == FS_STATUS_DONE ? 0u : 1u) << 8u) |
+                         ((uint32_t)fs_midilearn_write << 16u));
+#endif
+    filesystem_ack();
+}
+
+static void filesystem_midiLearnWriterSchedule_tick(void)
+{
+    /*
+     * Start one queued midilrn.cfg write from an idle facade (S083 §16).
+     *
+     * Inputs: fs_midilearn_write PENDING, menu_isLoadSaveCommandActive(),
+     * the boot gate fs_settings_runtime_ready, and a READY volume. The
+     * caller (filesystem_tick) runs this only with status IDLE and no
+     * copy/clear suspension, so AutoSave, a Load/Save command and a
+     * background Bank load are all waited out. No debounce: the write starts
+     * on the first idle tick. Output: one FS_INTERNAL_OP_SAVE_MIDILEARN with
+     * a private completion. PENDING is cleared as the write starts, so a
+     * Learn during the write sets it again and causes exactly one more
+     * write; a refused start keeps it.
+     */
+    if (!(fs_midilearn_write & FS_MIDILEARN_WRITE_PENDING))
+        return;
+    if (menu_isLoadSaveCommandActive())
+        return;
+    if (!fs_settings_runtime_ready ||
+        afatfs_getFilesystemState() != AFATFS_FILESYSTEM_STATE_READY)
+        return;
+#if DEV_STALL_DETECTION
+    /* Rearm the shared settings-writer stall observer (see the settings scheduler). */
+    op_settings_stall_last_phase = 0xffu;
+    op_settings_stall_ticks = 0u;
+#endif
+    fs_midilearn_write &= (uint8_t)~FS_MIDILEARN_WRITE_PENDING;
+    if (!filesystem_start(FS_INTERNAL_OP_SAVE_MIDILEARN,
+                          FS_FILE_SETTINGS, 0u,
+                          filesystem_midiLearnWriterCompleted))
+        fs_midilearn_write |= FS_MIDILEARN_WRITE_PENDING;
 }
 
 static void filesystem_autosaveWriterCompleted(void)
@@ -24839,6 +26677,9 @@ static void filesystem_autosaveWriterSchedule_tick(void)
 {
     uint16_t now;
 
+    /* S082 C7/C9: no new drain while a background Bank Load owns the Bank. */
+    if (fs_autosave_yield)
+        return;
     /*
      * This check is reached only while the facade is idle. Load/Save pages own
      * the library-name cache by contract, so they suppress new starts; an
@@ -25061,6 +26902,9 @@ static void filesystem_autosavePatternDrainSchedule_tick(void)
     uint32_t elapsed_us;
     uint32_t last_semantic_us;
 
+    /* S082 C7/C9: no new Pattern drain while a background Bank Load runs. */
+    if (fs_autosave_yield)
+        return;
     /* Reset the epoch even while policy/card gates suppress the scheduler. */
     mask = autosave_patternDirtyMask();
     if (mask == 0u) {
@@ -25741,6 +27585,12 @@ void filesystem_tick(void)
 
     if (cc_suspended)
         fs_autosave_page_suppressed = 1u;
+    /*
+     * S083 §16: a queued midilrn.cfg write goes first (no debounce), then
+     * the debounced settings writer gets the facade if it is still idle.
+     */
+    if (status == FS_STATUS_IDLE && !cc_suspended)
+        filesystem_midiLearnWriterSchedule_tick();
     if (status == FS_STATUS_IDLE && !cc_suspended)
         filesystem_settingsWriterSchedule_tick();
     /*
@@ -25801,15 +27651,24 @@ void filesystem_tick(void)
      * Why: the trace's J/I batch must become durable before a long first drain
      * can be interrupted by power removal. Affiliate: the scheduler above.
      */
-    if (status == FS_STATUS_IDLE && !cc_suspended)
+    /*
+     * S082 C9/D11: Scene 17 owns the background Pattern region and the
+     * sounding Effect while a background Bank Load runs. AutoSave drains are
+     * suspended (dirty bits keep accumulating and are written after the
+     * release); settings.cfg is not AutoSave and keeps writing (D24).
+     */
+    if (status == FS_STATUS_IDLE && !cc_suspended &&
+        !scene_backgroundExists())
         filesystem_autosaveWriterSchedule_tick();
     /* Pattern is the final background claimant after scalar AutoSave work. */
-    if (status == FS_STATUS_IDLE && !cc_suspended)
+    if (status == FS_STATUS_IDLE && !cc_suspended &&
+        !scene_backgroundExists())
         filesystem_autosavePatternDrainSchedule_tick();
     /* Non-semantic Pattern is the final background claimant after semantic
      * Pattern AutoSave work; it runs only when no higher-priority work is
      * pending. */
-    if (status == FS_STATUS_IDLE && !cc_suspended)
+    if (status == FS_STATUS_IDLE && !cc_suspended &&
+        !scene_backgroundExists())
         filesystem_autosaveNonSemanticPatternDrainSchedule_tick();
     if (status != FS_STATUS_BUSY) return;
 
@@ -25939,6 +27798,12 @@ void filesystem_tick(void)
     case FS_INTERNAL_OP_SAVE_GLOBALS:
         filesystem_saveGlobals_tick();
         break;
+    case FS_INTERNAL_OP_LOAD_MIDILEARN:
+        filesystem_loadMidiLearn_tick();
+        break;
+    case FS_INTERNAL_OP_SAVE_MIDILEARN:
+        filesystem_saveMidiLearn_tick();
+        break;
     case FS_INTERNAL_OP_SCAN_KITS:
         filesystem_scanKits_tick();
         break;
@@ -25971,6 +27836,34 @@ void filesystem_tick(void)
         break;
     default: break;
     }
+}
+
+/*
+ * Run one extra filesystem step that the stall observers do not count
+ * (S082 P2 fix 3).
+ *
+ * What: exactly filesystem_tick(), with the DEV poll-count stall observers
+ * suppressed for its duration. In builds without DEV_STALL_DETECTION it is a
+ * plain filesystem_tick().
+ * Why: the main loop may call this repeatedly in idle time during a
+ * background Bank load; the operation advances faster, while the observers'
+ * one-poll-per-pass calibration, and so their wall-clock window, stays as it
+ * was. A genuine stall is still caught by the regular per-pass tick.
+ * Inputs: none. Outputs: one operation step (callbacks may run, as in
+ * filesystem_tick()).
+ * Accessors: main_serviceBackgroundLoadIdle().
+ * Affiliates: filesystem_tick(), filesystem_pollPhaseStall(),
+ * filesystem_autosaveDrainStalled(), fs_stall_poll_uncounted.
+ */
+void filesystem_tickUncounted(void)
+{
+#if DEV_STALL_DETECTION
+    fs_stall_poll_uncounted = 1u;
+    filesystem_tick();
+    fs_stall_poll_uncounted = 0u;
+#else
+    filesystem_tick();
+#endif
 }
 
 fs_status_t filesystem_status(void)
@@ -26101,6 +27994,23 @@ uint8_t filesystem_bankChildCursor(void)
         current_op == FS_INTERNAL_OP_LOAD_BANK)
         return op_bank_child_cursor;
     return 0xFFu;
+}
+
+/*
+ * Display name of the Bank being loaded (S082 P3 W2, D49).
+ *
+ * What: the eight-character name captured by filesystem_requestLoadBank()
+ * (op_bank_display_name). Why: the frozen Load:[Bank] screen is re-entered
+ * after the user left Load/Save, which cleared the browser cache that
+ * normally supplies the name; the captured copy is stable until the next
+ * Bank operation, and no other operation can start during the load.
+ * Inputs: none. Outputs: pointer to 8 characters (NUL at [8]).
+ * Accessors: menu_repaintLoadSavePage() for an unlocked background load.
+ * Affiliates: filesystem_bankSlotName(), filesystem_requestLoadBank().
+ */
+const char *filesystem_bankLoadDisplayName(void)
+{
+    return op_bank_display_name;
 }
 
 void filesystem_ack(void)
@@ -26237,6 +28147,7 @@ static bool filesystem_start(fs_internal_op_t op, fs_file_type_t type,
            sizeof(op_save_bank_dir_display_name));
     memset(op_save_bank_dir_open_name, 0, sizeof(op_save_bank_dir_open_name));
     op_bank_child_present_mask = 0u;
+    op_bank_child_content_mask = 0u;
     /* Reset the shared Bank-child/boot-reader scratch only at a new async
      * request boundary.  This releases a finished reader's immutable type
      * image before Bank Load writes names, without clearing payload stage or
@@ -26249,6 +28160,9 @@ static bool filesystem_start(fs_internal_op_t op, fs_file_type_t type,
     op_bank_child_cursor = 0u;
     op_bank_loaded_scene = 0u;
     op_bank_payload_active = 0u;
+    op_bank_scene_empty_mask = 0u;
+    op_bank_save_written_mask = 0u;
+    op_bank_flags = 0u;
     op_rename_done = 0u;
     op_repair_scope = FS_REPAIR_SCOPE_NONE;
     op_repair_library_kind = FS_NAME_CACHE_NONE;
@@ -27931,6 +29845,42 @@ static uint8_t filesystem_bootReaderEnterSceneFolder(
             hcnames_name_mirror[filesystem_residentSceneRow(scene_index)]);
         return filesystem_bootReaderEnterDirectory(dir_name);
     }
+    /*
+     * Resolve a `bNNN` Scene source to its physical Bank child (S082 B3).
+     *
+     * What: enters Bank/NNN <name>/NN <scene name>/ for a Scene whose content came
+     * from a Bank other than row 0's, using the boot-resident Bank index for the
+     * root folder name and the register's Scene name for the child.
+     * Why: Merge Load keeps Scenes from the previous Bank; their provenance stays
+     * resolvable for the HCNAMES-authoritative boot path (S13).
+     * Inputs: scene_index, decoded Bank slot, Bank index cache.
+     * Outputs: CWD in the child on success; 0 -> Case 3 (empty + notice) as for
+     * any unresolvable source.
+     * Accessors: filesystem_bootReaderNarrowLoadScene/Kit/Instrument/Effect().
+     * Affiliates: FS_RESIDENT_SOURCE_BANK_CHILD_BASE, storage_formatBankSceneDir().
+     */
+    if (source_slot >= FS_RESIDENT_SOURCE_BANK_CHILD_BASE &&
+        source_slot < FS_RESIDENT_SOURCE_BANK_CHILD_END) {
+        uint16_t bank_child_slot =
+            (uint16_t)(source_slot - FS_RESIDENT_SOURCE_BANK_CHILD_BASE);
+        const char *cached_name;
+
+        if (fs_list_cache_kind != FS_NAME_CACHE_BANK)
+            return 0u;
+        cached_name = filesystem_cachedLibraryName(FS_NAME_CACHE_BANK,
+                                                    bank_child_slot);
+        if (!cached_name || cached_name[0] == '\0')
+            return 0u;
+        if (!filesystem_bootReaderEnterDirectory(STORAGE_ROOT_BANK))
+            return 0u;
+        filesystem_makeNumberedDir(dir_name, bank_child_slot, cached_name);
+        if (!filesystem_bootReaderEnterDirectory(dir_name))
+            return 0u;
+        storage_formatBankSceneDir(
+            dir_name, sizeof(dir_name), scene_index,
+            hcnames_name_mirror[filesystem_residentSceneRow(scene_index)]);
+        return filesystem_bootReaderEnterDirectory(dir_name);
+    }
     if (source_slot >= FS_RESIDENT_SOURCE_DIRECT_SLOT_LIMIT ||
         !filesystem_bootReaderEnterDirectory(STORAGE_ROOT_SCENE)) {
         return 0u;
@@ -28270,6 +30220,28 @@ static uint8_t filesystem_bootReaderParseInstrumentFile(
  * storage_scenesetInit/ParseLine/Finalize(), scene_get(),
  * filesystem_bootReaderEnterSceneFolder().
  */
+#if DEV_MODE_LOGGING
+/*
+ * Boot narrow-load failure reason for the Case-3 detail record (S082 review
+ * F5 evidence; +2 B, DEV logging only).
+ *
+ * What: reason/sub-step of the last narrow loader that returned 0, read by
+ * filesystem_bootReaderEvaluateScene() when it empties a Scene (Q flags 0x08).
+ * Reasons: 1 unresolvable source, 2 folder not entered, 3 sceneset.scg not
+ * opened, 4 sceneset.scg parse/finalize, 5 kitset.kcg parse/finalize,
+ * 6 Instrument member file (sub = slot 0..5), 7 Scene storage missing,
+ * 9 other loader (sub = row index 0..8). Why: the S082 Scene 2 Case-3 empty
+ * could not be explained because the existing record carries neither the
+ * source word nor the failing step. Owner: filesystem.c (boot only).
+ */
+static uint8_t fs_boot_fail_reason = 0u;
+static uint8_t fs_boot_fail_sub = 0u;
+#define FS_BOOT_FAIL(r, s) do { fs_boot_fail_reason = (uint8_t)(r); \
+                                fs_boot_fail_sub = (uint8_t)(s); } while (0)
+#else
+#define FS_BOOT_FAIL(r, s) do { } while (0)
+#endif
+
 static uint8_t filesystem_bootReaderNarrowLoadScene(
     uint8_t scene_index, uint16_t source_slot, uint16_t resolved_row)
 {
@@ -28282,14 +30254,17 @@ static uint8_t filesystem_bootReaderNarrowLoadScene(
 
     if (!filesystem_bootReaderEnterSceneFolder(
             scene_index, source_slot, resolved_row)) {
+        FS_BOOT_FAIL(2u, 0u);
         return 0u;
     }
     filesystem_initSceneStage(&fs_stage_workspace.scene_stage);
     storage_scenesetInit(&op_sceneset_state);
     filesystem_resetTextReader();
     file = filesystem_blockOpenLfn(STORAGE_SCENESET_FILENAME);
-    if (!file)
+    if (!file) {
+        FS_BOOT_FAIL(3u, 0u);
         return 0u;
+    }
     for (;;) {
         storage_status_t st = filesystem_bootReadLineBlocking(
             file, op_line_buf, &len, sizeof(op_line_buf), &ready, &eof);
@@ -28313,11 +30288,15 @@ static uint8_t filesystem_bootReaderNarrowLoadScene(
         }
     }
     (void)filesystem_blockClose(file);
-    if (!ok)
+    if (!ok) {
+        FS_BOOT_FAIL(4u, 0u);
         return 0u;
+    }
     scene = scene_get(scene_index);
-    if (!scene)
+    if (!scene) {
+        FS_BOOT_FAIL(7u, 0u);
         return 0u;
+    }
     scene->settings = fs_stage_workspace.scene_stage.settings;
     return 1u;
 }
@@ -28347,22 +30326,28 @@ static uint8_t filesystem_bootReaderNarrowLoadKit(
 
     if (!filesystem_bootReaderEnterKitFolder(
             scene_index, source_slot, resolved_row)) {
+        FS_BOOT_FAIL(2u, 1u);
         return 0u;
     }
     memset(&op_staged_kit, 0, sizeof(op_staged_kit));
-    if (!filesystem_bootReaderParseKitset(&op_kitset))
+    if (!filesystem_bootReaderParseKitset(&op_kitset)) {
+        FS_BOOT_FAIL(5u, 0u);
         return 0u;
+    }
     for (slot = 0u; slot < STORAGE_KIT_SLOT_COUNT; slot++) {
         if (!filesystem_bootReaderParseInstrumentFile(
                 op_kitset.instrument_file[slot],
                 op_kitset.instrument_type[slot], (uint8_t)(slot + 1u),
                 &op_staged_kit.instruments[slot])) {
+            FS_BOOT_FAIL(6u, slot);
             return 0u;
         }
     }
     scene = scene_get(scene_index);
-    if (!scene)
+    if (!scene) {
+        FS_BOOT_FAIL(7u, 1u);
         return 0u;
+    }
     scene->kit = op_staged_kit;
     return 1u;
 }
@@ -29021,34 +31006,10 @@ static void filesystem_bootReaderSeedInstrumentTypes(void)
  */
 static void filesystem_bootReaderEmptyScene(uint8_t scene_index)
 {
-    static const instrument_type_t initial_types[INSTRUMENT_SLOT_COUNT] = {
-        INSTRUMENT_TYPE_DRM, INSTRUMENT_TYPE_DRM, INSTRUMENT_TYPE_DRM,
-        INSTRUMENT_TYPE_SNR, INSTRUMENT_TYPE_CYM, INSTRUMENT_TYPE_HAT
-    };
-    scene_t *scene;
     uint8_t slot;
-    uint8_t track;
     uint16_t row;
 
-    scene = scene_get(scene_index);
-    if (!scene)
-        return;
-    memset(scene, 0, sizeof(*scene));
-    /* S074: emptied Scenes use the same bus compressor defaults as fresh ones. */
-    scene_busCompDefaults(&scene->settings);
-    for (track = 0u; track < NUM_TRACKS; track++) {
-        scene->settings.midi_channel[track] = (uint8_t)(track + 1u);
-    }
-    for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++) {
-        scene->settings.audio_out[slot] =
-            filesystem_defaultVoiceAudioOut(slot);
-        scene->settings.fx_send_amount[slot] = 0u;
-        scene->settings.fx_send_morph[slot] = 0u;   /* S075 F2-H */
-        scene->settings.fader_setting[slot] = 0u;
-        instrumentManager_resetSlot(&scene->kit.instruments[slot],
-                                    initial_types[slot]);
-    }
-    scene_effectRecordDefaults(&scene->effect);
+    scene_resetResidentToEmpty(scene_index);
     pat_initScene(scene_index);
     row = filesystem_residentSceneRow(scene_index);
     fs_resident_source[row] = (uint16_t)(
@@ -29238,8 +31199,36 @@ static uint8_t filesystem_bootReaderEvaluateScene(
                 row, &resolved_row);
             uint8_t load_ok = 0u;
 
+            FS_BOOT_FAIL(0u, 0u);
+            /*
+             * Boot reader dispatch for EMPTY and BANK_CHILD sources (S082 B3).
+             *
+             * What: an EMPTY Scene source resets the Scene data without setting
+             * the Case-3 notice mask (it is intentionally empty, not failed);
+             * a BANK_CHILD source is accepted like a direct slot and resolved
+             * through the narrow loaders with the Scene row as resolved_row.
+             * Why: Merge Load can produce `x` (emptied) or `bNNN` (kept from a
+             * previous Bank) rows that must survive a reboot intact.
+             * Inputs: resolved source from filesystem_bootReaderResolveResidentRow().
+             * Outputs: empty Scene or narrow-loaded Scene child.
+             * Affiliates: FS_RESIDENT_SOURCE_EMPTY, FS_RESIDENT_SOURCE_BANK_CHILD_BASE.
+             */
+            if (resolved == FS_RESIDENT_SOURCE_EMPTY) {
+                filesystem_bootReaderEmptyScene(scene_index);
+                if (rows_changed)
+                    *rows_changed = 1u;
+                return 1u;
+            }
+
+            if (resolved >= FS_RESIDENT_SOURCE_BANK_CHILD_BASE &&
+                resolved < FS_RESIDENT_SOURCE_BANK_CHILD_END) {
+                resolved_row = filesystem_residentSceneRow(scene_index);
+            }
+
             if (resolved < FS_RESIDENT_SOURCE_DIRECT_SLOT_LIMIT ||
-                resolved == FS_RESIDENT_SOURCE_INSTRUMENT_DIRECT) {
+                resolved == FS_RESIDENT_SOURCE_INSTRUMENT_DIRECT ||
+                (resolved >= FS_RESIDENT_SOURCE_BANK_CHILD_BASE &&
+                 resolved < FS_RESIDENT_SOURCE_BANK_CHILD_END)) {
                 if (index == 0u) {
                     load_ok = filesystem_bootReaderNarrowLoadScene(
                         scene_index, resolved, resolved_row);
@@ -29273,6 +31262,31 @@ static uint8_t filesystem_bootReaderEvaluateScene(
                 autosaveTrace_record(
                     AUTOSAVE_TRACE_STAGE_BOOT_READER, 0x02u,
                     ((uint32_t)scene_index) | ((uint32_t)row << 8u));
+#if DEV_MODE_LOGGING
+                /*
+                 * Case-3 detail (S082 review F5 evidence, Q flags 0x08).
+                 *
+                 * What: the raw register word of the failing row (source
+                 * value, R bit 13, dirty bit 15), the failure reason and its
+                 * sub-step. Unresolvable sources report reason 1 with the
+                 * resolving row. Why: tells "`?` + R in the register" apart
+                 * from "direct source whose folder/kit/member failed".
+                 */
+                if (fs_boot_fail_reason == 0u) {
+                    if (resolved >= FS_RESIDENT_SOURCE_DIRECT_SLOT_LIMIT &&
+                        resolved != FS_RESIDENT_SOURCE_INSTRUMENT_DIRECT &&
+                        !(resolved >= FS_RESIDENT_SOURCE_BANK_CHILD_BASE &&
+                          resolved < FS_RESIDENT_SOURCE_BANK_CHILD_END))
+                        FS_BOOT_FAIL(1u, resolved_row);
+                    else
+                        FS_BOOT_FAIL(9u, index);
+                }
+                autosaveTrace_record(
+                    AUTOSAVE_TRACE_STAGE_BOOT_READER, 0x08u,
+                    (uint32_t)fs_resident_source[row] |
+                    ((uint32_t)fs_boot_fail_reason << 16u) |
+                    ((uint32_t)fs_boot_fail_sub << 24u));
+#endif
                 fs_boot_latch.case3_scene_mask = (uint16_t)(
                     fs_boot_latch.case3_scene_mask |
                     (uint16_t)(1u << scene_index));
@@ -29536,6 +31550,51 @@ uint8_t filesystem_bootHcnamesAuthoritativeLoad(void)
     present_mask = filesystem_bootNarrowLoadBank(boot_bank_slot);
     if (present_mask == 0u)
         return 0u;
+    /*
+     * S082 B3.10: the HCNAMES-authoritative path must see the same Scene
+     * provenance as the AutoSave reader. The Bank child scan supplies the
+     * target Bank's children; a Scene row with bNNN keeps a Scene loaded from
+     * another Bank, and an x Scene row is intentionally empty even if the
+     * target Bank happens to contain a same-numbered child.
+     *
+     * What: extends/clears the Bank-derived present mask from the Scene rows.
+     * Why: Merge Load keeps Scenes whose children are not in the new Bank.
+     * Inputs: present_mask, the 16 Scene-row sources.
+     * Outputs: effective present mask committed to BankData.
+     * Accessors: filesystem_bootHcnamesAuthoritativeLoad().
+     * Affiliates: FS_RESIDENT_SOURCE_BANK_CHILD_BASE, FS_RESIDENT_SOURCE_EMPTY.
+     */
+    {
+        uint8_t scene_i;
+        uint16_t effective_present = present_mask;
+
+        for (scene_i = 0u; scene_i < AUTOSAVE_SCENE_COUNT; scene_i++) {
+            uint16_t row = filesystem_residentSceneRow(scene_i);
+            uint16_t src = (uint16_t)(
+                filesystem_residentSource(row) &
+                FS_RESIDENT_SOURCE_VALUE_MASK);
+            uint16_t bit = (uint16_t)(1u << scene_i);
+
+            if (src == FS_RESIDENT_SOURCE_EMPTY) {
+                effective_present = (uint16_t)(effective_present & ~bit);
+            } else if (src < FS_RESIDENT_SOURCE_DIRECT_SLOT_LIMIT ||
+                       (src >= FS_RESIDENT_SOURCE_BANK_CHILD_BASE &&
+                        src < FS_RESIDENT_SOURCE_BANK_CHILD_END)) {
+                effective_present = (uint16_t)(effective_present | bit);
+            }
+        }
+        /*
+         * S17: the active Scene always stays present, even when its Scene row
+         * is x. The Bank loader already selected it from the manifest.
+         */
+        if (scene_getActiveIndex() < AUTOSAVE_SCENE_COUNT) {
+            effective_present = (uint16_t)(effective_present |
+                (uint16_t)(1u << scene_getActiveIndex()));
+        }
+        if (effective_present != present_mask)
+            (void)bank_setScenePresentMask(effective_present);
+        present_mask = effective_present;
+    }
     /* The Bank loader navigated and scanned; reverify root before the
      * per-Scene narrow loads so a failed return-to-root declines instead of
      * poisoning every subsequent relative open. */
@@ -29569,8 +31628,25 @@ uint8_t filesystem_bootHcnamesAuthoritativeLoad(void)
                 return 0u;
             resolved = filesystem_bootReaderResolveResidentRow(
                 row, &resolved_row);
+            if (resolved == FS_RESIDENT_SOURCE_EMPTY) {
+                /*
+                 * An x Scene row is an intentional empty Scene (S082 S21):
+                 * reset its data without a Case-3 notice and keep the row.
+                 */
+                if (index == 0u) {
+                    scene_resetResidentToEmpty(scene_index);
+                    pat_initScene(scene_index);
+                }
+                break;
+            }
+            if (resolved >= FS_RESIDENT_SOURCE_BANK_CHILD_BASE &&
+                resolved < FS_RESIDENT_SOURCE_BANK_CHILD_END) {
+                resolved_row = filesystem_residentSceneRow(scene_index);
+            }
             if (resolved < FS_RESIDENT_SOURCE_DIRECT_SLOT_LIMIT ||
-                resolved == FS_RESIDENT_SOURCE_INSTRUMENT_DIRECT) {
+                resolved == FS_RESIDENT_SOURCE_INSTRUMENT_DIRECT ||
+                (resolved >= FS_RESIDENT_SOURCE_BANK_CHILD_BASE &&
+                 resolved < FS_RESIDENT_SOURCE_BANK_CHILD_END)) {
                 if (index == 0u) {
                     load_ok = filesystem_bootReaderNarrowLoadScene(
                         scene_index, resolved, resolved_row);
@@ -29755,24 +31831,42 @@ uint8_t filesystem_createLibraryIndexBlocking(fs_library_index_kind_t kind)
 bool filesystem_requestLoad(fs_file_type_t type, uint16_t slot, fs_completion_cb_t cb)
 {
     const fs_file_desc_t *desc = filesystem_desc(type);
+    uint8_t target_scene;
     if (desc == NULL || !desc->supports_load)
         return false;
+    /*
+     * Resident Scene-targeted generic loads while Scene 17 is active
+     * (S082 C3).
+     *
+     * What: Kit, Scene and Pattern generic loads address the home Scene of a
+     * background Bank load instead of index 16.
+     * Why: the destination masks are 16-bit and these loads never target
+     * Scene 17 (S082 P1 D18); shifting scene_getActiveIndex() == 16 and
+     * truncating would produce an empty mask and a silent refusal.
+     * Inputs: the active Scene or Scene 17's captured home Scene.
+     * Outputs: a one-bit resident destination mask.
+     * Accessors: legacy/generic load callers.
+     * Affiliates: scene_backgroundHomeIndex(), filesystem_requestLoadBank().
+     */
+    target_scene = scene_backgroundHomeIndex();
+    if (target_scene >= SCENE_COUNT)
+        target_scene = 0u;
 
     switch (type) {
     case FS_FILE_KIT:
         return filesystem_requestLoadKitForScenes(
-            slot, (uint16_t)(1u << scene_getActiveIndex()), cb);
+            slot, (uint16_t)(1u << target_scene), cb);
     case FS_FILE_SCENE:
         return filesystem_requestLoadSceneForScenes(
-            slot, (uint16_t)(1u << scene_getActiveIndex()), cb);
+            slot, (uint16_t)(1u << target_scene), cb);
     case FS_FILE_BANK:
         return filesystem_requestLoadBank(
-            slot, (uint16_t)(1u << scene_getActiveIndex()), cb);
+            slot, 0xffffu, 0u, FS_BANK_FLAG_BOOT, cb);
     case FS_FILE_MORPH:
         return filesystem_start(FS_INTERNAL_OP_LOAD_MORPH, type, slot, cb);
     case FS_FILE_PATTERN:
         return filesystem_requestLoadPatternForScenes(
-            slot, (uint16_t)(1u << scene_getActiveIndex()), cb);
+            slot, (uint16_t)(1u << target_scene), cb);
     case FS_FILE_ALL:
         return filesystem_start(FS_INTERNAL_OP_LOAD_ALL, type, slot, cb);
     case FS_FILE_PERFORMANCE:
@@ -29946,7 +32040,14 @@ bool filesystem_requestSaveSceneDirectory(uint16_t slot,
      * field or a 16-name Menu mirror. Affiliates: saveSceneDirectory phase 37
      * and filesystem_cacheCurrentResidentSceneNames().
      */
-    op_scene_load_scene_mask = (uint16_t)(1u << source_scene);
+    /*
+     * S082 C9/D15: a Scene Save from Scene 17 writes the Scene directory, but
+     * Scene rows are resident-only (1..16). A zero mask makes the HCNAMES
+     * publication a deliberate no-op instead of shifting bit 16 into a
+     * truncated mask.
+     */
+    op_scene_load_scene_mask = (source_scene < SCENE_COUNT)
+        ? (uint16_t)(1u << source_scene) : 0u;
     filesystem_makeNumberedDir(op_save_kit_dir_display_name,
                                slot,
                                display_name);
@@ -30087,7 +32188,13 @@ bool filesystem_requestSave(fs_file_type_t type, uint16_t slot, fs_completion_cb
         if (!filesystem_start(FS_INTERNAL_OP_SAVE_PATTERN, type, slot, cb))
             return false;
         op_pattern_scene = scene_getActiveIndex();
-        op_scene_load_scene_mask = (uint16_t)(1u << op_pattern_scene);
+        /*
+         * Pattern Save from Scene 17 (S082 P1 D29): the HCNAMES Pattern
+         * publication is a deliberate no-op for index 16 (explicit 0 instead
+         * of a truncated 1u << 16); case 13 renames the capture instead.
+         */
+        op_scene_load_scene_mask = (op_pattern_scene < SCENE_COUNT)
+            ? (uint16_t)(1u << op_pattern_scene) : 0u;
         op_scene_pattern_open_name[0] = '\0';
         if (filesystem_librarySlotExists(FS_NAME_CACHE_PATTERN, slot)) {
             filesystem_makePatternLibraryFilename(
@@ -30208,27 +32315,34 @@ bool filesystem_requestLoadPatternForScenes(uint16_t slot,
 }
 
 bool filesystem_requestLoadBank(uint16_t slot,
-                                uint16_t scene_mask,
+                                uint16_t act_mask,
+                                uint16_t empty_mask,
+                                uint8_t flags,
                                 fs_completion_cb_t cb)
 {
     uint8_t scene_index;
-    uint16_t valid_mask = 0u;
+    uint16_t valid_act = 0u;
+    uint16_t valid_empty = 0u;
 
     /*
-     * Validate and start a root Bank Load.
+     * Validate and start a Bank Load with explicit act/empty masks (S082 B3).
      *
-     * Inputs: root Bank slot and resident Scene destination mask. Output:
-     * Bank-level operation state plus a later Scene payload load if a
-     * Bank-local 00..15 child exists. The mask loop matches Kit/Scene request
-     * filtering so future SCENE_COUNT growth remains bounded by the 16 physical
-     * Bank Scene buttons.
+     * What: validates and starts a Bank Load with explicit act/empty masks and
+     * flags. Why: S082 outcome table; an all-empty Replace is a valid request.
+     * Inputs: slot, masks, flags, callback; flags may carry
+     * FS_BANK_FLAG_PROGRESSIVE (S082 P3). Outputs: accepted/refused; op masks.
+     * Accessors: preset_loadBank(). Affiliates:
+     * filesystem_loadBankDirectory_tick() phases 17/20/98.
      */
     for (scene_index = 0u; scene_index < SCENE_COUNT && scene_index < 16u;
          scene_index++) {
-        if ((scene_mask & (uint16_t)(1u << scene_index)) != 0u)
-            valid_mask = (uint16_t)(valid_mask | (uint16_t)(1u << scene_index));
+        uint16_t bit = (uint16_t)(1u << scene_index);
+        if (act_mask & bit)
+            valid_act = (uint16_t)(valid_act | bit);
+        if (empty_mask & bit)
+            valid_empty = (uint16_t)(valid_empty | bit);
     }
-    if (valid_mask == 0u || slot >= STORAGE_BANK_MAX_SLOTS ||
+    if ((valid_act | valid_empty) == 0u || slot >= STORAGE_BANK_MAX_SLOTS ||
         !filesystem_librarySlotExists(FS_NAME_CACHE_BANK, slot)) {
         return false;
     }
@@ -30260,8 +32374,24 @@ bool filesystem_requestLoadBank(uint16_t slot,
     op_scene_load_stall_last_phase = 0xffu;
     op_scene_load_stall_ticks = 0u;
 #endif
-    op_bank_scene_load_mask = valid_mask;
-    op_scene_load_scene_mask = valid_mask;
+    op_bank_scene_load_mask = valid_act;
+    op_scene_load_scene_mask = valid_act;
+    op_bank_scene_empty_mask = (uint16_t)(valid_empty & (uint16_t)~valid_act);
+    op_bank_flags = (uint8_t)(flags | (valid_empty ? FS_BANK_FLAG_REPLACE : 0u));
+    /*
+     * Start the load-availability session before any child phase
+     * (S082 P3 D44).
+     *
+     * What: a progressive load marks its load and empty sets unavailable now.
+     * Why: Preset unlocks the panel as soon as this request is accepted; a
+     * Scene about to be replaced must be excluded from that first moment.
+     * Inputs: FS_BANK_FLAG_PROGRESSIVE, validated masks.
+     * Outputs: BankData unavailable mask.
+     * Affiliates: bank_beginLoadAvailability(), on_bank_load_complete().
+     */
+    if (op_bank_flags & FS_BANK_FLAG_PROGRESSIVE)
+        bank_beginLoadAvailability(
+            (uint16_t)(op_bank_scene_load_mask | op_bank_scene_empty_mask));
     /*
      * Keep the root Bank display key intact while repair reads its cache row.
      *
@@ -30282,6 +32412,7 @@ bool filesystem_requestSaveBank(uint16_t slot,
                                 uint8_t source_scene,
                                 const char display_name[8],
                                 uint16_t bank_scene_save_mask,
+                                uint16_t empty_mask,
                                 uint8_t force_save,
                                 fs_completion_cb_t cb)
 {
@@ -30332,6 +32463,9 @@ bool filesystem_requestSaveBank(uint16_t slot,
                    (bank_hasResidentBank()
                         ? bank_scenePresentMask() : 0u));
     full_save_mask = bank_scene_save_mask;
+    op_bank_save_written_mask = full_save_mask;
+    op_bank_scene_empty_mask = (uint16_t)(empty_mask &
+                                          (uint16_t)~full_save_mask & 0xffffu);
     /*
      * Option 2: compute which children may skip their on-card rewrite.
      *
@@ -30392,7 +32526,15 @@ bool filesystem_requestSaveBank(uint16_t slot,
     op_bank_sd_clean_candidate_mask = op_bank_scene_save_mask;
     op_bank_sd_clean_candidate_slot = slot;
     bank_resetSdSaveMutationWindow();
+    /*
+     * S082 C3/D20: Scene 17 is never written as the manifest's active Scene.
+     * The Bank Save source is the home Scene captured when Scene 17 was built.
+     */
     op_bank_active_scene = bank_activeSceneSlot();
+    if (op_bank_active_scene >= SCENE_COUNT)
+        op_bank_active_scene = scene_backgroundHomeIndex();
+    if (op_bank_active_scene >= SCENE_COUNT)
+        op_bank_active_scene = 0u;
     if (full_save_mask != 0u &&
         (full_save_mask &
          (uint16_t)(1u << op_bank_active_scene)) == 0u) {
@@ -30418,24 +32560,40 @@ bool filesystem_requestSaveBank(uint16_t slot,
     }
     op_bankset_state.active_scene = op_bank_active_scene;
     /*
-     * Capture all per-Scene VOICE edit masks for the bankset writer.
+     * Stage the slot's edit masks with the resident Bank overruling (S4, S19, S24).
      *
-     * Inputs: indexed BankData entries. Output: the staging array carries the
-     * complete resident mask set and all seen bits are raised, so the writer
-     * emits one line for each Bank-local Scene. This avoids collapsing Scene 0
-     * through Scene 15 into the currently active entry during Bank Save.
-     * Affiliate: storage_formatBanksetLine() streams the indexed lines.
+     * What: a written Scene's entry is its RAM entry restricted to the written set
+     * plus itself; a removed child's entry is itself only. Entries of untouched
+     * children (Merge) are completed after the slot's existing bankset.bcg is read
+     * (phase 61), removing every written Scene from them.
+     * Why: Scenes in one mask must match; after a partial save, a written Scene can
+     * only match written Scenes, and untouched children no longer match the
+     * written ones.
+     * Inputs: BankData per-Scene entries, op_bank_save_written_mask,
+     * op_bank_scene_empty_mask.
+     * Outputs: op_bankset_state.scene_mask_voice_edit[] / seen bits.
+     * Accessors: filesystem_requestSaveBank().
+     * Affiliates: bank_mergeVoiceEditEntry() (B3.13), phases 61-64.
      */
     {
         uint8_t mask_i;
-        for (mask_i = 0u; mask_i < BANK_SCENE_SLOT_COUNT; mask_i++)
-            op_bankset_state.scene_mask_voice_edit[mask_i] =
-                bank_sceneMaskVoiceEditForScene(mask_i);
+        uint16_t written_and_empty =
+            (uint16_t)(op_bank_save_written_mask | op_bank_scene_empty_mask);
+        for (mask_i = 0u; mask_i < BANK_SCENE_SLOT_COUNT; mask_i++) {
+            uint16_t bit = (uint16_t)(1u << mask_i);
+            if (op_bank_save_written_mask & bit)
+                op_bankset_state.scene_mask_voice_edit[mask_i] =
+                    bank_mergeVoiceEditEntry(
+                        bank_sceneMaskVoiceEditForScene(mask_i),
+                        op_bank_save_written_mask, mask_i);
+            else if (op_bank_scene_empty_mask & bit)
+                op_bankset_state.scene_mask_voice_edit[mask_i] = bit;
+        }
+        op_bankset_state.seen_scene_mask_voice_edit = written_and_empty;
     }
     op_bankset_state.seen_format = 1u;
     op_bankset_state.seen_version = 1u;
     op_bankset_state.seen_active_scene = 1u;
-    op_bankset_state.seen_scene_mask_voice_edit = 0xffffu;
     filesystem_makeNumberedDir(op_save_bank_dir_display_name,
                                slot,
                                display_name);
@@ -30449,6 +32607,23 @@ bool filesystem_requestSaveBank(uint16_t slot,
         AUTOSAVE_TRACE_SAVE_LIFECYCLE_TYPE_BANK,
         (uint32_t)slot << AUTOSAVE_TRACE_SAVE_LIFECYCLE_SLOT_SHIFT);
     return true;
+}
+
+void filesystem_requestMidiLearnWrite(void)
+{
+    /*
+     * Queue one full midilrn.cfg rewrite (contract in filesystem.h). A new
+     * request also restores the one automatic retry after a failure.
+     */
+    fs_midilearn_write = FS_MIDILEARN_WRITE_PENDING;
+}
+
+bool filesystem_requestLoadMidiLearn(fs_completion_cb_t cb)
+{
+    /* Boot-only Learn table load (contract in filesystem.h). */
+    if (status == FS_STATUS_BUSY) return false;
+    return filesystem_start(FS_INTERNAL_OP_LOAD_MIDILEARN,
+                            FS_FILE_SETTINGS, 0u, cb);
 }
 
 bool filesystem_requestScanKits(fs_completion_cb_t cb)
@@ -30509,19 +32684,89 @@ bool filesystem_requestScanBankScenes(uint16_t slot, fs_completion_cb_t cb)
      *
      * Inputs: zero-based Bank slot from Menu's browser. Output: the shared
      * operation reset clears old child bits, then filesystem_scanBankScenes_tick()
-     * repopulates op_bank_child_present_mask from actual 00..15 child
-     * directories. Returning false means the filesystem is busy or the root
-     * Bank slot is not present, so callers should keep/defer their current LED
-     * state rather than trust a stale child mask.
+     * repopulates op_bank_child_present_mask (presence) and
+     * op_bank_child_content_mask (presence AND trigger steps) from actual
+     * 00..15 child directories. The scan runs on both Load (source) and Save
+     * (slot) Bank pages. Returning false means the filesystem is busy or the
+     * root Bank slot is not present, so callers should keep/defer their
+     * current LED state rather than trust a stale mask.
      */
     if (status == FS_STATUS_BUSY || slot >= STORAGE_BANK_MAX_SLOTS ||
         !filesystem_librarySlotExists(FS_NAME_CACHE_BANK, slot)) {
         return false;
     }
-    return filesystem_start(FS_INTERNAL_OP_SCAN_BANK_SCENES,
-                            FS_FILE_BANK,
-                            slot,
-                            cb);
+    /*
+     * Rearm the preview stall observer and stamp the start tick (S082 review
+     * F4/F8). Inputs: none. Outputs: diagnostic statics only.
+     */
+#if DEV_STALL_DETECTION
+    op_bank_preview_stall_last_phase = 0xffu;
+    op_bank_preview_stall_ticks = 0u;
+#endif
+#if DEV_MODE_LOGGING
+    op_bank_preview_start_tick = time_sysTick;
+#endif
+    {
+        const char *bank_name =
+            filesystem_cachedLibraryName(FS_NAME_CACHE_BANK, slot);
+
+        if (!filesystem_start(FS_INTERNAL_OP_SCAN_BANK_SCENES,
+                              FS_FILE_BANK,
+                              slot,
+                              cb))
+            return false;
+        /*
+         * Capture the Bank folder name with the request (Bank slot scroll).
+         *
+         * What: the selected slot's display name is copied out of the shared
+         * Bank index into the op-owned op_bank_display_name; phase 5 builds
+         * the `NNN Name` folder from this copy, not from the cache.
+         * Why: the preview no longer locks Menu input, so a type change may
+         * clear the shared name cache while the scan is still running.
+         * Inputs: slot, the resident Bank index. Outputs: op_bank_display_name.
+         */
+        memcpy(op_bank_display_name, bank_name, STORAGE_KIT_DISPLAY_NAME_LEN);
+        op_bank_display_name[STORAGE_KIT_DISPLAY_NAME_LEN] = '\0';
+    }
+    return true;
+}
+
+/*
+ * Report whether a Bank child preview scan owns the facade (Bank slot scroll).
+ *
+ * What: nonzero while FS_INTERNAL_OP_SCAN_BANK_SCENES is BUSY.
+ * Why: the preview no longer holds Menu's storage gate, so Menu asks the
+ * filesystem whether a scan is running before starting or cancelling one.
+ * Inputs: status, current_op. Outputs: boolean.
+ * Accessors: menu_requestBankChildPreview(), menu_requestCurrentLoadSaveSelection(),
+ * menu_backgroundBankLoadUiPoll(), Bank Save OK.
+ * Affiliates: filesystem_cancelScanBankScenes().
+ */
+uint8_t filesystem_scanBankScenesRunning(void)
+{
+    return (uint8_t)(status == FS_STATUS_BUSY &&
+                     current_op == FS_INTERNAL_OP_SCAN_BANK_SCENES);
+}
+
+/*
+ * Dispose the running Bank child preview scan (Bank slot scroll).
+ *
+ * What: when a preview scan is running, requests that it stop; the scan
+ * unwinds at its next phase with no callback outstanding (open directories
+ * closed, working directory returned to root) and finishes ERROR, so its
+ * completion is never mistaken for a valid preview. No-op otherwise.
+ * Why: scrolling the Bank slot must never wait for the preview of a slot the
+ * user has already left; each new selection disposes the work of the old
+ * one (number -> name -> LED preview, each superseded by the next turn).
+ * Inputs: status, current_op. Outputs: FS_BANK_FLAG_PREVIEW_CANCEL.
+ * Accessors: menu_requestCurrentLoadSaveSelection(), menu_requestBankChildPreview(),
+ * menu_switchPage() (leaving Load/Save), Bank Save OK.
+ * Affiliates: filesystem_scanBankScenes_tick(), menu_bankLoadPreviewComplete().
+ */
+void filesystem_cancelScanBankScenes(void)
+{
+    if (filesystem_scanBankScenesRunning())
+        op_bank_flags = (uint8_t)(op_bank_flags | FS_BANK_FLAG_PREVIEW_CANCEL);
 }
 
 uint16_t filesystem_bankChildSceneMask(void)
@@ -30537,6 +32782,21 @@ uint16_t filesystem_bankChildSceneMask(void)
      * this value.
      */
     return op_bank_child_present_mask;
+}
+
+/*
+ * Content mask (present AND trigger steps) of the last Bank child preview.
+ *
+ * What: bit N set when child NN exists and its PAT4 address array holds at
+ * least one trigger bit. Why: Bank LEDs and the Merge act mask need content,
+ * not just presence. Inputs: none. Outputs: 16-bit mask.
+ * Accessors: menu_bankLoadPreviewComplete().
+ * Affiliates: filesystem_bankChildSceneMask(). Risk: operation-local, so
+ * Menu must check that the slot it requested is still shown.
+ */
+uint16_t filesystem_bankChildContentMask(void)
+{
+    return op_bank_child_content_mask;
 }
 
 bool filesystem_requestLoadResidentInstrumentName(uint8_t scene_index,
@@ -30558,7 +32818,6 @@ bool filesystem_requestLoadResidentInstrumentName(uint8_t scene_index,
      */
     if (row >= FS_RESIDENT_NAMES_ROW_COUNT || status == FS_STATUS_BUSY)
         return false;
-    filesystem_prepareResidentNamesCache();
     if (!filesystem_start(FS_INTERNAL_OP_LOAD_HCNAMES_INSTRUMENT,
                           FS_FILE_SETTINGS,
                           instrument_slot,
@@ -30566,6 +32825,8 @@ bool filesystem_requestLoadResidentInstrumentName(uint8_t scene_index,
         filesystem_clearNameCacheStorage();
         return false;
     }
+    /* S082 review F9: reset the register only after the request is accepted. */
+    filesystem_prepareResidentNamesCache();
     op_kit_load_scene_mask = (uint16_t)(1u << scene_index);
     return true;
 }
@@ -30603,7 +32864,6 @@ bool filesystem_requestUpdateResidentInstrumentNames(
     }
     if (valid_mask == 0u)
         return false;
-    filesystem_prepareResidentNamesCache();
     if (!filesystem_start(FS_INTERNAL_OP_UPDATE_HCNAMES_INSTRUMENT,
                           FS_FILE_SETTINGS,
                           instrument_slot,
@@ -30611,6 +32871,8 @@ bool filesystem_requestUpdateResidentInstrumentNames(
         filesystem_clearNameCacheStorage();
         return false;
     }
+    /* S082 review F9: reset the register only after the request is accepted. */
+    filesystem_prepareResidentNamesCache();
     op_kit_load_scene_mask = valid_mask;
     return true;
 }
@@ -30632,7 +32894,6 @@ bool filesystem_requestLoadResidentKitName(uint8_t scene_index,
      */
     if (row >= FS_RESIDENT_NAMES_ROW_COUNT || status == FS_STATUS_BUSY)
         return false;
-    filesystem_prepareResidentNamesCache();
     if (!filesystem_start(FS_INTERNAL_OP_LOAD_HCNAMES_KIT,
                           FS_FILE_SETTINGS,
                           scene_index,
@@ -30640,6 +32901,8 @@ bool filesystem_requestLoadResidentKitName(uint8_t scene_index,
         filesystem_clearNameCacheStorage();
         return false;
     }
+    /* S082 review F9: reset the register only after the request is accepted. */
+    filesystem_prepareResidentNamesCache();
     op_kit_load_scene_mask = (uint16_t)(1u << scene_index);
     return true;
 }
@@ -30677,7 +32940,6 @@ bool filesystem_requestUpdateResidentKitNames(uint16_t scene_mask,
     }
     if (valid_mask == 0u)
         return false;
-    filesystem_prepareResidentNamesCache();
     if (!filesystem_start(FS_INTERNAL_OP_UPDATE_HCNAMES_KIT,
                           FS_FILE_SETTINGS,
                           0u,
@@ -30685,6 +32947,8 @@ bool filesystem_requestUpdateResidentKitNames(uint16_t scene_mask,
         filesystem_clearNameCacheStorage();
         return false;
     }
+    /* S082 review F9: reset the register only after the request is accepted. */
+    filesystem_prepareResidentNamesCache();
     op_kit_load_scene_mask = valid_mask;
     return true;
 }
@@ -30707,12 +32971,13 @@ bool filesystem_requestLoadResidentSceneName(uint8_t scene_index,
      */
     if (row >= FS_RESIDENT_NAMES_ROW_COUNT || status == FS_STATUS_BUSY)
         return false;
-    filesystem_prepareResidentNamesCache();
     if (!filesystem_start(FS_INTERNAL_OP_LOAD_HCNAMES_SCENE,
                           FS_FILE_SETTINGS, scene_index, cb)) {
         filesystem_clearNameCacheStorage();
         return false;
     }
+    /* S082 review F9: reset the register only after the request is accepted. */
+    filesystem_prepareResidentNamesCache();
     return true;
 }
 
@@ -30742,9 +33007,12 @@ bool filesystem_requestCopyResidentNames(fs_completion_cb_t cb)
 {
     if (status == FS_STATUS_BUSY || !fs_name_cache_borrowed)
         return false;
+    if (!filesystem_start(FS_INTERNAL_OP_UPDATE_HCNAMES_COPY,
+                          FS_FILE_SETTINGS, 0u, cb))
+        return false;
+    /* S082 review F9: reset the register only after the request is accepted. */
     filesystem_prepareResidentNamesCache();
-    return filesystem_start(FS_INTERNAL_OP_UPDATE_HCNAMES_COPY,
-                            FS_FILE_SETTINGS, 0u, cb);
+    return true;
 }
 
 bool filesystem_requestUpdateResidentSceneNames(
@@ -30781,12 +33049,13 @@ bool filesystem_requestUpdateResidentSceneNames(
     }
     if (valid_mask == 0u)
         return false;
-    filesystem_prepareResidentNamesCache();
     if (!filesystem_start(FS_INTERNAL_OP_UPDATE_HCNAMES_SCENE,
                           FS_FILE_SETTINGS, 0u, cb)) {
         filesystem_clearNameCacheStorage();
         return false;
     }
+    /* S082 review F9: reset the register only after the request is accepted. */
+    filesystem_prepareResidentNamesCache();
     op_scene_load_scene_mask = valid_mask;
     memcpy(op_scene_display_name, name, STORAGE_SCENE_DISPLAY_NAME_LEN);
     op_scene_display_name[STORAGE_SCENE_DISPLAY_NAME_LEN] = '\0';
@@ -31784,6 +34053,20 @@ uint16_t filesystem_lastBankLoadFailedSceneMask(void)
     return op_bank_scene_failed_mask;
 }
 
+/*
+ * Expose the completed Bank Load's empty mask (S082 B3, B3.15).
+ *
+ * What: returns the Scenes emptied by a Replace Bank Load, readable between
+ * the completion callback and filesystem_start(). Why: Menu uses the mask
+ * to decide whether the active Scene needs re-apply (S25).
+ * Accessors: preset on_bank_load_complete(), Menu PRESET_OP_BANK_LOAD.
+ * Affiliates: filesystem_lastBankLoadSceneMask().
+ */
+uint16_t filesystem_lastBankLoadEmptyMask(void)
+{
+    return op_bank_scene_empty_mask;
+}
+
 uint8_t filesystem_instrumentTargetExists(instrument_type_t type,
                                           const char *display_stem)
 {
@@ -31827,18 +34110,29 @@ uint8_t filesystem_instrumentTargetExists(instrument_type_t type,
 const char *filesystem_residentInstrumentName(uint8_t scene_index,
                                               uint8_t instrument_slot)
 {
-    uint16_t row = filesystem_residentInstrumentRow(scene_index,
-                                                    instrument_slot);
+    uint16_t row;
 
     /*
-     * Option 1C: read one Instrument name from the dedicated HCNAMES mirror.
+     * Scene 17 reads its captured Instrument name (S082 P1 D29).
      *
-     * Inputs must match the completed resident-name read/update request.
-     * Output is the eight-character, NUL-terminated mirror cell, or `Empty   `
-     * when the mirror is invalid, the row is out of range, or the file row is
-     * blank. The pointer is mirror-owned and valid until the next HCNAMES
-     * transaction; Menu copies it immediately into its edit/display buffer.
+     * What: index 16 while Scene 17 exists returns the capture row (blank ->
+     * the normal `Empty   ` fallback) instead of an HCNAMES mirror cell.
+     * Why: HCNAMES has no row for Scene 17; without this the Kit, Scene,
+     * Instrument and Pattern Save editors on 17 would prefill `Empty`, and
+     * Scene Save from 17 would write `Empty` member names.
+     * Inputs: scene_index, instrument_slot. Outputs: eight-cell name pointer.
+     * Accessors: Menu entry/prefill (E2), filesystem_requestSaveSceneDirectory().
+     * Affiliates: filesystem_backgroundNameRaw(), scene_backgroundExists().
      */
+    if (scene_index == SCENE_BACKGROUND_INDEX && scene_backgroundExists()) {
+        const char *name;
+        if (instrument_slot >= STORAGE_KIT_SLOT_COUNT)
+            return "Empty   ";
+        name = filesystem_backgroundNameRaw(
+            (uint8_t)(FS_BACKGROUND_NAME_INSTRUMENT_0 + instrument_slot));
+        return filesystem_residentNameIsBlank(name) ? "Empty   " : name;
+    }
+    row = filesystem_residentInstrumentRow(scene_index, instrument_slot);
     if (hcnames_mirror_valid != FS_HCNAMES_MIRROR_VALID ||
         row >= FS_RESIDENT_NAMES_ROW_COUNT ||
         filesystem_residentNameIsBlank(hcnames_name_mirror[row])) {
@@ -31849,16 +34143,26 @@ const char *filesystem_residentInstrumentName(uint8_t scene_index,
 
 const char *filesystem_residentKitName(uint8_t scene_index)
 {
-    uint16_t row = filesystem_residentKitRow(scene_index);
+    uint16_t row;
 
     /*
-     * Option 1C: read one Kit name from the dedicated HCNAMES mirror.
+     * Scene 17 reads its captured Kit name (S082 P1 D29).
      *
-     * Input must match the completed resident-Kit-name read/update request.
-     * Output is the eight-character, NUL-terminated mirror cell, or `Empty   `
-     * when the mirror is invalid, the row is out of range, or blank. The
-     * pointer is mirror-owned and valid until the next HCNAMES transaction.
+     * What: index 16 while Scene 17 exists returns the capture row (blank ->
+     * the normal `Empty   ` fallback) instead of an HCNAMES mirror cell.
+     * Why: HCNAMES has no row for Scene 17; without this the Kit/KitMrp Save
+     * prefill on 17 would read `Empty` and Scene Save from 17 would name its
+     * embedded Kit folder `Kit Empty`.
+     * Inputs: scene_index. Outputs: eight-cell name pointer.
+     * Accessors: menu_requestResidentNameScratch() (Kit/Instrument
+     * entry), filesystem_requestSaveSceneDirectory().
+     * Affiliates: filesystem_backgroundNameRaw(), scene_backgroundExists().
      */
+    if (scene_index == SCENE_BACKGROUND_INDEX && scene_backgroundExists()) {
+        const char *name = filesystem_backgroundNameRaw(FS_BACKGROUND_NAME_KIT);
+        return filesystem_residentNameIsBlank(name) ? "Empty   " : name;
+    }
+    row = filesystem_residentKitRow(scene_index);
     if (hcnames_mirror_valid != FS_HCNAMES_MIRROR_VALID ||
         row >= FS_RESIDENT_NAMES_ROW_COUNT ||
         filesystem_residentNameIsBlank(hcnames_name_mirror[row])) {
@@ -31869,15 +34173,24 @@ const char *filesystem_residentKitName(uint8_t scene_index)
 
 const char *filesystem_residentSceneName(uint8_t scene_index)
 {
-    uint16_t row = filesystem_residentSceneRow(scene_index);
+    uint16_t row;
 
     /*
-     * Option 1C: read one Scene name from the dedicated HCNAMES mirror.
+     * Scene 17 reads its captured Scene name (S082 P1 D29).
      *
-     * Input: resident Scene coordinate. Output: HCNAMES' eight-cell text or
-     * the normal `Empty` fallback for an invalid/blank row. The pointer is
-     * mirror-owned and valid until the next HCNAMES transaction.
+     * What: index 16 while Scene 17 exists returns the capture row (blank ->
+     * the normal `Empty   ` fallback) instead of an HCNAMES mirror cell.
+     * Why: HCNAMES has no row for Scene 17; without this the Scene Save prefill
+     * on 17 would read `Empty`.
+     * Inputs: scene_index. Outputs: eight-cell name pointer.
+     * Accessors: menu_requestSceneEntryName().
+     * Affiliates: filesystem_backgroundNameRaw(), scene_backgroundExists().
      */
+    if (scene_index == SCENE_BACKGROUND_INDEX && scene_backgroundExists()) {
+        const char *name = filesystem_backgroundNameRaw(FS_BACKGROUND_NAME_SCENE);
+        return filesystem_residentNameIsBlank(name) ? "Empty   " : name;
+    }
+    row = filesystem_residentSceneRow(scene_index);
     if (hcnames_mirror_valid != FS_HCNAMES_MIRROR_VALID ||
         row >= FS_RESIDENT_NAMES_ROW_COUNT ||
         filesystem_residentNameIsBlank(hcnames_name_mirror[row])) {
@@ -31888,15 +34201,130 @@ const char *filesystem_residentSceneName(uint8_t scene_index)
 
 const char *filesystem_residentPatternName(uint8_t scene_index)
 {
-    uint16_t row = filesystem_residentPatternRow(scene_index);
+    uint16_t row;
 
-    /* Borrow the appended Pattern HCNAMES cell for the Save-name editor. */
+    /*
+     * Scene 17 reads its captured Pattern name (S082 P1 D29).
+     *
+     * What: index 16 while Scene 17 exists returns the capture row (blank ->
+     * the normal `Empty   ` fallback) instead of an HCNAMES mirror cell.
+     * Why: HCNAMES has no row for Scene 17; without this the Pattern Save
+     * prefill on 17 would read `Empty`.
+     * Inputs: scene_index. Outputs: eight-cell name pointer.
+     * Accessors: Pattern Save name prefill (menu.c SAVE_TYPE_PATTERN).
+     * Affiliates: filesystem_backgroundNameRaw(), scene_backgroundExists().
+     */
+    if (scene_index == SCENE_BACKGROUND_INDEX && scene_backgroundExists()) {
+        const char *name = filesystem_backgroundNameRaw(
+            FS_BACKGROUND_NAME_PATTERN);
+        return filesystem_residentNameIsBlank(name) ? "Empty   " : name;
+    }
+    row = filesystem_residentPatternRow(scene_index);
     if (hcnames_mirror_valid != FS_HCNAMES_MIRROR_VALID ||
         row >= FS_RESIDENT_NAMES_ROW_COUNT ||
         filesystem_residentNameIsBlank(hcnames_name_mirror[row])) {
         return "Empty   ";
     }
     return hcnames_name_mirror[row];
+}
+
+/*
+ * Copy one eight-cell name into a Scene 17 capture row.
+ *
+ * What: stores up to eight printable cells, pads with spaces, NUL-terminates.
+ * Why: one formatter keeps every capture writer consistent with
+ * filesystem_setIdentityName().
+ * Inputs: row, source cells (NULL = blank). Outputs: one capture row.
+ * Accessors: the three public capture functions below.
+ * Affiliates: storage_copyDisplayName() (the same eight-cell rule).
+ */
+static void filesystem_backgroundNameStore(uint8_t row, const char *name)
+{
+    uint8_t i;
+
+    if (row >= FS_BACKGROUND_NAME_ROW_COUNT)
+        return;
+    for (i = 0u; i < STORAGE_KIT_DISPLAY_NAME_LEN; i++) {
+        char c = name ? name[i] : ' ';
+        if (c == '\0')
+            name = NULL, c = ' ';
+        fs_background_name[row][i] = (c >= 0x20 && c <= 0x7e) ? c : ' ';
+    }
+    fs_background_name[row][STORAGE_KIT_DISPLAY_NAME_LEN] = '\0';
+}
+
+/*
+ * Capture all names of the Scene that Scene 17 is built from (D29).
+ *
+ * What: copies the Scene, Kit, six Instrument, Pattern and Effect rows of
+ * src_scene from the HCNAMES mirror into the capture.
+ * Why: the Bank load that follows replaces those HCNAMES rows; Scene 17 must
+ * keep the identity that was playing (D15, D22, D29). R3: the mirror is the
+ * card authority for the mounted session; no card I/O runs, so the switch is
+ * not delayed. An invalid mirror yields blank rows, which read as `Empty`.
+ * Inputs: resident Scene 0..15; hcnames_name_mirror via
+ * filesystem_cachedResidentName(). Outputs: capture rows 0..9.
+ * Accessors: preset_buildBackgroundScene() (fresh build, phase 3: the facade
+ * is idle, so no HCNAMES writer is mid-rewrite).
+ * Affiliates: filesystem_resident*Row(), filesystem_backgroundNameStore().
+ */
+void filesystem_backgroundNamesCaptureScene(uint8_t src_scene)
+{
+    uint8_t slot;
+
+    if (src_scene >= SCENE_COUNT)
+        return;
+    filesystem_backgroundNameStore(FS_BACKGROUND_NAME_SCENE,
+        filesystem_cachedResidentName(filesystem_residentSceneRow(src_scene)));
+    filesystem_backgroundNameStore(FS_BACKGROUND_NAME_KIT,
+        filesystem_cachedResidentName(filesystem_residentKitRow(src_scene)));
+    for (slot = 0u; slot < STORAGE_KIT_SLOT_COUNT; slot++)
+        filesystem_backgroundNameCaptureInstrument(slot, src_scene, slot);
+    filesystem_backgroundNameStore(FS_BACKGROUND_NAME_PATTERN,
+        filesystem_cachedResidentName(filesystem_residentPatternRow(src_scene)));
+    filesystem_backgroundNameStore(FS_BACKGROUND_NAME_EFFECT,
+        filesystem_cachedResidentName(filesystem_residentEffectRow(src_scene)));
+}
+
+/*
+ * Capture one Instrument name into a Scene 17 slot (D29).
+ *
+ * What: copies HCNAMES Instrument row (src_scene, src_slot) into capture row
+ * FS_BACKGROUND_NAME_INSTRUMENT_0 + dst_slot.
+ * Why: with per-track playback each Scene 17 slot comes from that track's
+ * played Scene (D2), so its name must come from the same Scene.
+ * Inputs: dst_slot 0..5, resident src_scene, src_slot 0..5.
+ * Outputs: one capture row.
+ * Accessors: filesystem_backgroundNamesCaptureScene(),
+ * preset_copyBackgroundSlot().
+ * Affiliates: filesystem_residentInstrumentRow().
+ */
+void filesystem_backgroundNameCaptureInstrument(uint8_t dst_slot,
+                                                uint8_t src_scene,
+                                                uint8_t src_slot)
+{
+    if (dst_slot >= STORAGE_KIT_SLOT_COUNT || src_scene >= SCENE_COUNT)
+        return;
+    filesystem_backgroundNameStore(
+        (uint8_t)(FS_BACKGROUND_NAME_INSTRUMENT_0 + dst_slot),
+        filesystem_cachedResidentName(
+            filesystem_residentInstrumentRow(src_scene, src_slot)));
+}
+
+/*
+ * Rename one Scene 17 captured name (R2).
+ *
+ * What: stores a new eight-cell name in one capture row.
+ * Why: a successful normal save from Scene 17 makes the saved name Scene 17's
+ * identity, as a resident save does for its HCNAMES row.
+ * Inputs: FS_BACKGROUND_NAME_* row, name. Outputs: one capture row.
+ * Accessors: Kit Save case 21, Instrument Save completion, Scene Save
+ * staging, Pattern Save case 13 (E3).
+ * Affiliates: filesystem_backgroundNameStore().
+ */
+void filesystem_backgroundNameSet(uint8_t row, const char *name)
+{
+    filesystem_backgroundNameStore(row, name);
 }
 
 uint16_t filesystem_instrumentCount(instrument_type_t type)

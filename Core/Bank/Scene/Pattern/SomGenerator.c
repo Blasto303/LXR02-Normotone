@@ -37,7 +37,7 @@
 #include "SomGenerator.h"
 #include "SomData.h"
 #include "sequencer.h"
-#include "MidiNoteNumbers.h"
+#include "MidiPitch.h"
 #include "math.h"
 
 SomGenerator somGenerator;

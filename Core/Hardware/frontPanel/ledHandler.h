@@ -141,11 +141,17 @@ void led_flashLed(uint8_t ledNr);
 void led_setBlinkLed(uint8_t ledNr, uint8_t onOff);
 void led_clearAllBlinkLeds(void);
 /*
- * S080 P2 Defect 10: one double-rate blinking LED on its own layer (queued
- * Scene). ledNr 0xFF clears it. Blink and base writes never disturb it.
+ * Fast blink slots (S080 P2 Defect 10; S082 P3 W1): double-rate LEDs on their
+ * own layer, sharing one phase. Slot QUEUED_SCENE = queued Scene's SEQ LED;
+ * slot BANK_LOAD = Load/Save mode LED during a background Bank load.
+ * ledNr 0xFF frees a slot. Blink and base writes never disturb them.
+ * Accessors: menu_syncQueuedSceneLed().
  */
-void    led_setFastBlinkLed(uint8_t ledNr);
-uint8_t led_getFastBlinkLed(void);
+#define LED_FAST_SLOT_QUEUED_SCENE 0u
+#define LED_FAST_SLOT_BANK_LOAD    1u
+#define LED_FAST_SLOT_COUNT        2u
+void    led_setFastBlinkSlot(uint8_t slot, uint8_t ledNr);
+uint8_t led_getFastBlinkSlot(uint8_t slot);
 /* S080 P2: 1 when ledNr holds a persistent blink slot. */
 uint8_t led_isBlinkLed(uint8_t ledNr);
 

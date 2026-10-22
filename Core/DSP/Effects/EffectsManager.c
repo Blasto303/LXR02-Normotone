@@ -170,6 +170,11 @@ _Static_assert(sizeof(effects_runtime_t) == 76u,
  * live FX step/selection state, and the common return settings consumed by the
  * mixer's FX return. The spare `reserved` byte keeps the layout; the former
  * held Morph latch was removed (S081 §5.3, one-step Morph lane).
+ * scene_index is the Scene whose Effect record effects_service() reads every
+ * render block. effects_activateScene() sets it for a real Scene change;
+ * effects_rebindSourceScene() moves it to Scene 17 at the background-load
+ * switch without disturbing the runtime (S082 P2 fix 1). It must always name
+ * the active Scene while audio runs.
  */
 typedef struct {
     effect_type_id_t runtime_type;
@@ -584,36 +589,42 @@ uint8_t effects_storeValue7(uint8_t scene_index, uint8_t local,
  * Effect type differs, protecting local descriptor/lane indices until the
  * layout gate and revalidation have repaired every mask. Inactive edits reach
  * only their origin, matching VOICE editing. Foreground-only; no SRAM.
+ * Affiliates: bank_loadUnavailableMask().
  */
-static uint16_t effects_fanoutMask(uint8_t scene_index, uint8_t match_type)
+static uint32_t effects_fanoutMask(uint8_t scene_index, uint8_t match_type)
 {
     const effect_record_t *origin = scene_effectConst(scene_index);
-    uint16_t mask;
+    uint32_t mask;
     uint8_t s;
 
-    if (!origin || scene_index >= SCENE_COUNT)
+    if (!origin)
         return 0u;
-    mask = (uint16_t)(1u << scene_index);
-    /*
-     * S075: every Scene owns a directional VOICE edit-mask entry. The active
-     * Scene keeps the self-repairing UI accessor; an inactive Scene must use
-     * its indexed entry so an Effect paste cannot collapse to the audible
-     * Scene.
-     */
+    if (scene_index == SCENE_BACKGROUND_INDEX)
+        return scene_backgroundExists() ? (1ul << SCENE_BACKGROUND_INDEX) : 0u;
+    if (scene_index >= SCENE_COUNT)
+        return 0u;
+    mask = (uint32_t)(1ul << scene_index);
     if (scene_index == scene_getActiveIndex())
-        mask = (uint16_t)(mask | bank_sceneMaskVoiceEdit());
+        mask |= (uint32_t)bank_sceneMaskVoiceEdit();
     else
-        mask = (uint16_t)(mask | bank_sceneMaskVoiceEditForScene(scene_index));
+        mask |= (uint32_t)bank_sceneMaskVoiceEditForScene(scene_index);
+    /*
+     * S082 P3 D44: no Effect fan-out into a Scene a running background Bank
+     * load has not finished (pending, in progress or emptied); zero mask
+     * outside a load. Affiliates: bank_loadUnavailableMask(),
+     * bank_editTargetMask().
+     */
+    mask &= ~(uint32_t)bank_loadUnavailableMask();
     if (!match_type)
         return mask;
     for (s = 0u; s < SCENE_COUNT; s++) {
         const effect_record_t *record;
 
-        if (s == scene_index || (mask & (uint16_t)(1u << s)) == 0u)
+        if (s == scene_index || (mask & (1ul << s)) == 0u)
             continue;
         record = scene_effectConst(s);
         if (!record || record->type != origin->type)
-            mask = (uint16_t)(mask & (uint16_t)~(1u << s));
+            mask &= ~(1ul << s);
     }
     return mask;
 }
@@ -655,7 +666,7 @@ static uint8_t effects_setParameterScene(uint8_t scene_index, uint8_t index,
 uint8_t effects_setParameter(uint8_t scene_index, uint8_t index,
                              effect_image_t image, uint8_t value)
 {
-    uint16_t mask = effects_fanoutMask(scene_index, 1u);
+    uint32_t mask = effects_fanoutMask(scene_index, 1u);
     uint8_t changed = 0u;
     uint8_t s;
 
@@ -664,8 +675,8 @@ uint8_t effects_setParameter(uint8_t scene_index, uint8_t index,
      * clamps against its own descriptor and SceneData marks its own AutoSave
      * cell/card-clean state; the active runtime is rescanned by service.
      */
-    for (s = 0u; s < SCENE_COUNT; s++) {
-        if ((mask & (uint16_t)(1u << s)) != 0u)
+    for (s = 0u; s < SCENE_SLOT_TOTAL; s++) {
+        if ((mask & (1ul << s)) != 0u)
             changed |= effects_setParameterScene(s, index, image, value);
     }
     /*
@@ -746,7 +757,9 @@ static uint8_t effects_setMorphAmountScene(uint8_t scene_index, uint8_t amount)
      * runtime's own active Scene, which tracks scene_getActiveIndex()).
      * Output: effects_automation.morph_override_valid = 0.
      * Callers (upstream): effects_setMorphAmount() fan-out, called by
-     * menu_commitEffectMorphParam() and clearOps.c. Affiliate:
+     * menu_commitEffectMorphParam() and clearOps.c; and
+     * effects_setMorphAmountFromGlobal() (global Morph through
+     * preset_morphScene(), S083 follow-up). Affiliate:
      * effects_setMorphAutomation() (the automation setter).
      */
     if (scene_index == effects_state.scene_index)
@@ -757,12 +770,12 @@ static uint8_t effects_setMorphAmountScene(uint8_t scene_index, uint8_t amount)
 /* Sequence-setting fan-out: run, length, and scale share the same-type mask. */
 uint8_t effects_setSeqRunMode(uint8_t scene_index, uint8_t mode)
 {
-    uint16_t mask = effects_fanoutMask(scene_index, 1u);
+    uint32_t mask = effects_fanoutMask(scene_index, 1u);
     uint8_t changed = 0u;
     uint8_t s;
 
-    for (s = 0u; s < SCENE_COUNT; s++) {
-        if ((mask & (uint16_t)(1u << s)) != 0u)
+    for (s = 0u; s < SCENE_SLOT_TOTAL; s++) {
+        if ((mask & (1ul << s)) != 0u)
             changed |= effects_setSeqRunModeScene(s, mode);
     }
     return changed;
@@ -770,12 +783,12 @@ uint8_t effects_setSeqRunMode(uint8_t scene_index, uint8_t mode)
 
 uint8_t effects_setSeqLength(uint8_t scene_index, uint8_t length)
 {
-    uint16_t mask = effects_fanoutMask(scene_index, 1u);
+    uint32_t mask = effects_fanoutMask(scene_index, 1u);
     uint8_t changed = 0u;
     uint8_t s;
 
-    for (s = 0u; s < SCENE_COUNT; s++) {
-        if ((mask & (uint16_t)(1u << s)) != 0u)
+    for (s = 0u; s < SCENE_SLOT_TOTAL; s++) {
+        if ((mask & (1ul << s)) != 0u)
             changed |= effects_setSeqLengthScene(s, length);
     }
     return changed;
@@ -783,26 +796,36 @@ uint8_t effects_setSeqLength(uint8_t scene_index, uint8_t length)
 
 uint8_t effects_setSeqStepScale(uint8_t scene_index, uint8_t scale)
 {
-    uint16_t mask = effects_fanoutMask(scene_index, 1u);
+    uint32_t mask = effects_fanoutMask(scene_index, 1u);
     uint8_t changed = 0u;
     uint8_t s;
 
-    for (s = 0u; s < SCENE_COUNT; s++) {
-        if ((mask & (uint16_t)(1u << s)) != 0u)
+    for (s = 0u; s < SCENE_SLOT_TOTAL; s++) {
+        if ((mask & (1ul << s)) != 0u)
             changed |= effects_setSeqStepScaleScene(s, scale);
     }
+    return changed;
+}
+
+/* Contract in EffectsManager.h. */
+uint8_t effects_setMorphAmountFromGlobal(uint8_t scene_index, uint8_t amount)
+{
+    uint8_t changed = effects_setMorphAmountScene(scene_index, amount);
+
+    if (scene_index == effects_state.scene_index)
+        effects_automation.menuHoldMorph = 1u;
     return changed;
 }
 
 /* Effect Morph is type-agnostic, so its retained amount reaches the mask. */
 uint8_t effects_setMorphAmount(uint8_t scene_index, uint8_t amount)
 {
-    uint16_t mask = effects_fanoutMask(scene_index, 0u);
+    uint32_t mask = effects_fanoutMask(scene_index, 0u);
     uint8_t changed = 0u;
     uint8_t s;
 
-    for (s = 0u; s < SCENE_COUNT; s++) {
-        if ((mask & (uint16_t)(1u << s)) != 0u)
+    for (s = 0u; s < SCENE_SLOT_TOTAL; s++) {
+        if ((mask & (1ul << s)) != 0u)
             changed |= effects_setMorphAmountScene(s, amount);
     }
     /*
@@ -1053,7 +1076,7 @@ static uint8_t effects_setSeqLaneLockScene(uint8_t scene_index, uint16_t step_ma
 uint8_t effects_setSeqLaneLock(uint8_t scene_index, uint16_t step_mask,
                                uint8_t lane, uint8_t value)
 {
-    uint16_t mask = effects_fanoutMask(scene_index, 1u);
+    uint32_t mask = effects_fanoutMask(scene_index, 1u);
     uint8_t changed = 0u;
     uint8_t s;
 
@@ -1062,8 +1085,8 @@ uint8_t effects_setSeqLaneLock(uint8_t scene_index, uint16_t step_mask,
      * lane meaning is shared by equal types, while each worker applies its own
      * descriptor clamp and retained SceneData dirty markers.
      */
-    for (s = 0u; s < SCENE_COUNT; s++) {
-        if ((mask & (uint16_t)(1u << s)) != 0u)
+    for (s = 0u; s < SCENE_SLOT_TOTAL; s++) {
+        if ((mask & (1ul << s)) != 0u)
             changed |= effects_setSeqLaneLockScene(s, step_mask, lane, value);
     }
     return changed;
@@ -1082,19 +1105,19 @@ uint8_t effects_setSeqLaneLock(uint8_t scene_index, uint16_t step_mask,
 uint16_t effects_pasteRecord(uint8_t dst_scene, const effect_record_t *src)
 {
     const effect_record_t *dst = scene_effectConst(dst_scene);
-    uint16_t mask;
+    uint32_t mask;
     uint8_t member;
 
     if (!dst || !src || dst_scene >= SCENE_COUNT)
         return 0u;
     mask = effects_fanoutMask(dst_scene, 1u);
-    for (member = 0u; member < SCENE_COUNT; member++) {
-        if ((mask & (uint16_t)(1u << member)) == 0u ||
+    for (member = 0u; member < SCENE_SLOT_TOTAL; member++) {
+        if ((mask & (1ul << member)) == 0u ||
             scene_effectConst(member) == src)
             continue;
         (void)scene_commitEffectRecord(member, src);
     }
-    if ((mask & (uint16_t)(1u << scene_getActiveIndex())) != 0u)
+    if ((mask & (1ul << scene_getActiveIndex())) != 0u)
         effects_activateScene(scene_getActiveIndex());
     bank_revalidateVoiceEditMasks();
     return mask;
@@ -1111,16 +1134,16 @@ uint16_t effects_pasteRecord(uint8_t dst_scene, const effect_record_t *src)
 uint16_t effects_resetRecord(uint8_t dst_scene)
 {
     const effect_record_t *dst = scene_effectConst(dst_scene);
-    uint16_t mask;
+    uint32_t mask;
     uint8_t member;
 
     if (!dst || dst_scene >= SCENE_COUNT)
         return 0u;
     mask = effects_fanoutMask(dst_scene, 1u);
-    for (member = 0u; member < SCENE_COUNT; member++) {
+    for (member = 0u; member < SCENE_SLOT_TOTAL; member++) {
         effect_record_t *record;
 
-        if ((mask & (uint16_t)(1u << member)) == 0u)
+        if ((mask & (1ul << member)) == 0u)
             continue;
         record = scene_effectRecordForWholeCommit(member);
         if (!record)
@@ -1128,7 +1151,7 @@ uint16_t effects_resetRecord(uint8_t dst_scene)
         scene_effectRecordDefaults(record);
         scene_finishEffectWholeCommit(member);
     }
-    if ((mask & (uint16_t)(1u << scene_getActiveIndex())) != 0u)
+    if ((mask & (1ul << scene_getActiveIndex())) != 0u)
         effects_activateScene(scene_getActiveIndex());
     bank_revalidateVoiceEditMasks();
     return mask;
@@ -1157,7 +1180,7 @@ uint16_t effects_resetMorphToNormal(uint8_t dst_scene)
 {
     const effect_record_t *dst = scene_effectConst(dst_scene);
     effect_type_id_t type;
-    uint16_t mask;
+    uint32_t mask;
     uint16_t written = 0u;
     uint8_t member;
 
@@ -1165,12 +1188,12 @@ uint16_t effects_resetMorphToNormal(uint8_t dst_scene)
         return 0u;
     type = dst->type;
     mask = effects_fanoutMask(dst_scene, 1u);
-    for (member = 0u; member < SCENE_COUNT; member++) {
+    for (member = 0u; member < SCENE_SLOT_TOTAL; member++) {
         effect_record_t *record;
         uint8_t changed = 0u;
         uint8_t i;
 
-        if ((mask & (uint16_t)(1u << member)) == 0u)
+        if ((mask & (1ul << member)) == 0u)
             continue;
         record = scene_effectRecordForWholeCommit(member);
         if (!record)
@@ -1250,7 +1273,7 @@ uint8_t effects_pasteSeqStep(uint8_t dst_scene, uint8_t step,
                              const effect_seq_step_t *src)
 {
     const effect_record_t *dst = scene_effectConst(dst_scene);
-    uint16_t mask;
+    uint32_t mask;
     uint8_t member;
     uint8_t lane;
     uint8_t changed = 0u;
@@ -1260,10 +1283,10 @@ uint8_t effects_pasteSeqStep(uint8_t dst_scene, uint8_t step,
         step >= EFFECT_SEQ_STEP_COUNT)
         return 0u;
     mask = effects_fanoutMask(dst_scene, 1u);
-    for (member = 0u; member < SCENE_COUNT; member++) {
+    for (member = 0u; member < SCENE_SLOT_TOTAL; member++) {
         const effect_record_t *record;
 
-        if ((mask & (uint16_t)(1u << member)) == 0u)
+        if ((mask & (1ul << member)) == 0u)
             continue;
         record = scene_effectConst(member);
         if (!record)
@@ -1303,7 +1326,7 @@ uint8_t effects_clearSeqLanes(uint8_t scene_index, uint16_t step_mask,
                               uint16_t lane_mask)
 {
     const effect_record_t *dst = scene_effectConst(scene_index);
-    uint16_t mask;
+    uint32_t mask;
     uint8_t member;
     uint8_t step;
     uint8_t lane;
@@ -1313,10 +1336,10 @@ uint8_t effects_clearSeqLanes(uint8_t scene_index, uint16_t step_mask,
     if (!dst || scene_index >= SCENE_COUNT)
         return 0u;
     mask = effects_fanoutMask(scene_index, 1u);
-    for (member = 0u; member < SCENE_COUNT; member++) {
+    for (member = 0u; member < SCENE_SLOT_TOTAL; member++) {
         const effect_record_t *record;
 
-        if ((mask & (uint16_t)(1u << member)) == 0u)
+        if ((mask & (1ul << member)) == 0u)
             continue;
         record = scene_effectConst(member);
         if (!record)
@@ -1776,6 +1799,47 @@ void effects_activateScene(uint8_t scene_index)
 }
 
 /*
+ * Retarget the running Effect to an identical copy of its source Scene
+ * (S082 P2 fix 1).
+ *
+ * What: changes only effects_state.scene_index, the Scene whose Effect
+ * record effects_service() reads every render block. The runtime type and
+ * member, its arena and tails, last_applied[], the FX sequence step and clock
+ * state, the selected step, Pattern overlays, menu holds, LFO contributions
+ * and the force flag are all left exactly as they are. Refused when the new
+ * Scene has no record or its record's type differs from the running type.
+ * Why: the Scene 17 switch must make no audible change (S082_P1 D4, D5). A
+ * full effects_activateScene() resets the sequence step, clears automation
+ * overlays and forces every parameter write, which is audible. Without any
+ * rebind, the index keeps naming the home Scene, and the Bank load then
+ * replaces that Scene's Effect record under the sounding Effect (level, type
+ * parameters, Morph, FX sequence). Scene 17's record is a copy of the home
+ * record, so after the rebind every value effects_service() computes equals
+ * last_applied[] and no runtime write happens.
+ * Inputs: scene_index (Scene 17 while it exists). Outputs:
+ * effects_state.scene_index; returns 1 when retargeted, 0 when refused.
+ * Context: foreground only, the same context as effects_service() (mixer
+ * render in the main loop), so the single-byte store is never seen half-done.
+ * Accessors: preset_tickBackgroundBankLoad() phase 3 (fresh Scene 17 build).
+ * Affiliates: effects_activateScene() (the full activation used for real
+ * Scene changes, including the release from Scene 17), effects_service(),
+ * preset_buildBackgroundScene() (copies the Effect record).
+ */
+uint8_t effects_rebindSourceScene(uint8_t scene_index)
+{
+    const effect_record_t *record = scene_effectConst(scene_index);
+    effect_type_id_t type;
+
+    if (!record)
+        return 0u;
+    type = effects_registryEntry(record->type) ? record->type : EFFECT_TYPE_OFF;
+    if (type != effects_state.runtime_type)
+        return 0u;
+    effects_state.scene_index = scene_index;
+    return 1u;
+}
+
+/*
  * One-Scene type-change transaction. The public wrapper below fans the change
  * out and revalidates directional VOICE masks, while this worker preserves the
  * existing common-row, sequence, AutoSave, and active-runtime behavior.
@@ -1815,7 +1879,7 @@ static uint8_t effects_changeTypeScene(uint8_t scene_index, effect_type_id_t typ
 
 uint8_t effects_changeType(uint8_t scene_index, effect_type_id_t type)
 {
-    uint16_t mask;
+    uint32_t mask;
     uint8_t changed = 0u;
     uint8_t s;
 
@@ -1828,8 +1892,8 @@ uint8_t effects_changeType(uint8_t scene_index, effect_type_id_t type)
     if (!effects_registryEntry(type))
         return 0u;
     mask = effects_fanoutMask(scene_index, 0u);
-    for (s = 0u; s < SCENE_COUNT; s++) {
-        if ((mask & (uint16_t)(1u << s)) != 0u)
+    for (s = 0u; s < SCENE_SLOT_TOTAL; s++) {
+        if ((mask & (1ul << s)) != 0u)
             changed |= effects_changeTypeScene(s, type);
     }
     if (changed)

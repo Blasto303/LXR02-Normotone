@@ -313,6 +313,23 @@ uint8_t effects_setSeqRunMode(uint8_t scene_index, uint8_t mode);
 uint8_t effects_setSeqLength(uint8_t scene_index, uint8_t length);
 uint8_t effects_setSeqStepScale(uint8_t scene_index, uint8_t scale);
 uint8_t effects_setMorphAmount(uint8_t scene_index, uint8_t amount);
+/*
+ * Effect Morph from the global Morph (S083 follow-up, "global Morph sets
+ * all Morph").
+ *
+ * What: writes ONE Scene's retained Effect Morph amount with the same
+ * menu-edit semantics as an `fxm` edit: the Pattern `fxm` override is
+ * cleared (S076 Rule A) and, on the active Scene, menuHoldMorph keeps the
+ * new amount sounding over an FX Morph lock until the next Morph
+ * automation (S081 §5.3). No fan-out: the caller, preset_morphScene(),
+ * already runs once per edit-mask Scene. Never records (global Morph is
+ * never recorded, G-1; the per-voice Morph writes of the same gesture are
+ * not recorded either). Inputs: Scene index, 0..255 amount. Output: 1 if
+ * the retained amount changed. Callers: preset_morphScene() (PERF `mrp`,
+ * MIDI CC1 on G). Affiliates: effects_setMorphAmount() (the `fxm` page edit
+ * with its own fan-out), preset_syncEffectMorphMirror().
+ */
+uint8_t effects_setMorphAmountFromGlobal(uint8_t scene_index, uint8_t amount);
 
 /*
  * Live FX-sequencer state and lock API (Session 072 step 8; plan §11/§13.4).
@@ -471,6 +488,16 @@ uint8_t effects_registryCheckResult(void);
 /* Runtime lifecycle and resolution API. */
 void effects_init(void);
 void effects_activateScene(uint8_t scene_index);
+/*
+ * Retarget the running Effect to an identical copy of its source Scene
+ * (S082 P2 fix 1).
+ * What: changes only the Scene whose Effect record the per-block service
+ * reads; no runtime, sequence, automation or LFO state changes.
+ * Inputs: scene_index. Outputs: 1 retargeted, 0 refused (no record or a
+ * different type).
+ * Accessors: preset_tickBackgroundBankLoad() phase 3.
+ */
+uint8_t effects_rebindSourceScene(uint8_t scene_index);
 uint8_t effects_changeType(uint8_t scene_index, effect_type_id_t type);
 void effects_service(void);
 void effects_process(effect_io_t *io);

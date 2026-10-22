@@ -81,6 +81,17 @@ uint8_t ccSvc_enqueue(const cc_job_t *job);
 uint8_t ccSvc_jobCount(void);
 /* Nonzero while a job, the register, an apply wait or the name write remains. */
 uint8_t ccSvc_busy(void);
+/*
+ * Drop every queued paste/clear that has not started (S082 C7, D12).
+ *
+ * What: keeps the running queue-head job and discards the tail, restoring
+ * each dropped paste's early-trigger bits. Why: a background Bank Load owns
+ * the Pattern/card boundary and must not leave queued fan-out work behind.
+ * Inputs: none. Outputs: queued jobs removed (traced); the running job is
+ * unaffected. Accessors: preset_requestBackgroundBankLoad().
+ * Affiliates: ccSvc_busy(), ccSvc_tick().
+ */
+void ccSvc_dropQueued(void);
 /* Interaction ended (copy/clear released): allow the name write and teardown. */
 void ccSvc_interactionEnded(void);
 /* A new operation started: the teardown waits for its interaction to end. */

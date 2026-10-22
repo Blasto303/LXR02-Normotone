@@ -22,7 +22,7 @@
 #include "modulationNode.h"
 #include "InstrumentManager.h"
 #include "voicePostChain.h"
-#include "MidiNoteNumbers.h"
+#include "MidiPitch.h"
 #include <math.h>
 
 /*

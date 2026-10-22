@@ -135,14 +135,15 @@ const Page menuPages[NUM_PAGES][NUM_SUB_PAGES] = {
  * Subpage 0 is the track-settings front page. S078 §7 groups the three
  * morphable parameters (len, scl, shf) on the left, followed by the discrete
  * play mode (run), MIDI channel, MIDI note, the S080 P2 looper opt-out
- * (lop, Defect 8a) and the S081 P2 automation ramp mode (asm). All eight
+ * (lop, Defect 8a) and the S081 P2 automation ramp mode (rmp). All eight
  * cells are populated; the generic traversal stops at column 8. Clients:
  * STEP-mode VOICE re-press toggles menuIndex through Menu helpers, and encoder
  * scrolling reaches every cell through normal traversal.
  */
 /* SEQ_PAGE */ {
-  /* S081 P2: cell 7 = asm (automation ramp mode), after lop. */
-  {TEXT_PAT_LENGTH,TEXT_TRACK_SCALE,TEXT_SHUFFLE,TEXT_TRACK_PLAY_MODE,TEXT_MIDI_CHANNEL,TEXT_NOTE,TEXT_TRACK_LOOPABLE,TEXT_TRACK_AUTO_SMOOTH, PAR_TRACK_LENGTH,PAR_TRACK_SCALE,PAR_SHUFFLE,PAR_TRACK_PLAY_MODE,PAR_TRACK_MIDI_CHAN,PAR_TRACK_MIDI_NOTE,PAR_TRACK_LOOPABLE,PAR_TRACK_AUTO_SMOOTH},
+  /* S081 P2: cell 7 = automation ramp mode (`rmp`, was `asm`), after lop.
+   * S083 follow-up: cell 5 (`nte`) uses TEXT_TRACK_NOTE (category Track). */
+  {TEXT_PAT_LENGTH,TEXT_TRACK_SCALE,TEXT_SHUFFLE,TEXT_TRACK_PLAY_MODE,TEXT_MIDI_CHANNEL,TEXT_TRACK_NOTE,TEXT_TRACK_LOOPABLE,TEXT_TRACK_AUTO_SMOOTH, PAR_TRACK_LENGTH,PAR_TRACK_SCALE,PAR_SHUFFLE,PAR_TRACK_PLAY_MODE,PAR_TRACK_MIDI_CHAN,PAR_TRACK_MIDI_NOTE,PAR_TRACK_LOOPABLE,PAR_TRACK_AUTO_SMOOTH},
   /*
    * Step specials subpage 1 (S079): vel, note, condition, micro-timing. The
    * four fixed cells end at micro-timing; scrolling past it enters the
@@ -188,9 +189,10 @@ const Page menuPages[NUM_PAGES][NUM_SUB_PAGES] = {
 /* RECORDING_PAGE — repurposed as the SHIFT+REC performance settings menu (S080 E3).
  *
  * What: sub-page 0 holds the PERF BAR overlay settings (pb</pn</pb>/pn>,
- * category Prfrmnc); sub-page 1 holds the existing quantisation parameter
- * (category Record). Sub-pages 2-7 are reserved for the future live-record
- * options. Why: SHIFT+REC now opens a single performance/settings surface; the
+ * category Prfrmnc); sub-page 1 (S083 follow-up, user 2026-10-22) holds the
+ * overlay roll velocity rhythms pv</pv> (category Prfrmnc), quantisation
+ * `qnt` and the recording track `rtk` on one page (qnt and rtk were on
+ * sub-pages 1 and 2). Sub-pages 2-7 are reserved. Why: SHIFT+REC now opens a single performance/settings surface; the
  * overlay controls are shown first so they are reachable immediately. Inputs:
  * static table read by menu_repaintGeneric(). Accessors: menu_switchPage(
  * RECORDING_PAGE), the S080 cross-sub-page encoder step, buttonHandler's
@@ -203,13 +205,13 @@ const Page menuPages[NUM_PAGES][NUM_SUB_PAGES] = {
    TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,
    PAR_PERF_BTN_LT,PAR_PERF_NOTE_LT,PAR_PERF_BTN_RT,PAR_PERF_NOTE_RT,
    PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
-  /* Sub-page 1: recording quantisation. */
-  {TEXT_QUANTISATION,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,
+  /* Sub-page 1: overlay roll rhythms, quantisation, recording track. */
+  {TEXT_PERF_VEL_LT,TEXT_PERF_VEL_RT,TEXT_QUANTISATION,TEXT_AUTOMATION_TRACK,
    TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,
-   PAR_QUANTISATION,PAR_NONE,PAR_NONE,PAR_NONE,
+   PAR_PERF_VEL_LT,PAR_PERF_VEL_RT,PAR_QUANTISATION,PAR_AUTOM_TRACK,
    PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
-  /* Sub-page 2: recording track (rtk). Sub-pages 3-7 reserved. */
-  {TEXT_AUTOMATION_TRACK,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_AUTOM_TRACK,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
+  /* Sub-pages 2-7 reserved. */
+  {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},
   {TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY,TEXT_EMPTY, PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE,PAR_NONE},

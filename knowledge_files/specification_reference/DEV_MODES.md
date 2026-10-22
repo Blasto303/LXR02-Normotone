@@ -344,11 +344,63 @@ The S075 value vocabulary is:
 | guarded anomaly | `GROW_UNPLACEABLE`, `SWAP_RETURN_ABANDONED`, `SWAP_OCCUPIED`, `REGION_REWRITE_GREW`, `CLAIM_OTHER_SCENE`, `TEARDOWN_CLAIM_HELD`, `STALL_PHASE` |
 
 Drop reasons are `NO_ROOM`, `EVACUATE_FAILED`, `ADVANCED_LIMIT`,
-`FX_TYPE_MISMATCH`, `NO_SOURCE`, `NO_SCRATCH`, `BAD_SELECTION`, and
-`BAD_GEOMETRY`. `OP_REFUSED` values identify recording, erasing, storage
+`FX_TYPE_MISMATCH`, `NO_SOURCE`, `NO_SCRATCH`, `BAD_SELECTION`,
+`BAD_GEOMETRY`, and since S082 `SCENE17` (9, an overlapping paste while Scene
+17 owns the background region) and `LOAD_PENDING` (10, the job's destination
+or paste source is not yet available in a running background Bank load). `OP_REFUSED` values identify recording, erasing, storage
 busy, Instrument transaction, mode, and a previous queued operation. The
 exclusive Pattern mover is intentionally absent from PatternTrace per move;
 the copy/clear stage records aggregate job statistics instead.
+
+**Session 082 additions** (all logging-only, decoded by
+`tools/decode_devlogs.py`; layouts owned by `AutosaveTrace.h`):
+
+- **`b` (`AUTOSAVE_TRACE_STAGE_BANK_PREVIEW`)**: one record per completed
+  Bank child preview. `value = present_mask | content_mask << 16`; `flags` =
+  elapsed preview time in 64 ms units, saturated at 255 (start tick
+  `op_bank_preview_start_tick`, 2 B DEV). A cancelled preview ends as an `E`
+  record with op 0x2b (`FS_INTERNAL_OP_SCAN_BANK_SCENES`) at a close phase.
+- **`h` (`AUTOSAVE_TRACE_STAGE_HCNAMES_PROVENANCE`)**: the evidence path for
+  a Scene emptied as Case 3 at boot (S082 F5). `flags` selects the event:
+
+  | Code | Producer | Fires when | value |
+  |------|----------|------------|-------|
+  | 0x01 REFRESHED_RESET | `filesystem_prepareResidentNamesCache()` | refreshed, non-dirty Scene/Kit/Instrument rows are about to become UNKNOWN | count, first row, `current_op`, `op_phase` |
+  | 0x02 WRITE_UNKNOWN_REFRESHED | `filesystem_formatResidentNameLine()` | a present row is written to the card as `?` + R (the durable Case-3 precursor) | row, `current_op`, `op_phase` |
+  | 0x03 KIT_SOURCE_STAGED | `filesystem_setResidentSource()` | a Kit row (17..32) source is staged | row, source |
+  | 0x04 REFRESH_ON_UNKNOWN | `filesystem_setResidentRefreshed()` | R raised on a Scene/Kit/Instrument row whose source is UNKNOWN | row, `current_op`, `op_phase` |
+  | 0x05 KIT_LOAD_CONTEXT | Menu `PRESET_OP_KIT_LOAD` completion | a Kit Load completed after Menu left Load:[Kit]/[KitMrp] | what, page, request mask |
+  | 0x06 POT_DROPPED | `menu_handleLoadSaveKnobDelta()` | the first pot delta of a burst dropped by the Load/Save storage gate | knob, what, page, busy |
+
+- **`Q` 0x08 Case-3 detail**: emitted right after every Case-3 record by
+  `filesystem_bootReaderEvaluateScene()`. `value` = the raw register word of
+  the failing row (value, R bit 13, dirty bit 15) | reason << 16 | sub << 24.
+  Reasons (`FS_BOOT_FAIL()`): 1 unresolvable source, 2 folder not entered, 3
+  `sceneset.scg` not opened, 4 sceneset parse/finalize, 5 `kitset.kcg`
+  parse/finalize, 6 Instrument member file (sub = slot), 7 Scene storage
+  missing, 9 other loader (sub = row index). The plain Case-3 record never
+  carried the source (its "source" field was always zero).
+- **`m` (`AUTOSAVE_TRACE_STAGE_MIDI_LEARN_FILE`, S083)**: `midilrn.cfg`
+  (the MIDI Learn table file) writes and boot recovery. `flags` selects the
+  event:
+
+  | Code | Producer | Fires when | value |
+  |------|----------|------------|-------|
+  | 0x01 WRITE | `filesystem_midiLearnWriterCompleted()` | an autonomous `midilrn.cfg` write ends | rows, failed << 8, request flags after << 16 (bit 0 PENDING = one more write queued, bit 1 RETRIED) |
+  | 0x02 RECOVERY | `filesystem_loadMidiLearn_tick()` | a leftover `midilrn.tmp` is resolved at boot | outcome (1 promoted, 2 discarded, 3 promote remove failed, 4 promote rename failed), lines << 8, N << 16, terminator seen << 24 |
+  | 0x03 LOAD | `filesystem_loadMidiLearn_tick()` | the boot load ends | rows, present << 8, result << 16 (0 ok, 1 bad format/version = emptied, 2 read error = partial), lines read << 24 |
+
+  A failed write also leaves the usual `E` record (op
+  `FS_INTERNAL_OP_SAVE_MIDILEARN`). A Learn that never produces a WRITE
+  record was refused (`FUL`) or never left the RAM ring (power-off before
+  the next trace flush).
+- **`L` per whole Scene (S082 P2):** a whole-Scene AutoSave mark now emits one
+  `L` and no per-byte `D` or nested `I` records, so a Bank Load completion
+  produces one `L` per loaded Scene instead of about 1,400 `D` each.
+- **Trace-flush gap:** the flush is suppressed while an accepted Load/Save
+  command runs (`F` bit 0). A background Bank load therefore leaves its own
+  records in RAM until the next flush after the command ends; powering off
+  first loses them (seen on the S082 P1 card).
 
 The numeric event codes (0x01…0x50), every `value32` bit layout, the drop
 reasons with their detail byte, the anomaly codes, the volume budget and the
@@ -518,7 +570,7 @@ stage-letter set below despite the shared single-letter convention.
 
 ## Stall detection (`DEV_STALL_DETECTION`)
 
-Ten sites currently exist. Each follows the same shape: poll for
+Eleven sites currently exist (S082 added the Bank child preview). Each follows the same shape: poll for
 `op_phase` staying unchanged across a threshold count of ticks, then either
 only record one `X` trace entry ("observe"), or additionally write a named
 error code via `filesystem_makeNamedErrorCode()` and call
@@ -539,7 +591,9 @@ delta when disabled: -840 bytes text, -56 bytes BSS.
 | Scene Load | `filesystem_loadSceneDirectory_tick()` | 20,000 polls | `ScLd` | Abort (added Session 057) |
 | Bank Load entry | `filesystem_loadBankDirectory_tick()` | 20,000 polls | `BkLd` | Abort (added Session 057) |
 | Settings write | `filesystem_saveGlobals_tick()` | 30,000 polls | `StWr` | Abort (added Session 057) |
+| MIDI Learn write (site 8, shared with Settings; the two writers never overlap) | `filesystem_saveMidiLearn_tick()` | 30,000 polls | `MlWr` | Abort (S083) |
 | Flush Finish | `filesystem_flushFinish_tick()` | 50,000 polls | `Flsh` | Abort (added Session 057) — shared completion gate for every successful operation |
+| Bank child preview (site 10, `AUTOSAVE_TRACE_PHASE_STALL_SITE_BANK_PREVIEW`) | `filesystem_scanBankScenes_tick()` | 20,000 polls | `BkPv` | Abort (S082 F4): closes the preview's directory/file handles, returns to root and finishes ERROR, so a wedged probe never holds the facade. Observer storage 5 B, DEV only. |
 
 **The drain is progress-aware since S074; every other site is not.**
 
@@ -559,7 +613,17 @@ delta when disabled: -840 bytes text, -56 bytes BSS.
 - **What it still catches:** a wedged read, a removed card, or a close that
   is never accepted. For site 2 the `X` value's extra field carries
   `stream_offset / 16`.
-- The other nine observers still use `filesystem_pollPhaseStall()`. The
+- The other ten observers still use `filesystem_pollPhaseStall()`.
+- **Uncounted ticks (S082 P2):** `filesystem_tickUncounted()` sets
+  `fs_stall_poll_uncounted` (1 B, `DEV_STALL_DETECTION` only) for the
+  duration of one extra tick; while it is set `filesystem_pollPhaseStall()`
+  and `filesystem_autosaveDrainStalled()` neither count nor reset. The main
+  loop uses those ticks only to service a background Bank load in idle time
+  (both audio render slots full, at most 200 µs per pass), so the observers
+  keep their one-poll-per-pass calibration. Passes that spend the window make
+  the loop run fewer passes per second, so a real stall takes slightly longer
+  to declare; it never fires falsely. SD driver timeouts are time-based and
+  unaffected. The
   Bank-save and delete-slot observers share the old poll-count rule and could
   in principle kill a long progressing phase; no case is known.
 
@@ -724,6 +788,11 @@ determines interpretation.
 | `M` | Mutation — pool-mutating operation applied |
 | `G` | Gap scan — Tier 1 trailing-gap examination result |
 | `X` | Service state change — handover, mode transition |
+| `W` | Live-record drop (S081, `PAT_TRACE_STAGE_LIVEREC_DROP`): flags = cause (1 handover / target not open, 2 ownership, 3/4 refused write — the code uses 4 for every refused record or automation write, 5 step-boundary ring full), value = `track << 8 | step`. Emitted by `LiveRecord.c` (`liveRec_drop()`, which also counts `liveRec_drops[cause]`) and, for cause 5, by `seq_recRingPush()` in `sequencer.c` (`seq_recRingDrops`). Logging builds only. |
+
+The authoritative full stage list (including `H`, `V`, `L`, `D`) is
+`PATTERN_DYNAMIC_STACK.md` §12.16. `tools/decode_devlogs.py` does not decode
+stage `W` yet (S081 open item).
 
 These codes use the same 8-byte record format as AutoSaveTrace
 (`stage:u8, flags:u8, tick16:u16, value:u32`, little-endian) but are emitted
@@ -753,7 +822,7 @@ conditional `ASENSURE` capsule, and `/asavetrc.bin` records. Since S074:
 - it reads the `X` site from 4 bits and the native-delete flag from bit 4.
   Before S074 it used the pre-Session-057 3-bit layout, so sites 3..9 and
   native-delete records were misread;
-- it names all ten stall sites with their behaviour (abort or observe).
+- it names all eleven stall sites with their behaviour (abort or observe).
 
 Known decoder gaps: it misreads `/pattrace.bin` as the AutoSave format, and
 it labels boot-reader `Q` records "unknown producer" (cosmetic). It does not

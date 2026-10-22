@@ -212,7 +212,83 @@ typedef enum {
      * filesystem.c. Consumer: tools/decode_devlogs.py ('c' branch).
      */
     AUTOSAVE_TRACE_STAGE_COPY_CLEAR = 'c',
+    /*
+     * b: Bank child preview completion with both masks and elapsed time.
+     *
+     * What: one record per completed filesystem_scanBankScenes_tick() scan.
+     * flags: elapsed scan time in units of 64 ms, saturated at 255 (~16 s;
+     * S082 review F8). value32 packs present_mask in bits 0..15 and
+     * content_mask in bits 16..31. DEV logging only; no product state depends
+     * on this record. Why: R1 measurement on the slow and fast reference cards
+     * (S082 B1). Consumer: tools/decode_devlogs.py ('b' branch).
+     */
+    AUTOSAVE_TRACE_STAGE_BANK_PREVIEW = 'b',
+    /*
+     * h: HCNAMES provenance and Load/Save input evidence (S082 review F5).
+     *
+     * What: records the transitions that can leave a resident identity row
+     * "refreshed with an unknown source" - the state the boot reader treats as
+     * Case 3 (empty the whole Scene) - plus Load/Save pot input dropped while
+     * storage is busy. flags selects the event (AUTOSAVE_TRACE_HCN_*):
+     *   0x01 REFRESHED_RESET: filesystem_prepareResidentNamesCache() turned
+     *        refreshed, non-dirty rows into UNKNOWN before a register read.
+     *        value32 = count (0..7) | first_row << 8 | current_op << 16 |
+     *        op_phase << 24.
+     *   0x02 WRITE_UNKNOWN_REFRESHED: the HCNAMES formatter wrote a Scene, Kit
+     *        or Instrument row as `?` with the R witness. value32 = row |
+     *        current_op << 16 | op_phase << 24.
+     *   0x03 KIT_SOURCE_STAGED: a Kit row (17..32) source was staged.
+     *        value32 = row | source << 16 (low 13 bits).
+     *   0x04 REFRESH_ON_UNKNOWN: filesystem_setResidentRefreshed() raised R on
+     *        a row whose source is UNKNOWN. value32 = row | current_op << 16 |
+     *        op_phase << 24.
+     *   0x05 KIT_LOAD_CONTEXT: a Kit/KitMrp Load completed while Menu was no
+     *        longer on Load:[Kit]/[KitMrp]. value32 = what | page << 8 |
+     *        request scene mask << 16.
+     *   0x06 POT_DROPPED: a Load/Save pot delta was dropped while storage or
+     *        Preset was busy (first of a burst). value32 = knob | what << 8 |
+     *        page << 16 | menu_storageBusy << 24.
+     * DEV logging only; no product state depends on these records.
+     * Consumer: tools/decode_devlogs.py ('h' branch).
+     */
+    AUTOSAVE_TRACE_STAGE_HCNAMES_PROVENANCE = 'h',
+    /*
+     * m: midilrn.cfg (MIDI Learn table file) writes and boot recovery
+     * (S083 §16).
+     *
+     * What: flags selects the event (AUTOSAVE_TRACE_MLRN_*):
+     *   0x01 WRITE: one autonomous midilrn.cfg write finished.
+     *        value32 = rows | failed << 8 | request flags after << 16
+     *        (bit 0 PENDING = another write queued, bit 1 RETRIED).
+     *   0x02 RECOVERY: a leftover midilrn.tmp was resolved at boot.
+     *        value32 = outcome | lines << 8 | terminator N << 16 |
+     *        terminator seen << 24; outcome 1 promoted, 2 discarded
+     *        (invalid), 3 promote remove failed (tmp kept), 4 promote
+     *        rename failed (tmp kept).
+     *   0x03 LOAD: the boot load finished. value32 = rows | present << 8 |
+     *        result << 16 | lines read << 24 (saturated 255); result 0 OK,
+     *        1 wrong format/version (table emptied), 2 read error (rows
+     *        read so far kept).
+     * Why: Learn persistence is autonomous and silent; hardware tests need
+     * a witness that each Learn reached the card and what boot restored.
+     * DEV logging only; no product state depends on these records.
+     * Producers: filesystem_midiLearnWriterCompleted(),
+     * filesystem_loadMidiLearn_tick(). Consumer: tools/decode_devlogs.py
+     * ('m' branch).
+     */
+    AUTOSAVE_TRACE_STAGE_MIDI_LEARN_FILE = 'm',
 } autosave_trace_stage_t;
+
+#define AUTOSAVE_TRACE_MLRN_WRITE    0x01u
+#define AUTOSAVE_TRACE_MLRN_RECOVERY 0x02u
+#define AUTOSAVE_TRACE_MLRN_LOAD     0x03u
+
+#define AUTOSAVE_TRACE_HCN_REFRESHED_RESET        0x01u
+#define AUTOSAVE_TRACE_HCN_WRITE_UNKNOWN_REFRESHED 0x02u
+#define AUTOSAVE_TRACE_HCN_KIT_SOURCE_STAGED      0x03u
+#define AUTOSAVE_TRACE_HCN_REFRESH_ON_UNKNOWN     0x04u
+#define AUTOSAVE_TRACE_HCN_KIT_LOAD_CONTEXT       0x05u
+#define AUTOSAVE_TRACE_HCN_POT_DROPPED            0x06u
 
 /*
  * V (VALIDATED) flags layout.
@@ -278,6 +354,7 @@ typedef enum {
 #define AUTOSAVE_TRACE_PHASE_STALL_SITE_BANK_LOAD_ENTRY 7u
 #define AUTOSAVE_TRACE_PHASE_STALL_SITE_SETTINGS 8u
 #define AUTOSAVE_TRACE_PHASE_STALL_SITE_FLUSH 9u
+#define AUTOSAVE_TRACE_PHASE_STALL_SITE_BANK_PREVIEW 10u  /* S082 review F4 */
 #define AUTOSAVE_TRACE_PHASE_STALL_FLAG_IN_NATIVE_DELETE (1u << 4u)
 #define AUTOSAVE_TRACE_PHASE_STALL_PHASE_SHIFT 0u
 #define AUTOSAVE_TRACE_PHASE_STALL_SLOT_SHIFT 8u
@@ -541,6 +618,9 @@ typedef enum {
 #define AUTOSAVE_TRACE_CC_DROP_NO_SCRATCH       6u
 #define AUTOSAVE_TRACE_CC_DROP_BAD_SELECTION    7u
 #define AUTOSAVE_TRACE_CC_DROP_BAD_GEOMETRY     8u
+#define AUTOSAVE_TRACE_CC_DROP_SCENE17          9u
+/* S082 P3 D41: the job's Scene is still being loaded by a background Bank load. */
+#define AUTOSAVE_TRACE_CC_DROP_LOAD_PENDING    10u
 
 #define AUTOSAVE_TRACE_CC_ANOM_GROW_UNPLACEABLE      1u
 #define AUTOSAVE_TRACE_CC_ANOM_SWAP_RETURN_ABANDONED 2u

@@ -1704,7 +1704,7 @@ void instrumentManager_retriggerRuntimeLfos(uint8_t trigger_track)
         if (lfo && lfo->retrigger != 0u &&
             lfo->retrigger <= INSTRUMENT_SLOT_COUNT &&
             lfo->retrigger == (uint8_t)(trigger_track + 1u))
-            lfo->phase = lfo->phaseOffset;
+            lfo_restart(lfo);
     }
 }
 
@@ -3011,7 +3011,7 @@ void instrumentManager_restoreLfoPhaseIfNeeded(uint8_t slot)
     if (!lfo)
         return;
     if (lfo->retrigger == LFO_RETRIGGER_SCENE)
-        lfo->phase = lfo->phaseOffset;
+        lfo_restart(lfo);   /* a one-shot plays its cycle on the Scene change */
     else
         lfo->phase = lfo_scene_handoff.phase[slot];
 }

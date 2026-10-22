@@ -51,7 +51,7 @@
 #include "DrumVoice.h"
 #include "Snare.h"
 #include "HiHat.h"
-#include "MidiMessages.h"
+#include "MidiDefs.h"
 #include "CymbalVoice.h"
 #include "InstrumentManager.h"
 #include "presetManager.h"
@@ -59,7 +59,6 @@
 // TODO DSP_PORT
 // #include "sequencer.h"
 // #include "TriggerOut.h"
-#include "Uart.h"
 #include "ledHandler.h"
 /* Sequencer owns transient automation restore for the shared trigger funnel. */
 #include "sequencer.h"

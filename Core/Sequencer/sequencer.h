@@ -112,6 +112,8 @@ uint8_t seq_loopableTrackMask(void);
  * Affiliates: menu_serviceDeferredSceneChange(), buttonHandler SHIFT+SEQ.
  */
 void seq_requestSceneChange(uint8_t scene_index, uint8_t division);
+/* S083 Q9: mark the next whole-Scene change as panel or MIDI (no echo). */
+void seq_setSceneChangeOrigin(uint8_t origin);
 void seq_queueSceneChange(uint8_t scene_index, uint8_t division);
 uint8_t seq_sceneChangeFirePending(void);
 uint8_t seq_pendingSceneIsQueue(void);
@@ -160,6 +162,9 @@ extern uint8_t seq_perTrackActive;
  * together. Client: the buttonHandler PERF hold-VOICE+press-SEQ gesture.
  */
 void seq_setTrackPlayedScene(uint8_t track, uint8_t scene_index);
+/* S083 P3: shared panel/MIDI per-track Scene move (realign + note-off);
+** the HiHat pair (bits 5/6) always moves together (F-7). */
+void seq_assignTracksToScene(uint8_t trackMask, uint8_t scene_index);
 
 /*
  * Coalesce all tracks back to the active Scene (S077 P2 §1.5).
@@ -214,6 +219,19 @@ void seq_refreshTrackEffectiveParams(void);
  */
 void seq_triggerVoice(uint8_t voiceNr, uint8_t vol, uint8_t note, uint8_t reset);
 /*
+ * Roll velocity rhythm rule (S079 §5), shared (S083 follow-up).
+ *
+ * What: the velocity of roll hit `pos` (0 = the first hit) under the packed
+ * rhythm byte (bits 7..4 cycle, bit 3 0 halve / 1 double, bits 2..0 full
+ * count): inside the full-count window `vel`, beyond it vel/2 (floor 1) or
+ * vel*2 (clamp 127). 0x00 and any full > cycle are off (always `vel`).
+ * Why: step rolls (step special `rtm`) and the PERF BAR overlay rolls
+ * (`pv<`/`pv>`) must use one rule. Pure, no state. Callers:
+ * seq_rollComputeVelocity() (step rolls, TIM3), buttonHandler's overlay
+ * roll tick (foreground).
+ */
+uint8_t seq_rollRhythmVelocity(uint8_t rhythm, uint8_t vel, uint8_t pos);
+/*
  * Stopped-transport voice preview.
  *
  * Why: front-panel VOICE re-press audition should use Sequencer's existing
@@ -228,6 +246,11 @@ void seq_tick(void);
 void seq_resetDeltaAndTick(void);
 void seq_resetToPatternStart(void);
 void seq_realignActivePatternToMasterClock(void);
+/* S083 T1 transport: contract in sequencer.c. sendRealtime = 0 when the
+** change came from received MIDI transport (C-11: MRT forwards it). */
+void seq_setRunningEx(uint8_t isRunning, uint8_t sendRealtime);
+void seq_continueRunning(uint8_t sendRealtime);
+void seq_setResumeTick(uint32_t tick);
 void seq_setDeltaT(float delta);
 void seq_triggerNextMasterStep(uint8_t stepSize);
 void seq_setBpm(uint16_t bpm);
@@ -248,7 +271,6 @@ enum SeqExternalSyncSource {
 void seq_setExtSyncSource(uint8_t source);
 uint8_t seq_getExtSyncSource(void);
 void seq_noteExtSyncActivity(uint8_t source, uint32_t timestampUs);
-void seq_setNextPattern(const uint8_t patNr);
 /*
  * Immediately select the active Scene/Pattern for front-panel PERF switching.
  *
@@ -295,6 +317,25 @@ void seq_selectActivePattern(uint8_t pattern);
  */
 void seq_alignActivePatternToScene(uint8_t scene_index);
 /*
+ * Move playback to Scene 17 without a sound change (S082 P1 D5, D16).
+ *
+ * What: points the active, pending and every per-track Scene at index 16
+ * under PRIMASK, re-snapshots the looper and cancels pending Scene changes.
+ * It deliberately does not realign positions, reset rolls/conditions/epochs,
+ * send a program change or force note-offs.
+ * Inputs: a built Scene 17. Outputs: playback reads Scene 17.
+ * Accessors: preset_requestBackgroundBankLoad() tick.
+ * Affiliates: seq_selectActivePattern(), seq_loopRefreshSceneSnapshots().
+ */
+void seq_switchToBackgroundScene(void);
+/*
+ * Move selected tracks onto Scene 17 without a sound change (S082 P1 D31).
+ * Inputs: track_mask (bit t = track t). Outputs: those tracks play index 16;
+ * seq_perTrackActive recomputed; pending Scene changes cancelled.
+ * Accessors: preset_tickBackgroundBankLoad() phase 3 (rebuild in place).
+ */
+void seq_moveTracksToBackgroundScene(uint8_t track_mask);
+/*
  * Drain TIM3-published voice automation in foreground context.
  *
  * Inputs: the bounded pending queue written by seq_advanceTrackStep(), whose
@@ -304,19 +345,19 @@ void seq_alignActivePatternToScene(uint8_t scene_index);
  * remain queued only for the later Scene-target session. Affiliate: main.c
  * calls this before audio rendering.
  * S081 P2: first ends the ramps of tracks whose next step has applied; each
- * written Instrument entry of an asm track may start a linear ramp toward the
+ * written Instrument entry of an rmp track may start a linear ramp toward the
  * same target on the predicted next step.
  */
 void seq_drainPendingAutomation(void);
 /*
- * Automation ramp service (S081 P2, asm).
+ * Automation ramp service (S081 P2, rmp).
  *
  * What: every call (one per DSP block) ends the ramps of tracks whose next
  * step has applied; every third call (~2.2 ms) writes each running ramp's
  * interpolated 7-bit value, when it differs from the last value written,
  * through the drain's Instrument write path, so
  * ramp samples are held automation values (binding priority rule). Ramps are
- * cancelled, value kept, on asm off, live-record latch/erase, an R12 menu
+ * cancelled, value kept, on rmp off, live-record latch/erase, an R12 menu
  * override or an invalid target. Inputs: the ramp table filled by the drain,
  * TIM3's per-track ramp contexts, the master tick clock. Outputs: runtime
  * Instrument writes, seq_automation_dirty bits. Context: foreground only.
@@ -526,8 +567,5 @@ uint32_t seq_quantiseTick(uint32_t tick, uint8_t frac8);
 uint8_t seq_getPlaybackEpoch(void);
 uint8_t seq_getSceneEpoch(void);
 uint8_t seq_getQuantisation(void);
-
-void seq_midiNoteOff(uint8_t chan);
-void seq_sendMidiNoteOn(const uint8_t channel, const uint8_t note, const uint8_t veloc);
 
 #endif /* SEQUENCER_H_ */

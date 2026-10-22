@@ -56,6 +56,22 @@
 #define LFO_NOISE		0x05
 #define LFO_EXP_UP		0x06
 #define LFO_EXP_DOWN	0x07
+/*
+ * One-shot waveforms (LXR Catalyst): the same eight shapes, played once after
+ * a retrigger, then held. For these, lfo_offset is a delay before the cycle
+ * instead of a phase offset. Before and after the cycle each shape holds its
+ * natural end value: saw down and exp down hold 1 before and 0 after, saw up
+ * and exp up 0 before and 1 after, noise holds its one random value, the
+ * others hold 0. The square starts high. Menu names si1..xd1.
+ */
+#define LFO_SINE_ONE		0x08
+#define LFO_TRI_ONE			0x09
+#define LFO_SAW_UP_ONE		0x0a
+#define LFO_SAW_DOWN_ONE	0x0b
+#define LFO_REC_ONE			0x0c
+#define LFO_NOISE_ONE		0x0d
+#define LFO_EXP_UP_ONE		0x0e
+#define LFO_EXP_DOWN_ONE	0x0f
 
 
 #define LFO_MAX_F 		200 //[Hz]
@@ -88,6 +104,7 @@ typedef struct LfoStruct
 	uint32_t 	phaseInc;	// the phase increment controls the LFO frequency
 	uint8_t 	waveform;	// selects the waveform
 	uint8_t 	retrigger;	// defines the voice nr that retriggers the LFO (0=no retrigger)
+	uint8_t 	delay;		// one-shot: nonzero while the retrigger delay (offset) runs
 	uint32_t 	phaseOffset;// the phase value to which the LFO is retriggered
 	float 		rnd;
 	uint8_t 	sync;
@@ -139,5 +156,14 @@ void lfo_setFreq(Lfo *lfo, float f);
 void lfo_setSync(Lfo* lfo, uint8_t sync);
 void lfo_recalcSync();
 void lfo_retrigger(uint8_t voiceNr);
+/*
+ * Restart one LFO for a matching retrigger.
+ *
+ * Inputs: the LFO. Output: a looping waveform jumps to phaseOffset; a one-shot
+ * waveform starts its delay (phase = -phaseOffset, so the cycle begins when the
+ * phase wraps to 0) and, for noise without delay, draws its value now.
+ * Caller: instrumentManager_retriggerRuntimeLfos().
+ */
+void lfo_restart(Lfo *lfo);
 
 #endif /* LFO_H_ */

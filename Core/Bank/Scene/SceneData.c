@@ -1,7 +1,8 @@
 #include "SceneData.h"
 #include "Autosave.h"
 #include "BankData.h"
-#include "MidiNoteNumbers.h"
+#include "MidiPitch.h"
+#include "MidiDefs.h"
 #include <string.h>
 
 /*
@@ -24,6 +25,26 @@ _Static_assert(EFFECT_COMMON_PARAM_COUNT < EFFECT_PARAM_COUNT,
 
 scene_t scenes[SCENE_COUNT];
 static uint8_t scene_active_index;
+
+/*
+ * Scene 17: the background Scene of a running Bank load (S082 P1).
+ *
+ * What: one scene_t outside scenes[16] (index SCENE_BACKGROUND_INDEX), plus an
+ * exists flag and the index of the Scene that was active when it was built.
+ * scene_get()/scene_getConst()/scene_selectActive() address it as index 16
+ * while it exists; scene_indexValid() stays 0..15, so storage, AutoSave,
+ * HCNAMES and the 16-bit Bank masks never see it.
+ * Why: playback continues unchanged from Scene 17 while Scenes 1-16 are
+ * replaced (D1-D5); Scene 17 is otherwise a normal, editable Scene (D9, D15).
+ * SRAM: 1,656 B + 2 B, SRAM1 static, owner SceneData (accepted 2026-10-17).
+ * Lifetime: exists from the switch (C6) until a whole-Scene change (C8).
+ * Accessors: scene_background*(), scene_get(), scene_getConst().
+ * Affiliates: pat_background_region (its Pattern), seq_switchToBackgroundScene(),
+ * preset_buildBackgroundScene(), the S082 P1 §5 audit (C3).
+ */
+static scene_t scene_background;
+static uint8_t scene_backgroundFlags;
+static uint8_t scene_backgroundHome;
 
 static uint8_t scene_defaultVoiceAudioOut(uint8_t slot)
 {
@@ -138,26 +159,15 @@ uint8_t scene_indexValid(uint8_t scene_index)
 
 scene_t *scene_get(uint8_t scene_index)
 {
-    /*
-     * Borrow mutable Scene storage.
-     *
-     * Input: resident Scene index. Output: pointer to scenes[index] or NULL for
-     * invalid input. Affiliates are Preset, filesystem load/apply, PatternData,
-     * and future Scene/Bank file code; all use this central bounds check rather
-     * than indexing the global array directly.
-     */
+    if (scene_index == SCENE_BACKGROUND_INDEX && scene_backgroundFlags)
+        return &scene_background;
     return scene_indexValid(scene_index) ? &scenes[scene_index] : 0;
 }
 
 const scene_t *scene_getConst(uint8_t scene_index)
 {
-    /*
-     * Borrow read-only Scene storage.
-     *
-     * Input: resident Scene index. Output: const pointer or NULL. Menu,
-     * InstrumentManager, and runtime apply code use this when they need current
-     * Scene metadata without taking ownership of retained data writes.
-     */
+    if (scene_index == SCENE_BACKGROUND_INDEX && scene_backgroundFlags)
+        return &scene_background;
     return scene_indexValid(scene_index) ? &scenes[scene_index] : 0;
 }
 
@@ -175,17 +185,44 @@ uint8_t scene_getActiveIndex(void)
 
 uint8_t scene_selectActive(uint8_t scene_index)
 {
-    /*
-     * Selection changes identity, never data.
-     *
-     * Input is a resident Scene index; output reports acceptance. DSP apply is
-     * deliberately owned by Preset so selecting a record cannot unexpectedly
-     * perform a large foreground update.
-     */
+    if (scene_index == SCENE_BACKGROUND_INDEX && scene_backgroundFlags) {
+        scene_active_index = scene_index;
+        return 1u;
+    }
     if (!scene_indexValid(scene_index))
         return 0u;
     scene_active_index = scene_index;
     return 1u;
+}
+
+uint8_t scene_backgroundExists(void)
+{
+    return scene_backgroundFlags;
+}
+
+uint8_t scene_backgroundHomeIndex(void)
+{
+    return (scene_active_index < SCENE_COUNT)
+        ? scene_active_index : scene_backgroundHome;
+}
+
+uint8_t scene_playableIndexValid(uint8_t scene_index)
+{
+    if (scene_index < SCENE_COUNT)
+        return 1u;
+    return (uint8_t)(scene_index == SCENE_BACKGROUND_INDEX &&
+                     scene_backgroundFlags);
+}
+
+void scene_backgroundBegin(uint8_t home_index)
+{
+    scene_backgroundHome = home_index;
+    scene_backgroundFlags = 1u;
+}
+
+void scene_backgroundRelease(void)
+{
+    scene_backgroundFlags = 0u;
 }
 
 kit_instrument_slot_t *scene_instrumentSlot(uint8_t scene_index, uint8_t slot)
@@ -252,20 +289,18 @@ void scene_setTrackMidiChannel(uint8_t scene_index, uint8_t track,
 {
     scene_t *scene = scene_get(scene_index);
     /*
-     * Store a track MIDI channel in Scene settings.
+     * Store a track MIDI channel in Scene settings (S083).
      *
-     * Inputs: Scene index, track index, and requested channel. Output: valid
-     * coordinates store a clamped 1..16 value. A changed byte then marks the
-     * track's named Scene parameter; an equal final channel is a no-op. This
-     * remains a Scene setting so Kit/instrument changes do not rewrite MIDI
-     * assignment. Affiliate: scene_storeParameterByte().
+     * Inputs: Scene index, track, channel 0..17: 0 = `glb` (the track
+     * follows G), 1..16, MIDI_TRACK_CHANNEL_OFF (17) = `off` (no MIDI
+     * channel at all; S083 follow-up). Values above 17 clamp to `off`.
+     * Output: a changed byte marks the track's AutoSave Scene cell. Affiliates: scene_storeParameterByte(),
+     * menu_parseGlobalParam(PAR_TRACK_MIDI_CHAN), AutoSave restore.
      */
     if (!scene || track >= NUM_TRACKS)
         return;
-    if (channel < 1u)
-        channel = 1u;
-    else if (channel > 16u)
-        channel = 16u;
+    if (channel > MIDI_TRACK_CHANNEL_OFF)
+        channel = MIDI_TRACK_CHANNEL_OFF;
     scene_storeParameterByte(
         scene_index, &scene->settings.midi_channel[track],
         (uint8_t)(AUTOSAVE_SCENE_PARAM_MIDI_CHANNEL_BASE + track), channel);
@@ -276,19 +311,18 @@ uint8_t scene_getTrackMidiChannel(uint8_t scene_index, uint8_t track)
     const scene_t *scene = scene_getConst(scene_index);
     uint8_t channel;
     /*
-     * Read a track MIDI channel from Scene settings.
+     * Read a track MIDI channel (S083).
      *
-     * Inputs: Scene index and track index. Output: valid stored 1..16 channel,
-     * track+1 fallback for unset/stale values, or 1 for invalid coordinates.
-     * The fallback preserves current bridge defaults until MIDI off/channel
-     * policy is redesigned in Phase 5.
+     * Output: 1..16; 0 when the track is unassigned (`glb`, it follows G),
+     * the coordinates are invalid or the byte is out of range;
+     * MIDI_TRACK_CHANNEL_OFF (17) for `off`. The pre-S083 fallback to
+     * track+1 is gone. Accessors: MidiNoteMap loader (maps `off` to "no
+     * channel"), menu (menu-order conversion).
      */
     if (!scene || track >= NUM_TRACKS)
-        return 1u;
+        return 0u;
     channel = scene->settings.midi_channel[track];
-    return (channel >= 1u && channel <= 16u)
-        ? channel
-        : (uint8_t)(track + 1u);
+    return (channel <= MIDI_TRACK_CHANNEL_OFF) ? channel : 0u;
 }
 
 void scene_setTrackMidiNote(uint8_t scene_index, uint8_t track, uint8_t note)
@@ -306,7 +340,8 @@ void scene_setTrackMidiNote(uint8_t scene_index, uint8_t track, uint8_t note)
      */
     if (!scene || track >= NUM_TRACKS)
         return;
-    normalized_note = (note <= 127u) ? note : 127u;
+    /* S083 follow-up: 0 = `on`, 1..127 root, 128 = `off`; above clamps off. */
+    normalized_note = (note <= MIDI_TRACK_NOTE_OFF) ? note : MIDI_TRACK_NOTE_OFF;
     scene_storeParameterByte(
         scene_index, &scene->settings.midi_note[track],
         (uint8_t)(AUTOSAVE_SCENE_PARAM_MIDI_NOTE_BASE + track),
@@ -319,13 +354,14 @@ uint8_t scene_getTrackMidiNote(uint8_t scene_index, uint8_t track)
     /*
      * Read a track MIDI note from Scene settings.
      *
-     * Inputs: Scene index and track index. Output: stored 0..127 note or 0 for
-     * invalid/stale data. Menu and MIDI callers use this to keep the current
+     * Inputs: Scene index and track index. Output: 0 = `on` (no root; also
+     * for invalid/stale data), 1..127 = root, MIDI_TRACK_NOTE_OFF (128) =
+     * `off` (S083 follow-up). Menu and MIDI callers use this to keep the
      * Scene storage policy centralized.
      */
     if (!scene || track >= NUM_TRACKS)
         return 0u;
-    return (scene->settings.midi_note[track] <= 127u)
+    return (scene->settings.midi_note[track] <= MIDI_TRACK_NOTE_OFF)
         ? scene->settings.midi_note[track]
         : 0u;
 }
@@ -1110,8 +1146,9 @@ void scene_settingsDefaults(scene_settings_t *out)
         return;
     memset(out, 0, sizeof(*out));
     for (i = 0u; i < NUM_TRACKS; i++) {
-        out->midi_channel[i] = (uint8_t)(i + 1u);
-        out->midi_note[i] = MIDI_DEFAULT_TRIGGER_NOTE;
+        /* S083: tracks follow G and have no note root until assigned. */
+        out->midi_channel[i] = MIDI_CHANNEL_NONE;
+        out->midi_note[i] = 0u;
         /*
          * Track Morph endpoint defaults (S078 §5.4).
          *
@@ -1197,6 +1234,42 @@ void scene_resetKitToDefaults(uint8_t scene_index)
 }
 
 /*
+ * Reset one resident Scene's retained data to the empty Scene (S082 B3).
+ *
+ * What: settings (bus compressor, MIDI, per-voice routing/send/fader), the six
+ * Kit slots (default types) and the Effect record are reset to the values a
+ * fresh boot uses. Pattern, HCNAMES, present bit and edit masks belong to
+ * their owners and are handled by the caller.
+ * Why: one data definition of "empty Scene" for the boot reader (Case 3) and
+ * the S082 Replace Bank Load (R7); before S082 the boot reader owned a private
+ * copy.
+ * Inputs: resident Scene index 0..15 (Scene 17 is never emptied).
+ * Outputs: scenes[index] rewritten; no AutoSave mark (callers mark).
+ * Accessors: filesystem_bootReaderEmptyScene(), filesystem_bankEmptyScenes().
+ * Affiliates: scene_busCompDefaults(), instrumentManager_resetSlot(),
+ * scene_effectRecordDefaults(), pat_initScene() (caller).
+ */
+void scene_resetResidentToEmpty(uint8_t scene_index)
+{
+    scene_t *scene = scene_get(scene_index);
+    uint8_t slot;
+
+    if (!scene)
+        return;
+    memset(scene, 0, sizeof(*scene));
+    scene_busCompDefaults(&scene->settings);
+    for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++) {
+        scene->settings.audio_out[slot] = scene_defaultVoiceAudioOut(slot);
+        scene->settings.fx_send_amount[slot] = 0u;
+        scene->settings.fx_send_morph[slot] = 0u;
+        scene->settings.fader_setting[slot] = 0u;
+        instrumentManager_resetSlot(&scene->kit.instruments[slot],
+                                    scene_initialInstrumentTypes[slot]);
+    }
+    scene_effectRecordDefaults(&scene->effect);
+}
+
+/*
  * Replace one Scene's whole Kit (contract in SceneData.h).
  *
  * Whole-Kit commit: the six slots and the Kit settings are copied, then the
@@ -1234,9 +1307,6 @@ void scene_initAll(void)
     for (scene_index = 0u; scene_index < SCENE_COUNT; scene_index++) {
         /* S074/S075 F2-B: bus compressor defaults are off, 0, 0, off. */
         scene_busCompDefaults(&scenes[scene_index].settings);
-        for (track = 0u; track < NUM_TRACKS; track++)
-            scenes[scene_index].settings.midi_channel[track] =
-                (uint8_t)(track + 1u);
         for (track = 0u; track < INSTRUMENT_SLOT_COUNT; track++) {
             /*
              * Initialize Scene-owned per-voice mix settings before any SD

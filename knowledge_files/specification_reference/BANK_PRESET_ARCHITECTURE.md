@@ -138,11 +138,31 @@ Scene storage; it is a singleton module.
 |-------|------|---------|
 | `bank_display_name[9]` | char[9] | 8-char display name + NUL, from HCNAMES row 0 |
 | `bank_scene_present_mask` | uint16_t | Which of 16 Scenes are populated |
+| `bank_load_unavailable_mask` | uint16_t | Scenes a running background Bank load has not finished (S082 P3) |
 | `bank_scene_mask_voice_edit[16]` | uint16_t[16] | Per-Scene fan-out mask for VOICE-page and Scene-settings edits |
 | `bank_active_scene_slot` | uint8_t | Currently active Scene index (0..15) |
 | `bank_has_resident_bank` | uint8_t | Whether a Bank is loaded |
 | `bank_restore_slot` | uint16_t | SD library slot for `settings.cfg` persistence |
 | SD-clean authority | ~16 bytes | Session-scoped, never serialized |
+
+### Load availability (S082 P3)
+
+`bank_load_unavailable_mask` is zero outside a load. A progressive background
+Bank Load marks its load and empty sets at request acceptance
+(`bank_beginLoadAvailability()`); each completed child sets its own present
+bit, clears its unavailable bit and revalidates layouts among the Scenes now
+available (`bank_noteLoadChildDone()`); every exit clears the mask
+(`bank_endLoadAvailability()`, called by the Preset completion and as the
+`preset_bgEnd()` backstop).
+
+The resulting availability rule is **selection, fan-out, copy/clear and LED
+presence use `bank_sceneAvailableMask()`; persistence (AutoSave, Bank Save and
+the end-of-load present commit) keeps using `bank_scenePresentMask()`**. The
+helpers are `bank_sceneAvailable()`, `bank_loadUnavailableMask()`,
+`bank_sceneFanoutMask()` and `bank_editTargetMask()`; EffectsManager's
+`effects_fanoutMask()` masks the same unavailable bits. While Scene 17 is
+active the edit target remains Scene 17 alone. Outside a load availability is
+exactly presence, so every changed test reduces to its pre-P3 form.
 
 ### Voice-Edit Fan-Out Mask (Per-Scene, Session 071)
 
@@ -310,7 +330,11 @@ Parameters change through these paths:
    use runtime-only overlays (Session 070). Neither path changes stored
    images.
 
-   **S075 F3 priority (user): automation, then menu edits, then MIDI.**
+   **S083 Q1 priority (user): a MIDI write is a menu edit.** The S075 F3
+   "automation, then menu edits, then MIDI" order is superseded: MIDI writes
+   through `menu_commitTargetEdit()`, so it has the same priority and the
+   same actions against automation (R12/R13, Scene-target clears), fan-out
+   through `bank_editTargetMask()`, recording and display as a panel edit.
    - A voice-parameter automation value holds until the voice's next
      trigger. `seq_automationHoldsParameter(slot, local)` reports it; every
      Morph-base runtime write goes through `presetMorph_writeRuntimeBase()`,
@@ -320,13 +344,23 @@ Parameters change through these paths:
      re-interpolates that one parameter at the voice's resolved Morph amount
      (`presetMorph_applyParameterNow()`); with Morph above 0 the sound
      changes by less than the edit (correct). The whole voice is not queued.
-   - External MIDI CC/NRPN is lowest priority:
-     `preset_setInstrumentParameterFromMidi()` stores the active Scene's
-     clamped Normal endpoint (retained and AutoSaved, no fan-out) and queues
-     the voice; the Morph sweep applies it when it gets there.
+   - External MIDI CC/NRPN commits exactly like a menu edit: the active
+     Scene's clamped Normal endpoint, `seq_menuOverrideSet()` and edit-mask
+     fan-out. The retired `preset_setInstrumentParameterFromMidi()` path no
+     longer exists.
    - Before S075 F3 a menu edit queued the whole voice and the worker
      overwrote held automation mid-note (also on Morph changes, LFO on
      Morph, `Nvm` and Kit/Instrument applies).
+   - **S081 R12 amendment (user):** a menu edit of an automated Instrument
+     parameter sounds at once and suppresses that parameter's automation
+     until the voice's next trigger, a transport change or a Scene change
+     (`seq_menuOverrideSet()` clears the held bit and sets
+     `seq_menuOverride[slot]`; the drain skips the target). Other targets
+     take the menu value until their next automation: a menu edit clears
+     that FX send, audio out, `7dc` or track length/scale/shuffle override.
+     Effect parameters follow R13 (menuHold > lock > overlay > menu,
+     `EFFECTS_BUS_REFERENCE.md` §6). A menu value is never reverted.
+     Details: `PATTERN_DYNAMIC_STACK.md` §6.2a.
 
 6. **Kit/Instrument/Scene/Bank Load:** Commits validated data from staging
    into resident storage. Scene/Bank loads stage the Effect atomically with
@@ -646,11 +680,12 @@ result[i] = normal[i] + ((morph[i] - normal[i]) * amount) / 255
 Results are stored in `morph_interpolation[slot][descriptor_index]` and
 applied to DSP runtime through the normal descriptor writer.
 
-S075 F3 priority is explicit at the runtime boundary: step automation holds
+Priority at the runtime boundary (S081 R12, S083 Q1): step automation holds
 the current runtime value until the next trigger; a menu endpoint edit
 re-interpolates only the edited descriptor at the voice's resolved Morph
-amount; an external MIDI CC stores the active Scene's Normal endpoint and is
-applied by the bounded worker, which skips automation-held descriptors.
+amount and overrides that descriptor's automation until the next trigger; an
+external MIDI CC/NRPN goes through the same menu commit and therefore has the
+same effect.
 
 ### Track timing Morph (S078)
 
@@ -810,3 +845,25 @@ The voice-edit mask is restored after the active Scene is set, ensuring the
 active-Scene-in-mask invariant holds at every step. Pattern restore happens
 last because it is independent of scalar state and has its own generation-
 based winner selection.
+S082 active Scene and edit masks:
+
+* `bankset.bcg` `active_scene` is legacy boot data. It is applied only by a
+  boot Bank load with no AutoSave record; a runtime Bank Load never applies it
+  and never changes the active or viewed Scene. A Bank Save writes the home
+  Scene while Scene 17 is active (17 has no Bank number).
+* Replace Load assigns the present mask (loaded Scenes set, emptied Scenes
+  clear, the active Scene always stays present). Replace Save never changes
+  resident presence. A Merge Load re-marks the whole resident Bank for
+  AutoSave; a Merge Save reads the slot's existing manifest to keep untouched
+  children mutually exclusive.
+* A progressive Load sets each child's present bit as it completes and merges
+  the new Bank's edit entries before the first child; its final commit keeps
+  the live present mask and only strips failed children from the entries, so
+  user edits made while the panel was unlocked survive.
+* Voice edit masks stay mutually exclusive after a partial operation. A
+  loaded/written Scene takes its source/RAM entry restricted to the acted set
+  plus itself; an emptied/removed Scene resets to self and is removed from
+  every other entry; a kept Scene drops every Scene that was acted on. A
+  missing or malformed slot manifest counts as every untouched entry = self.
+* Scene 17's edit mask is itself only (bit 16 in the 32-bit fan-out helpers);
+  it is never part of a 16-bit resident Bank mask.
