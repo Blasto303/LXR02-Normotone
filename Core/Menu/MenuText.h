@@ -96,7 +96,9 @@ static const char retriggerNames[][4] = {
     {8}, {"off"},{"v1"},{"v2"},{"v3"},{"v4"},{"v5"},{"v6"},{"scn"},
 };
 static const char lfoWaveNames[][4] = {
-    {8}, {"sin"},{"tri"},{"sup"},{"sdn"},{"sqr"},{"rnd"},{"xup"},{"xdn"},
+    {16}, {"sin"},{"tri"},{"sup"},{"sdn"},{"sqr"},{"rnd"},{"xup"},{"xdn"},
+    /* One-shots (lfo.h LFO_*_ONE): one cycle per retrigger, offset = delay. */
+    {"si1"},{"tr1"},{"su1"},{"sd1"},{"sq1"},{"rn1"},{"xu1"},{"xd1"},
 };
 /* Three-character display names for the shared LFO polarity selector.
 ** Clients: descriptor ROW("lfo_polarity", ..., DTYPE_LFO_POLARITY), compact
