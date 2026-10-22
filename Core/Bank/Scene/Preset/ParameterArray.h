@@ -285,7 +285,7 @@ enum ParamEnums
 	PAR_TRACK_LOOPABLE,
 
 	/*
-	 * S081 P2: per-track automation ramp mirror (asm).
+	 * S081 P2: per-track automation ramp mirror (rmp).
 	 *
 	 * What: off/on display/edit mirror of the active track's automation ramp
 	 * mode in the viewed Scene's Pattern region (1 = automation on two
@@ -298,6 +298,24 @@ enum ParamEnums
 	 * SEQ_PAGE sub-page 0 cell 7.
 	 */
 	PAR_TRACK_AUTO_SMOOTH,
+
+	/*
+	 * S083 follow-up: PERF BAR overlay roll velocity rhythm (pv<, pv>).
+	 *
+	 * What: the packed roll-rhythm byte (the step special `rtm` encoding and
+	 * list: off, 1-2 .. 4-5 halve, 1+2 .. 4+5 double) applied to the roll of
+	 * BAR overlay `<` / `>` when its trigger type (pb< / pb>) is a roll.
+	 * Single and flam types ignore it. Why: user request 2026-10-22, the
+	 * overlay roll gets the same rhythm as a step roll. Persisted Globals
+	 * (settings.cfg perf_vel_lt / perf_vel_rt, default 0 = off). Appended
+	 * after PAR_TRACK_AUTO_SMOOTH so no established id is renumbered.
+	 * Inputs: SHIFT+REC sub-page 1 edits, settings load. Outputs: read by
+	 * buttonHandler's overlay roll tick through seq_rollRhythmVelocity().
+	 * Affiliates: RECORDING_PAGE, menu_paramIsRollRhythm(), filesystem
+	 * settings writer/parser.
+	 */
+	PAR_PERF_VEL_LT,
+	PAR_PERF_VEL_RT,
 
 	NUM_PARAMS = 384,
 };
@@ -314,9 +332,11 @@ _Static_assert(PAR_BUS_COMP_SIDECHAIN < NUM_PARAMS,
 _Static_assert(PAR_TRACK_LOOPABLE < NUM_PARAMS,
 	"S080 chain/loopable mirrors must fit the fixed flat parameter allocation");
 
-/* S081 P2: the asm mirror also consumes existing parameter_values[] capacity. */
+/* S081 P2: the rmp mirror also consumes existing parameter_values[] capacity. */
 _Static_assert(PAR_TRACK_AUTO_SMOOTH < NUM_PARAMS,
-	"S081 P2 asm mirror must fit the fixed flat parameter allocation");
+	"S081 P2 rmp mirror must fit the fixed flat parameter allocation");
+_Static_assert(PAR_PERF_VEL_RT < NUM_PARAMS,
+	"S083 pv</pv> Globals must fit the fixed flat parameter allocation");
 
 #include "stm32f4xx.h"
 

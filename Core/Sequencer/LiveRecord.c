@@ -1263,7 +1263,7 @@ static void liveRec_endRoll(uint8_t writeEnd)
  * position; the type check keeps an Instrument trigger from being recorded
  * into a Scene whose slot holds a different instrument (plan §7). Inputs:
  * liveRec_trigger_t. Outputs: Pattern writes, echo marks, live hold, LED.
- * Accessors: buttonHandler overlay (E-2), midiParser_noteOn().
+ * Accessors: buttonHandler overlay (E-2), midiNotes_handle() (S083).
  * Affiliates: seq_captureTrackTime(), seq_quantiseTick(),
  * seq_placeFromSnapshot(), liveRec_commitHit(), liveRec_placeFlam().
  */
@@ -1307,23 +1307,55 @@ void liveRec_triggerIn(const liveRec_trigger_t *t)
     frac8 = liveRec_frac8(&snap);
     setFil = seq_fillActive;
 
-    /* Quantise: master grid for 1/8..1/64, own steps for trk, none for off. */
-    switch (seq_getQuantisation()) {
-    case QUANT_TRACK:
-        deltaQ8 = frac8;
-        snapToStep = 1u;
-        break;
-    case QUANT_8:
-    case QUANT_16:
-    case QUANT_32:
-    case QUANT_64: {
-        uint32_t q = seq_quantiseTick(snap.elapsedTick, frac8);
+    /*
+     * Arrival-time correction (S083 Q6).
+     *
+     * What: posQ8 is the hit's position relative to the captured tick in
+     * Q8 ticks: the sub-tick fraction now, minus the hit's age (t->age_us
+     * converted with the current tick period). The shift is limited to one
+     * step interval of the track, so a placement never reaches further back
+     * than the step before the current one (seq_placeFromSnapshot()'s rel
+     * range). Why: a MIDI note waits in a buffer while the foreground
+     * renders; placed at processing time it lands late and can quantise to
+     * the next step. Panel and repeat hits have age 0 and are unchanged.
+     * Inputs: snap.periodUs (tick period), snap.interval (step, Q8 ticks).
+     * Output: posQ8 (signed), used by every quantise mode below.
+     * Affiliates: MidiNotes (age), seq_quantiseTick(), seq_placeFromSnapshot().
+     */
+    {
+        int32_t ageQ8 = 0;
+        int32_t posQ8;
+        int32_t whole;
 
-        deltaQ8 = (int32_t)(((int32_t)q - (int32_t)snap.elapsedTick) * 256);
-        break; }
-    default:
-        deltaQ8 = frac8;
-        break;
+        if (t->age_us != 0u && snap.periodUs != 0u) {
+            ageQ8 = (int32_t)(((uint32_t)t->age_us * 256u) / snap.periodUs);
+            if (ageQ8 > (int32_t)snap.interval)
+                ageQ8 = (int32_t)snap.interval;
+        }
+        posQ8 = (int32_t)frac8 - ageQ8;
+        whole = (posQ8 >= 0) ? (posQ8 >> 8) : -((-posQ8 + 255) >> 8);
+
+        /* Quantise: master grid for 1/8..1/64, own steps for trk, none for off. */
+        switch (seq_getQuantisation()) {
+        case QUANT_TRACK:
+            deltaQ8 = posQ8;
+            snapToStep = 1u;
+            break;
+        case QUANT_8:
+        case QUANT_16:
+        case QUANT_32:
+        case QUANT_64: {
+            uint32_t tick = ((int32_t)snap.elapsedTick + whole >= 0)
+                ? (uint32_t)((int32_t)snap.elapsedTick + whole) : 0u;
+            uint8_t f = (uint8_t)(posQ8 - whole * 256);
+            uint32_t q = seq_quantiseTick(tick, f);
+
+            deltaQ8 = (int32_t)(((int32_t)q - (int32_t)snap.elapsedTick) * 256);
+            break; }
+        default:
+            deltaQ8 = posQ8;
+            break;
+        }
     }
     if (!seq_placeFromSnapshot(track, &snap, deltaQ8, snapToStep, &pl)) {
         liveRec_drop(2u, track, 0u);

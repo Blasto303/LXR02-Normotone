@@ -4,11 +4,69 @@ Where every byte of the STM32F765VIH6's on-chip storage goes: program flash,
 sample flash, ITCM, DTCM, SRAM1 and SRAM2. It also records the rules for
 changing any of it.
 
-- **Current as of:** Session 080 close (2026-10-11), `dev-ph6-cleanup`,
-  code at `4869a98`. DEV link:
-  `text=556,008`, `data=412`, `bss=427,976`; flash payload 556,420 B of
-  753,664 B (**headroom 197,244 B**). Production (`DEV_MODE_LOGGING=0`) was
-  last measured at S075 F1 and needs a rebuild.
+- **Current as of:** Session 083 (2026-10-21), `dev-ph6-midi`. DEV link:
+  `text=603,896`, `data=424`, `bss=430,120`; flash payload 604,320 B of
+  753,664 B (**headroom 149,344 B**), after the MIDI rebuild.
+- **S083 follow-up (2026-10-22):** −1 B SRAM1. `MidiNotes` no longer has
+  a `midiNotes_action` CC2 state: CC2 sets `buttonHandler`
+  `bh_overlayActive`. The overlay entry field `vel` (always 100) became the
+  roll-rhythm position `pos`, so the size is unchanged. `pv<`/`pv>` use spare
+  `parameter_values[]` ids. The measured DEV BSS is unchanged at 430,112 B.
+- **S083 `midilrn.cfg` (2026-10-22):** +1 B approved SRAM1 `.bss`
+  (`filesystem.c` `fs_midilearn_write`, the MIDI Learn write request,
+  owner filesystem). The measured DEV BSS is unchanged at 430,112 B because
+  the byte filled alignment padding. The boot recovery reuses the four
+  `op_settings_recovery_*` bytes. Text 605,784 -> 608,424.
+- **S083 changes (MIDI):** measured DEV BSS 430,928 -> 430,120 (**-808 B**
+  net), data 420 -> 424, text 598,120 -> 603,896. New static SRAM1, all
+  approved: `MidiLearn` table 128 x 4 B = 512 B + count/state/target/deadline
+  16 B (528 B with alignment); `MidiControl` NRPN contexts 2 x 8 x 3 B =
+  48 B (exact); `buttonHandler` per-track overlay table 7 x 8 B = 56 B
+  replacing the 9 B single slot (R-A, +47 B aligned); `MidiOut` note-off
+  record 7 x 2 B = 14 B replacing the 16 + 2 B channel cache (R-B) and the
+  parameter TX state 8 B; `midiIn_config` 3 B and the 6 B in-progress DIN
+  message replacing the legacy channel/filter/parser state (R-D); DIN RX
+  stamps 64 x 2 B = 128 B; the USB ring is 128 x 6 B = 768 B (the pre-S083
+  ring was 256 x 8 B = 2,048 B: the old `MidiMsg` measured 8 B, not the
+  plan's 4 B). `MidiBits` is one byte of `uint8_t` bitfields so the new
+  `MidiMsg` is 6 B. `seq_resumeTick` 4 B (R-C) and the 1 B PC-origin flag.
+  Retired: `midiParser_originalCcValues[255]`, `midi_NoteOverride[7]`,
+  `midi_MidiChannels[8]`, `midi_chan_notes[16]` + `midi_notes_on` (18 B),
+  the 9 B overlay slot and the parser statics. A release does not
+  authorise reuse (MEMORY.md policy).
+- **S082 P3 changes:** +4 B approved SRAM1 (D47): BankData
+  `bank_load_unavailable_mask` 2 B, `ledHandler.c` `led_fastBlinkLed[]`
+  +1 B (1 → 2 slots), `menu.c` `menu_bgLoadAvailCount` 1 B. The measured DEV
+  BSS grew by 8 B because the new bytes changed section alignment; no page or
+  pool was enlarged. `PM_BG_UNLOCKED` is spare bit 3 of `pm_bg_phase`, and
+  the frozen-screen Bank name reuses `op_bank_display_name`; both add no RAM.
+- **S082 P2 changes:** no production SRAM growth. `filesystem.c`
+  `fs_stall_poll_uncounted` is 1 B inside `DEV_STALL_DETECTION` builds only
+  (idle-time Bank-load ticks stay invisible to the poll-count stall
+  observers). The measured DEV BSS is unchanged from S082 P1 because the byte
+  filled existing alignment padding. F1 and F2 add no static storage.
+- **S082 P1 changes:** +93 B SRAM1 from S082 P0: 91 B BSS (`filesystem.c`
+  `fs_background_name` 90 B, the 10 × 9 B name capture for Scene 17 identity
+  names, §8.2; `presetManager.c` `pm_bg_result` 1 B, one-shot result
+  register) and 2 B `.data` (`presetManager.c` `pm_bg_pending_slot`, deferred
+  MIDI Bank load slot, initialiser `0xFFFF`, which also adds 2 B of flash
+  initialiser). While a load is in flight `pm_bg_pending_slot` doubles as the
+  bounded-wait start tick (S082 P1 assessment A8), with no further storage.
+- **S081 changes** (logged after S082; `081_SESSION_HANDOFF_LOG.md` §10): DEV
+  link `text=556,008 → 573,296`, `data=412 → 416`, `bss=427,976 → 429,112`
+  (**+1,136 B BSS, +4 B data**; flash payload 573,712 B, headroom 179,952 B).
+  All static SRAM1, user-approved. P1 live record ≈ +428 B every build and
+  ≈ 80 B released (Effect owner/pending/held-Morph state, legacy roll bytes,
+  `recordSubStep`); P1B ≈ +61 B; P1C +10 B; P2 automation ramps +686 B
+  (`seq_ramps[64]` 640 B at 10 B per slot incl. the D11 `last` byte,
+  `seq_rampCtx[7]` 28 B, `seq_rampBlockDiv` 1 B, `track_auto_smooth` 16 B in
+  `pat_regions` + 1 B in `pat_background_region`); P3 none static (+12 B per
+  `seq_track_time_t` stack local); G-1 +7 B (`liveRec_morphValue[7]`, BSS +8
+  with padding); P4 +2 B `.data` (reported +4 B by `ALIGN(4)`). DEV-only:
+  `liveRec_drops` 14 B, `seq_recRingDrops` 2 B, `seq_rampNoSlotDrops` 2 B.
+  `effects_automation` 184 → 120 B, `effects_state` 84 → 80 B. Region size
+  10,527 → **10,528 B**. Owners in §8.2. The production build was not
+  re-measured in S081.
 - **S080 changes:** +200 B BSS (+4 B data) from S079 (PERF performance
   surface, `080_SESSION_HANDOFF_LOG.md` §8). Owners: `sequencer.c` looper
   state 67 B (`seq_loopActive`, mask/division/modifier 3 B,
@@ -19,7 +77,8 @@ changing any of it.
   `seq_pendingChainFire`); `buttonHandler.c` looper holds 5 B, overlay
   runtime 10 B (`bh_overlayActive`, voice mask, track, note, velocity,
   count, interval 2 B, next 2 B), SHIFT+REC 3 B, `bh_shiftReleaseConsume`,
-  `bh_chainPlayArmed`; `ledHandler.c` fast blink 4 B (`led_fastBlinkLed`,
+  `bh_chainPlayArmed`; `ledHandler.c` fast blink 5 B (two `led_fastBlinkLed`
+  slots since S082 P3, `led_fastBlinkPhase`,
   `led_fastBlinkPhase`, `led_fastBlinkNext`); `menu.c`
   `menu_chainMenuScene` 1 B; `scenes` +64 B (16 × 4 B chain settings,
   26,496 B); `pat_regions` +16 B and `pat_background_region` +1 B
@@ -348,17 +407,16 @@ only works while sector 6 holds no code.
 - **Session 080 changes:** `.bss` +200 B, `.data` +4 B over S079 (owners in
   the header and §8.2). DEV link `text=556,008`, `data=412`, `bss=427,976`;
   flash payload 556,420 B.
-- **Session 081 changes:** S081 P3 added a +12 B stack frame for
-  `seq_track_time_t` (approved stack-budget increase) and, with its global
-  Morph fix G-1, **+7 B SRAM1** `.bss`: LiveRecord `liveRec_morphValue[7]`
-  (owner LiveRecord, static runtime-only, approved by the user; the section
-  reports +8 B with alignment). S081 P4 adds **+2 B SRAM1** `.data`: ledHandler
-  `led_barPulseTrack` and `led_barPulseBar`, both 0xFF-initialised sentinels
-  (owner ledHandler, static runtime-only, approved by the user); the linker
-  script's `.data` `ALIGN(4)` reports the section as +4 B. DEV link after
-  P4: `text=573,160`, `data=416`, `bss=429,104`; flash payload 573,576 B.
-  After P3 G-1: `text=573,296`, `data=416`, `bss=429,112`; flash payload
-  573,712 B.
+- **Session 081 changes:** `.bss` 427,976 → 429,112 (+1,136 B), `.data`
+  412 → 416 (+4 B) over S080; DEV link `text=573,296`, `data=416`,
+  `bss=429,112`, flash payload 573,712 B. Parts: P1 live record ≈ +428 B
+  (≈ 80 B released), P1B ≈ +61 B, P1C +10 B, P2 automation ramps +686 B, P3
+  none static but a +12 B stack frame for `seq_track_time_t` (approved), G-1
+  **+7 B** `liveRec_morphValue[7]` (reported +8 B with alignment), P4 **+2 B**
+  `.data` `led_barPulseTrack`/`led_barPulseBar` (0xFF-initialised; `.data`
+  `ALIGN(4)` reports +4 B; the user accepted this as is). Owners in the
+  header and §8.2. The table above is still the S080 section breakdown; the
+  S081/S082 sections were not re-tabulated.
 - **Session 079 changes:** `.bss` +160 B (owners in the header). DEV link
   `text=544,072`, `data=408`, `bss=427,776`.
 - **Session 078 changes:** `.bss` +608 B (owners listed in the header and
@@ -498,8 +556,8 @@ byte, including alignment and small variables omitted here.
 | Owner / object | Bytes | Allocation and use |
 | --- | ---: | --- |
 | `SceneData.c`: `scenes` | 26,496 | Sixteen resident Scene records, 1,656 B each: 75 B settings including the S075 F2 `fx_send_morph[6]`, the S078 `track_morph_length/scale/shuffle[7]` and the S080 `chain_condition[2]`/`chain_next[2]`, 420 B Scene-owned Effect record, and the 1,160 B Kit (plus alignment); Pattern regions are separate. |
-| `PatternData.c`: `pat_regions` | 168,432 | Sixteen packed regions of 10,527 B: each has 1,792 B step addresses, 8,192 B pool, 512 B bitmap, and 31 B Pattern/track settings (length, scale CC, shuffle, run mode × 7, the S080 loop-exclude mask, 2 Pattern bytes; run mode added in S078). Since S075 the top 132 B of each pool (33 chunks) is a permanent swap block outside normal allocation (8,060 B usable), kept as a guaranteed rewrite area for copy/clear and later features (`PATTERN_DYNAMIC_STACK.md` §3, §12.17). |
-| `PatternData.c`: `pat_background_region` | 10,527 | One Scene-sized background region outside `pat_regions[]`, not a playable Scene (S077). Serves as the immutable snapshot for an in-flight Pattern AutoSave, the copy/clear scratch pool for an overlapping paste (`pat_backgroundPoolMut()`), and future Bank Load staging. Replaces the former `pat_autosave_snapshot` at identical size. |
+| `PatternData.c`: `pat_regions` | 168,448 | Sixteen packed regions of 10,528 B: each has 1,792 B step addresses, 8,192 B pool, 512 B bitmap, and 32 B Pattern/track settings (length, scale CC, shuffle, run mode × 7, the S080 loop-exclude mask, 2 Pattern bytes; run mode added in S078). Since S075 the top 132 B of each pool (33 chunks) is a permanent swap block outside normal allocation (8,060 B usable), kept as a guaranteed rewrite area for copy/clear and later features (`PATTERN_DYNAMIC_STACK.md` §3, §12.17). |
+| `PatternData.c`: `pat_background_region` | 10,528 | One Scene-sized background region outside `pat_regions[]`, not a playable Scene (S077). Serves as the immutable snapshot for an in-flight Pattern AutoSave, the copy/clear scratch pool for an overlapping paste (`pat_backgroundPoolMut()`), and future Bank Load staging. Replaces the former `pat_autosave_snapshot` at identical size. |
 | `PatternStackService.c`: `reservation_image` | 512 | One non-persisted bit image for the current service Scene's trailing pool reservations; three separate one-byte policy/rebuild flags accompany it. |
 | `PatternStackService.c`: `service_queue` | 256 | Sixty-four 32-bit mutation entries; cursors and repair/handover state are additional small SRAM1 objects. |
 | `Autosave.c`: `autosave_dirty_mask` | 3,856 | Sole canonical scalar dirty-bit mask. |
@@ -522,11 +580,20 @@ byte, including alignment and small variables omitted here.
 | `adcPots.c`: `slider_lut` | 4,096 | 1,024 `float` slider conversion values. |
 | `SampleMemory.c`: resident and install caches | 5,040 | 1,440 B `sample_info_cache`, 1,080 B `sample_name_cache`, 120 B loop flags, 1,440 B `install_info`, and 960 B `install_names`. |
 | `usb_manager.c`: `USB_OTG_dev` | 1,524 | USB core/device handle. |
-| `usb_midi_core.c`: `usb_MidiMessages` | 2,048 | USB MIDI input ring. |
+| `usb_midi_core.c`: `usb_MidiMessages` | 768 | USB MIDI input ring, `MIDI_USB_RX_RING_SIZE` (128) x 6 B `MidiMsg` with arrival stamp (S083 Q13; was 256 x 8 B = 2,048 B). |
 | `sequencer.c`: pending automation + dirty bits | 560 | 128 four-byte pending records (512 B) and six per-voice 64-bit dirty maps (48 B). |
+| `sequencer.c`: R12 menu override (S081) | 48 | `seq_menuOverride[6]` (`u64`): Instrument parameters whose automation a menu edit suppresses until the voice's next resetting trigger. Foreground only. |
+| `sequencer.c`: step reset / deferral (S081) | 15 | `seq_trackShuffleStep[7]`, `seq_trackShuffleRoll[7]` (deferred step index and roll flag), `seq_trackShuffleMuteMask` (1 B, a live hit muted the pending deferral). |
+| `sequencer.c`: live-record services (S081) | ≈ 94 | Boundary ring `seq_recRing[16]` (`u16`) + cursors (≈ 34 B), `seq_recTrack`/`seq_recWriting`, `seq_echoStep[7]` (`int8`) + `seq_echoDeadline[7]` (`u16`, 14 B), `seq_liveHoldMask`, `seq_eraseSpecialsMask`/`FullMask`, `seq_ppqStampUs`/`PeriodUs` (8 B), `seq_playbackEpoch`, `seq_sceneEpoch`, filter pointers (9 B). TIM3-shared fields are `volatile` bytes or PRIMASK-published pairs. |
+| `sequencer.c`: automation ramps (S081 P2) | 669 | `seq_ramps[64]` (`seq_ramp_t`, 10 B: id, from, to, last, start/end 1/16-tick times; 640 B), `seq_rampCtx[7]` (4 B TIM3 hand-off, 28 B), `seq_rampBlockDiv` (1 B). Static, written by the drain/ramp service (slots) and TIM3 (contexts). |
+| `LiveRecord.c`: live record state (S081) | ≈ 250 | `latch`/`dirty`/`erase` bitmaps (3 × 64 B over the 9-bit target space), mode/`rtk`/target/origin/epochs, roll capture (track, step, index, start delay, span, hits, pending index, note, velocity, note-default), flam grace (delta, tick, velocity, valid), `liveRec_prevStep[7]`/`liveRec_prevFlags[7]`, erase gesture state (specials, full, knob FX lanes 2 B, FX SEQ count, SEQ count and track). Static runtime-only. |
+| `PatternStackService.c`: live-record staging (S081) | 36 | `patSvc_recordStage[4]` (a `pat_record_spec_t` + scene/track/step/used each) and `service_target_request` (recording-target override). |
+| `MidiVoiceControl.c`: `voiceControl_pendingReset` (S081) | 1 | Per-voice pending-reset mask (bits 0..6), set by TIM3 and the foreground, tested and cleared under the queue's PRIMASK. |
+| `EffectsManager.c`: R13 and live erase (S081) | ≈ 43 | `menuHold` (`u64`) + `menuHoldMorph` (inside `effects_automation`), `effects_eraseLanes` (2 B), `effects_erasedLanes[16]` (`u16`, 32 B). |
+| `buttonHandler.c`: live record UI (S081) | ≈ 13 | REC hold timer (`bh_recPressTick` `u16`, `bh_recArmed`), `bh_shiftHeld`/`bh_clearHeld`, erase gesture masks `bh_eraseSeqMask`/`bh_eraseFxSeqMask`/`bh_eraseVoiceMask` (5 B), `bh_overlayHeldType`, `bh_overlayNoteDefault`. |
 | `sequencer.c`: PERF looper (S080) | 67 | `seq_loopActive` (ISR gate), `seq_loopTrackMask`/`Division`/`Modifier`, per track `seq_loopAnchor[7]` (uint32 master tick, 28 B) and the snapshot `seq_loopStartStep[7]` (14 B), `seq_loopStartAccum[7]` (14 B), `seq_loopStartPlayState[7]` (7 B). Runtime only; written under PRIMASK, read by TIM3 (`PATTERN_DYNAMIC_STACK.md` §6.5). |
 | `sequencer.c`: scene change / chain state (S080) | 12 | Pending direct/queued change (index, division, flags, fire flag, 7 B) and chain runtime (bar/repetition counts, previous Scene, `stp` freeze, chain-fire marker, 5 B) (`PATTERN_DYNAMIC_STACK.md` §6.6). |
-| `buttonHandler.c` / `ledHandler.c` / `menu.c`: PERF UI state (S080) | 25 | Looper holds 5 B, BAR overlay runtime 10 B, SHIFT+REC 3 B, release-consume and chain chord 2 B, fast blink 4 B, chain editor Scene 1 B. |
+| `buttonHandler.c` / `ledHandler.c` / `menu.c`: PERF UI state (S080) | 26 | Looper holds 5 B, BAR overlay runtime 10 B, SHIFT+REC 3 B, release-consume and chain chord 2 B, fast blink 5 B (second slot S082 P3), chain editor Scene 1 B. |
 | `LiveRecord.c`: individual Morph capture (S081 P3 G-1) | 7 | `liveRec_morphValue[7]`: the 7-bit value of the last individual edit of each voice Morph (slots 1..6) and the FX Morph. Every dirty Morph write uses it, so a global Morph change (never recorded) cannot leak into a recorded Morph value. Runtime-only, foreground; written by `liveRec_paramIn()`, read by `liveRec_recordValue7()`. |
 | `ledHandler.c`: VOICE-mode bar pulse (S081 P4) | 2 | `led_barPulseTrack` and `led_barPulseBar` (0xFF = none): the active track and bar last seen by `led_updateVoiceBarPulse()`, so the SELECT LED of a new bar pulses once in VOICE mode. Runtime-only, foreground, written only from the CHASE branch of `led_processSeqLedState()`. Initialised 0xFF, so `.data`, not `.bss`. |
 | `sequencer.c`: per-track timing state (S078) | 76 | ISR-static: `seq_trackAccumulator[7]` (Q8.8, 14 B), `seq_fxAccumulator` (2 B), `seq_fxStepCounter` (4 B), `seq_trackShuffleDelay/Pending/Vel/Note[7]` (28 B), `seq_trackPlayState[7]` (7 B), `seq_effectiveTrackLength/Scale/Shuffle[7]` (21 B, the morphed/automated timing cache). Written by TIM3 and by foreground refresh points (`PATTERN_DYNAMIC_STACK.md` §6.4). |
@@ -538,10 +605,10 @@ byte, including alignment and small variables omitted here.
 | `lcd.c`: `lcd_queue` | 384 | LCD command queue. |
 | `FxBuffer.c`: `fxbuf_state` | 28 | Linker arena base/size, twelve unit owners, count, and share callback. |
 | `FxBuffer.c`: `fxbuf_handoffRecord` | 180 | Effect/voice handoff metadata and arena-relative positions. |
-| `EffectsManager.c`: `effects_state` | 84 | Active type/Scene, force flag, 64-byte last-applied image, FX step/selection/held-Morph state, sequence signature, and common runtime values. |
-| `EffectsManager.c`: `effects_automation` | 184 | Effect Pattern overlays, owner/end masks, `fxm` override, and 6 × 2 base-independent LFO contribution entries. |
+| `EffectsManager.c`: `effects_state` | 80 | Active type/Scene, force flag, 64-byte last-applied image, FX step/selection state, sequence signature, and common runtime values (84 B before S081 removed the held-Morph latch). |
+| `EffectsManager.c`: `effects_automation` | 120 | Effect Pattern overlays (active/value), `menuHold` (`u64`) + `menuHoldMorph`, `fxm` override, and 6 × 2 base-independent LFO contribution entries (184 B before S081 removed the owner/end masks). |
 | `sequencer.c`: `seq_fxEvent` | 1 | TIM3-to-foreground newest-wins RESET/STEP latch; no Scene, DSP, or LED work occurs in the ISR. |
-| `sequencer.c`: `seq_effectAutomationTracks` / `seq_effectAutomationReset` | 2 | Owner-track publication and reset latch for the foreground Effect overlay drain. |
+| `sequencer.c`: `seq_effectAutomationReset` | 1 | Reset latch for the foreground Effect overlay drain (also set by `seq_requestEffectOverlayReset()` at a realign, S081). `seq_effectAutomationTracks` was removed in S081 with the step markers. |
 | `menuEffects.c`: page state | 21 | Eight SELECT screen cells, Morph-view flag, `typ` transaction state, last Scene/type tracking, SEQ hold mask, and LED repaint signature; SRAM1, foreground UI lifetime. S074 repacked the hold flag byte as `holdState` (active bit, last-held-valid bit, 4-bit last step held): 0 B change. |
 
 Other SRAM1 state comprises filesystem operation cursors and text buffers,
@@ -573,6 +640,9 @@ misses alignment and other compile-time changes.
 | `FxBuffer.c`: `fxbuf_selfTestResult` | 1 | Diagnostic-only allocation self-test result. |
 | `EffectsManager.c`: `effects_registryCheckCode` | 1 | Diagnostic-only registry invariant result. |
 | `copyClearService.c`: `ccSvc_traceState` | 22 | Packed DEV-only copy/clear operation, queue, scratch, drop, register and name counters. |
+| `LiveRecord.c`: `liveRec_drops[7]` (S081) | 14 | Live-record drop counters by cause (trace stage `W`). |
+| `sequencer.c`: `seq_recRingDrops` (S081) | 2 | Boundary-ring overflow count (stage `W` cause 5). |
+| `sequencer.c`: `seq_rampNoSlotDrops` (S081 P2) | 2 | Ramp pairs that jumped because all 64 slots were busy. |
 | `filesystem.c`: `fs_cc_suspended_prev`, `fs_cc_refusal_reported` | 2 | DEV-only suspension-edge and first-refusal latches for stage `c`. |
 
 `DEV_STALL_DETECTION=1` also keeps its phase/tick detector state; its
@@ -581,7 +651,8 @@ AutoSave drain's observer is 5 B: `op_autosave_drain_last_phase` (u8),
 `op_autosave_drain_stall_ticks` (u16) and `op_autosave_drain_last_progress`
 (u16). That is the same total as its pre-S074 `u8` + `u32`. The S073
 special-tag self-check (`instrumentManager_specialTagSelfCheck()`) uses no
-RAM.
+RAM. S082 P2 adds `fs_stall_poll_uncounted` (1 B) to the same conditional
+class; it is set only inside `filesystem_tickUncounted()`.
 
 Configuration at S073 close: `DEV_MODE_LOGGING=1`, `DEV_MODE_DIAGNOSTIC=0`,
 `DEV_LOGGING_IWDG=0`, `DEV_STALL_DETECTION=1`,
@@ -671,8 +742,54 @@ not describe it in detail.
   `data=416`, `bss=427,616`; flash payload 540,272 B (headroom 213,392 B).
 - **S079:** step conditions/roll state and roll fill duck (+160 B). DEV link
   `text=544,072`, `data=408`, `bss=427,776`; payload 544,480 B.
+- **S081:** live record and live erase (LiveRecord state, Sequencer ring /
+  echo / epochs / filter, staging table, pending-reset mask, R12 override map,
+  R13 `menuHold`, FX-erase per-step masks, REC/erase UI state), automation
+  ramps (640 + 28 + 1 B, `track_auto_smooth` +16 B `pat_regions`, +1 B
+  `pat_background_region`), G-1 Morph capture (+7 B), VOICE bar pulse (+2 B
+  `.data`); released the Effect owner/pending/held-Morph state and the legacy
+  roll bytes. `.bss` +1,136 B, `.data` +4 B. DEV link `text=573,296`,
+  `data=416`, `bss=429,112`; payload 573,712 B (headroom 179,952 B).
 - **S080:** PERF looper, scene change/queue/chain state, PERF UI state, Scene
   chain settings (+64 B `scenes`), loop exclude (+16 B `pat_regions`, +1 B
   `pat_background_region`); `.bss` +200 B, `.data` +4 B. DEV link
   `text=556,008`, `data=412`, `bss=427,976`; payload 556,420 B (headroom
   197,244 B).
+## S082 Load/Save and Scene 17 allocations
+
+All values are SRAM1 static storage. The Scene 17 allocation was approved
+2026-10-17; the remaining items were approved in S082 S6/S15/S25 and the
+user's 2026-10-18 statement that every expansion quoted in the plan is
+approved.
+
+| Owner | Object | Bytes | Lifetime | Purpose |
+| --- | --- | ---: | --- | --- |
+| SceneData | `scene_background` | 1,656 | permanent | Scene 17 record |
+| SceneData | `scene_backgroundFlags` + `scene_backgroundHome` | 2 | permanent | exists / home Scene |
+| Menu | `menu_bankPreviewContentMask` | 2 | permanent | Bank child content mask |
+| Menu | `menu_bankUiFlags` | 1 | permanent | Merge, COPY held/peek |
+| ButtonHandler | `bh_bankCopyPressTick` | 2 | permanent | COPY tap/hold |
+| filesystem | `op_bank_child_content_mask` | 2 | operation | preview content |
+| filesystem | `op_bank_scene_empty_mask` | 2 | operation | Load empty / Save removal |
+| filesystem | `op_bank_save_written_mask` | 2 | operation | Merge Save edit-mask rule |
+| filesystem | `op_bank_flags` | 1 | operation | BOOT / REPLACE / PROGRESSIVE |
+| filesystem | `fs_autosave_yield` | 1 | permanent | AutoSave drain gate |
+| Preset | `pm_bg_phase` | 1 | permanent | background Bank Load phase/flags |
+| Preset | `pm_bg_pending_slot` | 2 (`.data`, init 0xFFFF) | permanent | deferred MIDI Bank slot (D33); wait-start tick while a load runs (A8) |
+| Preset | `pm_bg_result` | 1 | permanent | background load result for CC0 TX (D34) |
+| filesystem | `fs_background_name` | 90 | permanent | Scene 17 name capture, 10 × 9 B (D29) |
+| Preset | `PM_BG_UNLOCKED` | 0 | permanent | spare bit 3 of `pm_bg_phase` |
+| BankData | `bank_load_unavailable_mask` | 2 | permanent | Scenes a background load has not finished |
+| LED | `led_fastBlinkLed[2]` | +1 | permanent | second fast-blink slot (Bank load mode LED) |
+| Menu | `menu_bgLoadAvailCount` | 1 | permanent | SEQ LED fill repaint trigger |
+| PatternData | Scene 17 Pattern region | 0 | reused | `pat_background_region` |
+
+Totals by part: P0 16 B outside Scene 17 (within the acknowledged ~13 B
+S6/S15 plus the plan's 2-3 B acknowledgement) plus Scene 17's 1,658 B; P1
+93 B (91 B BSS + 2 B `.data`, plus 2 B flash initialiser); P2 none in
+production (1 B DEV); P3 4 B. DEV-only S082 diagnostics:
+`menu_loadSavePotDropBurst` 1 B, `op_bank_preview_start_tick` 2 B,
+`fs_boot_fail_reason`/`_sub` 2 B, preview stall observer 5 B,
+`fs_stall_poll_uncounted` 1 B. Decision history: `082_SESSION_HANDOFF_LOG.md`
+§7. `preset_buildBackgroundScene()`
+uses one 136-byte stack block buffer; no new large stack frame is added.

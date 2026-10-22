@@ -109,12 +109,46 @@ int8_t buttonHandler_voiceIndex(uint8_t buttonNr);
 
 uint8_t buttonHandler_getMode(void);
 uint8_t buttonHandler_getShift(void);
-int8_t  buttonHandler_getArmedAutomationStep(void);
+/*
+ * Put the front panel into Load/Save for a MIDI-origin Bank load
+ * (S082 P1 D7, D32).
+ * Inputs: none. Outputs: latches closed, copy/clear session ended,
+ * Load/Save mode and LEDs. Menu performs the page change.
+ * Accessors: menu_backgroundBankLoadUiBegin().
+ */
+void buttonHandler_enterLoadSaveForBackgroundLoad(void);
 void    buttonHandler_setRunStopState(uint8_t running);
 void    buttonHandler_showMuteLEDs(void);
 void    buttonHandler_muteVoice(uint8_t voice, uint8_t isMuted);
 /* S080 P2 Defect 11: clear the VOICE mute mirror after a bulk unmute. */
 void    buttonHandler_clearAllMutes(void);
+/*
+ * Overlay executor entry points for MIDI notes (S083 Q5, N6, C8).
+ *
+ * buttonHandler_overlayActive(): the one overlay state, 0 off, 1 BAR `<`,
+ * 2 BAR `>`, in any mode. Set by the BAR presses in PERF and by CC2 on G
+ * (S083 follow-up; the earlier separate CC2 state and the BAR-over-CC2
+ * priority C-9/F-3 are retired). MidiNotes uses it for every note-on.
+ * buttonHandler_setOverlay(): CC2 on G: set the overlay exactly like a BAR
+ * press (state, BAR LEDs in PERF unless the looper owns them, held entries
+ * re-configured).
+ * buttonHandler_overlayMidiNoteOn(): start overlay `which` (1/2) on `track`
+ * at `internal` pitch; `midiNote` is remembered so its note-off ends a
+ * roll; ageUs is the arrival age for the first hit's record placement.
+ * buttonHandler_overlayMidiNoteOff(): end the roll held by `midiNote`
+ * (the resolved track first, then any track holding that note); a flam's
+ * main hit still plays.
+ * Context: foreground. Accessor: MidiNotes.c. Affiliates: the per-track
+ * overlay table, LiveRecord.
+ */
+uint8_t buttonHandler_overlayActive(void);
+void    buttonHandler_setOverlay(uint8_t which);
+void    buttonHandler_overlayMidiNoteOn(uint8_t track, uint8_t which,
+                                        uint8_t internal, uint8_t midiNote,
+                                        uint16_t ageUs);
+void    buttonHandler_overlayMidiNoteOff(uint8_t track, uint8_t midiNote);
+/* S083 C5: flash SHIFT/PLAY/REC while Learn is active; restore on off. */
+void    buttonHandler_setLearnLeds(uint8_t on);
 /*
  * S080 P2 Defect 4: SELECT index (0..7) of the PERF looper division while the
  * looper is held or engaged, else 0xFF. Client: menu_syncPerfSelectLed().
@@ -122,8 +156,5 @@ void    buttonHandler_clearAllMutes(void);
 uint8_t buttonHandler_loopSelectLed(void);
 
 extern uint8_t  buttonHandler_selectedStep;
-extern uint16_t buttonHandler_originalParameter;
-extern uint8_t  buttonHandler_originalValue;
-extern uint8_t  buttonHandler_resetLock;
 
 #endif

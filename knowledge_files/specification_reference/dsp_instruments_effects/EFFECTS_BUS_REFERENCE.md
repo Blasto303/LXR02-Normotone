@@ -11,7 +11,13 @@ long-name-only full views (§8.1) and the SHIFT+TRACK voice-mix overlay
 continuous step-scale curve with a Q8.8 DDA accumulator (§10) shared with the
 Pattern tracks, remapped the `.fx` `step_scale` tokens to curve positions
 (§12), and moved CrumpBit's sync division to the new StepScale API (§10).
-It describes what the firmware does and how to extend it. **Where any plan or
+Session 081 (`081_SESSION_HANDOFF_LOG.md` §3.3, §4.8) rewrote the
+automation layering as rule R13 (§6, §11.2): a menu edit beats a lock and a
+track overlay until the next automation, an FX lock applies for its own step
+only (the held Morph lane is gone), a lock start clears the track overlay,
+and the Effect step markers and overlay owner state were removed. It also
+added live FX-sequence erase (§10) and made the realigns realign the FX
+sequence (§10). It describes what the firmware does and how to extend it. **Where any plan or
 log disagrees, this document describes the code**; §13 lists the known
 differences from the plan.
 
@@ -85,7 +91,8 @@ differences from the plan.
 | Retained data | `Core/Bank/Scene/SceneData.c/.h` | the record, change-aware setters, `effect_morph_amount`, `scene_editLayoutMatches()` |
 | Masks | `Core/Bank/BankData.c/.h` | per-Scene VOICE edit masks, `bank_revalidateVoiceEditMasks()` |
 | Effect Morph target | `Core/Bank/Scene/SceneModTargets.c/.h` | `fxm` (ID 404, LFO + automation) |
-| Clock and drain | `Core/Sequencer/sequencer.c/.h`, `StepScale.c/.h` | FX step latch, Effect step markers, reset latch, the shared scale table |
+| Clock and drain | `Core/Sequencer/sequencer.c/.h`, `StepScale.c/.h` | FX step latch, reset latch, overlay-only reset latch and FX realign (S081), the shared scale table |
+| Live record | `Core/Sequencer/LiveRecord.c/.h` | live FX-sequence erase lanes and the per-step erased-lock drain (S081) |
 | LFO and validation | `Core/DSP/Instruments/InstrumentManager.c/.h` | LFO `fx` namespace (8), Effect LFO adapter, AUTOMATION validation of block 7 |
 | UI | `Core/Menu/menuEffects.c/.h` (page, hold editor, type-hook dispatch, row-0 painter, SELECT-LED owner check, home screen); `menu.c` (delegation, the shared automation-presence search and markers, `fx` step-automation category, LFO `fx` display, `menu_effectShowHome()`); `buttonHandler.c`; `ledHandler.c` | the SHIFT+PERF Effect page |
 | Storage | `Core/Hardware/SD/storageTypes.c` (`.fx` v2), `filesystem.c` (Scene/Bank `.fx`, HCNAMES rows 145..160) | files and names |
@@ -280,8 +287,8 @@ For each reached Scene (§9):
 4. All 16 steps are cleared, including the Morph lane.
 5. Rows 0..2, the sequence settings and Effect Morph are kept.
 6. The whole Effect region is marked for AutoSave.
-7. On the active Scene: the held Morph and the parameter overlays are
-   cleared, and the runtime switches (`init`).
+7. On the active Scene: the parameter overlays, `menuHold` and the `fxm`
+   override are cleared, and the runtime switches (`init`).
 
 Then the edit masks are re-validated.
 
@@ -289,29 +296,76 @@ Then the edit masks are re-validated.
 
 ## 6. Resolution order (`effects_service()`, every render block)
 
+Rule R13 (S081, user): track automation of Effect and Scene parameters is set
+once and forgotten; an FX-sequence lock (including the Morph lane) applies at
+its step start and returns to the menu value at its step end; a lock beats
+track automation; a menu edit beats both until the next automation.
+
+**S083 Q1:** a MIDI write is a menu edit. `MidiControl` writes Effect rows
+through `menu_commitTargetEdit()` -> `effects_setParameter(...,
+EFFECT_IMAGE_NORMAL, ...)`, which sets `menuHold` exactly like an Effect-page
+edit, so it beats a lock and the overlay until the next automation (R13).
+MIDI never writes a Morph image.
+
+Per Effect parameter `i` there are four layers:
+
+| Layer | Set by | Cleared by |
+|---|---|---|
+| `menu(i)` | the retained value, interpolated at the Effect Morph for MORPHABLE rows | — |
+| `overlay(i)` (Pattern track automation) | `effects_applyAutomation()` from the drain; last writer wins; held | an FX lock on `i` at its lock step start, a menu edit of `i`, the reset latch (Scene change, reload, realign, transport reset, Scene activation) |
+| `lock(i)` | the active FX step locks lane(i) | the end of that FX step (one step only) |
+| `menuHold(i)` (`u64`, S081) | a menu edit of `i` (`effects_setParameter()` when the origin is the active Scene and the row is in the runtime type) | the next automation of `i`: an FX lock step start (`effects_lockClearLayers()`) or a track entry (`effects_applyAutomation()`); the reset latch |
+
 ```
-consume TIM3 FX latch (RESET / STEP index)
+consume TIM3 FX latch (RESET / STEP index; a STEP from a realign keeps the
+  position valid, S081)
 active step:  sel → selected step (always valid);  others → clock step while running
-Morph base:   Pattern fxm overlay  >  held FX Morph lane  >  effect_morph_amount
+at an FX lock step start (effects_seqConsume() STEP, effects_seqSelect() in sel):
+   effects_lockClearLayers(): for each lane locked on the new step, clear the
+   mapped parameter's overlay and menuHold (lane 0: fxm override and
+   menuHoldMorph); lanes being live-erased are excluded instead and recorded
+   in effects_erasedLanes[step] (§10)
+Morph base:   menuHoldMorph ? effect_morph_amount
+            : Morph lane locked on the CURRENT step ? lane value
+            : Pattern fxm override ? override
+            : effect_morph_amount
 Morph      =  base + Σ LFO(fxm)                          (clamp 0..255)
 for each descriptor i:
    menu(i)  = MORPHABLE ? interpolate(normal, morph, Morph) : normal
-   seq(i)   = active step locks lane(i) ? lane value : menu(i)
-   held(i)  = Pattern overlay active ? overlay value : seq(i)
-   eff(i)   = held(i) + Σ LFO(i)  clamped to mod_domain  (MODULATABLE rows only)
+   eff(i)   = menuHold(i) ? menu(i)
+            : lock(i)     ? lane value
+            : overlay(i)  ? overlay value
+            : menu(i)
+   eff(i)   = eff(i) + Σ LFO(i)  clamped to mod_domain  (MODULATABLE rows only)
    eff(i)   = min(eff(i), max_value); BUFFER_DEPENDENT → min(·, effective_max)
    if eff(i) != last_applied[i] (or a forced pass): apply
             (0 → route, 1 → level/127, 2 → pan, else write_param)
 ```
 
-- **Held Morph lane.** A Morph-lane lock holds through later unlocked steps
-  until another Morph lock or a reset. In `sel`, selecting an unlocked step
-  keeps the held value.
+- **What the user hears.** A lock step overrides the track automation for
+  its step; when the lock step ends, the parameter returns to the **menu**
+  value, not to the earlier track value (the lock cleared the overlay). A
+  menu edit sounds at once and stays until the next lock start or track
+  entry of that parameter. A lock that is already running when the menu edit
+  happens stays overridden for the rest of its step.
+- **`sel` run mode:** "lock step start" = the step being selected; "end" =
+  another step being selected.
+- **One-step Morph lane (S081).** The Morph lane is like every other lane:
+  its lock holds only for its own step. (Up to S080 a Morph-lane lock held
+  through later unlocked steps until another Morph lock or a reset;
+  `held_morph`, `held_morph_valid` and `effects_seqLatchMorph()` are gone.)
+- **SHIFT Morph-view edits** of Effect/Scene parameters count as menu edits
+  for R12/R13 (overlay cleared, `menuHold` set) but are not recordable (S081
+  F-Q; to be tried on hardware).
 - **LFO math.** Each LFO entry is base-independent: a direction (toward max
-  or toward min) and a depth 0..255, applied around the *current* held value.
-  The math is the same as the Instrument LFO (`modNode_shapeParameterU16`).
+  or toward min) and a depth 0..255, applied around the *current* resolved
+  value. The math is the same as the Instrument LFO
+  (`modNode_shapeParameterU16`).
 - **Forced passes** happen after a type switch, a share change, or Scene
   activation.
+- **Reset.** `effects_automationReset()` (the reset latch) clears every
+  overlay, `menuHold`, `menuHoldMorph`, the `fxm` override and the live-erase
+  per-step state.
 
 ---
 
@@ -612,8 +666,8 @@ CrumpBit's F2 defaults are mix 0, feedback 64, rate 64, delay pan 63
   `effects_pasteSeqStep(dst, step, src)` (lock mask and 16 lane values) and
   `effects_clearSeqLanes(scene, step_mask, lane_mask)` (values 0, unlocked)
   fan out like edits. Record functions return the written Scene mask;
-  sequence functions bump the sequence serial and drop the held Morph latch
-  when the active Scene's Morph lane changed. An FX step paste whose
+  sequence functions bump the sequence serial (the held Morph latch they
+  used to drop no longer exists, S081). An FX step paste whose
   destination type differs from the source is dropped.
 - **Same-type guard.** Parameter, lock and sequence edits skip any masked
   Scene of a different Effect type. `mrp` and `typ` reach all masked Scenes.
@@ -654,11 +708,48 @@ CrumpBit's F2 defaults are mix 0, feedback 64, rate 64, delay pan 63
 - **Latch.** TIM3 publishes only the newest RESET/STEP + index
   (`seq_fxTakeEvent()`). It is also published on the Pattern-boundary
   early-return path.
-- **Scene switch.** Position is master-clock-aligned to the new Scene. Until
-  the new Scene's next boundary, only menu values apply (except in `sel`,
-  where the selected step applies at once), and the held Morph is cleared.
+- **Scene switch.** Position is master-clock-aligned to the new Scene. A
+  resetting change publishes RESET: until the new Scene's next boundary only
+  menu values apply (except in `sel`, where the selected step applies at
+  once). **S081:** a Scene change that does not reset (`pcr` off) runs the
+  Pattern realign, which also calls `seq_fxRealignToMasterClock()`, so the
+  FX sequence stays aligned to the master clock exactly like the Pattern
+  tracks (user decision, 2026-10-21: the intended behaviour). The realign
+  publishes the aligned step at once; on a whole-Scene change the Effect
+  activation that follows clears it (`seq_step_valid = 0`), so the new
+  Scene's locks start at the next FX boundary from the aligned position; on
+  a chain repeat to the same Scene (no re-apply) the aligned step's locks
+  apply at once.
+- **Realign (S081).** `seq_realignActivePatternToMasterClock()` and
+  `seq_realignTrackToMasterClock()` end with two calls:
+  - `seq_fxRealignToMasterClock()`: under PRIMASK, the same mapping as the
+    track realign (`position = (elapsed << 8) / interval`, accumulator =
+    remainder, `seq_fxStepCounter = position + 1`), then publishes the step
+    for `position` as a STEP event; `sel` is untouched. Needed because
+    `seq_fxStepCounter` counts boundaries since the last reset, so the FX
+    position drifts against the Pattern after an FX step-scale change.
+  - `seq_requestEffectOverlayReset()`: sets only the overlay reset latch
+    (clears overlays, `menuHold` and `fxm`), without touching the FX
+    position.
+  Realign must not use `seq_fxPublishReset()`: its RESET event invalidates
+  the current FX step and drops the running locks, and leaves the
+  accumulator un-seeded.
 - **Transport.** While stopped, only `sel` applies. Start/stop/reset publishes
   RESET.
+- **Live FX-sequence erase (S081, `PATTERN_DYNAMIC_STACK.md` §6.7.7).** While
+  live record is in ERASE, LiveRecord publishes a 16-bit lane mask
+  (`effects_setLiveEraseLanes(laneMask)`: the lanes of knob-erased Effect
+  targets, OR all 16 lanes while an FX-mode SEQ hold is down). At each FX
+  step start `effects_lockClearLayers()` excludes those lanes' locks from
+  resolution, so they never sound (not even for one block), and records them
+  in `effects_erasedLanes[16]` (one 16-bit lane mask per FX step, so two
+  steps with different lanes inside one 2 ms window stay exact).
+  `liveRec_service()` drains one step at a time
+  (`effects_takeErasedLocks(&step, &laneMask)`) into
+  `effects_clearSeqLanes(origin, 1 << step, laneMask)`, which clears the
+  retained locks in the take's origin Scene and every linked same-type
+  Scene (§9; the inactive Scene's own edit-mask entry, so a flush after a
+  Scene change still fans out). The FX playhead is never looped.
 - **Shared scale curve** (`StepScale.c`, S078): `seq_step_scale` is a CC
   0..127, `multiplier = 0.25 × 2^(cc / (127/5))` × 24 ticks, so 1/64 (CC 0,
   6 ticks) … 1/2 (CC 127, 192 ticks); default CC 76 = 1/16. The 14 musical
@@ -687,17 +778,28 @@ CrumpBit's F2 defaults are mix 0, feedback 64, rate 64, delay pan 63
 - The STEP automation page lists the viewed Scene's AUTOMATABLE rows.
   Values are 7-bit; WIDE8 rows show and apply `expand7(v)`.
 - **Apply.** `seq_drainPendingAutomation()` → `effects_applyAutomation(track,
-  local, v)` sets an overlay owned by the writing track (last writer wins).
-- **End.** TIM3 queues an **Effect step marker** (pending identity bit 11)
-  before the entries of any track that owns an overlay. The drain ends that
-  track's overlays that its new step does not rewrite. The value falls back
-  to the FX lock on the current step, else to the menu value.
-  - Steps whose probability fails, and muted tracks, keep their overlays.
-- **Reset.** A reset latch, set with every FX RESET, is taken at the top of
-  the drain. It clears all overlays and the `fxm` override before the new
-  pass applies. Scene activation clears them too.
-- **`fxm`.** The Pattern value expands like voice Morph (127 → 255) and holds
-  until the Scene-rule reset.
+  local, v)` sets the parameter's overlay (last writer wins; the track
+  argument is kept but no owner is stored) and clears its `menuHold`.
+- **Lifetime (S081 R13).** The overlay is held ("set once and forget") until
+  an FX lock on that parameter starts, a menu edit of it, or the reset latch.
+  There is no per-step end: the Effect step markers (pending identity bit 11),
+  owner tracks, `pending_end` and the "failed-condition or muted steps keep
+  their overlays" rule were removed in S081.
+- **Reset.** A reset latch, set with every FX RESET and by
+  `seq_requestEffectOverlayReset()` at a realign, is taken at the top of the
+  drain. It clears all overlays, `menuHold` and the `fxm` override before the
+  new pass applies. Scene activation clears them too.
+- **`fxm`.** The Pattern value expands like voice Morph (127 → 255:
+  `effect_expand7Linear()`, `v < 127 ? v × 2 : 255`); `effects_setMorphAutomation()`
+  clears `menuHoldMorph`; a menu edit of the Effect Morph amount clears the
+  override and sets `menuHoldMorph`; a Morph-lane lock beats it for its step.
+- **Live record (S081).** Effect parameter edits on the Effect page (and the
+  Effect Morph cell, labelled `mrp` there, which is `fxm`) are recordable onto
+  the recording track while T == A. The recorded value is the retained Normal
+  value, stored 7-bit through `effects_storeValue7(scene, local, value)`, the
+  inverse of a WIDE8 row's `expand7` (for `fxm`, `m / 2` is the exact inverse
+  of `effect_expand7Linear()`). The master morph `mrp` of the PERF page is
+  never recorded. Recording FX-sequence locks is not implemented.
 
 ### 11.3 LFO
 
@@ -714,8 +816,12 @@ CrumpBit's F2 defaults are mix 0, feedback 64, rate 64, delay pan 63
 
 ### 11.4 Priority
 
-Automation, FX lock and LFO precedence is the same as for Instrument
-parameters (§6).
+Effect parameters resolve `menuHold` > FX lock (its step only) > track
+overlay > menu, then LFO (§6). This differs from Instrument parameters, where
+a drain value is held until the voice's next trigger and a menu edit
+overrides it until then (R12, `PATTERN_DYNAMIC_STACK.md` §6.2a): Effects have
+no trigger, so "until the next automation" plays the role of "until the next
+trigger".
 
 ---
 
@@ -896,7 +1002,7 @@ all registry-driven.
 ## 15. Pitfalls
 
 - **Foreground only.** Nothing in EffectsManager or FxBuffer may be called
-  from an ISR. TIM3 only publishes latches and markers.
+  from an ISR. TIM3 only publishes latches.
 - **Clear unless you adopt.** Arena contents are undefined at boot and are
   never cleared by the system.
 - **Local indices are type-relative.** Pattern entries, LFO tokens and masked
@@ -961,7 +1067,7 @@ Called from `preset_sendDrumsetParameters()` (pre-audio) and
   refreshed (`effects_exportHandoff()`) without `init`, so the record always
   describes the live arena owner.
 - Either way it:
-  - invalidates the FX clock step and held Morph;
+  - invalidates the FX clock step;
   - clears the Pattern overlays and the `fxm` override;
   - bumps the sequence serial;
   - forces a pass.
@@ -1013,9 +1119,12 @@ Pattern (44–53) → publish (61).
   `seq_elapsedPpqTicks` and the *current* Scene's settings, so a Scene switch
   lands where the new Scene "would be" (A17). TIM3 only publishes; all work
   is foreground.
-- **Effect step markers through the pending queue.** An overlay "end" is
-  ordered with "apply" in one queue, so an end can never overtake the value
-  it ends. The reset latch is taken before any record, so a new pass's first
+- **No overlay end markers (S081 R13).** Up to S080 an overlay "end" was an
+  Effect step marker queued through the pending queue before each track's
+  entries. R13 makes track automation "set once and forget", so nothing ends
+  an overlay except an FX lock start, a menu edit or the reset latch, and the
+  markers and owner state were removed (`effects_automation_t` 184 → 120 B).
+  The reset latch is still taken before any record, so a new pass's first
   values survive the reset.
 - **Base-independent LFO entries** (direction + depth). The same math as the
   Instrument LFO shaper, applied around the current held value. Automation or
@@ -1096,3 +1205,16 @@ Pattern (44–53) → publish (61).
     64, rte 64, dpn 63) and the `snc` label, long-name-only full views and
     the `copyField` overread fix, no `typ` `*` mark, the SHIFT+TRACK
     voice-mix overlay (§8.4).
+- **Session 081** (`081_SESSION_HANDOFF_LOG.md` §3.3, §4.8):
+  - R13 automation layering (§6, §11.2): `menuHold` (`u64`) +
+    `menuHoldMorph`, `effects_lockClearLayers()` at FX lock step start,
+    one-step Morph lane, step markers and owner state removed
+    (`effects_automation_t` 184 → 120 B, `effects_state_t` 84 → 80 B);
+  - FX realign at both Pattern realigns (`seq_fxRealignToMasterClock()`,
+    `seq_requestEffectOverlayReset()`, §10); Scene changes with `pcr` off keep the FX sequence on the master clock like the tracks (decided 2026-10-21; FX step published
+    at once on a non-resetting Scene change);
+  - live FX-sequence erase (`effects_setLiveEraseLanes()`,
+    `effects_takeErasedLocks()`, `effects_erasedLanes[16]`, §10) and
+    `effects_storeValue7()` for recording WIDE8 rows (§11.2). Live record of
+    Effect parameter moves (A22) is done for track automation; FX-sequence
+    lock recording is still deferred.

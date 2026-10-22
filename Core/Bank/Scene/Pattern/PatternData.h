@@ -124,7 +124,7 @@ typedef struct __attribute__((packed)) {
      */
     uint8_t track_loop_exclude;
     /*
-     * Per-track automation ramp mode (S081 P2, "asm" / Automtn).
+     * Per-track automation ramp mode (S081 P2, "rmp" / Automtn / Ramp (was "asm", S083 follow-up)).
      *
      * What: bit N set = track N is "on": an Instrument parameter automated on
      * two consecutively played steps ramps linearly from the first step's
@@ -521,9 +521,9 @@ void pat_setTrackLoopable(uint8_t scene_index, uint8_t track, uint8_t loopable);
 uint8_t pat_trackLoopable(uint8_t scene_index, uint8_t track);
 
 /*
- * Per-track automation ramp mode (S081 P2): set/clear the asm bit of one
+ * Per-track automation ramp mode (S081 P2): set/clear the rmp bit of one
  * track (marks the Pattern dirty on change); read it (0 when invalid).
- * Clients: Menu STEP track page (asm cell), copy/clear. The sequencer reads
+ * Clients: Menu STEP track page (rmp cell), copy/clear. The sequencer reads
  * pat_scene_region_t.track_auto_smooth directly from TIM3.
  */
 void pat_setTrackAutoSmooth(uint8_t scene_index, uint8_t track, uint8_t on);

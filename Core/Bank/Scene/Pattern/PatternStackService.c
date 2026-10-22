@@ -1344,7 +1344,7 @@ static uint8_t patSvc_validStepRequest(uint8_t scene, uint8_t track,
                                        uint8_t step, uint16_t target,
                                        uint8_t needs_target)
 {
-    if (!scene_indexValid(scene) || !pat_trackValid(track) ||
+    if (!pat_patternValid(scene) || !pat_trackValid(track) ||
         !pat_stepValid(step) || (needs_target && target > 0x01FFu)) {
         patSvc_rejectScene(scene, 0u);
         return 0u;
@@ -1471,7 +1471,7 @@ void patSvc_finishSceneReplace(uint8_t scene)
  */
 uint8_t patSvc_beginExclusive(uint8_t scene)
 {
-    if (!scene_indexValid(scene) || service_replace_pending ||
+    if (!pat_patternValid(scene) || service_replace_pending ||
         (service_exclusive_scene != PATSVC_NO_SCENE &&
          service_exclusive_scene != scene))
         return 0u;
@@ -1834,7 +1834,7 @@ void patSvc_clearTrack(uint8_t scene, uint8_t track)
     uint8_t step;
     uint32_t event;
 
-    if (!scene_indexValid(scene) || !pat_trackValid(track)) {
+    if (!pat_patternValid(scene) || !pat_trackValid(track)) {
         patSvc_rejectScene(scene, 0u);
         return;
     }
@@ -1866,7 +1866,7 @@ void patSvc_clearPattern(uint8_t scene)
     uint8_t step;
     uint32_t event;
 
-    if (!scene_indexValid(scene) || !service_open || service_handover ||
+    if (!pat_patternValid(scene) || !service_open || service_handover ||
         scene != service_scene) {
         patSvc_rejectScene(scene, 0u);
         return;
@@ -1896,7 +1896,7 @@ void patSvc_clearPattern(uint8_t scene)
 uint8_t patSvc_removeTrackAutomationByTarget(uint8_t scene, uint8_t track,
                                              uint16_t target)
 {
-    if (!scene_indexValid(scene) || !pat_trackValid(track) || target > 0x01FFu) {
+    if (!pat_patternValid(scene) || !pat_trackValid(track) || target > 0x01FFu) {
         patSvc_rejectScene(scene, 0u);
         return 0u;
     }
@@ -2015,7 +2015,7 @@ uint8_t patSvc_recordStep(uint8_t scene, uint8_t track, uint8_t step,
  */
 uint8_t patSvc_requestTarget(uint8_t scene)
 {
-    if (!scene_indexValid(scene))
+    if (!pat_patternValid(scene))
         return 0u;
     if (service_exclusive_scene != PATSVC_NO_SCENE || service_replace_pending)
         return 0u;

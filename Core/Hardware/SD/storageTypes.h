@@ -58,6 +58,18 @@
  * write is discoverable by anyone inspecting the card root.
  */
 #define STORAGE_SETTINGS_TEMP_FILENAME "settings.tmp"
+/*
+ * MIDI Learn table file and its safe-write temp target (S083 §16).
+ *
+ * What: the device-wide Learn rows live in their own root file, rewritten
+ * in full after every stored or replaced Learn row, with the same
+ * temp + sync + remove + rename method as settings.cfg. Why: a Learn must
+ * be durable at once without rewriting settings.cfg on every gesture.
+ * Affiliates: filesystem_saveMidiLearn_tick(), filesystem_loadMidiLearn_tick(),
+ * FILESYSTEM_SPEC.md (midilrn.cfg), MIDI_SPEC.md §6.4.
+ */
+#define STORAGE_MIDILEARN_FILENAME      "midilrn.cfg"
+#define STORAGE_MIDILEARN_TEMP_FILENAME "midilrn.tmp"
 #define STORAGE_KIT_SLOT_COUNT        6u
 /*
  * Kit and Scene folders are numbered directory entries, not legacy file slots.
@@ -595,6 +607,9 @@ void storage_makeSavedEffectDisplayFilename(char *dst,
 void storage_banksetInit(storage_bankset_t *state);
 storage_status_t storage_banksetParseLine(storage_bankset_t *state,
                                           const char *line);
+storage_status_t storage_banksetParseLineMasked(storage_bankset_t *state,
+                                                const char *line,
+                                                uint16_t protect);
 storage_status_t storage_banksetFinalize(const storage_bankset_t *state);
 uint8_t storage_formatBanksetLine(char *dst,
                                   uint16_t capacity,

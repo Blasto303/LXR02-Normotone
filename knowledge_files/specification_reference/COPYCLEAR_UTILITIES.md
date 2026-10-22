@@ -5,7 +5,10 @@ children on the LXR-02: what the user can do, what each operation changes,
 and how the code does it. Written for a developer who has to read, fix or
 extend `Core/Menu/CopyClear/`.
 
-- **Current as of:** Session 080 close (2026-10-11, `dev-ph6-cleanup`).
+- **Current as of:** Session 082 close (S082 notes at the end); S081 added
+  the `asm` flag to track copy/clear and moved the recording gates to
+  LiveRecord (`liveRec_armed()`); Session 080 close (2026-10-11,
+  `dev-ph6-cleanup`):
   S080 added the per-track Loopable flag to track copy/clear and the Scene
   chain settings to Scene settings copy/clear (no copy/clear code path
   changed shape).
@@ -176,12 +179,16 @@ into a clear.
 
 ### 4.3 Refusals (silent; `OP_REFUSED` in DEV builds)
 
-No operation starts while the sequencer records or erases, while Load/Save
+No operation starts while live record is armed (`liveRec_armed()`: LATCH,
+OVERDUB or ERASE, also while stopped; S081 decision F-N), while Load/Save
 or an Instrument Load transaction owns the UI, in LOAD/SAVE, MENU or SOM
 mode, or while the **previous operation's** pastes/clears are still queued
 (they read that operation's source). A pending register drain or name write
-does not block a new operation. SHIFT + COPY while recording and running is
-still the sequencer erase gesture.
+does not block a new operation. While live record is armed, SHIFT + COPY
+(either order) is the live-erase chord instead and never reaches
+`copyClear_copyPressed()` (S081, `PATTERN_DYNAMIC_STACK.md` §6.7.7); outside
+record it keeps its clear meaning. During live erase a pot turn selects an
+erase target instead of a pot clear.
 
 Queued work that cannot run is dropped silently: not enough pool space, the
 Advanced instrument limit, an FX step paste onto another Effect type, a
@@ -310,8 +317,9 @@ navigation, not a paste. The job kind is `CC_KIND_BAR_TO_STEP`.
 ### 6.4 Track
 
 - `copy track` (`CC_COPY_TRACK`): all 128 steps as `… -> repl`, plus the
-  track's length, scale, shuffle, (S078) run mode and (S080) Loopable flag
-  (`pat_setTrackLoopable(dst, pat_trackLoopable(src))`). Early triggers.
+  track's length, scale, shuffle, (S078) run mode, (S080) Loopable flag
+  (`pat_setTrackLoopable(dst, pat_trackLoopable(src))`) and (S081) `asm`
+  automation-ramp flag (`pat_setTrackAutoSmooth()`). Early triggers.
   Never fans out. The track Morph endpoints are Scene settings and are not copied
   by `copy track`; `copy inst -> morph` handles them.
 - `copy instrument` (`CC_COPY_INSTRUMENT`): the source track's slot (type,
@@ -403,7 +411,7 @@ paste is dropped (`FX_TYPE_MISMATCH`).
 | Selection | Effect | Fans out |
 |---|---|---|
 | `step` / `bar` | trigger off, block released | no |
-| `track` | as above for 128 steps; length, scale, shuffle, run mode to defaults (16, scale CC 76 = 1/16, 0, `fwd`); Loopable back to on (S080) | no |
+| `track` | as above for 128 steps; length, scale, shuffle, run mode to defaults (16, scale CC 76 = 1/16, 0, `fwd`); Loopable back to on (S080); `asm` back to `off` (S081) | no |
 | `… auto` | automation removed; trigger and specials kept | no |
 | `… notes` | trigger off; note and velocity specials removed; **probability kept** (it gates the step's automation); automation kept | no |
 | `send` (EFFECTS TRACK) | the track's slot (track 7 → slot 6): **both** FX-send endpoints 0, fader `pre` | yes |
@@ -593,7 +601,7 @@ access** in `PatternStackService.c`; the **HCNAMES op** in `filesystem.c`;
 |---|---|---|
 | `main.c` | `copyClear_init()` | boot, after `patSvc_init()` |
 | `buttonHandler.c` `processPress()` | `copyClear_buttonPressed(btn)` | first, before every other handler; nonzero = consumed |
-| `buttonHandler.c` `case BUT_COPY` | `copyClear_copyPressed(shift)` | COPY press, except SHIFT + COPY while recording and running (erase) |
+| `buttonHandler.c` `case BUT_COPY` | `copyClear_copyPressed(shift)` | COPY press, except SHIFT + COPY while live record is armed (the live-erase chord, `buttonHandler_liveEraseBegin()`) |
 | `buttonHandler.c` `processRelease()` | `copyClear_copyReleased()` (COPY), `copyClear_buttonReleased(btn)` | release; consumed releases return |
 | `buttonHandler_processEvents()` | `copyClear_postEvent()`; `copyClear_eventOverflow()` | after every event; on event-ring overflow |
 | `menu.c` `menu_repaint()` | `copyClear_menuVisible()`, `copyClear_formatMenu()` | overlay |
@@ -1010,6 +1018,7 @@ bar, 3 track, 4 Scene, 5 FX step), 11..14 Scene, 15..17 track (7 = none),
 | 6 | `NO_SCRATCH` (retired in S077; no producer remains) | — |
 | 7 | `BAD_SELECTION` (dispatch default) | selection |
 | 8 | `BAD_GEOMETRY` (paste count 0) | kind |
+| 10 | `LOAD_PENDING` (the job's Scene is not yet available in a background Bank load, S082 P3) | kind |
 
 ### 15.4 Anomaly codes (`ANOMALY` bits 0..7); each one is a bug report
 
@@ -1039,7 +1048,7 @@ operation overflows and the `G` record reports the drop count.
 
 | Case | Records |
 |---|---|
-| COPY while recording | `OP_REFUSED` recording |
+| COPY while live record is armed | `OP_REFUSED` recording (`liveRec_armed()`) |
 | normal step paste | `OP_START`, `SUSPEND` begin, `SOURCE_SET`, `EARLY_TRIG`, `JOB_START`, `JOB_END` DONE, `OP_RELEASE`, `OP_FINISH`, `SUSPEND` end (`SCRATCH` only if it overlapped or names were written) |
 | paste during a running AutoSave drain | `SUSPEND` begin with facade busy, `JOB_TRICKLE` nonzero |
 | fifth quick paste | `QUEUE_FULL` |
@@ -1222,6 +1231,11 @@ block, and keep per-tick work bounded.
   STEP track-settings pot clears (§8: `menu_knobClearTarget()` SEQ arm for
   the whole Scene; held steps only from the STEP held-step overlay through
   `copyClear_isClearMode()` and `sa_clearAutomationFromKnob()`).
+- **S081 (2026-10-12/16):** `copy track` carries and `clear track` resets
+  the per-track `asm` flag (`copyClearService.c`), and `copy pattern`
+  carries it through `pat_rawRegionCopyBody()`. COPY is refused while live
+  record is armed (`liveRec_armed()`, also while stopped), and SHIFT + COPY
+  is the live-erase chord while armed (§1).
 - **S080 (2026-10-10/11):** `copy track` carries and `clear track` resets
   the per-track Loopable flag (`copyClearService.c`); the Scene chain
   settings travel with `copy scene` / `copy scene settings` and reset with
@@ -1285,3 +1299,54 @@ Decision tags in comments (all recorded in `075_SESSION_HANDOFF_LOG.md`):
 | D1–D5 | trace decisions (log §8.2) |
 | F2-A … F2-H, F2-Q1 … F2-Q9, R2-1 … R2-3 | F2 follow-up (log §10) |
 | F3 Q1, Q2, P1 | automation priority (log §11.4) |
+## S082 Scene 17 (background Bank load)
+
+* Scene 17 is a copy/clear source and a non-overlapping destination. Its
+  Pattern data is reached through `pat_regionFor()`; Scene-child edits fan out
+  with `bank_sceneFanoutMask32()` (bit 16 = Scene 17 itself only).
+* An overlapping paste needs the shared background-region snapshot, which
+  Scene 17 owns. While Scene 17 exists such a paste is refused with the
+  existing copy/clear refusal display and trace reason
+  `AUTOSAVE_TRACE_CC_DROP_SCENE17`; non-overlapping pastes still run.
+* A Kit copy into Scene 17 commits the Kit image but does not set a Bank
+  present bit and does not mark AutoSave (17 is never a Bank child).
+* `clear scene` keeps its existing per-field commit path and never targets
+  Scene 17.
+* A MIDI-origin Bank load (`buttonHandler_enterLoadSaveForBackgroundLoad()`)
+  ends an open COPY/CLEAR session with nothing applied: latched surfaces are
+  closed and the session is ended before the Load/Save mode switch. Queued
+  copy/clear jobs are dropped by every Bank load (Menu and MIDI), because
+  phase 2 of `preset_tickBackgroundBankLoad()` waits for card idle, which
+  includes the running job (S082 P1 D12, R6).
+
+## S082 P3 — copy/clear while an unlocked load runs
+
+* `copyClear_copyPressed()` refuses on `menu_isStorageBusy()` only when
+  `menu_backgroundLoadReleasesPanel()` is false, so an unlocked background
+  Bank load does not lock the copy/clear session out on ordinary pages.
+* Each queued job is gated when it runs: `ccSvc_jobLoadPending()` drops a job
+  whose destination (or paste source) Scene is still unavailable, with
+  `AUTOSAVE_TRACE_CC_DROP_LOAD_PENDING` (10). Availability only grows, so a
+  job that passes the gate stays valid. Fan-out members are filtered by
+  `bank_sceneFanoutMask32()`.
+* The name phase waits for the Load/Save command to end:
+  `ccSvc_ensureScratch()` will not borrow the 9 kB buffer while
+  `menu_isLoadSaveCommandActive()`, and `ccSvc_nameRetry` does not advance in
+  that window. A job's content commits first; names publish after the load,
+  so the Bank's own HCNAMES write cannot overwrite them (D53). While the
+  facade is busy the existing 0.1 % trickle governor still applies.
+* Consequences to expect: a job that remaps names (Kit, Scene, Instrument
+  copies) applies its content at once but stays the running job in its name
+  phase until the load and its final index restore finish; while any job is
+  queued a new COPY press is refused (`OP_REFUSED`, queued-operation bit), so
+  further copy/clear waits for the load to end. Pattern pastes and clears do
+  not borrow the buffer and complete at the trickle rate.
+* After the user leaves Scene 17 mid-load (a whole-Scene change releases it),
+  the background region is free again, so an overlapping paste runs; the
+  Pattern AutoSave snapshot cannot compete because the load's AutoSave yield
+  holds every drain until the load ends.
+* Ordering against the Bank's HCNAMES write: a loaded child's identity rows are
+  set at its own commit, before the child becomes available to copy into; the
+  end of the load stages only row 0 and the kept Scenes' sources; a copy
+  records a row remap and publishes after the command, so the copied names
+  land last.

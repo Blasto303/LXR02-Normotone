@@ -174,19 +174,16 @@ void usb_flushMidi()
 	}
 }
 //------------------------------------------------------------------------------
-void usb_sendMidi(MidiMsg msg)
+/* Contract in usb_manager.h. */
+void usb_sendMidiPacket(uint8_t cin, uint8_t b0, uint8_t b1, uint8_t b2)
 {
 	uint32_t primask = usb_irqSave();
 
-	//MIDI byte[0] = 4 bits cable number + 4 bits event type code
-	usb_sendByte(msg.status>>4);
-
-	//then the 3 midi message bytes
-	//USB MIDI msg has to be ALWAYS 4 bytes long
-	//even if it is just a single clock byte
-	usb_sendByte(msg.status);
-	usb_sendByte(msg.data1);
-	usb_sendByte(msg.data2);
+	/* MIDI byte[0] = 4 bits cable number + 4 bits event type code. */
+	usb_sendByte((uint8_t)(cin & 0x0Fu));	/* cable 0 */
+	usb_sendByte(b0);
+	usb_sendByte(b1);
+	usb_sendByte(b2);
 	usb_irqRestore(primask);
 }
 //-------------------------------------------------------------------------------

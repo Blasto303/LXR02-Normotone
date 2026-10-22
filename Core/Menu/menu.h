@@ -168,8 +168,16 @@ enum NamesEnum {
     TEXT_CHAIN_COND1, TEXT_CHAIN_NEXT1, TEXT_CHAIN_COND2, TEXT_CHAIN_NEXT2,
     /* S080 P2 Defect 8a: per-track loopable label (lop) on the STEP page. */
     TEXT_TRACK_LOOPABLE,
-    /* S081 P2: per-track automation ramp label (asm). */
+    /* S081 P2: per-track automation ramp label (`rmp`, was `asm`). */
     TEXT_TRACK_AUTO_SMOOTH,
+    /*
+     * S083 follow-up (user 2026-10-22): the STEP track-settings `nte` cell
+     * (track MIDI note) in category Track. TEXT_NOTE stays for the
+     * step-special note on the STEP step page (category Step).
+     */
+    TEXT_TRACK_NOTE,
+    /* S083 follow-up: SHIFT+REC overlay roll rhythm `pv<` / `pv>`. */
+    TEXT_PERF_VEL_LT, TEXT_PERF_VEL_RT,
     NUM_NAMES
 };
 
@@ -188,7 +196,9 @@ enum catNamesEnum {
     /* S080 E4: "Prfrmnc" category for the BAR overlay settings. */
     CAT_PERFORMANCE,
     /* S080 G10: "Chain" category for the scene chain parameters. */
-    CAT_CHAIN
+    CAT_CHAIN,
+    /* S083 follow-up: "Automtn" category of the track ramp cell `rmp`. */
+    CAT_AUTOMATION
 };
 
 enum longNamesEnum {
@@ -233,8 +243,10 @@ enum longNamesEnum {
     LONG_CHAIN_COND1, LONG_CHAIN_NEXT1, LONG_CHAIN_COND2, LONG_CHAIN_NEXT2,
     /* S080 P2 Defect 8a: "Loopable". */
     LONG_TRACK_LOOPABLE,
-    /* S081 P2: "Automtn". */
+    /* S081 P2: "Ramp" (was "Automtn", S083 follow-up). */
     LONG_TRACK_AUTO_SMOOTH,
+    /* S083 follow-up: "Rhythm<" / "Rhythm>" (category Prfrmnc). */
+    LONG_PERF_VEL_LT, LONG_PERF_VEL_RT,
 };
 
 enum shortNamesEnum {
@@ -277,8 +289,10 @@ enum shortNamesEnum {
     SHORT_CHAIN_COND1, SHORT_CHAIN_NEXT1, SHORT_CHAIN_COND2, SHORT_CHAIN_NEXT2,
     /* S080 P2 Defect 8a: "lop". */
     SHORT_TRACK_LOOPABLE,
-    /* S081 P2: "asm". */
-    SHORT_TRACK_AUTO_SMOOTH
+    /* S081 P2: "rmp" (was "asm", S083 follow-up). */
+    SHORT_TRACK_AUTO_SMOOTH,
+    /* S083 follow-up: "pv<" / "pv>". */
+    SHORT_PERF_VEL_LT, SHORT_PERF_VEL_RT
 };
 
 #define PAR_RUNTIME_CPU_USE 0xFFFEu
@@ -463,6 +477,15 @@ void menu_loadInstrumentExit(void);
  */
 uint8_t menu_loadSceneButtonPressed(uint8_t scene_index);
 void    menu_perfModeSceneButtonPressed(uint8_t scene_index);
+/* S083 P2/Q9: whole-Scene change with origin (MIDI_ORIGIN_PANEL/MIDI). */
+void    menu_perfModeSceneChangeFrom(uint8_t scene_index, uint8_t origin);
+/* Bank page COPY: tap toggles Merge, hold shows the other view (S082 B2.12).
+ * Inputs: ButtonHandler edges. Outputs: menu_bankUiFlags, LEDs, label. */
+uint8_t menu_bankCopyPressed(void);
+void    menu_bankCopyHoldReached(void);
+void    menu_bankCopyReleased(void);
+void    menu_bankCopyForceRelease(void);
+uint8_t menu_bankCopyArmed(void);
 /*
  * Run a deferred/queued scene change when the sequencer raises its fire flag
  * (S080 F8/F9). Input: none. Output: the pending change is executed (queue
@@ -554,24 +577,6 @@ void menu_fxVoiceMixOverlayEnd(void);
 uint8_t menu_fxVoiceMixOverlayActive(void);
 
 /*
- * Clamp one value to an instrument parameter's menu domain (S075 F3).
- *
- * What: applies the same descriptor-domain clamp as a VOICE-page edit
- * (menu_clampCellValue() for an instrument cell: dtype ranges, list sizes,
- * on/off, target-selector tokens, and LFO target voice range) to one
- * parameter of the active Scene's slot.
- * Why: external MIDI now enters values into the Scene (stored, saved); a raw
- * 0..127 CC must not persist an out-of-domain byte, for example 127 on an
- * on/off parameter. The clamp rules live in Menu; this wrapper keeps one copy.
- * Inputs: slot 0..5, descriptor-local index, raw value 0..255. Output: the
- * clamped value, or the input unchanged when the slot/descriptor is invalid.
- * Caller: MidiParser.c midiParser_enterTaggedParameter(). Affiliates:
- * menu_clampCellValue(), menu_cellDtype().
- */
-uint8_t menu_clampInstrumentValue(uint8_t slot, uint8_t descriptor_index,
-                                  uint8_t value);
-
-/*
  * VOICE held-step automation overlay bridge.
  *
  * What: ButtonHandler calls menu_voiceAutoOverlayHoldExpired() when the common
@@ -643,6 +648,16 @@ void menu_copyClearMenuChanged(void);
 void menu_copyClearMenuClosed(void);
 uint8_t menu_isStorageBusy(void);
 /*
+ * Background Bank load panel state (S082 P3).
+ * menu_backgroundLoadReleasesPanel(): unlocked load and not on Load/Save.
+ * menu_bankLoadFrozenPageActive(): unlocked load on the frozen Load:[Bank].
+ * menu_viewedSceneLoadPending(): the viewed Scene is not yet loaded.
+ * Accessors: copyClearSession.c, ledHandler.c, buttonHandler.c.
+ */
+uint8_t menu_backgroundLoadReleasesPanel(void);
+uint8_t menu_bankLoadFrozenPageActive(void);
+uint8_t menu_viewedSceneLoadPending(void);
+/*
  * STEP front-page half navigation.
  *
  * Why: repeated VOICE presses in STEP mode should toggle between track settings
@@ -708,9 +723,67 @@ uint8_t menu_paramUsesMorphView(uint16_t paramNr);
 uint8_t menu_getParameterDisplayValue(uint16_t paramNr);
 uint8_t *menu_getParameterEditPtr(uint16_t paramNr);
 void menu_parseKnobDelta(uint8_t knobNr, int8_t delta);
-void menu_notifyExternalParamChanged(uint16_t paramNr);
+/*
+ * MIDI write path (S083 Q1): a MIDI write commits exactly like a menu edit.
+ *
+ * menu_commitTargetEdit(): 9-bit target, 7-bit value, origin; returns 1 for
+ * a valid target in the active Scene. It clamps, fans out through
+ * bank_editTargetMask(), applies the R12/R13 actions, records in LATCH/
+ * OVERDUB and requests the repaint. menu_commitGlobalMorphFromMidi(): CC1
+ * on G (fan-out, never recorded, G-1). menu_notifyTargetChanged(): repaint
+ * request for a target ID (visible-cell test).
+ * Context: foreground only. Accessor: MidiControl.c. Affiliates:
+ * menu_cellCommitValueEx(), liveRec_paramIn(), effects_setParameter().
+ */
+uint8_t menu_commitTargetEdit(uint16_t id, uint8_t value, uint8_t origin);
+void menu_commitGlobalMorphFromMidi(uint8_t value);
+void menu_notifyTargetChanged(uint16_t id);
+/* S083 C5: Learn state changed; request a coalesced repaint (LRN/FUL). */
+void menu_learnDisplayChanged(void);
 void menu_serviceKnobRepaint(void);  /* call from main loop after RV1-4 read loop */
 void menu_pollPresetStatus(void);   /* call from main loop — handles async SD completion */
+/*
+ * Enter Load:[Bank] for a MIDI-origin background Bank Load (S082 C10, D7).
+ *
+ * What: switches to LOAD_PAGE with SAVE_TYPE_BANK, selects the requested
+ * slot, shows Replace with all 16 Scenes selected and the ellipsis busy
+ * state, and closes latched menus the way MODE does.
+ * Inputs: Bank slot. Outputs: the same UI state an accepted Bank OK leaves.
+ * Accessors: preset_requestBackgroundBankLoad() (MIDI origin).
+ * Affiliates: menu_beginLoadSaveCommand(), menu_chainMenuClose().
+ */
+/*
+ * Enter Load:[Bank] for a MIDI-origin background Bank load (S082 P1 D7, D32).
+ * Closes latched surfaces, ends copy/clear, enters Load:[Bank] at the slot,
+ * command active; precondition menu_backgroundBankLoadUiIdle().
+ */
+void menu_backgroundBankLoadUiBegin(uint16_t slot);
+/*
+ * Abort an accepted background Bank Load UI command (S082 C7).
+ *
+ * What: runs the ordinary Load/Save command-finish cleanup only when a
+ * command is active. Why: phase 4 can be refused after OK entered the busy
+ * state, and no Preset completion would clear it.
+ * Inputs: none. Outputs: normal cursor/input restored.
+ * Accessors: preset_tickBackgroundBankLoad().
+ * Affiliates: menu_finishLoadSaveCommand().
+ */
+void menu_backgroundBankLoadAbort(void);
+/*
+ * MIDI-origin Bank load UI hooks (S082 P1 D7, D29, D33).
+ * menu_backgroundBankLoadUiIdle(): nonzero when a deferred MIDI request may
+ * take the UI. menu_backgroundBankLoadUiPoll(): WAIT / READY (masks filled) /
+ * REFUSED for the Load:[Bank] preview of slot.
+ * menu_backgroundNamesChanged(): drop Menu name scratch keyed to Scene 17.
+ * Accessors: preset_tickBackgroundBankLoad().
+ */
+#define MENU_BG_UI_WAIT     0u
+#define MENU_BG_UI_READY    1u
+#define MENU_BG_UI_REFUSED  2u
+uint8_t menu_backgroundBankLoadUiIdle(void);
+uint8_t menu_backgroundBankLoadUiPoll(uint16_t slot, uint16_t *act_mask,
+                                      uint16_t *empty_mask);
+void    menu_backgroundNamesChanged(void);
 void menu_parseGlobalParam(uint16_t paramNr, uint8_t value);
 void menu_sendAllParameters(void);
 /*

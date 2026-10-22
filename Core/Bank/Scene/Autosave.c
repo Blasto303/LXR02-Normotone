@@ -433,6 +433,67 @@ static uint8_t autosave_markPayloadOffsetDirty(uint16_t payload_offset)
     return 1u;
 }
 
+/*
+ * Mark a contiguous payload range dirty in one short critical section
+ * (S082 P2 fix 2).
+ *
+ * What: ORs every payload bit in [first, first + count) into the canonical
+ * mask, whole mask bytes at a time (partial edge bytes masked), and adds each
+ * newly set bit to autosave_dirty_count, all inside one IRQ save/restore. No
+ * per-byte trace record is written; the caller emits one witness. Rejected
+ * while tracking is disabled or when the range starts outside the payload;
+ * an end past the payload is clamped.
+ * Why: marking a whole replaced Scene byte-by-byte costs one IRQ round trip
+ * and one DEV trace record per byte, about 20,000 of each for a 16-Scene Bank
+ * load in one foreground call, which stalls audio rendering long enough to
+ * underrun while Scene 17 plays. A whole Scene section is 239 mask bytes, so
+ * one pass takes a few microseconds. The drain discards dirty bits that have
+ * no live getter, so including reserved bytes is harmless.
+ * Inputs: payload-relative first offset, byte count; tracking flag.
+ * Outputs: autosave_dirty_mask and autosave_dirty_count; returns the number
+ * of newly set bits (0 when rejected or already dirty).
+ * Accessors: autosave_markSceneWithoutPatternDirty().
+ * Affiliates: autosave_maskByteOr() (the single-byte form with the same
+ * fresh-bit accounting), autosave_markPayloadOffsetDirty() (per-cell
+ * producer), drain phase 56 / autosave_getLivePayloadByte().
+ */
+static uint16_t autosave_maskPayloadRangeDirty(uint16_t first, uint16_t count)
+{
+    uint16_t end;
+    uint16_t offset;
+    uint16_t fresh_total = 0u;
+    uint32_t primask;
+
+    if (!autosave_mutation_tracking_enabled || count == 0u ||
+        first >= AUTOSAVE_PAYLOAD_BYTES)
+        return 0u;
+    end = (uint16_t)(first + count);
+    if (end > AUTOSAVE_PAYLOAD_BYTES || end < first)
+        end = AUTOSAVE_PAYLOAD_BYTES;
+    primask = autosave_irqSave();
+    offset = first;
+    while (offset < end) {
+        uint16_t mask_byte = (uint16_t)(offset >> 3u);
+        uint8_t first_bit = (uint8_t)(offset & 7u);
+        uint16_t span = (uint16_t)(8u - first_bit);
+        uint8_t bits;
+        uint8_t old;
+        uint8_t fresh;
+
+        if (span > (uint16_t)(end - offset))
+            span = (uint16_t)(end - offset);
+        bits = (uint8_t)(((1u << span) - 1u) << first_bit);
+        old = autosave_dirty_mask[mask_byte];
+        fresh = (uint8_t)(bits & (uint8_t)~old);
+        autosave_dirty_mask[mask_byte] = (uint8_t)(old | bits);
+        fresh_total = (uint16_t)(fresh_total + popcount8_lut[fresh]);
+        offset = (uint16_t)(offset + span);
+    }
+    autosave_dirty_count = (uint16_t)(autosave_dirty_count + fresh_total);
+    autosave_irqRestore(primask);
+    return fresh_total;
+}
+
 /* Return the validated payload-relative base for one resident Scene. */
 static uint8_t autosave_scenePayloadBase(uint8_t scene_index,
                                          uint16_t *payload_base)
@@ -2271,33 +2332,44 @@ void autosave_markEffectDirty(uint8_t scene_index)
 
 void autosave_markSceneWithoutPatternDirty(uint8_t scene_index)
 {
-    uint8_t parameter_index;
-
-    /*
-     * Mark the implemented non-Pattern payload of one committed Scene load.
-     *
-     * Input: destination Scene. Output: the Scene source, all Scene settings,
-     * Effect scope, and Kit scope become dirty; Scene name and Pattern are
-     * excluded. Why: direct Scene replacements bypass scalar setters but must
-     * not imply Pattern persistence. Affiliates: successful root Scene
-     * completion, exact-mask Bank completion, future Scene copy, Effect scope,
-     * and Kit marker.
-     */
+    uint16_t scene_base;
     /* Pack the outer terminal LOAD_MARK in locals only; no persistent state is added. */
     uint8_t trace_flags = 0u;
     uint32_t trace_value;
 
-    for (parameter_index = 0u; parameter_index < AUTOSAVE_SCENE_PARAM_COUNT;
-         parameter_index++) {
-        autosave_markSceneParameterDirty(scene_index, parameter_index);
+    /*
+     * Mark the whole live payload of one replaced Scene in one range
+     * (S082 P2 fix 2).
+     *
+     * What: one contiguous range from the Scene source field to the end of
+     * the Scene section (Scene source and settings, Effect type/source/
+     * parameters, Kit source/parameters and all six Instruments) becomes
+     * dirty; the eight Scene-name bytes and Pattern are excluded, exactly as
+     * before. One LOAD_MARK witness is recorded; the former per-byte DIRTY
+     * records and the nested Kit/Instrument witnesses are no longer emitted
+     * for whole-Scene marks.
+     * Why: the per-scope, per-byte markers cost one IRQ round trip and one DEV
+     * trace record per byte; a 16-Scene Bank load completion stalled the
+     * foreground long enough to underrun audio while Scene 17 plays. The drain
+     * keeps a patch only for bytes with a live getter, so the range captures
+     * the same live set; reserved bytes are taken and dropped.
+     * Inputs: resident Scene index (present, tracking enabled).
+     * Outputs: canonical mask range; one LOAD_MARK trace record.
+     * Accessors: autosave_markSceneWithPatternDirty() (Bank and Scene Load
+     * completion, copy/paste of a whole Scene), autosave_markResidentBankDirty(),
+     * and the filesystem baseline/ensure paths (Bank ensure completion, boot
+     * fallback and runtime-enable seeding).
+     * Affiliates: autosave_maskPayloadRangeDirty(), autosave_scenePayloadBase(),
+     * autosave_getLivePayloadByte(), drain phase 56.
+     */
+    if (autosave_scenePayloadBase(scene_index, &scene_base)) {
+        (void)autosave_maskPayloadRangeDirty(
+            (uint16_t)(scene_base + AUTOSAVE_SCENE_SOURCE_OFFSET),
+            (uint16_t)(AUTOSAVE_SCENE_SECTION_BYTES -
+                       AUTOSAVE_SCENE_SOURCE_OFFSET));
     }
-    /* Scene replacement also changes the source at the front of its header. */
-    autosave_markSourceDirty(
-        (uint16_t)(AUTOSAVE_HCNAMES_SCENE_BASE + scene_index));
-    autosave_markEffectDirty(scene_index);
-    autosave_markKitDirty(scene_index);
 
-    /* Emit the durable whole-Scene witness after the nested Kit marker completes. */
+    /* Emit the durable whole-Scene witness after the range is published. */
     if (autosave_mutation_tracking_enabled)
         trace_flags |= AUTOSAVE_TRACE_LOAD_MARK_FLAG_TRACKING_ENABLED;
     trace_value = ((uint32_t)AUTOSAVE_TRACE_LOAD_MARK_KIND_SCENE <<

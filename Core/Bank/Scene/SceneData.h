@@ -22,6 +22,8 @@
  * display Scene membership.
  */
 #define SCENE_COUNT 16u
+#define SCENE_BACKGROUND_INDEX 16u
+#define SCENE_SLOT_TOTAL       17u
 
 /*
  * Fixed-width resident object display names.
@@ -375,6 +377,14 @@ uint8_t scene_getActiveIndex(void);
  */
 uint8_t scene_selectActive(uint8_t scene_index);
 /*
+ * Scene 17 background Scene accessors (S082 P1).
+ */
+uint8_t scene_backgroundExists(void);
+uint8_t scene_backgroundHomeIndex(void);
+uint8_t scene_playableIndexValid(uint8_t scene_index);
+void scene_backgroundBegin(uint8_t home_index);
+void scene_backgroundRelease(void);
+/*
  * Borrow a mutable instrument slot from a Scene's embedded Kit.
  *
  * Inputs: Scene index and zero-based instrument slot. Output: pointer to the
@@ -409,33 +419,36 @@ uint8_t scene_editLayoutMatches(uint8_t scene_a, uint8_t scene_b);
 /*
  * Store one track's MIDI channel setting.
  *
- * Inputs: Scene index, track index, and requested channel. Output: the channel
- * is clamped to the current 1..16 bridge domain and stored when coordinates
- * are valid. Future MIDI rework may extend this with an off sentinel.
+ * Inputs: Scene index, track index, and requested channel 0..17 (S083):
+ * 0 = unassigned (`glb`, the track follows the global channel), 1..16,
+ * 17 = MIDI_TRACK_CHANNEL_OFF (`off`, no MIDI channel). Values above 17
+ * clamp to `off`. A changed byte marks the track's AutoSave Scene cell.
  */
 void scene_setTrackMidiChannel(uint8_t scene_index, uint8_t track,
                                uint8_t channel);
 /*
  * Read one track's MIDI channel setting.
  *
- * Inputs: Scene index and track index. Output: stored valid channel, or the
- * track+1 fallback for unset/stale values, or 1 for invalid coordinates. This
- * keeps legacy boot defaults stable while storage moves under SceneData.
+ * Inputs: Scene index and track index. Output: the stored 1..16 channel,
+ * 17 (MIDI_TRACK_CHANNEL_OFF) for `off`, or 0 when the track is unassigned
+ * (it follows G), the coordinates are invalid or the byte is out of range.
+ * The pre-S083 track+1 fallback is gone.
  */
 uint8_t scene_getTrackMidiChannel(uint8_t scene_index, uint8_t track);
 /*
  * Store one track's MIDI note setting.
  *
- * Inputs: Scene index, track index, and note. Output: valid coordinates store a
- * 0..127 note, clamping out-of-range input to 127. The setting belongs to Scene
- * track configuration rather than instrument files.
+ * Inputs: Scene index, track index, and note 0..128 (S083): 0 = `on` (no
+ * root), 1..127 = root, 128 = MIDI_TRACK_NOTE_OFF (`off`, no notes in or
+ * out). Values above 128 clamp to `off`. The setting belongs to Scene track
+ * configuration rather than instrument files.
  */
 void scene_setTrackMidiNote(uint8_t scene_index, uint8_t track, uint8_t note);
 /*
  * Read one track's MIDI note setting.
  *
- * Inputs: Scene index and track index. Output: stored 0..127 note, or 0 for
- * invalid/stale data. MIDI and menu code use this rather than reading the
+ * Inputs: Scene index and track index. Output: 0 = `on` (also invalid/stale
+ * data), 1..127 = root, 128 = `off` (MIDI_TRACK_NOTE_OFF). MIDI and menu code use this rather than reading the
  * settings array directly.
  */
 uint8_t scene_getTrackMidiNote(uint8_t scene_index, uint8_t track);
@@ -646,6 +659,14 @@ uint8_t scene_commitSettings(uint8_t scene_index, const scene_settings_t *src);
  * clearOps.c.
  */
 void scene_resetKitToDefaults(uint8_t scene_index);
+/*
+ * Reset one resident Scene's retained data to the empty Scene (S082 B3).
+ *
+ * What: settings, Kit (default types) and Effect are reset; Pattern, HCNAMES,
+ * present bit and edit masks belong to their owners (caller).
+ * Accessors: filesystem_bootReaderEmptyScene(), filesystem_bankEmptyScenes().
+ */
+void scene_resetResidentToEmpty(uint8_t scene_index);
 
 /*
  * Replace one Scene's whole Kit (S075, `copy kit` and `copy scene`).
