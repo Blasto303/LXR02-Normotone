@@ -726,7 +726,9 @@ static uint8_t effects_setMorphAmountScene(uint8_t scene_index, uint8_t amount)
      * runtime's own active Scene, which tracks scene_getActiveIndex()).
      * Output: effects_automation.morph_override_valid = 0.
      * Callers (upstream): effects_setMorphAmount() fan-out, called by
-     * menu_commitEffectMorphParam() and clearOps.c. Affiliate:
+     * menu_commitEffectMorphParam() and clearOps.c; and
+     * effects_setMorphAmountFromGlobal() (global Morph through
+     * preset_morphScene(), S083 follow-up). Affiliate:
      * effects_setMorphAutomation() (the automation setter).
      */
     if (scene_index == effects_state.scene_index)
@@ -771,6 +773,16 @@ uint8_t effects_setSeqStepScale(uint8_t scene_index, uint8_t scale)
         if ((mask & (1ul << s)) != 0u)
             changed |= effects_setSeqStepScaleScene(s, scale);
     }
+    return changed;
+}
+
+/* Contract in EffectsManager.h. */
+uint8_t effects_setMorphAmountFromGlobal(uint8_t scene_index, uint8_t amount)
+{
+    uint8_t changed = effects_setMorphAmountScene(scene_index, amount);
+
+    if (scene_index == effects_state.scene_index)
+        effects_automation.menuHoldMorph = 1u;
     return changed;
 }
 

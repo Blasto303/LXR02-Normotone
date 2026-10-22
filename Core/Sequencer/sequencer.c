@@ -838,7 +838,7 @@ static uint64_t seq_automation_dirty[INSTRUMENT_SLOT_COUNT];
 static uint64_t seq_menuOverride[INSTRUMENT_SLOT_COUNT];
 
 /*
- * Automation ramp state (S081 P2, asm; +669 B SRAM1, +2 B DEV-only).
+ * Automation ramp state (S081 P2, rmp; +669 B SRAM1, +2 B DEV-only).
  *
  * What: seq_ramps[64] are the running linear ramps. Each slot holds the
  * track and Instrument target, the from/to 7-bit values, the last value the
@@ -2696,16 +2696,25 @@ static uint8_t seq_rollPpq(uint8_t rate)
  * floors at 1; doubled clamps at 127. Byte 0x00 and any full >= cycle decode as
  * off (no velocity change: every retrigger at step velocity). Inputs:
  * seq_rollVelPos, seq_rollStepVel, seq_rollLastRhythm. Output: velocity
- * 1..127.
+ * 1..127. S083 follow-up: the decode moved unchanged into the pure
+ * seq_rollRhythmVelocity() (contract in sequencer.h) so the PERF BAR
+ * overlay rolls (`pv<`/`pv>`, buttonHandler) use the identical rule; this
+ * wrapper only supplies the step roll's per-track state.
  */
 static uint8_t seq_rollComputeVelocity(uint8_t track)
 {
-    uint8_t r = seq_rollLastRhythm[track];
+    return seq_rollRhythmVelocity(seq_rollLastRhythm[track],
+                                  seq_rollStepVel[track],
+                                  seq_rollVelPos[track]);
+}
+
+/* Contract in sequencer.h (the former body of seq_rollComputeVelocity()). */
+uint8_t seq_rollRhythmVelocity(uint8_t rhythm, uint8_t vel, uint8_t pos)
+{
+    uint8_t r = rhythm;
     uint8_t cycle = (uint8_t)((r >> 4u) & 0x0Fu);
     uint8_t dir = (uint8_t)((r >> 3u) & 1u);
     uint8_t full = (uint8_t)(r & 0x07u);
-    uint8_t vel = seq_rollStepVel[track];
-    uint8_t pos;
 
     if (cycle == 0u)
         cycle = 1u;
@@ -2715,7 +2724,7 @@ static uint8_t seq_rollComputeVelocity(uint8_t track)
         full = 1u;
         cycle = 1u;
     }
-    pos = (uint8_t)(seq_rollVelPos[track] % cycle);
+    pos = (uint8_t)(pos % cycle);
     if (pos < full)
         return vel;
     if (dir == 0u) {
@@ -3473,7 +3482,7 @@ static uint8_t seq_applySceneAutomation(uint16_t target, uint8_t value)
  * resets only after no append raced the drain. Affiliate: main.c's pre-audio
  * foreground sequence.
  * S081 P2: before applying entries it ends the ramps of tracks whose next
- * step has applied; each written Instrument entry of an asm track may start a
+ * step has applied; each written Instrument entry of an rmp track may start a
  * ramp toward the same target on the predicted next step
  * (seq_rampStartIfPaired()).
  */
@@ -3581,7 +3590,7 @@ void seq_drainPendingAutomation(void)
                      * Write the value and mark it held for the next trigger's
                      * restore (seq_writeInstrumentAutomation(), shared with
                      * the S081 P2 ramp service). A successful write of an
-                     * asm track's entry may start a ramp toward the same
+                     * rmp track's entry may start a ramp toward the same
                      * target on the predicted next step.
                      */
                     {
@@ -3823,7 +3832,7 @@ static uint8_t seq_rampConditionPredict(const pat_step_specials_t *sp,
 /*
  * Predict B and its apply time for step A (S081 P2 §5.2).
  *
- * What: at A's step start on an asm track, fills the context's B (+1) and
+ * What: at A's step start on an rmp track, fills the context's B (+1) and
  * B's apply time, or leaves b = 0 when no ramp may start because:
  *  - A has no automation, or the track is muted / full-erased;
  *  - there is no predictable B (rnd, once end);
@@ -3886,7 +3895,7 @@ static void seq_rampPredict(uint8_t track, const pat_scene_region_t *region,
 /*
  * TIM3 ramp hand-off at a step (S081 P2 §5.1/§5.5).
  *
- * What: on an asm track only, records what happened at this step for the
+ * What: on an rmp track only, records what happened at this step for the
  * foreground:
  *  - applied (automation queued now): stepped flag + prediction of B;
  *  - deferred (automation queues at the deferred fire): prediction only;
@@ -3894,7 +3903,7 @@ static void seq_rampPredict(uint8_t track, const pat_scene_region_t *region,
  *    the ramps into this step run until its value actually lands;
  *  - neither (condition failed, muted, full-erased, no automation block):
  *    stepped flag with no B, so ramps toward this step end at its start.
- * Tracks with asm off write nothing; the ramp service cancels any ramp left
+ * Tracks with rmp off write nothing; the ramp service cancels any ramp left
  * on them. Why: ramps end at the next played step's apply time, and that
  * step's own value then takes over. Context: TIM3. Accessors:
  * seq_advanceTrackStep(). Affiliates: seq_rampPredict(), seq_fireDeferred(),
@@ -4090,7 +4099,7 @@ static uint8_t seq_rampDtypeOk(const ParamDescriptor *descriptor)
 }
 
 /*
- * Is the track's asm mode on in its played Scene? (S081 P2)
+ * Is the track's rmp mode on in its played Scene? (S081 P2)
  *
  * What: reads pat_scene_region_t.track_auto_smooth of
  * seq_perTrackPattern[track]. Why: ramps start and keep running only while
@@ -4140,7 +4149,7 @@ static const ParamDescriptor *seq_writeInstrumentAutomation(
 /*
  * Start a ramp for a just-written entry of step A (S081 P2 §5.4).
  *
- * What: when A's entry was written on an asm track for a rampable target,
+ * What: when A's entry was written on an rmp track for a rampable target,
  * and TIM3's context for this track still describes this A with a
  * predicted B that holds the same target, takes a slot that ramps from A's
  * value (just written) to B's value, from now to B's predicted apply time.
@@ -4224,7 +4233,7 @@ static void seq_rampStartIfPaired(uint8_t track, uint8_t scene, uint8_t step,
  * written value (user decision; the held bit keeps every other writer off the
  * parameter, so an unchanged value is still in the runtime). A ramp is
  * cancelled (its value stays) when:
- *  - the track's asm turned off;
+ *  - the track's rmp turned off;
  *  - live record latches or erases the target (the drain's filters);
  *  - an R12 menu override is set;
  *  - the target is no longer valid in the track's played Scene.

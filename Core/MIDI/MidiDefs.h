@@ -213,6 +213,23 @@ static inline uint8_t midiDefs_routeMask(uint8_t mrt)
 #define MIDI_CHANNEL_NONE   0u
 #define MIDI_CHANNEL_COUNT  16u
 
+/*
+ * Track MIDI settings `ch` and `nte`: stored "off" values (S083 follow-up,
+ * user 2026-10-22).
+ *
+ * Track channel byte: 0 = `glb` (follow G), 1..16 = channel,
+ * MIDI_TRACK_CHANNEL_OFF = `off`: the track has no MIDI channel at all (no
+ * notes in or out, no voice-channel CC/NRPN/PC/Learn, no per-track PC out).
+ * Track note byte: 0 = `on` (the default: no root, the track takes part in
+ * the stripe/split note map), 1..127 = root, MIDI_TRACK_NOTE_OFF = `off`:
+ * the track takes no notes in and sends none out; its channel still carries
+ * CC/NRPN/PC/Learn. The menu shows both lists as off, glb/on, values
+ * (menu.c converts between the menu order and these stored values).
+ * Accessors: SceneData setters/getters, MidiNoteMap, storageTypes parse.
+ */
+#define MIDI_TRACK_CHANNEL_OFF  17u
+#define MIDI_TRACK_NOTE_OFF     128u
+
 /* Origin of a change: echo suppression and record exclusions (S083 Q1/Q9). */
 #define MIDI_ORIGIN_PANEL   0u
 #define MIDI_ORIGIN_MIDI    1u

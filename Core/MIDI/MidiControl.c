@@ -260,6 +260,12 @@ uint8_t midiControl_handleCc(const MidiMsg *msg)
 
 	switch (cc) {
 	case CC_NOTE_ACTION:
+		/*
+		 * CC2 on G only (user 2026-10-22): sets the PERF BAR overlay
+		 * itself (0 off, 1 `<`, 2 `>`), like a BAR press, through
+		 * midiNotes_setNoteAction() -> buttonHandler_setOverlay(). On any
+		 * other channel it is not consumed (forwarded).
+		 */
 		return onG ? midiNotes_setNoteAction(value) : 0u;
 	case CC_MOD_WHEEL:
 		/* C7: G = global Morph (never recorded, G-1); voice channel =

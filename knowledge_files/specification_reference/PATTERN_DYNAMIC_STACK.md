@@ -696,10 +696,12 @@ are layered overlays read every block. An Instrument type change while values
 are held is out of scope (a held bit may name the old type's descriptor until
 the next trigger). Details: `075_SESSION_HANDOFF_LOG.md` §11.
 
-### 6.2b Linear automation ramps: `asm` / Automtn (S081 P2)
+### 6.2b Linear automation ramps: `rmp` / Automtn / Ramp (S081 P2)
 
-**What the user gets.** A per-track **Pattern** setting `asm` (long name
-`Automtn`, values `off`/`on`, STEP mode track parameters, SEQ_PAGE sub-page 0
+**What the user gets.** A per-track **Pattern** setting `rmp` (category
+`Automtn`, long name `Ramp`; labelled `asm` / Track / `Automtn` until the
+S083 follow-up of 2026-10-22; code and storage names keep `auto_smooth`
+and the PAT4 "asm" byte), values `off`/`on`, STEP mode track parameters, SEQ_PAGE sub-page 0
 cell 7, after `lop`). `off`: every step's value is applied as a jump, as
 before. `on`: an Instrument parameter ramps linearly from the current step's
 value to the next played step's value, **only if both steps hold an entry for

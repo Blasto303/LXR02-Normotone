@@ -16,6 +16,7 @@
  * must remain aligned with the descriptor keys.
  */
 #include "storageTypes.h"
+#include "MidiDefs.h"
 #include "EffectsManager.h"
 #include <string.h>
 #include <stdint.h>
@@ -633,20 +634,23 @@ storage_status_t storage_scenesetParseLine(
     } else if (storage_streq(key, "midi_channel")) {
         if (!target_settings)
             return STORAGE_STATUS_BAD_VALUE;
+        /* S083: 0 = unassigned (`glb`), 1..16 a channel, 17 = `off`
+        ** (MIDI_TRACK_CHANNEL_OFF, S083 follow-up). */
         st = storage_parseCsvU8(value,
                                 target_settings->midi_channel,
                                 NUM_TRACKS,
-                                16u);
+                                MIDI_TRACK_CHANNEL_OFF);
         if (st != STORAGE_STATUS_OK)
             return st;
-        /* S083: 0 = unassigned (`glb`), 1..16 a channel. */
     } else if (storage_streq(key, "midi_note")) {
         if (!target_settings)
             return STORAGE_STATUS_BAD_VALUE;
+        /* S083: 0 = `on` (no root), 1..127 root, 128 = `off`
+        ** (MIDI_TRACK_NOTE_OFF, S083 follow-up). */
         return storage_parseCsvU8(value,
                                   target_settings->midi_note,
                                   NUM_TRACKS,
-                                  127u);
+                                  MIDI_TRACK_NOTE_OFF);
     } else if (storage_streq(key, "audio_out")) {
         /*
          * Parse Scene-owned per-voice output routing.

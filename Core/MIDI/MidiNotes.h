@@ -24,14 +24,15 @@
  *
  * What: resolves a note-on/off through the active Scene's note map, then
  * either triggers the track once at the note's velocity and pitch, or,
- * when a BAR overlay is selected (a held BAR in PERF, else CC2), performs
- * that overlay's action through the per-track overlay executor. Reports
- * each single trigger to LiveRecord with the note's arrival age. Holds the
- * CC2 note-action state.
+ * when the BAR overlay is on (set by BAR `<`/`>` in PERF or by CC2 on G),
+ * performs that overlay's action through the per-track overlay executor.
+ * Reports each single trigger to LiveRecord with the note's arrival age.
+ * CC2 sets the PERF BAR overlay itself (buttonHandler_setOverlay()); this
+ * module keeps no separate CC2 state (S083 follow-up).
  * Why: N1-N6; Q5 (concurrent rolls per track); Q6 (arrival time).
  * Context: foreground (midiIn_dispatch()).
- * RAM: CC2 state 1 B SRAM1 (approved). Held notes live in the overlay
- * table (buttonHandler.c).
+ * RAM: none (the former 1 B CC2 state is retired). Held notes and the
+ * overlay state live in buttonHandler.c.
  * Affiliates: MidiNoteMap, buttonHandler overlay executor, sequencer
  * (seq_triggerVoice(), seq_isTrackMuted()), LiveRecord, MidiIn.
  */
@@ -46,14 +47,14 @@
  */
 uint8_t midiNotes_handle(const MidiMsg *msg);
 /*
- * CC2 on G (C8): 0 single trigger, 1 BAR `<` overlay, 2 BAR `>` overlay.
- * Output: 1 consumed (0..2), 0 other values (ignored and forwarded).
- * The value persists until the next CC2; reset at boot. A change
- * re-configures MIDI-held overlay entries while no BAR is held.
- * Accessors: midiIn_dispatch() (B), midiControl_handleCc() (E).
+ * CC2 on G only (C8): 0 single trigger (overlay off), 1 BAR `<` overlay,
+ * 2 BAR `>` overlay. Sets the PERF BAR overlay exactly like a BAR press:
+ * the BAR LEDs follow in PERF, panel VOICE triggers and received notes use
+ * it, and held overlays re-configure. The value persists until the next
+ * CC2 or BAR press (last one wins); off at boot. Output: 1 consumed (0..2),
+ * 0 other values (ignored and forwarded). Accessor: midiControl_handleCc()
+ * (G-only check there).
  */
 uint8_t midiNotes_setNoteAction(uint8_t value);
-/* Current CC2 state (0..2). */
-uint8_t midiNotes_noteAction(void);
 
 #endif /* MIDINOTES_H_ */

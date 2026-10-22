@@ -382,6 +382,7 @@ Settled target root file:
 
 ```text
 settings.cfg
+midilrn.cfg        (S083: MIDI Learn table; absent until the first Learn)
 /.hcnames
 /.hcprms1
 /.hcprms2
@@ -712,14 +713,17 @@ midi_routing (S083: 0..7 = off UtD DtD DtU bth DtA AtD all),
 screensaver_on_off, bar_reset_mode, prescaler_clock_in,
 prescaler_clock_out1, prescaler_clock_out2, follow, and osc_wave_interp, and
 since Session 080 `perf_btn_lt`, `perf_note_lt`, `perf_btn_rt`,
-`perf_note_rt`, `scd`, `qcd`, `qac` (writer cases 17..23; defaults 0). The
-complete writer schema is 24 fixed data lines, then one `learn=` line per
-MIDI Learn row (S083; at most 128), then the `lines=24+N` terminator (17
-before S080). A `learn=` line is
-`learn=CCC,<g|v>,<v1..v6|fx|scn>,<type>,<key>` (Scene rows omit `<type>`);
-a malformed or unresolvable line is skipped while the rest of the file
-loads, and an unresolvable row is written as a `#` comment so the count
-stays exact. Load sanitizes out-of-range S080 values to 0: `qac` > 8,
+`perf_note_rt`, `scd`, `qcd`, `qac` (writer cases 17..23; defaults 0), and
+since the S083 follow-up `perf_vel_lt`, `perf_vel_rt` (cases 24/25: the
+SHIFT+REC `pv<`/`pv>` overlay roll velocity rhythm, a packed roll-rhythm
+byte as the step `rtm` special, 0 = off; the menu snaps an unlisted byte and
+the roll treats an invalid one as off). The complete writer schema is 26
+fixed data lines, then the `lines=26` terminator (24 before the S083
+follow-up, 17 before S080; an older file loads with the new keys at 0). MIDI Learn rows are not in `settings.cfg`:
+they live in `midilrn.cfg` (below). A `learn=` line left by the first S083
+build is an unknown key, ignored on load and dropped by the next settings
+write (no migration); a settings load does not touch the Learn table.
+Load sanitizes out-of-range S080 values to 0: `qac` > 8,
 `qcd` > 17, `scd` > 9. Value meanings: `scd` 0..9 = ins 1/8 1/4 1/2 1b 2b 3b
 4b ens enl; `qcd` 0..17 = ins 1/8 1/4 1/2 1b..9b 12b 15b 16b ens enl; `qac`
 0..8 = nrm mut mrp res u+r o+r mmr rld r+r. P1-era files storing qac 3/4 or
@@ -739,12 +743,56 @@ make it durable, then removes the old `settings.cfg` and renames the temp
 file into place. A boot-time recovery prelude runs before the normal settings
 load: a leftover `settings.tmp` is validated with the same
 `filesystem_parseSettingsLine()` parser plus a self-checking terminator line
-(`lines=N` with N = the number of data lines before it; 24 since Session 080,
-17 before) and either promoted (valid) or discarded
+(`lines=N` with N = the number of data lines before it; 26 since the S083
+follow-up, 24 since Session 080, 17 before) and either promoted (valid) or discarded
 (invalid), leaving the prior `settings.cfg` untouched either way. Hardware-
 tested via a deliberate mid-promotion power-cut simulation
 (`057_SESSION_HANDOFF_LOG.md` §6). This is the same temp+sync+promote pattern
 AutoSave's `.hcprms1/2` already use.
+
+### `midilrn.cfg` — MIDI Learn table (S083)
+
+The device-wide MIDI Learn table (`MIDI_SPEC.md` §6) is its own root
+keyed-text file, so each Learn is written at once without rewriting
+`settings.cfg`:
+
+    format=helicase.midilearn
+    version=1
+    learn=020,g,v1,drm,filter_freq
+    learn=023,g,scn,1vm
+    lines=4
+
+- **Rows:** `learn=CCC,<g|v>,<v1..v6|fx|scn>,<type>,<key>` (Scene rows omit
+  `<type>`), at most 128. An unresolvable row is written as a `#` comment so
+  the count stays exact. `lines=N` counts every line before it (2 + rows).
+- **Write:** every stored or replaced Learn row rewrites the whole file, with
+  no debounce: `midilrn.tmp` (`STORAGE_MIDILEARN_TEMP_FILENAME`), sync, remove
+  the old `midilrn.cfg`, rename (`FS_INTERNAL_OP_SAVE_MIDILEARN`, error code
+  `MlrS`, stall code `MlWr`). A refused Learn (`FUL`) writes nothing.
+- **Write timing:** the write starts on the first idle `filesystem_tick()`
+  after the boot gate (`filesystem_enableRuntimeSettingsWrites()`). It waits
+  for any running operation (AutoSave, a Load/Save command, a background Bank
+  load), for copy/clear suspension, and for `menu_isLoadSaveCommandActive()`.
+  It runs before the debounced settings writer. A Learn made during a write
+  queues exactly one more write. A failed write retries once; after that it
+  waits for the next Learn.
+- **State:** `fs_midilearn_write`, 1 B (PENDING, RETRIED).
+- **Boot:** `main.c` runs `FS_INTERNAL_OP_LOAD_MIDILEARN` (boot code
+  `MLRNLOAD`) right after the `settings.cfg` load, before audio.
+  - A leftover `midilrn.tmp` is validated: no format/version error, and the
+    last line is `lines=N` with N = lines − 1. A valid file is promoted
+    (remove `midilrn.cfg`, rename); an invalid one is discarded.
+  - The table is then cleared and `midilrn.cfg` is read.
+  - A missing file is an empty table: a card has no file until its first
+    Learn.
+  - Malformed rows, lines without `=`, comments and unknown keys are
+    skipped. Only the recovery prelude checks `lines=`, so editing the file
+    by hand is safe.
+  - A wrong `format`/`version` empties the table. A read error, such as an
+    over-long line, keeps the rows read so far.
+  - The load always completes DONE: a Learn file never fails boot.
+- **Trace:** DEV_MODE_LOGGING stage `m` (write result, recovery outcome,
+  load result; `DEV_MODES.md`).
 
 Root-level entries outside the recognized list are ignored by normal
 loader/browser code.
@@ -760,7 +808,8 @@ loader/browser code.
   `filesystem_returnNameCacheScratch()` clears it; Load/Save reloads its index
   on the next entry.
 - **Suspension.** While `copyClear_backgroundSuspended()` is nonzero,
-  `filesystem_tick()` admits no background writer: `settings.cfg`, both trace
+  `filesystem_tick()` admits no background writer: `settings.cfg`,
+  `midilrn.cfg` (S083), both trace
   flushes, the deferred Load/Save HCNAMES flush, scalar AutoSave, and both
   Pattern AutoSave drains. A writer already running finishes; dirty marks keep
   accumulating; the scalar writer resumes on its 250 ms continuation deadline.
@@ -1255,8 +1304,8 @@ The writer emits one `key=value` line per field, in this order:
 | 1 | `version` | `1` | |
 | 2 | `morph_amount` | 0..255 | |
 | 3 | `voice_morph_amount` | 6 × 0..255, comma-separated | |
-| 4 | `midi_channel` | 7 values, each 0..16 | **S083: 0 = unassigned (`glb`, follows G); defaults 0.** |
-| 5 | `midi_note` | 7 values, each 0..127 | **S083: 0 = `def` (no note root); defaults 0.** |
+| 4 | `midi_channel` | 7 values, each 0..17 | **S083: 0 = unassigned (`glb`, follows G), 17 = `off` (no MIDI channel); defaults 0.** |
+| 5 | `midi_note` | 7 values, each 0..128 | **S083: 0 = `on` (no note root; shown `def` before 2026-10-22), 128 = `off` (no notes in or out); defaults 0.** |
 | 6 | `audio_out` | 6 × 0..5 | |
 | 7 | `fx_send_amount` | 6 × 0..127 | |
 | 8 | `fader_setting` | 6 × 0..3 (`pre pst fx xfd`) | **3 = `xfd` since S074.** A value above the domain rejects the file, so firmware older than S074 rejects a Scene that uses `xfd` (downgrade only). |
@@ -2751,6 +2800,7 @@ dot-backer design.
 
 ```text
 settings.cfg
+midilrn.cfg
 Bank/
   000 Factory/
     bankset.bcg

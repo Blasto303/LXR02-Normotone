@@ -918,6 +918,11 @@ uint8_t menu_paramUsesMorphView(uint16_t paramNr)
     return (uint8_t)(paramNr < END_OF_SOUND_PARAMETERS);
 }
 
+/* S083 follow-up: track MIDI ch/nte stored <-> menu order (defined with
+** menu_getMidiStaticName()). */
+static uint8_t menu_trackMidiChanToMenu(uint8_t stored);
+static uint8_t menu_trackMidiNoteToMenu(uint8_t stored);
+
 uint8_t menu_getParameterDisplayValue(uint16_t paramNr)
 {
     /*
@@ -953,6 +958,22 @@ uint8_t menu_getParameterDisplayValue(uint16_t paramNr)
             return scene_getTrackMorphShuffle(scene_index, track);
         }
     }
+    /*
+     * Track MIDI `ch`/`nte` read the viewed Scene directly (S083 follow-up).
+     *
+     * What: the STEP track-settings cells show the active track's stored
+     * setting in menu order (off, glb/on, values). Why: no path refreshed
+     * their parameter_values[] mirror from the Scene (it showed the last
+     * edit, not the track and Scene in front of the user), and the menu
+     * order differs from the stored values. Affiliates:
+     * menu_trackMidiChanToMenu(), menu_trackMidiNoteToMenu().
+     */
+    if (paramNr == PAR_TRACK_MIDI_CHAN)
+        return menu_trackMidiChanToMenu(scene_getTrackMidiChannel(
+            menu_getViewedPattern(), menu_getActiveVoice()));
+    if (paramNr == PAR_TRACK_MIDI_NOTE)
+        return menu_trackMidiNoteToMenu(scene_getTrackMidiNote(
+            menu_getViewedPattern(), menu_getActiveVoice()));
     if (paramNr < NUM_PARAMS)
         return parameter_values[paramNr];
     return 0u;
@@ -1221,7 +1242,7 @@ const enum Datatypes parameter_dtypes[NUM_PARAMS] = {
      * scene division/action names, chain condition/next names and their clamp
      * domains are applied by static-param special cases keyed on the PAR_ id
      * (the S078 run-mode precedent). PAR_PERF_NOTE_* render def or a note name.
-     * PAR_TRACK_LOOPABLE and PAR_TRACK_AUTO_SMOOTH (S081 P2, asm) are
+     * PAR_TRACK_LOOPABLE and PAR_TRACK_AUTO_SMOOTH (S081 P2, rmp) are
      * ordinary on/off cells.
      */
     [PAR_PERF_BTN_LT] = DTYPE_0B127,
@@ -1237,6 +1258,10 @@ const enum Datatypes parameter_dtypes[NUM_PARAMS] = {
     [PAR_CHAIN_NEXT2] = DTYPE_0B127,
     [PAR_TRACK_LOOPABLE] = DTYPE_ON_OFF,
     [PAR_TRACK_AUTO_SMOOTH] = DTYPE_ON_OFF,
+    /* S083 follow-up: pv</pv> hold the packed roll-rhythm byte, like
+     * PAR_STEP_RHYTHM (menu_paramIsRollRhythm()). */
+    [PAR_PERF_VEL_LT] = DTYPE_0B255,
+    [PAR_PERF_VEL_RT] = DTYPE_0B255,
 };
 
 /* -----------------------------------------------------------------------
@@ -1369,8 +1394,15 @@ static const Name valueNames[NUM_NAMES] = {
     {SHORT_CHAIN_NEXT2,CAT_CHAIN,LONG_CHAIN_NEXT2},
     /* S080 P2 Defect 8a: lop / Track / Loopable on the STEP track page. */
     {SHORT_TRACK_LOOPABLE,CAT_TRACK,LONG_TRACK_LOOPABLE},
-    /* S081 P2: asm / Track / Automtn on the STEP track page. */
-    {SHORT_TRACK_AUTO_SMOOTH,CAT_TRACK,LONG_TRACK_AUTO_SMOOTH},
+    /* S081 P2 automation ramp on the STEP track page; S083 follow-up (user
+     * 2026-10-22): `rmp` / Automtn / Ramp (was asm / Track / Automtn). */
+    {SHORT_TRACK_AUTO_SMOOTH,CAT_AUTOMATION,LONG_TRACK_AUTO_SMOOTH},
+    /* S083 follow-up: TEXT_TRACK_NOTE, the track MIDI note `nte` ("Track
+     * Note"); the step-special note keeps TEXT_NOTE (category Step). */
+    {SHORT_NOTE,CAT_TRACK,LONG_NOTE},
+    /* S083 follow-up: SHIFT+REC overlay roll rhythm pv</pv>. */
+    {SHORT_PERF_VEL_LT,CAT_PERFORMANCE,LONG_PERF_VEL_LT},
+    {SHORT_PERF_VEL_RT,CAT_PERFORMANCE,LONG_PERF_VEL_RT},
 };
 
 /* -----------------------------------------------------------------------
@@ -2011,6 +2043,22 @@ static void menu_getConditionName(uint16_t value, char *buf);
 static void menu_getRollRateName(uint16_t value, char *buf);
 static void menu_getRollRhythmName(uint16_t value, char *buf);
 static uint16_t menu_rollRhythmStep(uint16_t byte, int32_t delta);
+
+/*
+ * Static cells holding a packed roll-rhythm byte (S083 follow-up).
+ *
+ * What: nonzero for the step special `rtm` (PAR_STEP_RHYTHM) and the
+ * SHIFT+REC overlay roll rhythms `pv<`/`pv>` (PAR_PERF_VEL_LT/RT). Why: all
+ * three show the N-M/N+M label and step the ordered rhythm list
+ * (menu_rollRhythmStep()) instead of raw byte arithmetic, so the display,
+ * clamp, encoder and pot paths test this one predicate. Input: static id.
+ */
+static uint8_t menu_paramIsRollRhythm(uint16_t paramNr)
+{
+    return (uint8_t)(paramNr == PAR_STEP_RHYTHM ||
+                     paramNr == PAR_PERF_VEL_LT ||
+                     paramNr == PAR_PERF_VEL_RT);
+}
 static void menu_endlessPotMappingChanged(void);
 static uint8_t menu_cpuUseWidgetVisible(void);
 static void menu_formatCpuUsePercent3(char *buf);
@@ -3263,7 +3311,7 @@ static void va_formatValue3(const menu_cell_t *cell, uint8_t value,
         return;
     }
     if (cell && cell->kind == MENU_CELL_STATIC &&
-        cell->static_param == PAR_STEP_RHYTHM) {
+        menu_paramIsRollRhythm(cell->static_param)) {
         menu_getRollRhythmName(value, out);
         return;
     }
@@ -5296,7 +5344,7 @@ static uint8_t menu_cellCommitValueEx(const menu_cell_t *cell, uint16_t value,
         return 1u;
     }
     /*
-     * S081 P2: STEP-page asm cell.
+     * S081 P2: STEP-page rmp cell.
      *
      * What: commits off/on to the viewed Scene's active track via PatternData
      * and refreshes the mirror. Why: PAR_TRACK_AUTO_SMOOTH sits in the
@@ -5580,9 +5628,10 @@ uint8_t menu_commitTargetEdit(uint16_t id, uint8_t value, uint8_t origin)
  * Global Morph from MIDI CC1 on G (S083 C7, Q1; G-1 binding).
  *
  * What: commits PAR_MORPH through its static cell exactly like the PERF
- * `mrp` edit (edit-mask fan-out through preset_morphScene()), never records
- * (global Morph is never recorded, G-1), and repaints `mrp` and the six
- * per-voice Morph cells when visible. Inputs: 7-bit value (translated
+ * `mrp` edit (edit-mask fan-out through preset_morphScene(), which also
+ * sets the Effect Morph), never records (global Morph is never recorded,
+ * G-1), and repaints `mrp`, the six per-voice Morph cells and `fxm` when
+ * visible. Inputs: 7-bit value (translated
  * 0..126 -> x2, 127 -> 255). Accessor: midiControl_handleCc().
  */
 void menu_commitGlobalMorphFromMidi(uint8_t value)
@@ -5598,6 +5647,8 @@ void menu_commitGlobalMorphFromMidi(uint8_t value)
         menu_knobs_dirty = 1u;
     for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++)
         menu_notifyTargetChanged(sceneModTarget_voiceMorphId(slot));
+    /* Global Morph also sets the Effect Morph (`fxm`, S083 follow-up). */
+    menu_notifyTargetChanged(sceneModTarget_effectMorphId());
 }
 
 static uint8_t menu_lfoTargetContext(const menu_cell_t *cell,
@@ -6155,26 +6206,82 @@ void menu_learnDisplayChanged(void)
 }
 
 /*
- * Names for the MIDI static cells (S083).
+ * Names for the MIDI static cells (S083; follow-up 2026-10-22).
  *
- * What: `ch` 0 -> `off`; `chn` 0 -> `glb`; `nte` 0 -> `def`. Returns 1 when
- * it wrote buf (3 chars), else 0 and the generic formatter runs. Why: the
- * zero values are special cases of DTYPE_1B16/DTYPE_NOTE_NAME (dtype space
- * full). `nte` 0 showed `any` before S083; it now means "no note assigned"
- * (`def`). Inputs: cell, value. Accessors: menu_formatCellValue3(),
- * menu_repaintGeneric().
+ * What: MIDI page `ch` (G): 0 -> `off`, else the generic number. Track `ch`
+ * (menu order): 0 `off`, 1 `glb`, 2..17 -> channel 1..16. Track `nte`
+ * (menu order): 0 `off`, 1 `on` (the default, was `def`), 2..128 -> the
+ * name of note 1..127. Returns 1 when it wrote buf (3 chars), else 0 and
+ * the generic formatter runs. Why: these lists are static-param special
+ * cases of DTYPE_1B16/DTYPE_NOTE_NAME (dtype space full). Inputs: cell,
+ * menu-order value. Accessors: menu_formatCellValue3(), menu_repaintGeneric().
  */
 static uint8_t menu_getMidiStaticName(const menu_cell_t *cell, uint16_t value,
                                       char *buf)
 {
-    if (!cell || cell->kind != MENU_CELL_STATIC || value != 0u)
+    if (!cell || cell->kind != MENU_CELL_STATIC)
         return 0u;
     switch (cell->static_param) {
-    case PAR_MIDI_CHAN_GLOBAL: memcpy(buf, menuText_off, 3); return 1u;
-    case PAR_TRACK_MIDI_CHAN:  memcpy(buf, menuText_glb, 3); return 1u;
-    case PAR_TRACK_MIDI_NOTE:  memcpy(buf, menuText_def, 3); return 1u;
-    default:                   return 0u;
+    case PAR_MIDI_CHAN_GLOBAL:
+        if (value != 0u)
+            return 0u;
+        memcpy(buf, menuText_off, 3);
+        return 1u;
+    case PAR_TRACK_MIDI_CHAN:
+        if (value == 0u)
+            memcpy(buf, menuText_off, 3);
+        else if (value == 1u)
+            memcpy(buf, menuText_glb, 3);
+        else
+            numtostrpu(buf, (uint8_t)(value - 1u), ' ');
+        return 1u;
+    case PAR_TRACK_MIDI_NOTE:
+        if (value == 0u)
+            memcpy(buf, menuText_off, 3);
+        else if (value == 1u)
+            memcpy(buf, menuText_on, 3);
+        else
+            setNoteName((uint8_t)(value - 1u), buf);
+        return 1u;
+    default:
+        return 0u;
     }
+}
+
+/*
+ * Track MIDI settings: stored value <-> menu order (S083 follow-up,
+ * 2026-10-22).
+ *
+ * What: the Scene stores track `ch` as 0 glb, 1..16, 17 off
+ * (MIDI_TRACK_CHANNEL_OFF) and track `nte` as 0 on, 1..127, 128 off
+ * (MIDI_TRACK_NOTE_OFF), so the defaults (glb, on) stay 0. The menu lists
+ * them as off, glb/on, values ("off below glb/on"), so menu value =
+ * stored + 1 with `off` at 0. Inputs/outputs: one byte each way.
+ * Accessors: menu_getParameterDisplayValue() (stored -> menu),
+ * menu_parseGlobalParam() (menu -> stored).
+ */
+static uint8_t menu_trackMidiChanToMenu(uint8_t stored)
+{
+    return (stored >= MIDI_TRACK_CHANNEL_OFF) ? 0u : (uint8_t)(stored + 1u);
+}
+
+static uint8_t menu_trackMidiChanFromMenu(uint8_t menuValue)
+{
+    if (menuValue == 0u)
+        return MIDI_TRACK_CHANNEL_OFF;
+    return (uint8_t)((menuValue > 17u) ? 16u : menuValue - 1u);
+}
+
+static uint8_t menu_trackMidiNoteToMenu(uint8_t stored)
+{
+    return (stored >= MIDI_TRACK_NOTE_OFF) ? 0u : (uint8_t)(stored + 1u);
+}
+
+static uint8_t menu_trackMidiNoteFromMenu(uint8_t menuValue)
+{
+    if (menuValue == 0u)
+        return MIDI_TRACK_NOTE_OFF;
+    return (uint8_t)((menuValue > 128u) ? 127u : menuValue - 1u);
 }
 
 static void menu_formatCellValue3(const menu_cell_t *cell, char *valueAsText)
@@ -6210,7 +6317,7 @@ static void menu_formatCellValue3(const menu_cell_t *cell, char *valueAsText)
         return;
     }
     if (cell && cell->kind == MENU_CELL_STATIC &&
-        cell->static_param == PAR_STEP_RHYTHM) {
+        menu_paramIsRollRhythm(cell->static_param)) {
         menu_getRollRhythmName(value, valueAsText);
         return;
     }
@@ -6219,7 +6326,8 @@ static void menu_formatCellValue3(const menu_cell_t *cell, char *valueAsText)
     if (menu_getS080StaticName(cell, value, valueAsText))
         return;
 
-    /* S083: `off` / `glb` / `def` at MIDI value 0. */
+    /* S083: MIDI page `ch` off; track `ch` off/glb/1..16 and track `nte`
+    ** off/on/note names (menu order, follow-up 2026-10-22). */
     if (menu_getMidiStaticName(cell, value, valueAsText))
         return;
 
@@ -6352,16 +6460,26 @@ static void menu_clampCellValue(const menu_cell_t *cell, uint16_t *value)
     if (cell->kind == MENU_CELL_STATIC) {
         switch (cell->static_param) {
         /*
-         * S083: MIDI channel cells accept 0 (plan 3.10).
+         * S083: MIDI channel and note cells (plan 3.10; follow-up
+         * 2026-10-22).
          *
-         * What: G (`ch`) and the track channel (`chn`) are 0..16; 0 shows
-         * `off` (G) or `glb` (track). Why: DTYPE_1B16 clamps to 1..16 and
-         * the dtype space is full, so the zero is a static-param special
-         * case (the run-mode precedent). Affiliates: menu_getMidiStaticName().
+         * What: G (`ch` on the MIDI page) is 0..16 (0 = `off`). The track
+         * cells use the menu order off, glb/on, values: track `ch` 0..17
+         * (0 off, 1 glb, 2..17 = channel 1..16) and track `nte` 0..128
+         * (0 off, 1 on, 2..128 = note 1..127). Why: DTYPE_1B16 and
+         * DTYPE_NOTE_NAME cannot express these lists and the dtype space is
+         * full, so they are static-param special cases (the run-mode
+         * precedent). Affiliates: menu_getMidiStaticName(),
+         * menu_trackMidiChanToMenu() and the other conversions.
          */
         case PAR_MIDI_CHAN_GLOBAL:
-        case PAR_TRACK_MIDI_CHAN:
             if (*value > 16u) *value = 16u;
+            return;
+        case PAR_TRACK_MIDI_CHAN:
+            if (*value > 17u) *value = 17u;
+            return;
+        case PAR_TRACK_MIDI_NOTE:
+            if (*value > 128u) *value = 128u;
             return;
         case PAR_PERF_BTN_LT:
         case PAR_PERF_BTN_RT:
@@ -6443,7 +6561,7 @@ static void menu_clampCellValue(const menu_cell_t *cell, uint16_t *value)
         return;
     }
     if (cell->kind == MENU_CELL_STATIC &&
-        cell->static_param == PAR_STEP_RHYTHM) {
+        menu_paramIsRollRhythm(cell->static_param)) {
         /* Snap any unlisted byte to a list entry (off by default, S079 P2). */
         *value = menu_rollRhythmStep(*value, 0);
         return;
@@ -13893,7 +14011,7 @@ static void menu_repaintGeneric(void)
                 /* Learn target: LRN / FUL. */
             } else if (menu_getMidiStaticName(&cell, value,
                                        &editDisplayBuffer[1][13])) {
-                /* S083 zero names: off / glb / def. */
+                /* S083 MIDI names: off / glb / on / channel / note. */
             } else switch (dtype) {
             case DTYPE_TARGET_SELECTION_VELO:
             case DTYPE_TARGET_SELECTION_LFO:
@@ -13971,9 +14089,10 @@ static void menu_repaintGeneric(void)
                 /* fall through */
             default:
             case DTYPE_0B255:
-                /* Step roll rhythm shows its N-M/N+M cycle label (S079). */
+                /* Roll rhythm (step `rtm`, overlay pv</pv>) shows its
+                 * N-M/N+M cycle label (S079; S083 follow-up). */
                 if (cell.kind == MENU_CELL_STATIC &&
-                    cell.static_param == PAR_STEP_RHYTHM) {
+                    menu_paramIsRollRhythm(cell.static_param)) {
                     menu_getRollRhythmName(value, &editDisplayBuffer[1][13]);
                     break;
                 }
@@ -14235,7 +14354,7 @@ static void menu_encoderChangeParameter(int8_t inc)
      * fix 3) instead of the generic value+delta arithmetic.
      */
     if (cell.kind == MENU_CELL_STATIC &&
-        cell.static_param == PAR_STEP_RHYTHM) {
+        menu_paramIsRollRhythm(cell.static_param)) {
         value = menu_rollRhythmStep(value, inc);
         (void)menu_cellCommitValue(&cell, value);
         return;
@@ -16153,7 +16272,7 @@ void menu_parseKnobDelta(uint8_t knobNr, int8_t delta)
 
     /* Roll rhythm scrolls its ordered list (S079 P2 fix 3). */
     if (cell.kind == MENU_CELL_STATIC &&
-        cell.static_param == PAR_STEP_RHYTHM) {
+        menu_paramIsRollRhythm(cell.static_param)) {
         value = menu_rollRhythmStep(value, delta);
         if (menu_cellCommitValue(&cell, value))
             menu_knobs_dirty = 1;
@@ -18264,33 +18383,51 @@ void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
     case PAR_TRACK_MIDI_CHAN:
     {
         /*
-         * Track MIDI channel `chn` for the STEP track settings (S083).
+         * Track MIDI channel `ch` for the STEP track settings (S083;
+         * follow-up 2026-10-22).
          *
-         * What: stores 0 (`glb`: follow G) or 1..16 in the viewed Scene's
-         * track settings, and ends the track's sounding MIDI note when the
-         * value changes. Why: the legacy PAR_MIDI_CHAN_* mirror and the
-         * MidiParser channel copy are retired (plan 3.10); Scene settings
-         * are the only source. Inputs: active track, viewed Scene, value.
-         * Affiliates: scene_setTrackMidiChannel(), midiOut_trackNoteOff().
+         * What: converts the menu-order value (0 off, 1 glb, 2..17 =
+         * channel 1..16) to the stored value (17 off, 0 glb, 1..16), stores
+         * it in the viewed Scene's track settings, and ends the track's
+         * sounding MIDI note when it changes. Why: the legacy
+         * PAR_MIDI_CHAN_* mirror and the MidiParser channel copy are retired
+         * (plan 3.10); Scene settings are the only source. Inputs: active
+         * track, viewed Scene, menu value. Affiliates:
+         * menu_trackMidiChanFromMenu(), scene_setTrackMidiChannel(),
+         * midiOut_trackNoteOff().
          */
         uint8_t track = menu_getActiveVoice();
         uint8_t scene = menu_getViewedPattern();
+        uint8_t stored = menu_trackMidiChanFromMenu(value);
 
-        if (scene_getTrackMidiChannel(scene, track) != value)
+        if (scene_getTrackMidiChannel(scene, track) != stored)
             midiOut_trackNoteOff(track);
-        scene_setTrackMidiChannel(scene, track, value);
+        scene_setTrackMidiChannel(scene, track, stored);
         break;
     }
 
     case PAR_TRACK_MIDI_NOTE:
     {
         /*
-         * Track MIDI note `nte` (S083): 0 = `def` (unassigned), 1..127 the
-         * root of the track's receive range (plan 3.3). Not a pitch: the
-         * root plays the default pitch. Affiliate: scene_setTrackMidiNote().
+         * Track MIDI note `nte` (S083; follow-up 2026-10-22).
+         *
+         * What: converts the menu-order value (0 off, 1 on, 2..128 = note
+         * 1..127) to the stored value (128 off, 0 on, 1..127), stores it,
+         * and ends the track's sounding MIDI note when it changes. `on` (the
+         * default) = no root, the track takes part in the stripe/split note
+         * map; 1..127 = the root of its receive range (plan 3.3; not a
+         * pitch: the root plays the default pitch); `off` = the track takes
+         * no notes in and sends none out, its channel still carries
+         * CC/NRPN/PC. Affiliates: menu_trackMidiNoteFromMenu(),
+         * scene_setTrackMidiNote(), midiOut_trackNoteOff().
          */
         uint8_t track = menu_getActiveVoice();
-        scene_setTrackMidiNote(menu_getViewedPattern(), track, value);
+        uint8_t scene = menu_getViewedPattern();
+        uint8_t stored = menu_trackMidiNoteFromMenu(value);
+
+        if (scene_getTrackMidiNote(scene, track) != stored)
+            midiOut_trackNoteOff(track);
+        scene_setTrackMidiNote(scene, track, stored);
         break;
     }
 
@@ -18328,7 +18465,7 @@ void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
     case PAR_CHAIN_COND2:
     case PAR_CHAIN_NEXT2:
         /*
-         * S080 P2 (lop, chain; S081 P2 asm): display mirrors only.
+         * S080 P2 (lop, chain; S081 P2 rmp): display mirrors only.
          * menu_sendAllGlobals() replays every
          * id from PAR_BEGINNING_OF_GLOBALS on settings load; these mirrors
          * must never write PatternData or SceneData from that bulk path.

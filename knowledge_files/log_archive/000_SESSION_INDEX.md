@@ -1989,3 +1989,56 @@ Session 082 ran on `dev-ph6-midi` from the S081 code commit (`2a0fd86`; S081 was
   (availability, edit masks, `active_scene`), `AUTOSAVE.md`,
   `COPYCLEAR_UTILITIES.md`, `PATTERN_DYNAMIC_STACK.md`, `DEV_MODES.md`,
   `MIDI_SPEC.md`, `STORAGE_SRAM_MANIFEST.md`.
+
+### 083 — MIDI Implementation: `Core/MIDI/` Rebuild, Note Map, NRPN/Learn, Transport, Transmit; Track `ch`/`nte` `off`, `midilrn.cfg`, CC2 = BAR Overlay, `pv<`/`pv>` (2026-10-21/22)
+
+Session 083 ran on `dev-ph6-midi`: planning commit `f9aaeec`, the implementation commit `d007027`, then follow-ups uncommitted at the close. The final DEV link is `text=608,744`, `data=424`, `bss=430,112` (payload 608,848 B of 753,664 B, **headroom 144,816 B**). The work was the S082-planned MIDI rework (`SCOPING_TARGETS.md` Phase 6 §6.1, A20): plan revision 5 (Q1–Q13), a full code schedule, implementation in phases A–H, an assessment with fixes, and three rounds of hardware follow-ups.
+
+- **Rebuild (Q7):** `Core/MIDI/` was replaced by single-role modules:
+  - `MidiDefs.h`, `MidiBuffer`, `MidiDin`, `MidiIn`, `MidiTransport`;
+  - `MidiNoteMap` (stateless, host-tested in `tools/midi_test/`);
+  - `MidiNotes`, `MidiControl`, `MidiLearn`, `MidiProgram`, `MidiOut`, `MidiPitch.h`;
+  - `MidiVoiceControl` kept.
+
+  `MidiParser`, `FIFO`, `Uart`, `MidiRealtime`, `MidiMessages.h` and `MidiNoteNumbers.h` were deleted, and `valueShaper.h` moved to `Core/DSPAudio/`.
+- **Receive:**
+  - consume-then-route, with the new MRT list `off UtD DtD DtU bth DtA AtD all`; the S082 Bank-load drop filter is kept;
+  - SPP and Song Select are framed, and USB packets use the correct CIN;
+  - the USB ring is 128 × 6 B and drops the newest message when full;
+  - G can be `off`.
+- **Notes:**
+  - N1–N5 note map: a stripe on G, splits on other channels, assigned ranges, root = default pitch 63;
+  - TX goes through the inverse map only inside the track's own range (Q4);
+  - per-track overlay executor shared by panel and MIDI (Q5, rolls run together);
+  - arrival stamps place MIDI hits in LiveRecord (Q6).
+- **Control:**
+  - **A MIDI write is a menu edit (Q1):** one commit (`menu_commitTargetEdit()`) with R12/R13, Scene-target clears, edit-mask fan-out, recording and an LCD repaint by target ID;
+  - NRPN = the 9-bit target ID;
+  - CC1 is global Morph on G (never recorded) and per-voice Morph on a voice channel;
+  - **MIDI Learn:** 128 type-tagged rows; SHIFT+PLAY+REC, `LRN`/`FUL`.
+- **PC/CC0/transport:**
+  - PC 0..15 on G is a whole-Scene change; PC on a voice channel moves that channel's tracks;
+  - CC0 requests the S082 background Bank load;
+  - the S082 A1 queued-action fix (Q2);
+  - Continue resumes, SPP applies while stopped, and both are gated by `snc` (Q11).
+- **Transmit:** per-track note-off record; parameter TX as the learned CC, else NRPN, coalesced and throttled; no echo of MIDI-originated changes (Q9).
+- **Assessment fixes F-1..F-7:** Continue no longer replays a tick; note record under PRIMASK; 7-bit TX mask; Learn cancelled by CC0 on Load/Save; stamp read order; the HiHat pair moves together.
+- **Follow-ups (hardware):**
+  - **Track `ch`/`nte`:** `ch` gains `off` (stored 17); `nte` gains `off` (stored 128); `def` became `on`; `asm` became `rmp` (Automtn, Ramp).
+  - **Learn persistence:** a formatter length bug lost every row. Rows now live in `midilrn.cfg`, safely rewritten after every Learn, with a boot `.tmp` recovery and trace stage `m`.
+  - **Global Morph** sets FX Morph (not recorded).
+  - **SHIFT+REC:** page 2 is `pv< pv> qnt rtk`; `pv<`/`pv>` set the overlay roll velocity rhythm (`settings.cfg` `lines=26`).
+  - **CC2 on G** sets the PERF BAR overlay itself (state and LEDs; last action wins).
+  - **Decoder:** op-list drift fixed.
+- **RAM:**
+  - net about −800 B (the old USB ring was 2,048 B);
+  - new: Learn 518 B, overlay table 56 B, NRPN 48 B, DIN stamps 128 B, TX 22 B, `midilrn.cfg` flag 1 B;
+  - CC2 state retired.
+- **Hardware:** the user tested the P1 build ("seems ok", which led to the follow-ups) and the final build ("hardware checks out").
+
+- **Find here**: [083_SESSION_HANDOFF_LOG.md](083_SESSION_HANDOFF_LOG.md),
+  `MIDI_SPEC.md` (complete use and code reference), `MODULE_INTERCHANGE_SPEC.md`
+  (Core/MIDI modules, overlay entry points, SHIFT+REC page), `FILESYSTEM_SPEC.md`
+  (`settings.cfg`, `midilrn.cfg`, `sceneset.scg` rows 4/5), `PATTERN_DYNAMIC_STACK.md`,
+  `BANK_PRESET_ARCHITECTURE.md`, `DEV_MODES.md` (stage `m`),
+  `STORAGE_SRAM_MANIFEST.md`, `MEMORY.md`.

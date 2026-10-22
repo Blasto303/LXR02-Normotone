@@ -7,7 +7,8 @@
  * What it checks:
  *  1. the four worked examples of MIDI_SPEC 4.2, note by note;
  *  2. N5 (equal roots: the lower track wins, the other owns nothing);
- *  3. G off (unassigned tracks unmapped);
+ *  3. G off (unassigned tracks unmapped); `ch off` / `nte off` tracks
+ *     (S083 follow-up);
  *  4. for 200,000 pseudo-random settings: every (channel, note) maps to at
  *     most one track whose effective channel is that channel, and every
  *     inverse() result resolves back to the same (track, internal note)
@@ -117,6 +118,32 @@ static void examples(void)
 	expect(&s, 1u, 36u, -1, 0);
 	expect(&s, 5u, 36u, 0, 99);
 
+	/*
+	 * S083 follow-up (user 2026-10-22): `ch off` removes a track from every
+	 * channel; `nte off` keeps the channel but removes the track from the
+	 * note map (no notes in, none out).
+	 */
+	base(&s, 10u);
+	s.channel[1] = MIDI_NOTEMAP_CHANNEL_OFF;	/* T2 ch off */
+	expect(&s, 10u, 0u, 0, 63);
+	expect(&s, 10u, 1u, 2, 63);	/* stripe T1 T3 T4 T5 T6 T7 */
+	expect(&s, 10u, 6u, 0, 63);
+	CHECK(midiNoteMap_effectiveChannel(&s, 1u) == 0u, "ch off: no channel");
+	CHECK((midiNoteMap_tracksOnChannel(&s, 10u) & 0x02u) == 0u,
+	      "ch off: not on G");
+	base(&s, 10u);
+	s.note[2] = MIDI_NOTEMAP_NOTE_OFF;		/* T3 nte off */
+	expect(&s, 10u, 2u, 3, 63);	/* stripe T1 T2 T4 T5 T6 T7 */
+	CHECK((midiNoteMap_tracksOnChannel(&s, 10u) & 0x04u) != 0u,
+	      "nte off keeps the channel (CC/NRPN/PC)");
+	{
+		uint8_t c, nn;
+		CHECK(!midiNoteMap_inverse(&s, 2u, 63u, &c, &nn),
+		      "nte off: nothing sent");
+	}
+	s.channel[2] = 4u;	/* alone on ch 4 with nte off: unmapped */
+	expect(&s, 4u, 60u, -1, 0);
+
 	/* Q4 transmit rule on row 2. */
 	base(&s, 10u);
 	s.note[2] = 48u;
@@ -153,8 +180,11 @@ static void randomised(void)
 
 		s.global = (uint8_t)rnd(17u);
 		for (t = 0u; t < 7u; t++) {
-			s.channel[t] = (uint8_t)(rnd(3u) ? 0u : 1u + rnd(4u));
-			s.note[t] = (uint8_t)(rnd(3u) ? 0u : 1u + rnd(127u));
+			/* include the S083 follow-up `off` values */
+			s.channel[t] = (uint8_t)(rnd(3u) ? 0u :
+			    (rnd(6u) ? 1u + rnd(4u) : MIDI_NOTEMAP_CHANNEL_OFF));
+			s.note[t] = (uint8_t)(rnd(3u) ? 0u :
+			    (rnd(6u) ? 1u + rnd(127u) : MIDI_NOTEMAP_NOTE_OFF));
 		}
 		for (ch = 1u; ch <= 16u; ch++) {
 			for (n = 0u; n < 128u; n++) {
@@ -162,6 +192,7 @@ static void randomised(void)
 				if (midiNoteMap_resolve(&s, (uint8_t)ch, (uint8_t)n,
 				                        &tr, &in))
 					CHECK(midiNoteMap_effectiveChannel(&s, tr) == ch &&
+					      s.note[tr] <= 127u &&	/* nte off never maps */
 					      in >= 63u && in <= 127u,
 					      "iter %u ch %u n %u -> T%u ec %u in %u", iter,
 					      ch, n, tr + 1u,

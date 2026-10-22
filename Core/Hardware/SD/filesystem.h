@@ -673,6 +673,32 @@ const char *filesystem_bankLoadDisplayName(void);
 void filesystem_markSettingsDirty(void);
 void filesystem_enableRuntimeSettingsWrites(void);
 
+/*
+ * MIDI Learn table persistence: midilrn.cfg (S083 §16).
+ *
+ * filesystem_requestMidiLearnWrite(): what: queue one full safe rewrite of
+ * midilrn.cfg (midilrn.tmp, sync, remove old, rename). Why: every stored or
+ * replaced Learn row must be durable at once, without a settings.cfg
+ * rewrite per gesture. Inputs: none (the writer streams the live Learn
+ * table). Outputs: one pending flag; no file is opened here. The idle
+ * filesystem_tick() starts FS_INTERNAL_OP_SAVE_MIDILEARN as soon as the
+ * facade is idle, no Load/Save command is active, copy/clear is not
+ * suspending the card, and the boot gate (filesystem_enableRuntimeSettingsWrites())
+ * is open. A request made during a write queues exactly one more write.
+ * Caller: midiLearn_captureCc() after it stores a row (never on FUL).
+ *
+ * filesystem_requestLoadMidiLearn(): what: boot-only load of midilrn.cfg,
+ * started by main.c right after the settings.cfg load, before audio.
+ * A leftover midilrn.tmp is validated by its `lines=N` terminator and
+ * promoted or discarded first; then the table is cleared and the file read.
+ * A missing file is an empty table; malformed rows are skipped; a file
+ * whose format/version is wrong leaves the table empty. Completion is
+ * always DONE unless the facade itself fails. Inputs: completion callback
+ * (NULL at boot; main.c polls and acks). Output: false if the facade is busy.
+ */
+void filesystem_requestMidiLearnWrite(void);
+bool filesystem_requestLoadMidiLearn(fs_completion_cb_t cb);
+
 bool filesystem_requestLoad(fs_file_type_t type, uint16_t slot, fs_completion_cb_t cb);
 /*
  * Load one numbered Kit directory into every Scene selected by scene_mask.

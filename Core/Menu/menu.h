@@ -168,8 +168,16 @@ enum NamesEnum {
     TEXT_CHAIN_COND1, TEXT_CHAIN_NEXT1, TEXT_CHAIN_COND2, TEXT_CHAIN_NEXT2,
     /* S080 P2 Defect 8a: per-track loopable label (lop) on the STEP page. */
     TEXT_TRACK_LOOPABLE,
-    /* S081 P2: per-track automation ramp label (asm). */
+    /* S081 P2: per-track automation ramp label (`rmp`, was `asm`). */
     TEXT_TRACK_AUTO_SMOOTH,
+    /*
+     * S083 follow-up (user 2026-10-22): the STEP track-settings `nte` cell
+     * (track MIDI note) in category Track. TEXT_NOTE stays for the
+     * step-special note on the STEP step page (category Step).
+     */
+    TEXT_TRACK_NOTE,
+    /* S083 follow-up: SHIFT+REC overlay roll rhythm `pv<` / `pv>`. */
+    TEXT_PERF_VEL_LT, TEXT_PERF_VEL_RT,
     NUM_NAMES
 };
 
@@ -188,7 +196,9 @@ enum catNamesEnum {
     /* S080 E4: "Prfrmnc" category for the BAR overlay settings. */
     CAT_PERFORMANCE,
     /* S080 G10: "Chain" category for the scene chain parameters. */
-    CAT_CHAIN
+    CAT_CHAIN,
+    /* S083 follow-up: "Automtn" category of the track ramp cell `rmp`. */
+    CAT_AUTOMATION
 };
 
 enum longNamesEnum {
@@ -233,8 +243,10 @@ enum longNamesEnum {
     LONG_CHAIN_COND1, LONG_CHAIN_NEXT1, LONG_CHAIN_COND2, LONG_CHAIN_NEXT2,
     /* S080 P2 Defect 8a: "Loopable". */
     LONG_TRACK_LOOPABLE,
-    /* S081 P2: "Automtn". */
+    /* S081 P2: "Ramp" (was "Automtn", S083 follow-up). */
     LONG_TRACK_AUTO_SMOOTH,
+    /* S083 follow-up: "Rhythm<" / "Rhythm>" (category Prfrmnc). */
+    LONG_PERF_VEL_LT, LONG_PERF_VEL_RT,
 };
 
 enum shortNamesEnum {
@@ -277,8 +289,10 @@ enum shortNamesEnum {
     SHORT_CHAIN_COND1, SHORT_CHAIN_NEXT1, SHORT_CHAIN_COND2, SHORT_CHAIN_NEXT2,
     /* S080 P2 Defect 8a: "lop". */
     SHORT_TRACK_LOOPABLE,
-    /* S081 P2: "asm". */
-    SHORT_TRACK_AUTO_SMOOTH
+    /* S081 P2: "rmp" (was "asm", S083 follow-up). */
+    SHORT_TRACK_AUTO_SMOOTH,
+    /* S083 follow-up: "pv<" / "pv>". */
+    SHORT_PERF_VEL_LT, SHORT_PERF_VEL_RT
 };
 
 #define PAR_RUNTIME_CPU_USE 0xFFFEu

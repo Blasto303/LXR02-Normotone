@@ -24,9 +24,6 @@
 #include "timebase.h"
 #include "config.h"
 
-/* CC2 note action (C8): 0 single, 1 BAR <, 2 BAR >. Reset at boot. 1 B. */
-static uint8_t midiNotes_action = 0u;
-
 /*
  * Arrival age of a message in us (S083 Q6).
  * What: now - stamp in the 16-bit us domain; ages above
@@ -45,16 +42,9 @@ uint8_t midiNotes_setNoteAction(uint8_t value)
 {
 	if (value > 2u)
 		return 0u;
-	if (value != midiNotes_action) {
-		midiNotes_action = value;
-		buttonHandler_overlayMidiActionChanged(value);
-	}
+	/* The PERF BAR overlay itself (state, LEDs, held entries). */
+	buttonHandler_setOverlay(value);
 	return 1u;
-}
-
-uint8_t midiNotes_noteAction(void)
-{
-	return midiNotes_action;
 }
 
 /* Contract in MidiNotes.h. */
@@ -82,10 +72,8 @@ uint8_t midiNotes_handle(const MidiMsg *msg)
 	}
 	if (seq_isTrackMuted(track))
 		return 1u;	/* resolved, so consumed; a muted track is silent */
-	/* C-9: an active BAR overlay in PERF wins over CC2 (see F-3 in buttonHandler.h). */
-	overlay = buttonHandler_overlayHeldBar();
-	if (overlay == 0u)
-		overlay = midiNotes_action;
+	/* The one overlay state, set by BAR `<`/`>` or CC2 (any mode). */
+	overlay = buttonHandler_overlayActive();
 	if (overlay != 0u) {
 		buttonHandler_overlayMidiNoteOn(track, overlay, internal,
 		                                msg->data1,

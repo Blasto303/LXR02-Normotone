@@ -419,34 +419,36 @@ uint8_t scene_editLayoutMatches(uint8_t scene_a, uint8_t scene_b);
 /*
  * Store one track's MIDI channel setting.
  *
- * Inputs: Scene index, track index, and requested channel 0..16 (S083).
- * Output: values above 16 clamp to 16 and valid coordinates store the byte;
- * 0 means unassigned (`glb`, the track follows the global channel). A changed
- * byte marks the track's AutoSave Scene cell.
+ * Inputs: Scene index, track index, and requested channel 0..17 (S083):
+ * 0 = unassigned (`glb`, the track follows the global channel), 1..16,
+ * 17 = MIDI_TRACK_CHANNEL_OFF (`off`, no MIDI channel). Values above 17
+ * clamp to `off`. A changed byte marks the track's AutoSave Scene cell.
  */
 void scene_setTrackMidiChannel(uint8_t scene_index, uint8_t track,
                                uint8_t channel);
 /*
  * Read one track's MIDI channel setting.
  *
- * Inputs: Scene index and track index. Output: the stored 1..16 channel, or 0
- * when the track is unassigned (it follows G), the coordinates are invalid or
- * the byte is out of range. The pre-S083 track+1 fallback is gone.
+ * Inputs: Scene index and track index. Output: the stored 1..16 channel,
+ * 17 (MIDI_TRACK_CHANNEL_OFF) for `off`, or 0 when the track is unassigned
+ * (it follows G), the coordinates are invalid or the byte is out of range.
+ * The pre-S083 track+1 fallback is gone.
  */
 uint8_t scene_getTrackMidiChannel(uint8_t scene_index, uint8_t track);
 /*
  * Store one track's MIDI note setting.
  *
- * Inputs: Scene index, track index, and note. Output: valid coordinates store a
- * 0..127 note, clamping out-of-range input to 127. The setting belongs to Scene
- * track configuration rather than instrument files.
+ * Inputs: Scene index, track index, and note 0..128 (S083): 0 = `on` (no
+ * root), 1..127 = root, 128 = MIDI_TRACK_NOTE_OFF (`off`, no notes in or
+ * out). Values above 128 clamp to `off`. The setting belongs to Scene track
+ * configuration rather than instrument files.
  */
 void scene_setTrackMidiNote(uint8_t scene_index, uint8_t track, uint8_t note);
 /*
  * Read one track's MIDI note setting.
  *
- * Inputs: Scene index and track index. Output: stored 0..127 note, or 0 for
- * invalid/stale data. MIDI and menu code use this rather than reading the
+ * Inputs: Scene index and track index. Output: 0 = `on` (also invalid/stale
+ * data), 1..127 = root, 128 = `off` (MIDI_TRACK_NOTE_OFF). MIDI and menu code use this rather than reading the
  * settings array directly.
  */
 uint8_t scene_getTrackMidiNote(uint8_t scene_index, uint8_t track);

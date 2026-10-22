@@ -7,6 +7,16 @@ changing any of it.
 - **Current as of:** Session 083 (2026-10-21), `dev-ph6-midi`. DEV link:
   `text=603,896`, `data=424`, `bss=430,120`; flash payload 604,320 B of
   753,664 B (**headroom 149,344 B**), after the MIDI rebuild.
+- **S083 follow-up (2026-10-22):** −1 B SRAM1. `MidiNotes` no longer has
+  a `midiNotes_action` CC2 state: CC2 sets `buttonHandler`
+  `bh_overlayActive`. The overlay entry field `vel` (always 100) became the
+  roll-rhythm position `pos`, so the size is unchanged. `pv<`/`pv>` use spare
+  `parameter_values[]` ids. The measured DEV BSS is unchanged at 430,112 B.
+- **S083 `midilrn.cfg` (2026-10-22):** +1 B approved SRAM1 `.bss`
+  (`filesystem.c` `fs_midilearn_write`, the MIDI Learn write request,
+  owner filesystem). The measured DEV BSS is unchanged at 430,112 B because
+  the byte filled alignment padding. The boot recovery reuses the four
+  `op_settings_recovery_*` bytes. Text 605,784 -> 608,424.
 - **S083 changes (MIDI):** measured DEV BSS 430,928 -> 430,120 (**-808 B**
   net), data 420 -> 424, text 598,120 -> 603,896. New static SRAM1, all
   approved: `MidiLearn` table 128 x 4 B = 512 B + count/state/target/deadline

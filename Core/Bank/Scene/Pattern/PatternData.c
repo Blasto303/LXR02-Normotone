@@ -1354,7 +1354,7 @@ void pat_applyPatternSettingsToMenu(uint8_t scene_index)
  * Repaint one resident track's v4 parameters in the menu buffer.
  *
  * Inputs: Scene and track. Outputs: length, scale, shuffle, play mode,
- * loopable and asm cells mirror the resident region; invalid coordinates
+ * loopable and rmp cells mirror the resident region; invalid coordinates
  * leave the menu untouched.
  */
 void pat_applyTrackSettingsToMenu(uint8_t scene_index, uint8_t track)
@@ -1370,7 +1370,7 @@ void pat_applyTrackSettingsToMenu(uint8_t scene_index, uint8_t track)
     /* S080 P2 Defect 8a: lop mirror (1 = loopable). */
     parameter_values[PAR_TRACK_LOOPABLE] =
         (uint8_t)((region->track_loop_exclude & (uint8_t)(1u << track)) == 0u);
-    /* S081 P2: asm mirror (1 = automation ramps on). */
+    /* S081 P2: rmp mirror (1 = automation ramps on). */
     parameter_values[PAR_TRACK_AUTO_SMOOTH] =
         (uint8_t)((region->track_auto_smooth >> track) & 1u);
 }
@@ -1465,7 +1465,7 @@ uint8_t pat_trackLoopable(uint8_t scene_index, uint8_t track)
 }
 
 /*
- * Per-track automation ramp setter/getter (S081 P2, asm).
+ * Per-track automation ramp setter/getter (S081 P2, rmp).
  *
  * What: pat_setTrackAutoSmooth() sets (on = 1) or clears the track's bit in
  * the resident region and marks the Scene's Pattern dirty only on change;
@@ -1473,7 +1473,7 @@ uint8_t pat_trackLoopable(uint8_t scene_index, uint8_t track)
  * the flag is Pattern data persisted in the PAT4 track header and travels
  * with Pattern copy/clear, exactly like the loopable flag. Inputs: Scene,
  * track, flag. Outputs: region byte, Pattern AutoSave dirty. Accessors:
- * menu_cellCommitValue() (asm cell), copyClearService.c. The sequencer reads
+ * menu_cellCommitValue() (rmp cell), copyClearService.c. The sequencer reads
  * the region directly (TIM3). Affiliates:
  * pat_scene_region_t.track_auto_smooth, seq_rampStepEvent().
  */

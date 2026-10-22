@@ -26,10 +26,10 @@
  * What: the device-wide table (up to MIDI_LEARN_MAX_ENTRIES rows of 4 B:
  * CC + channel kind, target space, type, index); the capture state of the
  * SHIFT+PLAY+REC gesture; the lookup that routes a received CC to its
- * targets (all matching rows, macros); the TX lookup; and the settings.cfg
- * `learn=` line format. It is the module that coordinates CCs into the
- * other modules: matches are written through MidiControl, which commits
- * them as menu edits (Q1).
+ * targets (all matching rows, macros); the TX lookup; and the midilrn.cfg
+ * `learn=` line format (S083 §16; the table was in settings.cfg before).
+ * It is the module that coordinates CCs into the other modules: matches
+ * are written through MidiControl, which commits them as menu edits (Q1).
  * Rules: one CC -> many parameters (one row each); one parameter -> at most
  * one CC (rows are unique on target space + type + index; re-learning
  * replaces CC and channel kind, F49); a row applies only while its type is
@@ -38,16 +38,17 @@
  * per-voice Scene targets only); a `v` row affects only its own slot even
  * when several voices share the channel (F50); reserved CCs never learn.
  * Why: plan F6/F27; no fan-out, no Scene storage, no UI remove (delete the
- * line from settings.cfg).
+ * line from midilrn.cfg).
  * Context: foreground. RAM: 518 B SRAM1 static (approved ~519).
  * Affiliates: MidiControl (capture/lookup caller, writes), menu.c (target
  * selection, LRN/FUL display, page-change cancel), buttonHandler (gesture,
- * LEDs), filesystem.c (lines), MidiOut (TX CC).
+ * LEDs), filesystem.c (midilrn.cfg load/write, write request),
+ * MidiOut (TX CC).
  */
 
 #include <stdint.h>
 
-/* Empty the table (settings load start, filesystem defaults). */
+/* Empty the table (start of the boot midilrn.cfg load). */
 void     midiLearn_clearAll(void);
 uint8_t  midiLearn_count(void);
 
@@ -79,13 +80,18 @@ uint8_t  midiLearn_ccForTarget(uint16_t id, uint8_t *cc,
                                uint8_t *voiceKind);
 
 /*
- * settings.cfg (F34): line `index` of the table as
+ * midilrn.cfg (F34, S083 §16).
+ * formatFileLine(): line `index` of the table as
  * "learn=CCC,<g|v>,<v1..v6|fx|scn>,<type>,<key>\n" (Scene rows have no
  * type field). A row whose names cannot be resolved writes a "#" comment
- * line so the line count stays exact. parse: one `learn=` value; a
+ * line so the line count stays exact. Returns the line length in bytes
+ * (the filesystem_writeTextLine() contract); 0 when `index` is past the
+ * table or cap < 32. Caller: filesystem_nextMidiLearnLine().
+ * parseFileValue(): one `learn=` value; stores or replaces its row (1); a
  * malformed or unresolvable line is skipped (0), the file still loads.
+ * Caller: filesystem_parseMidiLearnLine().
  */
-uint8_t  midiLearn_formatSettingsLine(uint8_t index, char *dst, uint16_t cap);
-uint8_t  midiLearn_parseSettingsValue(const char *value);
+uint8_t  midiLearn_formatFileLine(uint8_t index, char *dst, uint16_t cap);
+uint8_t  midiLearn_parseFileValue(const char *value);
 
 #endif /* MIDILEARN_H_ */

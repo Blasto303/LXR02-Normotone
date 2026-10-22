@@ -190,8 +190,6 @@
  * while still avoiding whole-file staging.
  */
 #define FS_TEXT_LINE_MAX 160u
-/* settings.cfg data lines before the learn= rows (cases 0..23). */
-#define FS_SETTINGS_FIXED_LINES 24u
 /* The shared cache is the complete Instrument browser capacity. */
 #define FS_LIBRARY_NAME_CACHE_MAX 1000u
 #define FS_TEST_OBJECT_MAX 64u
@@ -413,6 +411,14 @@ typedef enum {
     FS_INTERNAL_OP_LOAD_INDEX,
     /* Async reader that replaces the shared cache from a root `.hcindex`. */
     FS_INTERNAL_OP_LOAD_LIBRARY_INDEX,
+    /*
+     * MIDI Learn table file midilrn.cfg (S083 §16). LOAD: boot-only, with
+     * the midilrn.tmp recovery prelude. SAVE: the immediate safe rewrite
+     * after every stored Learn row. Appended last so the numeric op codes
+     * in trace records and tools/decode_devlogs.py stay stable.
+     */
+    FS_INTERNAL_OP_LOAD_MIDILEARN,
+    FS_INTERNAL_OP_SAVE_MIDILEARN,
 } fs_internal_op_t;
 
 typedef struct {
@@ -1656,6 +1662,8 @@ static uint8_t fs_stall_poll_uncounted = 0u;
 static void filesystem_autosaveTraceFlush_tick(void);
 static void filesystem_settingsWriterSchedule_tick(void);
 static void filesystem_settingsWriterCompleted(void);
+static void filesystem_midiLearnWriterSchedule_tick(void);
+static void filesystem_midiLearnWriterCompleted(void);
 static void filesystem_autosaveWriterSchedule_tick(void);
 static void filesystem_autosaveWriterCompleted(void);
 static void filesystem_autosavePatternDrain_tick(void);
@@ -2213,6 +2221,23 @@ static uint8_t fs_settings_dirty = 0u;
 static uint8_t fs_settings_runtime_ready = 0u;
 static uint8_t op_settings_write_active = 0u;
 /*
+ * midilrn.cfg write request (S083 §16). 1 B, SRAM1 .bss, owner filesystem.
+ *
+ * What: bit 0 PENDING asks the idle scheduler for one full safe rewrite of
+ * midilrn.cfg; bit 1 RETRIED marks that the one automatic retry after a
+ * failed write is used. Why: every stored Learn row must reach the card
+ * without a debounce, a Learn made during a write must cause exactly one
+ * more write, and a failing card must not retry forever (the next Learn
+ * re-arms it). Inputs: filesystem_requestMidiLearnWrite() (sets PENDING,
+ * clears RETRIED). Outputs: filesystem_midiLearnWriterSchedule_tick()
+ * clears PENDING as it starts the write; filesystem_midiLearnWriterCompleted()
+ * sets PENDING|RETRIED once on error. Gate: fs_settings_runtime_ready (the
+ * same boot exit as settings.cfg). Reset on every card mount/facade reset.
+ */
+#define FS_MIDILEARN_WRITE_PENDING 0x01u
+#define FS_MIDILEARN_WRITE_RETRIED 0x02u
+static uint8_t fs_midilearn_write = 0u;
+/*
  * Boot recovery-validation scratch for the settings temp-file prelude.
  *
  * What: tracks validity, line count, and terminator state while the boot
@@ -2226,8 +2251,11 @@ static uint8_t op_settings_write_active = 0u;
  * Affiliates: filesystem_loadGlobals_tick()'s recovery prelude,
  * filesystem_parseSettingsLine(), and the §6 terminator-count check.
  *
- * Lifetime: meaningful only during FS_INTERNAL_OP_LOAD_GLOBALS phases 0-10;
- * not referenced by any other operation. 4 bytes total, normal SRAM .bss.
+ * Lifetime: meaningful only during FS_INTERNAL_OP_LOAD_GLOBALS phases 0-10
+ * and FS_INTERNAL_OP_LOAD_MIDILEARN (S083 §16, which reuses all four for
+ * midilrn.tmp, then valid/line_count as its Pass B format flag and line
+ * counter). The two ops never overlap (one facade). 4 bytes total, normal
+ * SRAM .bss.
  */
 static uint8_t op_settings_recovery_valid = 0u;
 static uint8_t op_settings_recovery_line_count = 0u;
@@ -2762,6 +2790,9 @@ static void filesystem_resetGlobalsToDefaults(void)
     parameter_values[PAR_PERF_NOTE_LT] = 0u;
     parameter_values[PAR_PERF_BTN_RT] = 0u;
     parameter_values[PAR_PERF_NOTE_RT] = 0u;
+    /* S083 follow-up: overlay roll rhythms pv</pv>, 0 = off. */
+    parameter_values[PAR_PERF_VEL_LT] = 0u;
+    parameter_values[PAR_PERF_VEL_RT] = 0u;
     parameter_values[PAR_SCENE_CHANGE_DIV] = 0u;
     parameter_values[PAR_SCENE_QUEUE_DIV] = 0u;
     parameter_values[PAR_SCENE_QUEUE_ACTION] = 0u;
@@ -2882,9 +2913,6 @@ static void filesystem_resetSettingsToDefaults(void)
      * touched here, because those now belong to Scene/Bank storage rather than
      * root machine settings.
      */
-    /* S083: the Learn table belongs to settings.cfg; a load starts empty
-    ** (the recovery pass's parse is discarded with the other values). */
-    midiLearn_clearAll();
     parameter_values[PAR_BPM] = 120u;
     parameter_values[PAR_EXT_SYNC] = SEQ_EXT_SYNC_AUTO;
     parameter_values[PAR_QUANTISATION] = 0u;
@@ -2975,6 +3003,10 @@ static uint8_t filesystem_settingsParamForKey(const char *key,
     else if (strcmp(key, "perf_note_lt") == 0) *param = PAR_PERF_NOTE_LT;
     else if (strcmp(key, "perf_btn_rt") == 0) *param = PAR_PERF_BTN_RT;
     else if (strcmp(key, "perf_note_rt") == 0) *param = PAR_PERF_NOTE_RT;
+    /* S083 follow-up: overlay roll rhythms (packed byte; the menu snaps an
+    ** unlisted byte, the roll treats an invalid one as off). */
+    else if (strcmp(key, "perf_vel_lt") == 0) *param = PAR_PERF_VEL_LT;
+    else if (strcmp(key, "perf_vel_rt") == 0) *param = PAR_PERF_VEL_RT;
     /* S080 F6: scene queue / change division globals. */
     else if (strcmp(key, "scd") == 0) *param = PAR_SCENE_CHANGE_DIV;
     else if (strcmp(key, "qcd") == 0) *param = PAR_SCENE_QUEUE_DIV;
@@ -3067,14 +3099,10 @@ static fs_status_t filesystem_parseSettingsLine(const char *line)
         return FS_STATUS_DONE;
     }
     /*
-     * MIDI Learn row (S083 F34). A malformed or unresolvable line is
-     * skipped: the rest of the file still loads (MIDI_SPEC 6.4), so the
-     * line is always accepted here.
+     * S083 §16: Learn rows live in midilrn.cfg. A `learn=` line left in
+     * settings.cfg by the first S083 build is an unknown key here and is
+     * ignored (no migration); the next settings write drops it.
      */
-    if (strcmp(key, "learn") == 0) {
-        (void)midiLearn_parseSettingsValue(value);
-        return FS_STATUS_DONE;
-    }
     if (strncmp(key, "scene_source_", 13u) == 0) {
         /* Legacy v1 provenance is deliberately ignored: HCNAMES owns it. */
         return FS_STATUS_DONE;
@@ -3087,6 +3115,55 @@ static fs_status_t filesystem_parseSettingsLine(const char *line)
         parameter_values[param] = (uint8_t)parsed;
     }
     filesystem_sanitizeLoadedGlobals();
+    return FS_STATUS_DONE;
+}
+
+/*
+ * Parse one midilrn.cfg line (S083 §16, MIDI_SPEC §6.4).
+ *
+ * What: applies one `learn=` row through midiLearn_parseFileValue() and
+ * checks the `format=helicase.midilearn` / `version=1` guards. Why: the file
+ * is hand-editable, so a malformed or unresolvable row (or a line with no
+ * `=`) is skipped and the rest still loads; only a wrong format or version
+ * marks the whole file as not a Learn file. Inputs: one NUL-terminated line
+ * from filesystem_readTextLine() (CR already dropped). Outputs: DONE for every
+ * accepted or skipped line (blank, `#` comment, `lines=N` terminator, unknown
+ * key); ERROR only for a bad format/version value. Callers:
+ * filesystem_loadMidiLearn_tick() (recovery validation of midilrn.tmp, and the
+ * Pass B load, which empties the table on ERROR).
+ */
+static fs_status_t filesystem_parseMidiLearnLine(const char *line)
+{
+    char key[16];
+    const char *eq;
+    const char *value;
+    uint8_t len = 0u;
+    uint16_t parsed;
+
+    if (!line)
+        return FS_STATUS_ERROR;
+    line = filesystem_trimSettingsText(line);
+    if (*line == '\0' || *line == '#')
+        return FS_STATUS_DONE;
+    eq = strchr(line, '=');
+    if (!eq)
+        return FS_STATUS_DONE;
+    while (line < eq && len < (uint8_t)(sizeof(key) - 1u))
+        key[len++] = *line++;
+    key[len] = '\0';
+    while (len > 0u && (key[len - 1u] == ' ' || key[len - 1u] == '\t'))
+        key[--len] = '\0';
+    value = filesystem_trimSettingsText(eq + 1u);
+    if (strcmp(key, "format") == 0)
+        return (strcmp(value, "helicase.midilearn") == 0)
+            ? FS_STATUS_DONE
+            : FS_STATUS_ERROR;
+    if (strcmp(key, "version") == 0)
+        return (filesystem_parseSettingsU16(value, &parsed) && parsed == 1u)
+            ? FS_STATUS_DONE
+            : FS_STATUS_ERROR;
+    if (strcmp(key, "learn") == 0)
+        (void)midiLearn_parseFileValue(value);
     return FS_STATUS_DONE;
 }
 
@@ -3341,6 +3418,7 @@ static const char *filesystem_bootLogCodeForOperation(
     case FS_INTERNAL_OP_LOAD_SCENE:           return "SCNELOAD";
     case FS_INTERNAL_OP_LOAD_BANK:            return "BANKLOAD";
     case FS_INTERNAL_OP_LOAD_GLOBALS:         return "GLOBLOAD";
+    case FS_INTERNAL_OP_LOAD_MIDILEARN:       return "MLRNLOAD";
     case FS_INTERNAL_OP_SCAN_KITS:            return "KITSCAN ";
     case FS_INTERNAL_OP_SCAN_SCENES:          return "SCNSCAN ";
     case FS_INTERNAL_OP_SCAN_BANKS:           return "BNKSCAN ";
@@ -3833,6 +3911,8 @@ static const char *filesystem_errorPrefix(fs_internal_op_t op)
     case FS_INTERNAL_OP_SAVE_PERFORMANCE:      return "PrfS";
     case FS_INTERNAL_OP_LOAD_GLOBALS:          return "GloL";
     case FS_INTERNAL_OP_SAVE_GLOBALS:          return "GloS";
+    case FS_INTERNAL_OP_LOAD_MIDILEARN:        return "MlrL";
+    case FS_INTERNAL_OP_SAVE_MIDILEARN:        return "MlrS";
     case FS_INTERNAL_OP_SCAN_KITS:             return "KitSc";
     case FS_INTERNAL_OP_SCAN_SCENES:           return "ScnSc";
     case FS_INTERNAL_OP_SCAN_BANKS:            return "BnkSc";
@@ -18443,31 +18523,6 @@ static uint8_t filesystem_nextSettingsLine(char *dst, uint16_t cap,
     (void)raw;
 
     /*
-     * Learn rows and the terminator (S083 F34, R11).
-     *
-     * What: after the FS_SETTINGS_FIXED_LINES fixed lines come one line per
-     * Learn row, then "lines=N" with N = fixed + rows. Rows are only ever
-     * appended or replaced in place at runtime (no UI remove), so a row
-     * learned during a write is either included or written next time; the
-     * live count keeps the terminator equal to the lines written. A row
-     * whose names cannot be resolved writes a comment line, keeping the
-     * count exact. Line length: at most ~50 characters (< FS_TEXT_LINE_MAX).
-     * Line count: at most 24 + 128 = 152 (uint8_t recovery counter).
-     * Affiliates: midiLearn_formatSettingsLine(), the recovery prelude.
-     */
-    if (op_write_line_index >= FS_SETTINGS_FIXED_LINES) {
-        uint16_t row = (uint16_t)(op_write_line_index - FS_SETTINGS_FIXED_LINES);
-        uint8_t rows = midiLearn_count();
-
-        if (row < rows)
-            return midiLearn_formatSettingsLine((uint8_t)row, dst, cap);
-        if (row == rows)
-            return filesystem_formatAssignmentU16Line(
-                dst, cap, "lines", (uint16_t)(FS_SETTINGS_FIXED_LINES + rows));
-        return 0u;
-    }
-
-    /*
      * Stream one settings.cfg line.
      *
      * Inputs: op_write_line_index and the live global settings/Bank restore
@@ -18573,9 +18628,68 @@ static uint8_t filesystem_nextSettingsLine(char *dst, uint16_t cap,
     case 23u:
         return filesystem_formatAssignmentU16Line(
             dst, cap, "qac", parameter_values[PAR_SCENE_QUEUE_ACTION]);
+    case 24u:
+        /* S083 follow-up: SHIFT+REC overlay roll rhythm `pv<`. */
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "perf_vel_lt", parameter_values[PAR_PERF_VEL_LT]);
+    case 25u:
+        /* S083 follow-up: SHIFT+REC overlay roll rhythm `pv>`. */
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "perf_vel_rt", parameter_values[PAR_PERF_VEL_RT]);
+    case 26u:
+        /*
+         * Self-checking terminator for format expansion.
+         *
+         * What: emits "lines=26\n" as the final line, where 26 is the count
+         * of preceding data lines (cases 0u..25u: 17 original + 4 overlay
+         * (S080 E10) + 3 scene globals (S080 F5, P2 Defect 5) + 2 overlay
+         * roll rhythms (S083 follow-up; 24 before)). Why: gives
+         * consumers a cheap completeness signal that distinguishes a genuine
+         * end-of-file from a clean-but-early EOF after a crash. Adding a
+         * settings key requires incrementing both its own case and this
+         * declared count. The boot recovery prelude validates this count; the
+         * normal load path ignores it as an unknown key. MIDI Learn rows are
+         * not settings lines: they live in midilrn.cfg (S083 §16). Affiliates:
+         * §6 of S057_SETTINGS_WRITE_SAFE.md.
+         */
+        return filesystem_formatAssignmentU16Line(dst, cap, "lines", 26u);
     default:
         return 0u;
     }
+}
+
+/*
+ * Stream one midilrn.cfg line (S083 §16).
+ *
+ * What: line 0 `format=helicase.midilearn`, line 1 `version=1`, then one
+ * `learn=` line per Learn row (midiLearn_formatFileLine(); an unresolvable
+ * row is a `#` comment so the count stays exact), then `lines=N` with
+ * N = 2 + rows, the terminator the boot recovery prelude checks. Inputs:
+ * op_write_line_index and the live Learn table. Rows are only appended or
+ * replaced in place at runtime, so a row learned mid-stream is either
+ * written now (the live count keeps `lines=` equal to the lines written) or
+ * by the follow-up write its request queued. Output: line length, 0 at the
+ * end. Size: at most 2 + 128 + 1 = 131 lines of <= ~60 characters
+ * (< FS_TEXT_LINE_MAX). Caller: filesystem_saveMidiLearn_tick() phase 2.
+ */
+static uint8_t filesystem_nextMidiLearnLine(char *dst, uint16_t cap,
+                                            void *raw)
+{
+    uint8_t rows = midiLearn_count();
+
+    (void)raw;
+    if (op_write_line_index == 0u)
+        return filesystem_formatLiteralLine(dst, cap,
+                                            "format=helicase.midilearn\n");
+    if (op_write_line_index == 1u)
+        return filesystem_formatLiteralLine(dst, cap, "version=1\n");
+    if (op_write_line_index < (uint16_t)(2u + rows))
+        return midiLearn_formatFileLine(
+            (uint8_t)(op_write_line_index - 2u), dst, cap);
+    if (op_write_line_index == (uint16_t)(2u + rows))
+        return filesystem_formatAssignmentU16Line(
+            dst, cap, "lines", (uint16_t)(2u + rows));
+    return 0u;
 }
 
 static uint8_t filesystem_nextKitsetLine(char *dst, uint16_t cap,
@@ -22148,6 +22262,392 @@ static void filesystem_saveGlobals_tick(void)
 }
 
 /* -----------------------------------------------------------------------
+** LOAD MIDI LEARN state machine (S083 §16) — boot-only, with recovery.
+**
+** What: restores the device-wide MIDI Learn table from midilrn.cfg in the
+** card root. Pass A (phases 0-8) mirrors the settings.cfg prelude: a
+** leftover midilrn.tmp (an interrupted safe write) is read and validated
+** (no format/version error, last line `lines=N` with N == lines - 1), then
+** promoted (remove old midilrn.cfg, rename) or discarded (remove the tmp).
+** Pass B (phases 10-14) empties the table and reads midilrn.cfg. A missing
+** file is an empty table (a card has none until its first Learn);
+** malformed rows are skipped by the parser; a wrong format/version line
+** empties the table and stops reading; a read error (e.g. an over-long
+** hand-edited line) keeps the rows read so far. Completion is always DONE:
+** a Learn file problem must never fail the boot ladder.
+**
+** Why: Learn rows moved out of settings.cfg so each Learn can be written at
+** once without rewriting settings.cfg. Inputs: the card root. Outputs: the
+** Learn table (midiLearn_clearAll() + midiLearn_parseFileValue()), one
+** DEV_MODE_LOGGING `m` record per decision. Scratch: the four
+** op_settings_recovery_* bytes (Pass B: valid = format flag, line_count =
+** lines read, saturating). Caller: main.c boot ladder via
+** filesystem_requestLoadMidiLearn(), right after the settings.cfg load,
+** before audio. Affiliates: filesystem_parseMidiLearnLine(),
+** filesystem_isSettingsTerminatorLine(), filesystem_saveMidiLearn_tick().
+** ----------------------------------------------------------------------- */
+#if DEV_MODE_LOGGING
+static void filesystem_traceMidiLearnRecovery(uint8_t outcome)
+{
+    /* `m` 0x02: outcome | lines << 8 | N << 16 | terminator seen << 24. */
+    autosaveTrace_record(AUTOSAVE_TRACE_STAGE_MIDI_LEARN_FILE,
+                         AUTOSAVE_TRACE_MLRN_RECOVERY,
+                         (uint32_t)outcome |
+                         ((uint32_t)op_settings_recovery_line_count << 8u) |
+                         ((uint32_t)op_settings_recovery_terminator_n << 16u) |
+                         ((uint32_t)op_settings_recovery_terminator_seen << 24u));
+}
+
+static void filesystem_traceMidiLearnLoad(uint8_t present, uint8_t result)
+{
+    /* `m` 0x03: rows | present << 8 | result << 16 | lines read << 24. */
+    autosaveTrace_record(AUTOSAVE_TRACE_STAGE_MIDI_LEARN_FILE,
+                         AUTOSAVE_TRACE_MLRN_LOAD,
+                         (uint32_t)midiLearn_count() |
+                         ((uint32_t)present << 8u) |
+                         ((uint32_t)result << 16u) |
+                         ((uint32_t)op_settings_recovery_line_count << 24u));
+}
+#endif
+
+static void filesystem_loadMidiLearn_tick(void)
+{
+    uint8_t line_ready;
+    uint8_t eof;
+    storage_status_t st;
+
+    switch (op_phase) {
+
+    /* Pass A — midilrn.tmp discovery and resolution. */
+    case 0: /* OPEN_TEMP */
+        op_file_ready = false;
+        op_file = NULL;
+        if (!afatfs_fopen(STORAGE_MIDILEARN_TEMP_FILENAME, "r", on_file_opened))
+            return;
+        op_phase = 1;
+        return;
+
+    case 1: /* WAIT_OPEN_TEMP — no temp file is the common case */
+        if (!op_file_ready) return;
+        if (op_file == NULL) {
+            op_phase = 10;
+            return;
+        }
+        op_settings_recovery_valid = 1u;
+        op_settings_recovery_line_count = 0u;
+        op_settings_recovery_terminator_n = 0u;
+        op_settings_recovery_terminator_seen = 0u;
+        op_line_len = 0u;
+        op_phase = 2;
+        return;
+
+    case 2: /* READ_VALIDATE_TEMP */
+        st = filesystem_readTextLine(op_file, op_line_buf, &op_line_len,
+                                     sizeof(op_line_buf), &line_ready, &eof);
+        if (st == STORAGE_STATUS_WAIT)
+            return;
+        if (st != STORAGE_STATUS_OK) {
+            op_settings_recovery_valid = 0u;
+            op_phase = 3;
+            return;
+        }
+        if (line_ready) {
+            /* Saturate: a valid file has at most 131 lines. */
+            if (op_settings_recovery_line_count < 0xFFu)
+                op_settings_recovery_line_count++;
+            op_settings_recovery_terminator_seen =
+                filesystem_isSettingsTerminatorLine(
+                    op_line_buf, &op_settings_recovery_terminator_n);
+            /* Rows applied here are discarded: Pass B clears the table. */
+            if (filesystem_parseMidiLearnLine(op_line_buf) != FS_STATUS_DONE)
+                op_settings_recovery_valid = 0u;
+            return;
+        }
+        if (eof) {
+            if (!op_settings_recovery_valid ||
+                !op_settings_recovery_terminator_seen ||
+                op_settings_recovery_terminator_n !=
+                    (uint8_t)(op_settings_recovery_line_count - 1u)) {
+                op_settings_recovery_valid = 0u;
+            }
+            op_phase = 3;
+        }
+        return;
+
+    case 3: /* CLOSE_TEMP */
+        op_close_done = false;
+        if (afatfs_fclose(op_file, on_file_closed))
+            op_phase = 4;
+        return;
+
+    case 4: /* WAIT_CLOSE_TEMP */
+        if (!op_close_done) return;
+        op_phase = 5;
+        return;
+
+    case 5: /* REMOVE — old midilrn.cfg (promote) or the invalid tmp (discard) */
+        op_remove_done = 0u;
+        op_remove_result = AFATFS_RESULT_OK;
+        if (!afatfs_removeObjects_lfn(
+                op_settings_recovery_valid
+                    ? STORAGE_MIDILEARN_FILENAME
+                    : STORAGE_MIDILEARN_TEMP_FILENAME,
+                AFATFS_MATCH_CASE_INSENSITIVE,
+                AFATFS_REMOVE_FILES_ONLY,
+                on_remove_complete))
+            return;
+        op_phase = 6;
+        return;
+
+    case 6: /* WAIT_REMOVE */
+        if (!op_remove_done) return;
+        if (op_settings_recovery_valid &&
+            op_remove_result == AFATFS_RESULT_OK) {
+            op_phase = 7;
+            return;
+        }
+        /*
+         * Discard path, or a promote whose remove failed: midilrn.cfg (if
+         * any) is untouched and loads in Pass B; a kept tmp is retried at
+         * the next boot.
+         */
+#if DEV_MODE_LOGGING
+        filesystem_traceMidiLearnRecovery(op_settings_recovery_valid ? 3u : 2u);
+#endif
+        op_phase = 10;
+        return;
+
+    case 7: /* RENAME midilrn.tmp -> midilrn.cfg */
+        op_rename_done = 0u;
+        op_rename_result = AFATFS_RESULT_OK;
+        memset(op_repair_rename_open_name, 0,
+               sizeof(op_repair_rename_open_name));
+        if (!afatfs_renameObject_lfn(STORAGE_MIDILEARN_TEMP_FILENAME,
+                                     STORAGE_MIDILEARN_FILENAME,
+                                     AFATFS_MATCH_CASE_INSENSITIVE,
+                                     op_repair_rename_open_name,
+                                     on_rename_complete))
+            return;
+        op_phase = 8;
+        return;
+
+    case 8: /* WAIT_RENAME — on failure Pass B finds no file; tmp kept */
+        if (!op_rename_done) return;
+#if DEV_MODE_LOGGING
+        filesystem_traceMidiLearnRecovery(
+            op_rename_result == AFATFS_RESULT_OK ? 1u : 4u);
+#endif
+        op_phase = 10;
+        return;
+
+    /* Pass B — midilrn.cfg load. */
+    case 10: /* CLEAR + OPEN */
+        midiLearn_clearAll();
+        op_settings_recovery_valid = 1u;
+        op_settings_recovery_line_count = 0u;
+        op_file_ready = false;
+        op_file = NULL;
+        op_line_len = 0u;
+        if (!afatfs_fopen(STORAGE_MIDILEARN_FILENAME, "r", on_file_opened))
+            return;
+        op_phase = 11;
+        return;
+
+    case 11: /* WAIT_OPEN — no file: empty table */
+        if (!op_file_ready) return;
+        if (op_file == NULL) {
+#if DEV_MODE_LOGGING
+            filesystem_traceMidiLearnLoad(0u, 0u);
+#endif
+            filesystem_finish(FS_STATUS_DONE);
+            return;
+        }
+        op_close_status = FS_STATUS_DONE;
+        op_phase = 12;
+        return;
+
+    case 12: /* READ LINES */
+        st = filesystem_readTextLine(op_file, op_line_buf, &op_line_len,
+                                     sizeof(op_line_buf), &line_ready, &eof);
+        if (st == STORAGE_STATUS_WAIT)
+            return;
+        if (st != STORAGE_STATUS_OK) {
+            /* Keep the rows read so far; result 2 in the trace. */
+            op_close_status = FS_STATUS_ERROR;
+            op_phase = 13;
+            return;
+        }
+        if (line_ready) {
+            if (op_settings_recovery_line_count < 0xFFu)
+                op_settings_recovery_line_count++;
+            if (filesystem_parseMidiLearnLine(op_line_buf) != FS_STATUS_DONE) {
+                /* Not a Learn file (format/version): empty the table. */
+                midiLearn_clearAll();
+                op_settings_recovery_valid = 0u;
+                op_phase = 13;
+            }
+            return;
+        }
+        if (eof)
+            op_phase = 13;
+        return;
+
+    case 13: /* CLOSE */
+        op_close_done = false;
+        if (afatfs_fclose(op_file, on_file_closed))
+            op_phase = 14;
+        return;
+
+    case 14: /* WAIT_CLOSE */
+        if (!op_close_done) return;
+#if DEV_MODE_LOGGING
+        filesystem_traceMidiLearnLoad(
+            1u, !op_settings_recovery_valid ? 1u :
+                (op_close_status != FS_STATUS_DONE ? 2u : 0u));
+#endif
+        filesystem_finish(FS_STATUS_DONE);
+        return;
+
+    default:
+        filesystem_finish(FS_STATUS_ERROR);
+        return;
+    }
+}
+
+/* -----------------------------------------------------------------------
+** SAVE MIDI LEARN state machine (S083 §16) — safe write, temp + sync + promote.
+**
+** Phases: 0=open midilrn.tmp, 1=wait_open, 2=write lines, 3=close,
+**         4=wait_close, 5=sync, 6=remove old midilrn.cfg, 7=wait_remove,
+**         8=rename, 9=wait_rename, 10=finish (shared flush).
+**
+** What: writes the whole Learn table (filesystem_nextMidiLearnLine()) to
+** midilrn.tmp, makes it durable, then replaces midilrn.cfg by remove-old +
+** rename — the same method and power-loss argument as
+** filesystem_saveGlobals_tick(): a crash before the sync leaves the old
+** midilrn.cfg; a crash after it leaves a complete tmp that the boot
+** prelude promotes. Why: every Learn is written at once (user rule).
+** Inputs: the live Learn table. Outputs: one durable midilrn.cfg. Errors
+** finish ERROR; filesystem_midiLearnWriterCompleted() retries once.
+** Stall: shares the settings writer's DEV_STALL_DETECTION observer
+** (code `MlWr NN`, site SETTINGS) — the two writers never overlap.
+** Caller: filesystem_midiLearnWriterSchedule_tick() only.
+** ----------------------------------------------------------------------- */
+static void filesystem_saveMidiLearn_tick(void)
+{
+#if DEV_STALL_DETECTION
+    if (filesystem_pollPhaseStall(op_phase,
+                                  &op_settings_stall_last_phase,
+                                  &op_settings_stall_ticks,
+                                  30000u)) {
+        autosaveTrace_record(AUTOSAVE_TRACE_STAGE_PHASE_STALL,
+                             AUTOSAVE_TRACE_PHASE_STALL_SITE_SETTINGS,
+                             (uint32_t)op_phase <<
+                             AUTOSAVE_TRACE_PHASE_STALL_PHASE_SHIFT);
+        filesystem_makeNamedErrorCode("MlWr", op_phase);
+        filesystem_finish(FS_STATUS_ERROR);
+        return;
+    }
+#endif
+
+    switch (op_phase) {
+    case 0: /* OPEN midilrn.tmp (truncate) */
+        op_file_ready = false;
+        op_file = NULL;
+        if (!afatfs_fopen(STORAGE_MIDILEARN_TEMP_FILENAME, "w", on_file_opened))
+            return;
+        op_phase = 1;
+        return;
+
+    case 1: /* WAIT_OPEN */
+        if (!op_file_ready) return;
+        if (op_file == NULL) {
+            filesystem_finish(FS_STATUS_ERROR);
+            return;
+        }
+        op_write_line_index = 0u;
+        op_write_line_len = 0u;
+        op_write_line_offset = 0u;
+        op_phase = 2;
+        return;
+
+    case 2: /* WRITE LINES (header, rows, terminator) */
+        if (filesystem_writeTextLine(filesystem_nextMidiLearnLine, NULL))
+            return;
+        op_phase = 3;
+        return;
+
+    case 3: /* CLOSE */
+        op_close_done = false;
+        if (afatfs_fclose(op_file, on_file_closed))
+            op_phase = 4;
+        return;
+
+    case 4: /* WAIT_CLOSE */
+        if (!op_close_done) return;
+        op_phase = 5;
+        return;
+
+    case 5: /* SYNC — the tmp is durable before the old file is touched */
+        if (!afatfs_sync())
+            return;
+        op_phase = 6;
+        return;
+
+    case 6: /* REMOVE old midilrn.cfg (not-found is OK: first Learn) */
+        op_remove_done = 0u;
+        op_remove_result = AFATFS_RESULT_OK;
+        if (!afatfs_removeObjects_lfn(STORAGE_MIDILEARN_FILENAME,
+                                      AFATFS_MATCH_CASE_INSENSITIVE,
+                                      AFATFS_REMOVE_FILES_ONLY,
+                                      on_remove_complete))
+            return;
+        op_phase = 7;
+        return;
+
+    case 7: /* WAIT_REMOVE — on error the durable tmp waits for boot */
+        if (!op_remove_done) return;
+        if (op_remove_result != AFATFS_RESULT_OK) {
+            filesystem_finish(FS_STATUS_ERROR);
+            return;
+        }
+        op_phase = 8;
+        return;
+
+    case 8: /* RENAME midilrn.tmp -> midilrn.cfg */
+        op_rename_done = 0u;
+        op_rename_result = AFATFS_RESULT_OK;
+        memset(op_repair_rename_open_name, 0,
+               sizeof(op_repair_rename_open_name));
+        if (!afatfs_renameObject_lfn(STORAGE_MIDILEARN_TEMP_FILENAME,
+                                     STORAGE_MIDILEARN_FILENAME,
+                                     AFATFS_MATCH_CASE_INSENSITIVE,
+                                     op_repair_rename_open_name,
+                                     on_rename_complete))
+            return;
+        op_phase = 9;
+        return;
+
+    case 9: /* WAIT_RENAME — on error boot recovery promotes the tmp */
+        if (!op_rename_done) return;
+        if (op_rename_result != AFATFS_RESULT_OK) {
+            filesystem_finish(FS_STATUS_ERROR);
+            return;
+        }
+        op_phase = 10;
+        return;
+
+    case 10: /* FINISH — shared flush makes the rename durable */
+        filesystem_finish(FS_STATUS_DONE);
+        return;
+
+    default:
+        filesystem_finish(FS_STATUS_ERROR);
+        return;
+    }
+}
+
+/* -----------------------------------------------------------------------
 ** SCAN PHASE 2 KIT DIRECTORIES state machine
 **
 ** Why this exists: the menu still browses fixed numeric slots, but the card now
@@ -25249,6 +25749,8 @@ static void filesystem_resetFacadeForBootLogRecovery(void)
     fs_settings_change_revision = 0u;
     op_settings_change_revision = 0u;
     op_settings_write_active = 0u;
+    /* A pending midilrn.cfg write dies with the facade (S083 §16). */
+    fs_midilearn_write = 0u;
     memset(fs_error_code, 0, sizeof(fs_error_code));
 }
 
@@ -25273,6 +25775,11 @@ void filesystem_initAfterCardReady(void)
     fs_settings_change_revision = 0u;
     op_settings_change_revision = 0u;
     op_settings_write_active = 0u;
+    /*
+     * No midilrn.cfg write is pending on a fresh mount (S083 §16): the boot
+     * load re-reads the table from this card before any Learn can happen.
+     */
+    fs_midilearn_write = 0u;
     /*
      * Reset hidden-writer policy to its documented cold default.
      *
@@ -25762,6 +26269,71 @@ static void filesystem_settingsWriterSchedule_tick(void)
     (void)filesystem_start(FS_INTERNAL_OP_SAVE_GLOBALS,
                            FS_FILE_SETTINGS, 0u,
                            filesystem_settingsWriterCompleted);
+}
+
+static void filesystem_midiLearnWriterCompleted(void)
+{
+    /*
+     * Complete an autonomous midilrn.cfg write (S083 §16).
+     *
+     * Inputs: terminal SAVE_MIDILEARN status. Outputs: DONE clears the
+     * RETRIED mark; the first ERROR re-queues one retry (PENDING|RETRIED),
+     * a second ERROR gives up until the next Learn re-arms the request (a
+     * failing card must not hold the facade in a retry loop). A request
+     * made during the write already set PENDING and is kept either way.
+     * Then the private acknowledgement, as the settings writer does.
+     * Affiliates: filesystem_midiLearnWriterSchedule_tick(),
+     * filesystem_requestMidiLearnWrite().
+     */
+    if (status == FS_STATUS_DONE) {
+        fs_midilearn_write &= (uint8_t)~FS_MIDILEARN_WRITE_RETRIED;
+    } else if (!(fs_midilearn_write & FS_MIDILEARN_WRITE_RETRIED)) {
+        fs_midilearn_write |= (uint8_t)(FS_MIDILEARN_WRITE_PENDING |
+                                        FS_MIDILEARN_WRITE_RETRIED);
+    }
+#if DEV_MODE_LOGGING
+    /* `m` 0x01: rows | failed << 8 | request flags after << 16. */
+    autosaveTrace_record(AUTOSAVE_TRACE_STAGE_MIDI_LEARN_FILE,
+                         AUTOSAVE_TRACE_MLRN_WRITE,
+                         (uint32_t)midiLearn_count() |
+                         ((uint32_t)(status == FS_STATUS_DONE ? 0u : 1u) << 8u) |
+                         ((uint32_t)fs_midilearn_write << 16u));
+#endif
+    filesystem_ack();
+}
+
+static void filesystem_midiLearnWriterSchedule_tick(void)
+{
+    /*
+     * Start one queued midilrn.cfg write from an idle facade (S083 §16).
+     *
+     * Inputs: fs_midilearn_write PENDING, menu_isLoadSaveCommandActive(),
+     * the boot gate fs_settings_runtime_ready, and a READY volume. The
+     * caller (filesystem_tick) runs this only with status IDLE and no
+     * copy/clear suspension, so AutoSave, a Load/Save command and a
+     * background Bank load are all waited out. No debounce: the write starts
+     * on the first idle tick. Output: one FS_INTERNAL_OP_SAVE_MIDILEARN with
+     * a private completion. PENDING is cleared as the write starts, so a
+     * Learn during the write sets it again and causes exactly one more
+     * write; a refused start keeps it.
+     */
+    if (!(fs_midilearn_write & FS_MIDILEARN_WRITE_PENDING))
+        return;
+    if (menu_isLoadSaveCommandActive())
+        return;
+    if (!fs_settings_runtime_ready ||
+        afatfs_getFilesystemState() != AFATFS_FILESYSTEM_STATE_READY)
+        return;
+#if DEV_STALL_DETECTION
+    /* Rearm the shared settings-writer stall observer (see the settings scheduler). */
+    op_settings_stall_last_phase = 0xffu;
+    op_settings_stall_ticks = 0u;
+#endif
+    fs_midilearn_write &= (uint8_t)~FS_MIDILEARN_WRITE_PENDING;
+    if (!filesystem_start(FS_INTERNAL_OP_SAVE_MIDILEARN,
+                          FS_FILE_SETTINGS, 0u,
+                          filesystem_midiLearnWriterCompleted))
+        fs_midilearn_write |= FS_MIDILEARN_WRITE_PENDING;
 }
 
 static void filesystem_autosaveWriterCompleted(void)
@@ -27013,6 +27585,12 @@ void filesystem_tick(void)
 
     if (cc_suspended)
         fs_autosave_page_suppressed = 1u;
+    /*
+     * S083 §16: a queued midilrn.cfg write goes first (no debounce), then
+     * the debounced settings writer gets the facade if it is still idle.
+     */
+    if (status == FS_STATUS_IDLE && !cc_suspended)
+        filesystem_midiLearnWriterSchedule_tick();
     if (status == FS_STATUS_IDLE && !cc_suspended)
         filesystem_settingsWriterSchedule_tick();
     /*
@@ -27219,6 +27797,12 @@ void filesystem_tick(void)
         break;
     case FS_INTERNAL_OP_SAVE_GLOBALS:
         filesystem_saveGlobals_tick();
+        break;
+    case FS_INTERNAL_OP_LOAD_MIDILEARN:
+        filesystem_loadMidiLearn_tick();
+        break;
+    case FS_INTERNAL_OP_SAVE_MIDILEARN:
+        filesystem_saveMidiLearn_tick();
         break;
     case FS_INTERNAL_OP_SCAN_KITS:
         filesystem_scanKits_tick();
@@ -32023,6 +32607,23 @@ bool filesystem_requestSaveBank(uint16_t slot,
         AUTOSAVE_TRACE_SAVE_LIFECYCLE_TYPE_BANK,
         (uint32_t)slot << AUTOSAVE_TRACE_SAVE_LIFECYCLE_SLOT_SHIFT);
     return true;
+}
+
+void filesystem_requestMidiLearnWrite(void)
+{
+    /*
+     * Queue one full midilrn.cfg rewrite (contract in filesystem.h). A new
+     * request also restores the one automatic retry after a failure.
+     */
+    fs_midilearn_write = FS_MIDILEARN_WRITE_PENDING;
+}
+
+bool filesystem_requestLoadMidiLearn(fs_completion_cb_t cb)
+{
+    /* Boot-only Learn table load (contract in filesystem.h). */
+    if (status == FS_STATUS_BUSY) return false;
+    return filesystem_start(FS_INTERNAL_OP_LOAD_MIDILEARN,
+                            FS_FILE_SETTINGS, 0u, cb);
 }
 
 bool filesystem_requestScanKits(fs_completion_cb_t cb)

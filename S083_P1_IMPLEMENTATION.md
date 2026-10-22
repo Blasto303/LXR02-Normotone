@@ -6057,3 +6057,265 @@ each change amended to describe the new behaviour. No new RAM.*
   flashing) and the load runs.
 - **F-7:** per-track PC (or hold one HiHat VOICE + SEQ) that maps only T7:
   T6 and T7 both move, realigned.
+
+---
+
+## 15. Follow-up: track `ch` / `nte` lists and the `rmp` label (2026-10-22)
+
+*User corrections after §14. The STEP track settings second page holds
+`ch`, `nte`, `lop`, `asm`. Requested: `ch` gains `off` below `glb`; `nte`
+moves to category Track, gains `off` below `def`, and `def` is relabelled
+`on` (still the default); `asm` becomes `rmp` with category `Automtn` and
+long name `Ramp`. No new RAM.*
+
+### 15.1 Meaning chosen for the new `off` values
+
+The request named the values but not their effect. Applied as follows;
+correct me if a different effect was meant.
+
+| Setting | Effect |
+|---------|--------|
+| `ch off` | The track has no MIDI channel at all: no notes in or out, no voice-channel CC1/NRPN/Learn/PC, no per-track PC out. (`glb` = follow G, as before.) |
+| `nte on` (default, was `def`) | No root: the track shares its channel's notes (stripe on G, split elsewhere). Unchanged behaviour. |
+| `nte off` | The track is left out of the note map: no notes received, none sent. It keeps its channel for CC1/NRPN/Learn/PC. |
+
+### 15.2 Storage and menu order
+
+The defaults stay stored as 0, so no default changes:
+
+| Setting | Stored (Scene, `sceneset.scg`, AutoSave) | Menu order |
+|---------|-------------------------------------------|------------|
+| Track `ch` | 0 `glb`, 1..16, **17 `off`** (`MIDI_TRACK_CHANNEL_OFF`) | 0 `off`, 1 `glb`, 2..17 = 1..16 |
+| Track `nte` | 0 `on`, 1..127, **128 `off`** (`MIDI_TRACK_NOTE_OFF`) | 0 `off`, 1 `on`, 2..128 = notes 1..127 |
+
+`menu.c` converts between the two orders (`menu_trackMidiChan/NoteToMenu()`,
+`…FromMenu()`).
+
+### 15.3 Changes
+
+| File | Change |
+|------|--------|
+| `MidiDefs.h` | ADD `MIDI_TRACK_CHANNEL_OFF` (17), `MIDI_TRACK_NOTE_OFF` (128) with a contract block. |
+| `SceneData.c/h` | Setters clamp to 0..17 / 0..128 (above clamps to `off`); getters return `off` values; contract blocks updated. |
+| `storageTypes.c` | `midi_channel` parses 0..17, `midi_note` 0..128 (includes `MidiDefs.h`). |
+| `MidiNoteMap.c/h` | `effectiveChannel()` returns 0 for `ch off` (not G). New static `midiNoteMap_noteTracksOnChannel()` drops `nte off` tracks; `resolve()` and `inverse()` use it, and `inverse()` refuses a `nte off` track. `tracksOnChannel()` still includes `nte off` tracks (CC/NRPN/PC). Host-test-local copies of the two values with a firmware `_Static_assert`. Header and settings-struct blocks updated. |
+| `tools/midi_test/notemap_test.c` | New cases: `ch off` leaves the stripe and has no channel; `nte off` leaves the stripe, keeps its channel, sends nothing, and alone on a channel is unmapped. The random settings include both `off` values; a new invariant checks a `nte off` track never resolves. |
+| `menu.c` | `menu_getParameterDisplayValue()` reads track `ch`/`nte` from the viewed Scene in menu order (fixes a pre-existing staleness: their `parameter_values[]` mirror was never refreshed from the Scene). Clamp: G 0..16, track `ch` 0..17, track `nte` 0..128. `menu_getMidiStaticName()` names the full lists (`off`/`glb`/channel; `off`/`on`/note). `menu_parseGlobalParam()` converts menu → stored, and also ends the track's MIDI note on a `nte` change. Prototypes added before first use. |
+| `menu.h`, `menu.c` (`valueNames`), `menuPages.h` | New `TEXT_TRACK_NOTE` (`nte`, category Track) for the STEP track page; the step-special note keeps `TEXT_NOTE` (category Step). New `CAT_AUTOMATION`; `TEXT_TRACK_AUTO_SMOOTH` uses it. |
+| `MenuText.h` | Short name `asm` → `rmp`; long name `Automtn` → `Ramp`; category list gains `Automtn`; `menuText_def` removed (unused). |
+| Comments | Every comment naming the cell `asm` now says `rmp` (`PatternData.c/h`, `ParameterArray.h`, `menu.c`, `menuPages.h`, `sequencer.c/h`). Code and storage identifiers (`auto_smooth`, the PAT4 byte) keep their names. |
+| Specs | `MIDI_SPEC.md` §2.2 (lists, stored values, effects) and §4.1 (`off` tracks); `FILESYSTEM_SPEC.md` `sceneset.scg` rows 4/5; `MODULE_INTERCHANGE_SPEC.md` SEQ_PAGE row; `PATTERN_DYNAMIC_STACK.md` §6.2b heading and label; `MEMORY.md` binding note under MIDI / Clock Reminders. |
+
+### 15.4 Gates
+
+| Gate | Result |
+|------|--------|
+| `make all`, `make img` | PASS. New warnings: none. Rebuilt units also show the older `PatternData.c:201` packed-member and `EuklidGenerator.c:54` sign-compare warnings (lines not touched; they show because header comment edits forced a recompile) and the §14.1 `filesystem.c` unused-function set. |
+| Link | `text=605,784`, `data=424`, `bss=430,112`; flash 606,208 / 753,664 B (**147,456 B free**). Text +1,584 B versus §14 (menu list formatting and conversions, note-map changes); bss unchanged. |
+| Host test | `PASS (0 failures)`. |
+
+### 15.5 Hardware checks
+
+1. STEP track settings second page reads `ch nte lop rmp`. Turning `ch`
+   down past `glb` gives `off`; `nte` lists `off`, `on`, then note names; the
+   full views read "Voice Channel", "Track Note" and "Automtn Ramp".
+2. Change track, change viewed Scene: `ch`/`nte` show that track's stored
+   setting (staleness fix).
+3. `ch off` on T3: notes on G skip T3 (the stripe has six tracks), T3 sends
+   no notes, CC1/NRPN on any channel do not reach slot 3 through a voice
+   channel.
+4. `nte off` on T3 with `ch` 5: notes on ch 5 do nothing for T3 (forwarded),
+   T3 sends no notes, NRPN for slot 3 on ch 5 works, a PC on ch 5 moves T3.
+5. Settings survive reboot (`sceneset.scg` holds 17/128 for `off`).
+
+## 16. Follow-up: MIDI Learn persistence in `midilrn.cfg` (2026-10-22)
+
+**Problem.** Learn assignments did not survive a reboot.
+
+**Root cause.** `midiLearn_formatSettingsLine()` returned `1` instead of the
+line length. `filesystem_writeTextLine()` writes exactly the returned number
+of bytes, so every learn row reached `settings.cfg` as the single character
+`l`. On load, the first `l` line (a line without `=`) was a parse error. The
+24 fixed lines before it had already loaded, but the load stopped there and
+ended with ERROR, so no row was restored. This was a defect in the
+schedule's F-3 text.
+
+**User decision.** Learn rows move to their own root file, `midilrn.cfg`. It
+is safely rewritten after **every** Learn, so `settings.cfg` is no longer
+rewritten for Learn. The seven follow-up decisions were all accepted
+("yes to all"):
+
+1. **Format:** `format=helicase.midilearn`, `version=1`, the existing
+   `learn=` rows, then `lines=N`, where N counts every line before it
+   (2 + rows). The file can be edited by hand.
+2. **`settings.cfg`:** returns to 24 fixed lines plus `lines=24`. An old
+   `learn=` line is an unknown key and is ignored (no migration).
+3. **Safe write:** the `settings.cfg` method: `midilrn.tmp`, sync, remove
+   the old file, rename. At boot, a leftover tmp is checked by its
+   terminator, then promoted or discarded. Both files are in the card root.
+4. **Write timing:** immediate, with no debounce, whenever a row is stored or
+   replaced. `FUL` writes nothing.
+   - The write waits for an idle facade (AutoSave, a Load/Save command, a
+     background Bank load).
+   - A Learn made during a write queues one more write.
+   - Learns made during an unlocked Bank load are kept.
+5. **Boot:** the load runs right after `settings.cfg`, before audio.
+   - A missing file means an empty table.
+   - Malformed rows are skipped.
+   - A settings load no longer clears the table.
+6. **RAM:** 1 B request flag, SRAM1, static, owned by the filesystem.
+7. **Trace:** a DEV_MODE_LOGGING record (stage `m`), in logging builds only.
+
+### 16.1 Changes
+
+| File | Change |
+|------|--------|
+| `Core/MIDI/MidiLearn.c` | **Fix:** both returns of the line formatter now give the line length (`(uint8_t)pos`), both for a real row and for the `#` comment fallback. Renamed `midiLearn_formatSettingsLine()` → `midiLearn_formatFileLine()` and `midiLearn_parseSettingsValue()` → `midiLearn_parseFileValue()`. `midiLearn_captureCc()` calls `filesystem_requestMidiLearnWrite()` instead of `filesystem_markSettingsDirty()`; the `FUL` path still writes nothing. |
+| `Core/MIDI/MidiLearn.h` | Module block and the format/parse contract now describe `midilrn.cfg`: the return value is the length, plus the callers. `midiLearn_clearAll()` comment: the start of the boot load. |
+| `Core/Hardware/SD/storageTypes.h` | ADD `STORAGE_MIDILEARN_FILENAME` `"midilrn.cfg"` and `STORAGE_MIDILEARN_TEMP_FILENAME` `"midilrn.tmp"`, with a contract block. |
+| `Core/Hardware/SD/filesystem.h` | ADD `filesystem_requestMidiLearnWrite()` and `filesystem_requestLoadMidiLearn(cb)`, with a contract block (gates, callers, outputs). |
+| `filesystem.c`: `settings.cfg` revert | REMOVE `FS_SETTINGS_FIXED_LINES`, the learn block in `filesystem_nextSettingsLine()`, the `learn` branch in `filesystem_parseSettingsLine()` (now a comment: ignored as an unknown key) and `midiLearn_clearAll()` in `filesystem_resetSettingsToDefaults()`. Restore `case 24u` → `lines=24`; its comment says Learn rows are in `midilrn.cfg`. |
+| `filesystem.c`: ops | ADD `FS_INTERNAL_OP_LOAD_MIDILEARN` and `FS_INTERNAL_OP_SAVE_MIDILEARN`, appended at the end of `fs_internal_op_t` so trace op numbers stay stable. Boot code `MLRNLOAD`, error names `MlrL`/`MlrS`. Dispatch cases in the op switch. |
+| `filesystem.c`: state | ADD `fs_midilearn_write` (1 B: bit 0 PENDING, bit 1 RETRIED) with a contract block. It is cleared in the facade reset and in `filesystem_initAfterCardReady()`. The `op_settings_recovery_*` comment records that the Learn load reuses those 4 B. |
+| `filesystem.c`: parser | ADD `filesystem_parseMidiLearnLine()`. Blank lines, `#` comments, lines without `=`, `lines=`, unknown keys and malformed `learn=` rows return DONE (skipped). Only a wrong `format`/`version` returns ERROR. |
+| `filesystem.c`: line generator | ADD `filesystem_nextMidiLearnLine()`: header, rows, `lines=2+rows` (at most 131 lines). |
+| `filesystem.c`: load | ADD `filesystem_loadMidiLearn_tick()`. Pass A (0-8) mirrors the `settings.tmp` prelude for `midilrn.tmp`. Pass B (10-14) clears the table and reads `midilrn.cfg`. The load always finishes DONE: a missing file is an empty table, a format/version error empties the table and stops, and a read error keeps the rows read so far. |
+| `filesystem.c`: save | ADD `filesystem_saveMidiLearn_tick()`: the `saveGlobals` safe-write phases 0-10 on the Learn files. Its stall observer is shared with the settings writer (code `MlWr`, site 8). |
+| `filesystem.c`: scheduler | ADD `filesystem_midiLearnWriterSchedule_tick()` and `filesystem_midiLearnWriterCompleted()`. The scheduler starts on PENDING plus the boot gate (`fs_settings_runtime_ready`), a READY volume and no active Load/Save command. PENDING is cleared at the start of a write, so a Learn during the write queues exactly one more. On the first error the completion requeues once (PENDING\|RETRIED); after that it waits for the next Learn, so a failing card cannot loop. It then acks privately. `filesystem_tick()` runs it before the settings writer, under the same idle and copy/clear guard. ADD the request functions next to `filesystem_requestScanKits()`. |
+| `main.c` | After the settings load and `filesystem_setAutosaveEnabled()`: `filesystem_requestLoadMidiLearn(NULL)`, poll while BUSY under the boot-logging timeout, then ack. |
+| `Core/Bank/Scene/AutosaveTrace.h` | ADD stage `m` `AUTOSAVE_TRACE_STAGE_MIDI_LEARN_FILE` with events `WRITE` 0x01, `RECOVERY` 0x02 and `LOAD` 0x03 (layouts in the block). |
+| `tools/decode_devlogs.py` | Stage `m` name, producer and decoder branch; boot code `MLRNLOAD`; the two new op names. **Also fixed** a pre-existing drift: `FS_INTERNAL_OP_PATTERN_TRACE_FLUSH` was missing from the op-name list, so every op from `AUTOSAVE_PATTERN_DRAIN` onward decoded as its neighbour. The list now matches the enum (54 entries, checked by script). |
+| Specs | `FILESYSTEM_SPEC.md`: root file lists, `settings.cfg` schema back to 24 + `lines=24`, the new "`midilrn.cfg`" section, and the copy/clear suspension list. `MIDI_SPEC.md`: §6.1, §6.3 step 3, §6.4 rewritten for `midilrn.cfg`, §11 and the related-documents/as-built rows. `DEV_MODES.md`: stage `m` table and the `MlWr` stall row. `STORAGE_SRAM_MANIFEST.md`: +1 B entry. `MODULE_INTERCHANGE_SPEC.md`: MidiLearn row. `MEMORY.md`: tree line and the MIDI Learn reminder. |
+
+### 16.2 Gates
+
+| Gate | Result |
+|------|--------|
+| `make all`, `make img` | PASS. New warnings: none; only the §14.1 `filesystem.c` unused-function set remains. `DEV_MODE_LOGGING` and `DEV_STALL_DETECTION` are both 1 in `config.h`, so the trace and stall paths were compiled. |
+| Link | `text=608,424`, `data=424`, `bss=430,112`; flash 608,848 / 753,664 B (**144,816 B free**). Text is +2,640 B versus §15. bss is unchanged: the 1 B flag fits in alignment padding. |
+| Host test | `PASS (0 failures)`. The Learn file path is firmware-only; no host test covers it. |
+
+### 16.3 Hardware checks
+
+1. **First Learn on a clean card.**
+   - Steps: Learn a CC, then look at the card root.
+   - Expect: `midilrn.cfg` with the header, one `learn=` row and `lines=3`;
+     no `midilrn.tmp`. A trace `m` WRITE record shows rows=1, ok, pending=0.
+2. **Survives reboot.**
+   - Steps: power-cycle.
+   - Expect: the CC moves its parameter with no new Learn. A trace `m` LOAD
+     record shows present=1, result ok and the row count.
+3. **Re-learn and macros.**
+   - Steps: re-learn the same parameter to another CC, and learn one CC to
+     a second parameter.
+   - Expect: each Learn rewrites the file (one WRITE record per Learn), and
+     the file shows the replaced CC and the new row.
+4. **Learn during a busy card.**
+   - Steps: Learn while AutoSave or a background Bank load is running.
+   - Expect: the write happens after it finishes. Two quick Learns can show
+     a WRITE with pending=1, followed by a second WRITE.
+5. **`FUL`.**
+   - Steps: with 128 rows, Learn a new parameter.
+   - Expect: `FUL` is shown and no WRITE record appears.
+6. **`settings.cfg` is clean.**
+   - Steps: make a settings change and check the file.
+   - Expect: 24 data lines and `lines=24`. Old `l`/`learn=` lines from the
+     first S083 build are gone after the next settings write.
+7. **Recovery.**
+   - Steps: copy a valid `midilrn.cfg` to `midilrn.tmp`, change one row, and
+     boot.
+   - Expect: the tmp is promoted (RECOVERY outcome 1) and its rows load.
+   - Then: truncate the tmp's `lines=` line and boot.
+   - Expect: it is discarded (outcome 2) and the old file loads.
+8. **Hand edits.**
+   - Steps: delete a row, then add a row with an unknown key.
+   - Expect: both load without error, and the bad row is skipped.
+   - Steps: set `format=` to something else.
+   - Expect: the table is empty (LOAD result 1).
+
+## 17. Follow-up: FX Morph from global Morph, `pv<`/`pv>`, CC2 sets the BAR overlay (2026-10-22)
+
+The user reported three problems:
+
+1. FX Morph does not follow the global Morph. Global Morph sets all Morph,
+   and like the voice Morphs, the FX Morph it sets is not recorded.
+2. SHIFT+REC needs `pv<` and `pv>`: the velocity rhythm of the overlay roll,
+   with the same list as the step special (`1-2`, `1-3`, …). Its second page
+   becomes `pv< pv> qnt rtk`.
+3. Check the MIDI assignment for the PERF roll/trigger overlay, which should
+   also update the LEDs. The user later confirmed: CC2, on G only, for both
+   the trigger and the overlay change.
+
+### 17.1 Findings
+
+- **FX Morph.** `preset_morphScene()` wrote only the stored byte
+  (`scene_setEffectMorphAmount()`). Three things kept the old amount:
+  - it never cleared a Pattern `fxm` override (S076 Rule A);
+  - it never set the menu hold, so an FX Morph lock step still won;
+  - it never refreshed the `PAR_EFFECT_MORPH` mirror or the `fxm` display.
+
+  The panel `mrp` edit and MIDI CC1 on G both go through this function.
+- **CC2.** CC2 is the assignment (MIDI_SPEC §5.3: on G, 0 single, 1 BAR `<`,
+  2 BAR `>`). As built, it kept its own state in `MidiNotes` that only shaped
+  received MIDI notes. It never changed `bh_overlayActive`, so the panel
+  VOICE overlay and the BAR LEDs did not follow, and a BAR overlay in PERF
+  overrode it (C-9).
+
+### 17.2 Changes
+
+| File | Change |
+|------|--------|
+| `EffectsManager.c/h` | ADD `effects_setMorphAmountFromGlobal(scene, amount)` (contract block). It sets one Scene, with no fan-out because the caller already fans out per Scene. Through `effects_setMorphAmountScene()` it stores the amount and clears the `fxm` override; on the active Scene it also sets `menuHoldMorph`, the `fxm` menu-edit rule. It never records. |
+| `presetManager.c` | `preset_morphScene()` calls it instead of the bare `scene_setEffectMorphAmount()`. For the active Scene it also calls `preset_syncEffectMorphMirror()`. Bulk Global apply starts at `PAR_BEGINNING_OF_GLOBALS` (135) and `PAR_MORPH` is 78, so a settings load never reaches this path. |
+| `menu.c` | `menu_commitGlobalMorphFromMidi()` also repaints `fxm` (`sceneModTarget_effectMorphId()`). |
+| `buttonHandler.c/h` | One overlay state. ADD `buttonHandler_overlayActive()` (any mode) and `buttonHandler_setOverlay(which)`. `setOverlay` makes the same change as a BAR press: state, BAR LEDs (in PERF while the looper does not own them) and held entries. REMOVE `buttonHandler_overlayHeldBar()`, `buttonHandler_overlayMidiActionChanged()` and the `BH_OVERLAY_SEL_*` split: `buttonHandler_overlayReconfigure(which)` now re-configures every held entry, and `buttonHandler_overlaySwitchHeld()` lost its CC2 branch. Comment blocks updated. |
+| `MidiNotes.c/h` | REMOVE `midiNotes_action` (−1 B) and `midiNotes_noteAction()`. `midiNotes_setNoteAction()` calls `buttonHandler_setOverlay()`. Notes use `buttonHandler_overlayActive()` in any mode. The G-only check stays in `midiControl_handleCc()`. |
+| `sequencer.c/h` | ADD the pure `seq_rollRhythmVelocity(rhythm, vel, pos)`, the former body of `seq_rollComputeVelocity()`, which now calls it. One rule for step and overlay rolls. |
+| `ParameterArray.h` | ADD `PAR_PERF_VEL_LT`/`PAR_PERF_VEL_RT`, appended after `PAR_TRACK_AUTO_SMOOTH` so no id is renumbered, plus a `_Static_assert`. |
+| `menu.h`, `MenuText.h`, `menu.c` | ADD `TEXT_`/`SHORT_`/`LONG_PERF_VEL_LT/RT`: `pv<`/`pv>`, Prfrmnc, `Rhythm<`/`Rhythm>`. Dtype `DTYPE_0B255`. ADD `menu_paramIsRollRhythm()` (step `rtm` + `pv<`/`pv>`). The six `PAR_STEP_RHYTHM` cell tests (two value-name paths, clamp, full view, encoder, pot) use it, so the new cells show `off`/`1-2`… and step the same ordered list. |
+| `menuPages.h` | RECORDING_PAGE sub-page 1 is `pv< pv> qnt rtk`; sub-page 2 (formerly `rtk`) is reserved. The generic cross-sub-page step needs no change. |
+| `buttonHandler.c` (roll) | The overlay entry field `vel` (always 100) became `pos`, the roll hit position, so there is no RAM change. Roll repeats play `seq_rollRhythmVelocity(pv of bh_overlayActive, 100, pos)`. Hit 0 is always 100. A change from single/flam to roll continues at position 1. Flam main hits stay at 100. `pos` saturation wraps 255 → 16 (256 mod 60), keeping the phase for cycles 2..5. |
+| `filesystem.c` | `settings.cfg` keys `perf_vel_lt`/`perf_vel_rt` (cases 24/25, defaults 0, parser keys); terminator case 26 → `lines=26`. A RECORDING_PAGE edit already marks settings dirty. |
+| Specs | MIDI_SPEC: §4.3, §5.2 (global Morph sets FX Morph, never recorded), §5.3 rewritten (CC2 sets the BAR overlay; C-9 retired), §10 RAM, §11, the as-built row. MODULE_INTERCHANGE_SPEC: overlay entry points, MidiNotes row, RECORDING_PAGE row, settings keys, overlay table fields. FILESYSTEM_SPEC: 26 lines + `lines=26`. STORAGE_SRAM_MANIFEST: −1 B entry. MEMORY.md: CC2, global Morph and SHIFT+REC notes. |
+
+§16.3 check 6 now expects 26 data lines and `lines=26`.
+
+### 17.3 Gates
+
+| Gate | Result |
+|------|--------|
+| `make all`, `make img` | PASS. No new warnings. Rebuilt units show the older `PatternData.c:201` and `EuklidGenerator.c:54` warnings, recompiled because of the `ParameterArray.h` edit. |
+| Link | `text=608,744`, `data=424`, `bss=430,112`. Text is +320 B versus §16; bss is unchanged (−1 B absorbed by padding). |
+| Host test | `PASS (0 failures)`. |
+
+### 17.4 Hardware checks
+
+1. **FX Morph follows global Morph.**
+   - Steps: on an Effect with a Morph image, turn PERF `mrp` (and send CC1
+     on G).
+   - Expect: the Effect sound and `fxm` follow. With `fxm` automation in
+     the Pattern, `mrp` still moves FX Morph until the next `fxm` step.
+   - Steps: record with REC latched.
+   - Expect: no `fxm` (and no `1vm`..`6vm`) lane is written by `mrp`.
+2. **CC2.**
+   - Steps: in PERF, send CC2 = 1, then 2, then 0 on G.
+   - Expect: the BAR `<` LED, then `>`, then neither. VOICE buttons fire the
+     overlay and MIDI notes perform it.
+   - Steps: press BAR after a CC2.
+   - Expect: the last action wins.
+   - Steps: send CC2 on a non-G channel.
+   - Expect: it is ignored and forwarded.
+   - Steps: send CC2 outside PERF, then enter PERF.
+   - Expect: the LEDs show the state. While the looper is engaged, the LEDs
+     stay the looper's.
+3. **`pv<`/`pv>`.**
+   - Steps: SHIFT+REC, page 2.
+   - Expect: `pv< pv> qnt rtk`.
+   - Steps: set `pb<` = `r16`, `pv<` = `1-2`, and hold a VOICE in PERF with
+     `<` on.
+   - Expect: roll velocities alternate 100 and 50. `1+3` gives 100, 127, 127.
+   - Steps: MIDI-held rolls.
+   - Expect: they use it too.
+   - Steps: reboot.
+   - Expect: `pv<`/`pv>` survive (`settings.cfg` has `perf_vel_lt/rt` and
+     `lines=26`).

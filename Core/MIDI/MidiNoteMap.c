@@ -21,6 +21,9 @@
 #include "SceneData.h"
 _Static_assert(MIDI_NOTEMAP_ROOT_INTERNAL == MIDI_DEFAULT_TRIGGER_NOTE,
                "note map root must be the default trigger note");
+_Static_assert(MIDI_NOTEMAP_CHANNEL_OFF == MIDI_TRACK_CHANNEL_OFF &&
+               MIDI_NOTEMAP_NOTE_OFF == MIDI_TRACK_NOTE_OFF,
+               "note map off values must match MidiDefs.h");
 #endif
 
 /* Contracts in MidiNoteMap.h. */
@@ -32,9 +35,41 @@ uint8_t midiNoteMap_effectiveChannel(const midiNoteMap_settings_t *s,
 	if (!s || track >= MIDI_NOTEMAP_TRACKS)
 		return 0u;
 	ch = s->channel[track];
+	/* S083 follow-up: `off` = no channel (not G); other bytes above 16 are
+	** treated as `glb`. */
+	if (ch == MIDI_NOTEMAP_CHANNEL_OFF)
+		return 0u;
 	if (ch > 16u)
 		ch = 0u;
 	return (ch != 0u) ? ch : ((s->global <= 16u) ? s->global : 0u);
+}
+
+/*
+ * Tracks that take part in the note map on `channel` (S083 follow-up,
+ * user 2026-10-22: track `nte off`).
+ *
+ * What: midiNoteMap_tracksOnChannel() minus the tracks whose note byte is
+ * `off` (MIDI_NOTEMAP_NOTE_OFF; any byte above 127 is treated the same).
+ * Why: `nte off` must take a track out of the note map only. It neither
+ * receives nor sends notes, and it does not use up a stripe or split
+ * position, so the remaining tracks on the channel map as if it were not
+ * there. Its channel still counts for CC1/NRPN/Learn/PC, which use
+ * midiNoteMap_tracksOnChannel() directly. Inputs: settings, channel 1..16.
+ * Output: track bit mask (0 for an invalid channel). Accessors:
+ * midiNoteMap_resolve() (RX), midiNoteMap_inverse() (TX). Host test:
+ * tools/midi_test/notemap_test.c (`nte off` cases and invariant).
+ */
+static uint8_t midiNoteMap_noteTracksOnChannel(const midiNoteMap_settings_t *s,
+                                               uint8_t channel)
+{
+	uint8_t set = midiNoteMap_tracksOnChannel(s, channel);
+	uint8_t t;
+
+	for (t = 0u; t < MIDI_NOTEMAP_TRACKS; t++) {
+		if (s->note[t] > 127u)
+			set &= (uint8_t)~(1u << t);
+	}
+	return set;
 }
 
 uint8_t midiNoteMap_tracksOnChannel(const midiNoteMap_settings_t *s,
@@ -102,7 +137,7 @@ uint8_t midiNoteMap_resolve(const midiNoteMap_settings_t *s, uint8_t channel,
 
 	if (!s || !track || !internal || note > 127u)
 		return 0u;
-	set = midiNoteMap_tracksOnChannel(s, channel);
+	set = midiNoteMap_noteTracksOnChannel(s, channel);
 	if (set == 0u)
 		return 0u;
 	/* Rule 1: the assigned track with the greatest root <= note; on equal
@@ -184,9 +219,9 @@ uint8_t midiNoteMap_inverse(const midiNoteMap_settings_t *s, uint8_t track,
 	    internal < MIDI_NOTEMAP_ROOT_INTERNAL || internal > 127u)
 		return 0u;
 	ch = midiNoteMap_effectiveChannel(s, track);
-	if (ch == 0u)
-		return 0u;
-	set = midiNoteMap_tracksOnChannel(s, ch);
+	if (ch == 0u || s->note[track] > 127u)
+		return 0u;	/* no channel, or note `off`: never sent */
+	set = midiNoteMap_noteTracksOnChannel(s, ch);
 	if (s->note[track] != 0u) {
 		candidate = (uint16_t)(s->note[track] +
 		                       (internal - MIDI_NOTEMAP_ROOT_INTERNAL));

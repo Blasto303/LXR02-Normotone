@@ -36,7 +36,10 @@
  *  3. one voice per note; 4. internal notes clamp at 127 (+64).
  * A track's effective channel is its own channel, else G; a track set
  * explicitly to G's number follows the G rules; with G off unassigned
- * tracks have no channel.
+ * tracks have no channel. S083 follow-up (user 2026-10-22): a track whose
+ * channel is `off` has no channel at all; a track whose note is `off` keeps
+ * its channel (for CC/NRPN/PC) but takes no part in the note map, so it
+ * receives no notes and sends none.
  * Why: N1-N5. Stateless and table-free: at most seven tracks per lookup,
  * no RAM. The pure functions take a settings snapshot, so the host test
  * (tools/midi_test/) links this file alone (MIDI_NOTEMAP_HOST_TEST).
@@ -49,11 +52,16 @@
 /* Internal note for the voice's default pitch (= MIDI_DEFAULT_TRIGGER_NOTE). */
 #define MIDI_NOTEMAP_ROOT_INTERNAL  63u
 #define MIDI_NOTEMAP_TRACKS         7u
+/* Stored `off` values (= MIDI_TRACK_CHANNEL_OFF / MIDI_TRACK_NOTE_OFF in
+** MidiDefs.h; repeated here so the host test needs no firmware header). */
+#define MIDI_NOTEMAP_CHANNEL_OFF    17u
+#define MIDI_NOTEMAP_NOTE_OFF       128u
 
 /*
  * One Scene's note-map inputs (stack only, 15 B).
- * global: G 0..16 (0 off). channel[t]: 0 unassigned or 1..16.
- * note[t]: 0 unassigned or 1..127 (MIDI note 0 cannot be a root).
+ * global: G 0..16 (0 off). channel[t]: 0 unassigned (`glb`), 1..16, or
+ * MIDI_NOTEMAP_CHANNEL_OFF (`off`). note[t]: 0 unassigned (`on`), 1..127
+ * root (MIDI note 0 cannot be a root), or MIDI_NOTEMAP_NOTE_OFF (`off`).
  */
 typedef struct {
 	uint8_t global;
@@ -61,10 +69,13 @@ typedef struct {
 	uint8_t note[MIDI_NOTEMAP_TRACKS];
 } midiNoteMap_settings_t;
 
-/* Effective channel of track t: own channel, else G; 0 = none. */
+/* Effective channel of track t: own channel, else G; 0 = none (also for a
+** track whose channel is `off`). */
 uint8_t midiNoteMap_effectiveChannel(const midiNoteMap_settings_t *s,
                                      uint8_t track);
-/* Bit t set for every track whose effective channel is `channel` (1..16). */
+/* Bit t set for every track whose effective channel is `channel` (1..16).
+** Includes tracks whose note is `off`: their channel still carries
+** CC/NRPN/PC. The note functions below exclude them. */
 uint8_t midiNoteMap_tracksOnChannel(const midiNoteMap_settings_t *s,
                                     uint8_t channel);
 /*
@@ -78,7 +89,8 @@ uint8_t midiNoteMap_resolve(const midiNoteMap_settings_t *s, uint8_t channel,
  * Transmit: (track, internal note) -> (channel, note) such that resolve()
  * returns the same track and internal note. Output: 0 when no such note
  * exists (stripe pitch other than default, below the default pitch, past
- * the range end, a tie loser, no channel): nothing is sent (S083 Q4).
+ * the range end, a tie loser, no channel, note `off`): nothing is sent
+ * (S083 Q4).
  */
 uint8_t midiNoteMap_inverse(const midiNoteMap_settings_t *s, uint8_t track,
                             uint8_t internal, uint8_t *channel, uint8_t *note);

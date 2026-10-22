@@ -125,27 +125,28 @@ void    buttonHandler_clearAllMutes(void);
 /*
  * Overlay executor entry points for MIDI notes (S083 Q5, N6, C8).
  *
- * buttonHandler_overlayHeldBar(): 1/2 while the BAR </> overlay is active
- * in PERF, else 0. MidiNotes gives an active BAR priority over CC2 (C-9);
- * when the BAR overlay turns off, MIDI-held entries switch to the CC2
- * overlay rather than stopping (S083 assessment F-3).
+ * buttonHandler_overlayActive(): the one overlay state, 0 off, 1 BAR `<`,
+ * 2 BAR `>`, in any mode. Set by the BAR presses in PERF and by CC2 on G
+ * (S083 follow-up; the earlier separate CC2 state and the BAR-over-CC2
+ * priority C-9/F-3 are retired). MidiNotes uses it for every note-on.
+ * buttonHandler_setOverlay(): CC2 on G: set the overlay exactly like a BAR
+ * press (state, BAR LEDs in PERF unless the looper owns them, held entries
+ * re-configured).
  * buttonHandler_overlayMidiNoteOn(): start overlay `which` (1/2) on `track`
  * at `internal` pitch; `midiNote` is remembered so its note-off ends a
  * roll; ageUs is the arrival age for the first hit's record placement.
  * buttonHandler_overlayMidiNoteOff(): end the roll held by `midiNote`
  * (the resolved track first, then any track holding that note); a flam's
  * main hit still plays.
- * buttonHandler_overlayMidiActionChanged(): CC2 changed to `which`;
- * re-configures MIDI-held entries unless a BAR overlay is active.
  * Context: foreground. Accessor: MidiNotes.c. Affiliates: the per-track
  * overlay table, LiveRecord.
  */
-uint8_t buttonHandler_overlayHeldBar(void);
+uint8_t buttonHandler_overlayActive(void);
+void    buttonHandler_setOverlay(uint8_t which);
 void    buttonHandler_overlayMidiNoteOn(uint8_t track, uint8_t which,
                                         uint8_t internal, uint8_t midiNote,
                                         uint16_t ageUs);
 void    buttonHandler_overlayMidiNoteOff(uint8_t track, uint8_t midiNote);
-void    buttonHandler_overlayMidiActionChanged(uint8_t which);
 /* S083 C5: flash SHIFT/PLAY/REC while Learn is active; restore on off. */
 void    buttonHandler_setLearnLeds(uint8_t on);
 /*

@@ -4425,11 +4425,13 @@ static uint8_t preset_interpolate(uint8_t a, uint8_t b, uint8_t x)
 void preset_morph(uint8_t morph)
 {
     /*
-     * Set overall Scene Morph by writing all per-voice Morph amounts.
+     * Set overall Scene Morph by writing all per-voice Morph amounts and the
+     * Effect Morph (S083 follow-up: global Morph sets all Morph).
      *
      * Inputs: user-facing 0..255 Morph amount from PERF, global MIDI CC1, or
-     * Scene-load fallback. Outputs: the Scene global mirror and all six
-     * per-slot Morph amounts are retained, flat PERF menu mirrors are updated,
+     * Scene-load fallback. Outputs: the Scene global mirror, all six
+     * per-slot Morph amounts and the Effect Morph are retained, flat PERF menu
+     * mirrors (`fxm` included) are updated,
      * and the Morph worker is queued for every instrument slot. Runtime Morph
      * is still per voice; this function is only the bulk-set operation that
      * gives the user one overall control.
@@ -4445,8 +4447,9 @@ void preset_morphScene(uint8_t scene_index, uint8_t morph)
      * Set overall Morph for a specific resident Scene.
      *
      * Inputs: Scene index from active UI, MIDI, or scene_mask_voice_edit fan-
-     * out and 0..255 Morph amount. Outputs: retained Scene global Morph and
-     * all six per-voice Morph amounts update. Runtime/PERF mirrors are updated
+     * out and 0..255 Morph amount. Outputs: retained Scene global Morph,
+     * all six per-voice Morph amounts and the Effect Morph (applied as an
+     * `fxm` menu edit, S083 follow-up) update. Nothing is recorded. Runtime/PERF mirrors are updated
      * only for the active Scene, because inactive Scenes are stored state until
      * selected. The overall value and each per-voice value use SceneData's
      * change-aware owner setters, so retained storage precedes exact dirty bits
@@ -4458,8 +4461,16 @@ void preset_morphScene(uint8_t scene_index, uint8_t morph)
         return;
     scene_setMorphAmount(scene_index, morph);
     scene_setAllVoiceMorphAmounts(scene_index, morph);
-    /* Global Morph also owns the retained Scene Effect Morph amount. */
-    scene_setEffectMorphAmount(scene_index, morph);
+    /*
+     * Global Morph sets all Morph, the Effect Morph included (S083
+     * follow-up). Before, only the retained byte was written: a Pattern
+     * `fxm` override or an Effect-page menu hold kept the old amount
+     * sounding and the `fxm` mirror stayed stale, so FX Morph did not
+     * follow. effects_setMorphAmountFromGlobal() applies it as an `fxm`
+     * menu edit of this one Scene (Rule A override clear, menuHoldMorph on
+     * the active Scene), never recorded, like the per-voice amounts below.
+     */
+    (void)effects_setMorphAmountFromGlobal(scene_index, morph);
     /*
      * S076 Rule A: bulk Morph set from PERF / global MIDI CC1 supersedes
      * every active step-automation Morph override. Each slot is cleared
@@ -4477,6 +4488,7 @@ void preset_morphScene(uint8_t scene_index, uint8_t morph)
     }
     if (scene_index == scene_getActiveIndex()) {
         preset_syncSceneMorphMirrors(scene);
+        preset_syncEffectMorphMirror();	/* PERF/Effect `fxm` display */
         presetMorph_requestAll(scene_index);
     }
 }

@@ -1299,7 +1299,7 @@ are superseded by `knowledge_files/log_archive/052_SESSION_HANDOFF_LOG.md`.
     │   ├── MidiNoteMap.c/h          ← N1-N5 note map and Q4 TX inverse
     │   ├── MidiNotes.c/h            ← triggers, overlays, CC2, LiveRecord age
     │   ├── MidiControl.c/h          ← NRPN, CC1, value rules, menu-edit writes
-    │   ├── MidiLearn.c/h            ← 128-row Learn table, gesture, settings.cfg lines
+    │   ├── MidiLearn.c/h            ← 128-row Learn table, gesture, midilrn.cfg lines
     │   ├── MidiProgram.c/h          ← PC and CC0
     │   ├── MidiOut.c/h              ← all TX, forwarding, framing, no echo
     │   ├── MidiPitch.h              ← default note 63, frequency table, detune
@@ -1896,6 +1896,14 @@ sequencerTimer_init(); // TIM3 4kHz sequencer owner — AFTER audioCodec_init()
   transmitted only when the inverse lands on the same track and pitch (Q4).
   Default internal note 63 is the default pitch for stripe hits, overlay
   `def` and preview (C-1).
+- **Track `ch`/`nte` lists (user, 2026-10-22) — binding:** the STEP track
+  settings second page is `ch nte lop rmp`. Track `ch` = `off`, `glb`,
+  1..16; track `nte` = `off`, `on` (default; was `def`), notes; `nte` has
+  category Track. Menu order is off first; the Scene stores `ch` 0 glb,
+  1..16, 17 off and `nte` 0 on, 1..127, 128 off (`MIDI_TRACK_*_OFF`), and
+  menu.c converts. `ch off` = no MIDI channel at all; `nte off` = no notes
+  in or out, channel kept for CC/NRPN/PC. The automation ramp cell is
+  labelled `rmp` / category `Automtn` / long name `Ramp` (was `asm`).
 - **A MIDI parameter write is a menu edit (Q1).** `MidiControl` calls
   `menu_commitTargetEdit()`: Normal image, R12/R13 and Scene-target clears,
   edit-mask fan-out, LiveRecord in LATCH/OVERDUB, target-ID LCD repaint. It
@@ -1903,13 +1911,26 @@ sequencerTimer_init(); // TIM3 4kHz sequencer owner — AFTER audioCodec_init()
 - **CC1:** on G it is global Morph through `menu_commitGlobalMorphFromMidi()`
   (fan-out, never recorded, G-1); on a voice channel it is that voice's Morph
   and is recorded.
-- **CC2** (note action: 0 single, 1 BAR <, 2 BAR >) is G-only; a held BAR in
-  PERF wins over CC2. **CC0** on G requests the S082 background Bank load
+- **CC2** (0 off/single, 1 BAR <, 2 BAR >) is G-only and sets the PERF BAR
+  overlay itself, like a BAR press: LEDs follow in PERF, panel and MIDI
+  notes share the one state, and the last BAR press or CC2 wins.
+- **Global Morph** (`mrp`, CC1 on G) sets all Morph, the Effect Morph
+  included (as an `fxm` menu edit). It is never recorded.
+- **SHIFT+REC:** page 2 is `pv< pv> qnt rtk`. `pv<`/`pv>` set the overlay
+  roll velocity rhythm, using the step `rtm` list
+  (`settings.cfg` `perf_vel_lt/rt`, `lines=26`). **CC0** on G requests the S082 background Bank load
   under RXF P. **PC** 0..15 on G is a whole-Scene change; on a voice channel
   it moves that channel's tracks. PC/CC0 are dropped during a Bank load.
-- **MIDI Learn** is global, 128 type-tagged rows in `settings.cfg`
-  (`learn=` lines after the 24 fixed lines, `lines=24+N`). Gesture:
-  SHIFT+PLAY+REC; `LRN`/`FUL`; one parameter has at most one CC.
+- **MIDI Learn** is global: 128 type-tagged rows in the root file
+  `midilrn.cfg`, not `settings.cfg` (26 lines, `lines=26`).
+  - The file has a `format=helicase.midilearn`/`version=1` header, then
+    `learn=` rows, then `lines=2+N`.
+  - Every stored Learn rewrites it at once with the safe method
+    (`midilrn.tmp`, sync, remove, rename). The write waits for an idle
+    facade, and a Learn made during a write queues one more.
+  - Boot loads it right after `settings.cfg`, with `.tmp` recovery.
+  - Trace stage `m`.
+  - Gesture: SHIFT+PLAY+REC; `LRN`/`FUL`; one parameter has at most one CC.
 - **Arrival time** is carried in `MidiMsg.stamp` (low 16 bits of TIM2 µs) and
   used only for live-record placement (`liveRec_trigger_t.age_us`, clamped to
   `MIDI_ARRIVAL_MAX_AGE_US`).

@@ -228,7 +228,13 @@ uint8_t midiLearn_captureCc(uint8_t channel, uint8_t cc)
 	midiLearn_table[row].space = space;
 	midiLearn_table[row].type = type;
 	midiLearn_table[row].index = index;
-	filesystem_markSettingsDirty();	/* normal debounced settings write */
+	/*
+	 * S083 §16: every stored or replaced row rewrites midilrn.cfg in full
+	 * (no debounce; the writer waits for an idle facade and writes once
+	 * more if a row arrives during a write). A FUL refusal above writes
+	 * nothing.
+	 */
+	filesystem_requestMidiLearnWrite();
 	midiLearn_end();
 	return 1u;
 }
@@ -294,7 +300,7 @@ static uint16_t midiLearn_append(char *dst, uint16_t cap, uint16_t pos,
 }
 
 /* Contract in MidiLearn.h. */
-uint8_t midiLearn_formatSettingsLine(uint8_t index, char *dst, uint16_t cap)
+uint8_t midiLearn_formatFileLine(uint8_t index, char *dst, uint16_t cap)
 {
 	const midiLearn_entry_t *e;
 	const char *space = 0;
@@ -353,13 +359,17 @@ uint8_t midiLearn_formatSettingsLine(uint8_t index, char *dst, uint16_t cap)
 		if ((uint16_t)(pos + 2u) <= cap && key[0] != '\0') {
 			dst[pos++] = '\n';
 			dst[pos] = '\0';
-			return 1u;
+			/*
+			 * The line LENGTH: filesystem_writeTextLine() writes exactly
+			 * this many bytes (S083 §16 fix; returning 1 wrote only "l").
+			 */
+			return (uint8_t)pos;
 		}
 	}
 	/* Unresolvable or too long: a comment line keeps `lines=` exact. */
 	pos = midiLearn_append(dst, cap, 0u, "# learn row unresolved\n", 24u);
 	dst[pos] = '\0';
-	return 1u;
+	return (uint8_t)pos;
 }
 
 /*
@@ -367,7 +377,7 @@ uint8_t midiLearn_formatSettingsLine(uint8_t index, char *dst, uint16_t cap)
  * in a local copy; resolve names to indices once (F34). Duplicate keys:
  * the later line replaces the earlier row (one parameter -> one CC).
  */
-uint8_t midiLearn_parseSettingsValue(const char *value)
+uint8_t midiLearn_parseFileValue(const char *value)
 {
 	char buf[64];
 	char *field[5];

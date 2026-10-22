@@ -68,6 +68,8 @@ BOOT_CODES = {
                  "root Bank directory load"),
     "GLOBLOAD": ("filesystem_loadGlobals_tick",
                  "root settings.cfg load"),
+    "MLRNLOAD": ("filesystem_loadMidiLearn_tick",
+                 "root midilrn.cfg (MIDI Learn) load + midilrn.tmp recovery"),
     "KITSCAN ": ("filesystem_scanKits_tick",
                  "/Kit directory scan"),
     "SCNSCAN ": ("filesystem_scanScenes_tick",
@@ -127,6 +129,8 @@ STAGE_ENUM = {
     "b": "AUTOSAVE_TRACE_STAGE_BANK_PREVIEW",
     # h: S082 review F5 HCNAMES provenance and Load/Save pot-drop evidence.
     "h": "AUTOSAVE_TRACE_STAGE_HCNAMES_PROVENANCE",
+    # m: S083 midilrn.cfg (MIDI Learn table) writes and boot recovery.
+    "m": "AUTOSAVE_TRACE_STAGE_MIDI_LEARN_FILE",
 }
 
 STAGE_PRODUCER = {
@@ -166,6 +170,8 @@ STAGE_PRODUCER = {
     "c": "Core/Menu/CopyClear/* and filesystem suspension/loan witnesses",
     "b": "filesystem_scanBankScenes_tick() probe completion",
     "h": "filesystem HCNAMES register / Menu Load/Save (S082 review F5)",
+    "m": "filesystem_midiLearnWriterCompleted() / "
+         "filesystem_loadMidiLearn_tick() (S083)",
 }
 
 # AUTOSAVE_TRACE_PHASE_STALL_SITE_* (AutosaveTrace.h). Session 057 widened the
@@ -248,6 +254,7 @@ FS_INTERNAL_OPS = [
     "FS_INTERNAL_OP_ENSURE_AUTOSAVE_FILES",
     "FS_INTERNAL_OP_AUTOSAVE_PARAMETER_DRAIN",
     "FS_INTERNAL_OP_AUTOSAVE_TRACE_FLUSH",
+    "FS_INTERNAL_OP_PATTERN_TRACE_FLUSH",
     "FS_INTERNAL_OP_AUTOSAVE_PATTERN_DRAIN",
     "FS_INTERNAL_OP_VALIDATE_AUTOSAVE_WINNER",
     "FS_INTERNAL_OP_REGENERATE_HCNAMES_FROM_WINNER",
@@ -290,6 +297,8 @@ FS_INTERNAL_OPS = [
     "FS_INTERNAL_OP_LOAD_NAME",
     "FS_INTERNAL_OP_LOAD_INDEX",
     "FS_INTERNAL_OP_LOAD_LIBRARY_INDEX",
+    "FS_INTERNAL_OP_LOAD_MIDILEARN",
+    "FS_INTERNAL_OP_SAVE_MIDILEARN",
 ]
 # NOTE: keep this list in sync with the fs_internal_op_t enum in
 # filesystem.c by hand -- there is no automatic extraction here. If a
@@ -985,6 +994,31 @@ def trace_record_text(index: int, stage: int, flags: int, tick: int,
             detail = (f"{enum_name}: POT_DROPPED knob={value & 0xFF} "
                       f"what={(value >> 8) & 0xFF} page={(value >> 16) & 0xFF} "
                       f"storageBusy={(value >> 24) & 0xFF}")
+        else:
+            detail = f"{enum_name}: unknown event 0x{flags:02x}"
+    elif ch == "m":
+        if flags == 0x01:
+            after = (value >> 16) & 0xFF
+            detail = (f"{enum_name}: WRITE midilrn.cfg rows={value & 0xFF} "
+                      f"{'FAILED' if (value >> 8) & 0xFF else 'ok'} "
+                      f"pending={after & 1} retried={(after >> 1) & 1}")
+        elif flags == 0x02:
+            outcomes = {1: "promoted", 2: "discarded (invalid)",
+                        3: "promote remove failed (tmp kept)",
+                        4: "promote rename failed (tmp kept)"}
+            outcome = value & 0xFF
+            detail = (f"{enum_name}: RECOVERY midilrn.tmp "
+                      f"{outcomes.get(outcome, f'outcome {outcome}')}, "
+                      f"lines={(value >> 8) & 0xFF} N={(value >> 16) & 0xFF} "
+                      f"terminator_seen={(value >> 24) & 0xFF}")
+        elif flags == 0x03:
+            results = {0: "ok", 1: "bad format/version (emptied)",
+                       2: "read error (partial)"}
+            result = (value >> 16) & 0xFF
+            detail = (f"{enum_name}: LOAD midilrn.cfg rows={value & 0xFF} "
+                      f"present={(value >> 8) & 0xFF} "
+                      f"result={results.get(result, result)} "
+                      f"lines={(value >> 24) & 0xFF}")
         else:
             detail = f"{enum_name}: unknown event 0x{flags:02x}"
     else:

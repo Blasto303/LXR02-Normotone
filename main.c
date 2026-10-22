@@ -717,6 +717,26 @@ int main(void)
                 parameter_values[PAR_AUTOSAVE_ENABLED]);
 
             /*
+             * Load the MIDI Learn table from midilrn.cfg (S083 §16).
+             *
+             * Inputs: mounted card, settings already applied. Output: the
+             * Learn table, after a leftover midilrn.tmp is promoted or
+             * discarded. A missing file is an empty table and a bad file
+             * never fails boot (the op always completes DONE). Why here:
+             * pre-audio, so the blocking poll is allowed, and before any
+             * MIDI input can apply a learned CC. Affiliates:
+             * filesystem_requestLoadMidiLearn(), filesystem_loadMidiLearn_tick().
+             */
+            if (filesystem_requestLoadMidiLearn(NULL)) {
+                while (filesystem_status() == FS_STATUS_BUSY &&
+                       !filesystem_bootLoggingTimedOut())
+                    filesystem_tick();
+                if (filesystem_bootLoggingTimedOut())
+                    goto boot_filesystem_timeout;
+                filesystem_ack();
+            }
+
+            /*
              * (The root-level `.hcindex` boot marker generation has been moved
              * to run after the Instrument scan so it can write the cache).
              */

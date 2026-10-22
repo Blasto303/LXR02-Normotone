@@ -252,7 +252,36 @@ typedef enum {
      * Consumer: tools/decode_devlogs.py ('h' branch).
      */
     AUTOSAVE_TRACE_STAGE_HCNAMES_PROVENANCE = 'h',
+    /*
+     * m: midilrn.cfg (MIDI Learn table file) writes and boot recovery
+     * (S083 §16).
+     *
+     * What: flags selects the event (AUTOSAVE_TRACE_MLRN_*):
+     *   0x01 WRITE: one autonomous midilrn.cfg write finished.
+     *        value32 = rows | failed << 8 | request flags after << 16
+     *        (bit 0 PENDING = another write queued, bit 1 RETRIED).
+     *   0x02 RECOVERY: a leftover midilrn.tmp was resolved at boot.
+     *        value32 = outcome | lines << 8 | terminator N << 16 |
+     *        terminator seen << 24; outcome 1 promoted, 2 discarded
+     *        (invalid), 3 promote remove failed (tmp kept), 4 promote
+     *        rename failed (tmp kept).
+     *   0x03 LOAD: the boot load finished. value32 = rows | present << 8 |
+     *        result << 16 | lines read << 24 (saturated 255); result 0 OK,
+     *        1 wrong format/version (table emptied), 2 read error (rows
+     *        read so far kept).
+     * Why: Learn persistence is autonomous and silent; hardware tests need
+     * a witness that each Learn reached the card and what boot restored.
+     * DEV logging only; no product state depends on these records.
+     * Producers: filesystem_midiLearnWriterCompleted(),
+     * filesystem_loadMidiLearn_tick(). Consumer: tools/decode_devlogs.py
+     * ('m' branch).
+     */
+    AUTOSAVE_TRACE_STAGE_MIDI_LEARN_FILE = 'm',
 } autosave_trace_stage_t;
+
+#define AUTOSAVE_TRACE_MLRN_WRITE    0x01u
+#define AUTOSAVE_TRACE_MLRN_RECOVERY 0x02u
+#define AUTOSAVE_TRACE_MLRN_LOAD     0x03u
 
 #define AUTOSAVE_TRACE_HCN_REFRESHED_RESET        0x01u
 #define AUTOSAVE_TRACE_HCN_WRITE_UNKNOWN_REFRESHED 0x02u

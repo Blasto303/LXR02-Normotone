@@ -312,6 +312,23 @@ uint8_t effects_setSeqRunMode(uint8_t scene_index, uint8_t mode);
 uint8_t effects_setSeqLength(uint8_t scene_index, uint8_t length);
 uint8_t effects_setSeqStepScale(uint8_t scene_index, uint8_t scale);
 uint8_t effects_setMorphAmount(uint8_t scene_index, uint8_t amount);
+/*
+ * Effect Morph from the global Morph (S083 follow-up, "global Morph sets
+ * all Morph").
+ *
+ * What: writes ONE Scene's retained Effect Morph amount with the same
+ * menu-edit semantics as an `fxm` edit: the Pattern `fxm` override is
+ * cleared (S076 Rule A) and, on the active Scene, menuHoldMorph keeps the
+ * new amount sounding over an FX Morph lock until the next Morph
+ * automation (S081 §5.3). No fan-out: the caller, preset_morphScene(),
+ * already runs once per edit-mask Scene. Never records (global Morph is
+ * never recorded, G-1; the per-voice Morph writes of the same gesture are
+ * not recorded either). Inputs: Scene index, 0..255 amount. Output: 1 if
+ * the retained amount changed. Callers: preset_morphScene() (PERF `mrp`,
+ * MIDI CC1 on G). Affiliates: effects_setMorphAmount() (the `fxm` page edit
+ * with its own fan-out), preset_syncEffectMorphMirror().
+ */
+uint8_t effects_setMorphAmountFromGlobal(uint8_t scene_index, uint8_t amount);
 
 /*
  * Live FX-sequencer state and lock API (Session 072 step 8; plan §11/§13.4).

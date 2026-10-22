@@ -380,6 +380,20 @@ the copy/clear stage records aggregate job statistics instead.
   parse/finalize, 6 Instrument member file (sub = slot), 7 Scene storage
   missing, 9 other loader (sub = row index). The plain Case-3 record never
   carried the source (its "source" field was always zero).
+- **`m` (`AUTOSAVE_TRACE_STAGE_MIDI_LEARN_FILE`, S083)**: `midilrn.cfg`
+  (the MIDI Learn table file) writes and boot recovery. `flags` selects the
+  event:
+
+  | Code | Producer | Fires when | value |
+  |------|----------|------------|-------|
+  | 0x01 WRITE | `filesystem_midiLearnWriterCompleted()` | an autonomous `midilrn.cfg` write ends | rows, failed << 8, request flags after << 16 (bit 0 PENDING = one more write queued, bit 1 RETRIED) |
+  | 0x02 RECOVERY | `filesystem_loadMidiLearn_tick()` | a leftover `midilrn.tmp` is resolved at boot | outcome (1 promoted, 2 discarded, 3 promote remove failed, 4 promote rename failed), lines << 8, N << 16, terminator seen << 24 |
+  | 0x03 LOAD | `filesystem_loadMidiLearn_tick()` | the boot load ends | rows, present << 8, result << 16 (0 ok, 1 bad format/version = emptied, 2 read error = partial), lines read << 24 |
+
+  A failed write also leaves the usual `E` record (op
+  `FS_INTERNAL_OP_SAVE_MIDILEARN`). A Learn that never produces a WRITE
+  record was refused (`FUL`) or never left the RAM ring (power-off before
+  the next trace flush).
 - **`L` per whole Scene (S082 P2):** a whole-Scene AutoSave mark now emits one
   `L` and no per-byte `D` or nested `I` records, so a Bank Load completion
   produces one `L` per loaded Scene instead of about 1,400 `D` each.
@@ -577,6 +591,7 @@ delta when disabled: -840 bytes text, -56 bytes BSS.
 | Scene Load | `filesystem_loadSceneDirectory_tick()` | 20,000 polls | `ScLd` | Abort (added Session 057) |
 | Bank Load entry | `filesystem_loadBankDirectory_tick()` | 20,000 polls | `BkLd` | Abort (added Session 057) |
 | Settings write | `filesystem_saveGlobals_tick()` | 30,000 polls | `StWr` | Abort (added Session 057) |
+| MIDI Learn write (site 8, shared with Settings; the two writers never overlap) | `filesystem_saveMidiLearn_tick()` | 30,000 polls | `MlWr` | Abort (S083) |
 | Flush Finish | `filesystem_flushFinish_tick()` | 50,000 polls | `Flsh` | Abort (added Session 057) — shared completion gate for every successful operation |
 | Bank child preview (site 10, `AUTOSAVE_TRACE_PHASE_STALL_SITE_BANK_PREVIEW`) | `filesystem_scanBankScenes_tick()` | 20,000 polls | `BkPv` | Abort (S082 F4): closes the preview's directory/file handles, returns to root and finishes ERROR, so a wedged probe never holds the facade. Observer storage 5 B, DEV only. |
 

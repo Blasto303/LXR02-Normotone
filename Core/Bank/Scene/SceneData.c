@@ -289,17 +289,18 @@ void scene_setTrackMidiChannel(uint8_t scene_index, uint8_t track,
 {
     scene_t *scene = scene_get(scene_index);
     /*
-     * Store a track MIDI channel in Scene settings (S083: 0 = unassigned).
+     * Store a track MIDI channel in Scene settings (S083).
      *
-     * Inputs: Scene index, track, channel 0..16 (0 = `glb`: the track
-     * follows G). Values above 16 clamp to 16. Output: a changed byte marks
-     * the track's AutoSave Scene cell. Affiliates: scene_storeParameterByte(),
+     * Inputs: Scene index, track, channel 0..17: 0 = `glb` (the track
+     * follows G), 1..16, MIDI_TRACK_CHANNEL_OFF (17) = `off` (no MIDI
+     * channel at all; S083 follow-up). Values above 17 clamp to `off`.
+     * Output: a changed byte marks the track's AutoSave Scene cell. Affiliates: scene_storeParameterByte(),
      * menu_parseGlobalParam(PAR_TRACK_MIDI_CHAN), AutoSave restore.
      */
     if (!scene || track >= NUM_TRACKS)
         return;
-    if (channel > 16u)
-        channel = 16u;
+    if (channel > MIDI_TRACK_CHANNEL_OFF)
+        channel = MIDI_TRACK_CHANNEL_OFF;
     scene_storeParameterByte(
         scene_index, &scene->settings.midi_channel[track],
         (uint8_t)(AUTOSAVE_SCENE_PARAM_MIDI_CHANNEL_BASE + track), channel);
@@ -312,15 +313,16 @@ uint8_t scene_getTrackMidiChannel(uint8_t scene_index, uint8_t track)
     /*
      * Read a track MIDI channel (S083).
      *
-     * Output: 1..16, or 0 when the track is unassigned (it follows G), the
-     * coordinates are invalid, or the byte is out of range. The pre-S083
-     * fallback to track+1 is gone: an unassigned track has no channel of
-     * its own. Accessors: MidiNoteMap loader, MidiOut callers, menu.
+     * Output: 1..16; 0 when the track is unassigned (`glb`, it follows G),
+     * the coordinates are invalid or the byte is out of range;
+     * MIDI_TRACK_CHANNEL_OFF (17) for `off`. The pre-S083 fallback to
+     * track+1 is gone. Accessors: MidiNoteMap loader (maps `off` to "no
+     * channel"), menu (menu-order conversion).
      */
     if (!scene || track >= NUM_TRACKS)
         return 0u;
     channel = scene->settings.midi_channel[track];
-    return (channel <= 16u) ? channel : 0u;
+    return (channel <= MIDI_TRACK_CHANNEL_OFF) ? channel : 0u;
 }
 
 void scene_setTrackMidiNote(uint8_t scene_index, uint8_t track, uint8_t note)
@@ -338,7 +340,8 @@ void scene_setTrackMidiNote(uint8_t scene_index, uint8_t track, uint8_t note)
      */
     if (!scene || track >= NUM_TRACKS)
         return;
-    normalized_note = (note <= 127u) ? note : 127u;
+    /* S083 follow-up: 0 = `on`, 1..127 root, 128 = `off`; above clamps off. */
+    normalized_note = (note <= MIDI_TRACK_NOTE_OFF) ? note : MIDI_TRACK_NOTE_OFF;
     scene_storeParameterByte(
         scene_index, &scene->settings.midi_note[track],
         (uint8_t)(AUTOSAVE_SCENE_PARAM_MIDI_NOTE_BASE + track),
@@ -351,13 +354,14 @@ uint8_t scene_getTrackMidiNote(uint8_t scene_index, uint8_t track)
     /*
      * Read a track MIDI note from Scene settings.
      *
-     * Inputs: Scene index and track index. Output: stored 0..127 note or 0 for
-     * invalid/stale data. Menu and MIDI callers use this to keep the current
+     * Inputs: Scene index and track index. Output: 0 = `on` (no root; also
+     * for invalid/stale data), 1..127 = root, MIDI_TRACK_NOTE_OFF (128) =
+     * `off` (S083 follow-up). Menu and MIDI callers use this to keep the
      * Scene storage policy centralized.
      */
     if (!scene || track >= NUM_TRACKS)
         return 0u;
-    return (scene->settings.midi_note[track] <= 127u)
+    return (scene->settings.midi_note[track] <= MIDI_TRACK_NOTE_OFF)
         ? scene->settings.midi_note[track]
         : 0u;
 }

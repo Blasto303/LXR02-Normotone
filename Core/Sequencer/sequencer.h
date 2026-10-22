@@ -219,6 +219,19 @@ void seq_refreshTrackEffectiveParams(void);
  */
 void seq_triggerVoice(uint8_t voiceNr, uint8_t vol, uint8_t note, uint8_t reset);
 /*
+ * Roll velocity rhythm rule (S079 §5), shared (S083 follow-up).
+ *
+ * What: the velocity of roll hit `pos` (0 = the first hit) under the packed
+ * rhythm byte (bits 7..4 cycle, bit 3 0 halve / 1 double, bits 2..0 full
+ * count): inside the full-count window `vel`, beyond it vel/2 (floor 1) or
+ * vel*2 (clamp 127). 0x00 and any full > cycle are off (always `vel`).
+ * Why: step rolls (step special `rtm`) and the PERF BAR overlay rolls
+ * (`pv<`/`pv>`) must use one rule. Pure, no state. Callers:
+ * seq_rollComputeVelocity() (step rolls, TIM3), buttonHandler's overlay
+ * roll tick (foreground).
+ */
+uint8_t seq_rollRhythmVelocity(uint8_t rhythm, uint8_t vel, uint8_t pos);
+/*
  * Stopped-transport voice preview.
  *
  * Why: front-panel VOICE re-press audition should use Sequencer's existing
@@ -332,19 +345,19 @@ void seq_moveTracksToBackgroundScene(uint8_t track_mask);
  * remain queued only for the later Scene-target session. Affiliate: main.c
  * calls this before audio rendering.
  * S081 P2: first ends the ramps of tracks whose next step has applied; each
- * written Instrument entry of an asm track may start a linear ramp toward the
+ * written Instrument entry of an rmp track may start a linear ramp toward the
  * same target on the predicted next step.
  */
 void seq_drainPendingAutomation(void);
 /*
- * Automation ramp service (S081 P2, asm).
+ * Automation ramp service (S081 P2, rmp).
  *
  * What: every call (one per DSP block) ends the ramps of tracks whose next
  * step has applied; every third call (~2.2 ms) writes each running ramp's
  * interpolated 7-bit value, when it differs from the last value written,
  * through the drain's Instrument write path, so
  * ramp samples are held automation values (binding priority rule). Ramps are
- * cancelled, value kept, on asm off, live-record latch/erase, an R12 menu
+ * cancelled, value kept, on rmp off, live-record latch/erase, an R12 menu
  * override or an invalid target. Inputs: the ramp table filled by the drain,
  * TIM3's per-track ramp contexts, the master tick clock. Outputs: runtime
  * Instrument writes, seq_automation_dirty bits. Context: foreground only.
