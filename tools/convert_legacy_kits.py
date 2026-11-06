@@ -52,62 +52,35 @@ LFO_TARGET_VOICE_KEYS = {"lfo_target_voice", "lfo_target_voice_2"}
 
 # Descriptor order is the generic storage index for each instrument type.
 # ParameterArray only allocates slot storage; the firmware's instrument files
-# define what each index means. This Python copy exists only so legacy
-# modTargets[] bytes can be converted into slot*64+descriptor_index references.
-DESCRIPTOR_KEYS = {
-    "DRUM": [
-        "osc1_wave", "osc1_pitch_coarse", "osc1_pitch_fine",
-        "osc2_wave", "osc2_pitch_coarse", "osc2_mod_amount",
-        "osc2_mod_type", "filter_freq", "filter_reso", "filter_drive",
-        "filter_type", "amp_envelope_attack", "amp_envelope_decay",
-        "amp_envelope_slope", "pitch_envelope_decay",
-        "pitch_envelope_amount", "pitch_envelope_slope", "instrument_vol",
-        "instrument_pan", "instrument_drive", "instrument_decimation",
-        "lfo_rate", "lfo_amount", "lfo_wave", "lfo_retrigger_voice",
-        "lfo_sync", "lfo_offset", "velo_vol_on_off", "velo_mod_amount",
-        "velo_mod_dest", "lfo_target_voice", "lfo_target_param",
-        "transient_wave", "transient_vol", "transient_freq",
-    ],
-    "SNARE": [
-        "osc1_wave", "osc1_pitch_coarse", "osc1_pitch_fine",
-        "noise_freq", "osc1_noise_mix", "filter_freq", "filter_reso",
-        "filter_drive", "filter_type", "amp_envelope_attack",
-        "amp_envelope_decay", "amp_envelope_slope", "amp_attack_repeat",
-        "pitch_envelope_decay", "pitch_envelope_amount",
-        "pitch_envelope_slope", "instrument_vol", "instrument_pan",
-        "instrument_drive", "instrument_decimation", "lfo_rate",
-        "lfo_amount", "lfo_wave", "lfo_retrigger_voice", "lfo_sync",
-        "lfo_offset", "velo_vol_on_off", "velo_mod_amount",
-        "velo_mod_dest", "lfo_target_voice", "lfo_target_param",
-        "transient_wave", "transient_vol", "transient_freq",
-    ],
-    "CYMBAL": [
-        "osc1_wave", "osc1_pitch_coarse", "osc1_pitch_fine",
-        "osc2_wave", "osc2_pitch_coarse", "osc2_mod_amount",
-        "osc3_wave", "osc3_pitch_coarse", "osc3_mod_amount",
-        "filter_freq", "filter_reso", "filter_drive", "filter_type",
-        "amp_envelope_attack", "amp_envelope_decay",
-        "amp_envelope_slope", "amp_attack_repeat", "instrument_vol",
-        "instrument_pan", "instrument_drive", "instrument_decimation",
-        "lfo_rate", "lfo_amount", "lfo_wave", "lfo_retrigger_voice",
-        "lfo_sync", "lfo_offset", "velo_vol_on_off", "velo_mod_amount",
-        "velo_mod_dest", "lfo_target_voice", "lfo_target_param",
-        "transient_wave", "transient_vol", "transient_freq",
-    ],
-    "HIHAT": [
-        "osc1_wave", "osc1_pitch_coarse", "osc1_pitch_fine",
-        "osc2_wave", "osc2_pitch_coarse", "osc2_mod_amount",
-        "osc3_wave", "osc3_pitch_coarse", "osc3_mod_amount",
-        "filter_freq", "filter_reso", "filter_drive", "filter_type",
-        "amp_envelope_attack", "amp_envelope_decay",
-        "amp_envelope_decay_choke", "amp_envelope_slope", "instrument_vol",
-        "instrument_pan", "instrument_drive", "instrument_decimation",
-        "lfo_rate", "lfo_amount", "lfo_wave", "lfo_retrigger_voice",
-        "lfo_sync", "lfo_offset", "velo_vol_on_off", "velo_mod_amount",
-        "velo_mod_dest", "lfo_target_voice", "lfo_target_param",
-        "transient_wave", "transient_vol", "transient_freq",
-    ],
+# define what each index means. The order is read from those files so legacy
+# modTargets[] bytes always become current slot*64+descriptor_index references
+# (a hand-kept copy went stale when lfo_amount_2 and lfo_polarity were added).
+DESCRIPTOR_SOURCES = {
+    "DRUM": ROOT / "Core" / "DSP" / "Instruments" / "Drum" / "DrumParameters.c",
+    "SNARE": ROOT / "Core" / "DSP" / "Instruments" / "Snare" / "SnareParameters.c",
+    "CYMBAL": ROOT / "Core" / "DSP" / "Instruments" / "Cymbal" / "CymbalParameters.c",
+    "HIHAT": ROOT / "Core" / "DSP" / "Instruments" / "HiHat" / "HiHatParameters.c",
 }
+DESCRIPTOR_ROW_RE = re.compile(r'^\s*ROW[A-Z_]*\("([^"]+)"')
+
+
+def load_descriptor_keys() -> dict[str, list[str]]:
+    """Return each instrument's descriptor keys in firmware row order."""
+    keys: dict[str, list[str]] = {}
+    for section, path in DESCRIPTOR_SOURCES.items():
+        rows = [
+            match.group(1)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            for match in [DESCRIPTOR_ROW_RE.match(line)]
+            if match
+        ]
+        if not rows:
+            raise RuntimeError(f"no descriptor rows found in {path}")
+        keys[section] = rows
+    return keys
+
+
+DESCRIPTOR_KEYS = load_descriptor_keys()
 
 DEFAULT_PARAM_RENAMES = {
     "DRUM": {
