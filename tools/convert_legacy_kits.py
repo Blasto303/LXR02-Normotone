@@ -47,6 +47,8 @@ INSTRUMENT_RENAME_SECTIONS = {
 
 INSTRUMENT_PARAM_COUNT = 64
 INSTRUMENT_PARAM_INVALID = 0xFFFF
+INSTRUMENT_SLOT_COUNT = 6
+TARGET_TOKEN_OFF = 0xFF  # firmware INSTRUMENT_TARGET_TOKEN_OFF
 CANONICAL_TARGET_KEYS = {"velo_mod_dest", "lfo_target_param"}
 LFO_TARGET_VOICE_KEYS = {"lfo_target_voice", "lfo_target_voice_2"}
 
@@ -1022,7 +1024,38 @@ def instrument_values(
         elif file_key in CANONICAL_TARGET_KEYS:
             value = legacy_target_to_canonical(value, canonical_by_param)
         values.append((file_key, value))
-    return values
+    return target_ids_to_tokens(values, slot)
+
+
+def target_ids_to_tokens(
+    values: list[tuple[str, int | str]],
+    slot: int,
+) -> list[tuple[str, int | str]]:
+    """Write target rows as the compact byte tokens the firmware parses.
+
+    storageTypes.c reads every target row as uint8_t: the local descriptor
+    index in the destination slot, 255 for off (FILESYSTEM_SPEC.md,
+    Instrument files). A canonical ID (slot*64+index, 0xFFFF for invalid)
+    fails that parse and the whole Kit is rejected. The legacy LFO target
+    names its voice, so lfo_target_voice follows the target; velocity targets
+    only address the instrument's own slot.
+    """
+    out = dict(values)
+    lfo_id = out.get("lfo_target_param")
+    if isinstance(lfo_id, int):
+        if lfo_id >= INSTRUMENT_SLOT_COUNT * INSTRUMENT_PARAM_COUNT:
+            out["lfo_target_param"] = TARGET_TOKEN_OFF
+        else:
+            target_slot = lfo_id // INSTRUMENT_PARAM_COUNT + 1
+            out["lfo_target_param"] = lfo_id % INSTRUMENT_PARAM_COUNT
+            out["lfo_target_voice"] = "self" if target_slot == slot else target_slot
+    velo_id = out.get("velo_mod_dest")
+    if isinstance(velo_id, int):
+        if velo_id // INSTRUMENT_PARAM_COUNT == slot - 1:
+            out["velo_mod_dest"] = velo_id % INSTRUMENT_PARAM_COUNT
+        else:
+            out["velo_mod_dest"] = TARGET_TOKEN_OFF
+    return [(key, out[key]) for key, _ in values]
 
 
 def write_instrument(
