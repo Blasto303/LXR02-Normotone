@@ -7,23 +7,33 @@
 #   tools/fs_test/build.sh                      -> build/fs_test/harness
 #   tools/fs_test/mkimg.sh <card dir> card.img  -> MBR + FAT32 image
 #   build/fs_test/harness card.img 108 k:100 s:002 p:000
-#       bare number = Bank Load (all 16 Scenes, Replace), k:/s:/p: = root
+#       bare number = Bank Load (all 16 Scenes, Replace), c: = Bank child
+#       preview scan, k:/s:/p: = root
 #       Kit/Scene/Pattern Load into Scene 0. Prints status, error code, SD
 #       block reads/writes and simulated time (0.6 ms read, 1.5 ms write).
 # Needs gcc-multilib (-m32) and, for mkimg.sh, dosfstools + mtools.
 set -e
 cd "$(dirname "$0")/../.."
-OUT=build/fs_test; mkdir -p $OUT/obj
+# MENU=1 also links the real Menu, CopyClear and buttonHandler (menu_harness.c).
+OUT=build/fs_test; MAIN=tools/fs_test/harness.c; SOURCES=tools/fs_test/sources.txt
+if [ "$MENU" = 1 ]; then
+  OUT=build/fs_test/menu; MAIN=tools/fs_test/menu_harness.c
+  SOURCES=$OUT/sources.txt; mkdir -p $OUT
+  (cat tools/fs_test/sources.txt; ls Core/Menu/*.c Core/Menu/CopyClear/*.c
+   echo Core/Hardware/frontPanel/buttonHandler.c) > $SOURCES
+fi
+mkdir -p $OUT/obj
 INC=$(grep -oE '\-I[^ ]+' Makefile | sort -u | tr '\n' ' ')
-for f in $(cat tools/fs_test/sources.txt); do
+for f in $(cat $SOURCES); do
   b=$(echo $f | tr '/' '_')
   gcc -m32 -fshort-enums -E -w $INC -include stddef.h $f \
     | perl -0pe 's/__asm\s+(volatile\s*)?\((?:[^;])*?\)\s*;/;/gs; s/__asm__\s+(__volatile__\s*)?\((?:[^;])*?\)\s*;/;/gs' > $OUT/obj/$b.i
   gcc -m32 -fshort-enums -O0 -g -w -c -o $OUT/obj/$b.o $OUT/obj/$b.i
 done
 gcc -m32 -fshort-enums -w -g $INC -c -o $OUT/obj/zz_ramsd.o tools/fs_test/ramsd.c
-gcc -m32 -fshort-enums -w -g $INC -c -o $OUT/obj/zz_harness.o tools/fs_test/harness.c
+gcc -m32 -fshort-enums -w -g $INC -c -o $OUT/obj/zz_harness.o $MAIN
 # Stub every remaining undefined symbol (variables get zeroed storage).
+rm -f $OUT/obj/zz_stubs.o $OUT/harness
 gcc -m32 -o $OUT/harness $OUT/obj/*.o -lm 2>&1 | grep "undefined reference to" | grep -v "more undefined" \
   | sed "s/.*undefined reference to .//; s/'$//" | sort -u > $OUT/undef.txt || true
 python3 -I - $OUT <<'PY'
@@ -41,11 +51,19 @@ var = {'menu_activePage': 'unsigned char menu_activePage;',
        '_efxbuf': 'char _efxbuf[1];', '_sfxbuf': 'char _sfxbuf[1];',
        'seq_getBpm': 'unsigned short seq_getBpm(void){return 120;}',
        'GetRngValue': 'unsigned int GetRngValue(void){return 12345;}'}
+import glob
+headers = ''.join(open(h, errors='ignore').read() for h in glob.glob('Core/**/*.h', recursive=True))
 lines = []
 for s in sorted(set(open(out + '/undef.txt').read().split())):
     if s == 'main' or not re.fullmatch(r'[A-Za-z_]\w*', s):
         continue
-    lines.append(var.get(s, f'int {s}(){{return 0;}}'))
+    if s in var:
+        lines.append(var[s])
+    elif re.search(r'extern[^;(]*\b' + s + r'\b\s*(\[[^]]*\])*\s*;', headers):
+        # A variable: zeroed storage, large enough for any of its users.
+        lines.append(f'char {s}[4096] __attribute__((aligned(16)));')
+    else:
+        lines.append(f'int {s}(){{return 0;}}')
 open(out + '/stubs.c', 'w').write('\n'.join(lines) + '\n')
 PY
 gcc -m32 -w -c -o $OUT/obj/zz_stubs.o $OUT/stubs.c

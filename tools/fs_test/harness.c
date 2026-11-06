@@ -37,7 +37,8 @@ int main(int argc,char**argv){
     char kind = (arg[0]>='0'&&arg[0]<='9') ? 'b' : arg[0];
     slot = atoi(kind=='b'?arg:arg+2);
     if(kind!=cur_index){
-      if(kind=='k') ok=filesystem_requestLoadKitIndex(NULL);
+      if(kind=='c') ok=filesystem_requestLoadBankIndex(NULL);
+      else if(kind=='k') ok=filesystem_requestLoadKitIndex(NULL);
       else if(kind=='s') ok=filesystem_requestLoadSceneIndex(NULL);
       else if(kind=='p') ok=filesystem_requestLoadPatternIndex(NULL);
       else ok=filesystem_requestLoadBankIndex(NULL);
@@ -45,7 +46,8 @@ int main(int argc,char**argv){
       cur_index=kind;
     }
     snprintf(w,sizeof w,"%c load %03d",kind,slot);
-    if(kind=='k') ok=filesystem_requestLoadKitForScenes((uint16_t)slot,1u,NULL);
+    if(kind=='c') ok=filesystem_requestScanBankScenes((uint16_t)slot,NULL);
+    else if(kind=='k') ok=filesystem_requestLoadKitForScenes((uint16_t)slot,1u,NULL);
     else if(kind=='s') ok=filesystem_requestLoadSceneForScenes((uint16_t)slot,1u,NULL);
     else if(kind=='p') ok=filesystem_requestLoadPatternForScenes((uint16_t)slot,1u,NULL);
     else ok=filesystem_requestLoadBank((uint16_t)slot,0xFFFFu,0u,0x02u,NULL);

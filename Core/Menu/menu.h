@@ -445,6 +445,15 @@ uint8_t menu_loadInstrumentVoicePressed(uint8_t voiceNr);
 uint8_t menu_loadInstrumentIsActive(void);
 uint8_t menu_loadSaveBarButtonPressed(uint8_t advance);
 /*
+ * SELECT on the Load/Save page (LXR-02 direct navigation): SELECT 1..6 pick
+ * Kit, KitMrp, Scene, Bank, Pattern, Samples; inside a nested Instrument
+ * Load, SELECT 1..8 pick Drum, Snare, Cymbal, HiHat, PlKick, PlSnare, PlHat,
+ * PlModal. Returns nonzero when consumed. menu_loadSaveRefreshTypeLed()
+ * lights the SELECT LED of the shown type.
+ */
+uint8_t menu_loadSaveSelectButton(uint8_t selectNr);
+void menu_loadSaveRefreshTypeLed(void);
+/*
  * Report whether nested Instrument Load owns an immutable in-flight transaction.
  *
  * Inputs: Menu's nested-load state, storage/apply busy state, and Preset's

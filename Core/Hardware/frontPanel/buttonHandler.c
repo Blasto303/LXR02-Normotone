@@ -2349,8 +2349,13 @@ static void handleSelectButton(uint8_t selectNr)
     }
 
     case SELECT_MODE_LOAD_SAVE:
-        /* _SEQUENCER_ADD_SPIKE_: AVR parity for load/save page select LED. */
-        led_setActivePage(selectNr);
+        /*
+         * SELECT picks what the Load/Save page loads or saves (Kit, KitMrp,
+         * Scene, Bank, Pattern, Samples; Instrument types inside a nested
+         * Instrument Load). The menu lights the matching LED.
+         */
+        if (!menu_loadSaveSelectButton(selectNr))
+            led_setActivePage(selectNr);
         break;
 
     default:
