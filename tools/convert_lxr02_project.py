@@ -39,12 +39,12 @@ from __future__ import annotations
 
 import argparse
 import re
-import struct
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import convert_legacy_kits as kits  # noqa: E402
+import pat4  # noqa: E402
 
 LEGACY_PARAMETER_ARRAY_H = Path(__file__).resolve().parent / "lxr_legacy" / "ParameterArray.h"
 
@@ -62,24 +62,9 @@ PAT_TRAILER_BYTES = 65
 LXR02_NEUTRAL_NOTE = 60
 NO_AUTOMATION = 0xFF
 
-# PAT4 v2 geometry (PATTERN_DYNAMIC_STACK.md section 7).
 NUM_TRACKS = 7
-NUM_STEPS = 128
-PAT4_HEADER_BYTES = 160
-PAT4_ADDRESS_OFFSET = 160
-PAT4_BITMAP_OFFSET = 1952
-PAT4_POOL_OFFSET = 2464
-PAT4_FILE_BYTES = 10656
-PAT4_POOL_ALLOC_BYTES = 8056  # chunks above this are the reserved swap block
-PAT_ADDR_TRIGGER = 0x8000
-PAT_ADDR_SPECIALS = 0x4000
-PAT_ADDR_SENTINEL = 0x3FFF
-SPECIAL_NOTE = 0x01
-SPECIAL_VELOCITY = 0x02
-SPECIAL_CONDITION = 0x04
 DEFAULT_NOTE = 63
 DEFAULT_VELOCITY = 100
-DEFAULT_SCALE = 76  # 1/16
 INSTRUMENT_PARAM_LIMIT = 384  # voice parameter IDs are 0..383
 
 # LXR-02 modulation target list: target index -> legacy PAR_* index. Read
@@ -109,16 +94,6 @@ LXR02_MOD_TARGET_PARAMS = [
 ]
 
 PROJECT_DIR_RE = re.compile(r"^PROJ(\d\d)$", re.IGNORECASE)
-
-
-def crc32c(data: bytes) -> int:
-    """CRC32C (Castagnoli, reflected), as in tools/convert_pattern_specials.py."""
-    crc = 0xFFFFFFFF
-    for value in data:
-        crc ^= value
-        for _ in range(8):
-            crc = (crc >> 1) ^ 0x82F63B78 if crc & 1 else crc >> 1
-    return (~crc) & 0xFFFFFFFF
 
 
 def display_name(raw: bytes) -> str:
@@ -219,32 +194,31 @@ class Converter:
         }
 
     def build_pat4(self, pattern: dict, where: str) -> bytes:
-        address = [PAT_ADDR_SENTINEL] * (NUM_TRACKS * NUM_STEPS)
-        pool = bytearray()
+        steps: dict[tuple[int, int], tuple[int, list[int], dict[int, int]]] = {}
         dropped_targets: set[int] = set()
         unknown_extra = 0
 
         for track in range(NUM_TRACKS):
-            steps, extra = pattern["tracks"][track]
+            track_steps, extra = pattern["tracks"][track]
             for step in range(PAT_STEPS):
                 if not pattern["masks"][track] >> step & 1:
                     continue
                 if extra and extra[step] != 0x70:
                     unknown_extra += 1
-                volume, prob, note, dest1, val1, dest2, val2 = steps[step]
+                volume, prob, note, dest1, val1, dest2, val2 = track_steps[step]
                 flags = 0
                 values = []
                 helicase_note = max(0, min(127, note - LXR02_NEUTRAL_NOTE + DEFAULT_NOTE))
                 if helicase_note != DEFAULT_NOTE:
-                    flags |= SPECIAL_NOTE
+                    flags |= pat4.SPECIAL_NOTE
                     values.append(helicase_note)
                 velocity = volume & 0x7F
                 if velocity != DEFAULT_VELOCITY:
-                    flags |= SPECIAL_VELOCITY
+                    flags |= pat4.SPECIAL_VELOCITY
                     values.append(velocity)
                 condition = probability_to_condition(prob)
                 if condition:
-                    flags |= SPECIAL_CONDITION
+                    flags |= pat4.SPECIAL_CONDITION
                     values.append(condition)
 
                 automations: dict[int, int] = {}
@@ -256,26 +230,8 @@ class Converter:
                         dropped_targets.add(dest - 1)
                         continue
                     automations[target] = min(value, 127)
+                steps[(track, step)] = (flags, values, automations)
 
-                index = track * NUM_STEPS + step
-                if not flags and not automations:
-                    address[index] = PAT_ADDR_TRIGGER | PAT_ADDR_SENTINEL
-                    continue
-
-                offset = len(pool)
-                block = bytearray()
-                header = (index << 6) | len(automations)
-                block += bytes([header >> 8, header & 0xFF, flags])
-                block += bytes(values)
-                for target, value in automations.items():
-                    block += struct.pack("<H", (value << 9) | target)
-                while len(block) % 4:
-                    block.append(0)
-                pool += block
-                address[index] = PAT_ADDR_TRIGGER | PAT_ADDR_SPECIALS | offset
-
-        if len(pool) > PAT4_POOL_ALLOC_BYTES:
-            raise RuntimeError(f"{where}: pattern needs {len(pool)} pool bytes")
         if dropped_targets:
             self.notes.append(
                 f"{where}: automations on PAR indexes without a Helicase voice "
@@ -283,27 +239,13 @@ class Converter:
             )
         if unknown_extra:
             self.notes.append(f"{where}: {unknown_extra} steps with an unconverted extra byte")
-
-        out = bytearray(PAT4_FILE_BYTES)
-        out[0:4] = b"PAT4"
-        struct.pack_into("<HHH", out, 4, 2, 256, PAT4_HEADER_BYTES)
-        for track in range(NUM_TRACKS):
-            base = 48 + 16 * track
-            # Length 0 holds a normal 16-step track on every card seen; it is
-            # written as 16, the length the firmware falls back to for 0.
-            out[base] = min(pattern["lengths"][track], 128) or 16
-            out[base + 1] = DEFAULT_SCALE
-            out[base + 2] = min(pattern["shuffle"], 127)
-        struct.pack_into(f"<{NUM_TRACKS * NUM_STEPS}H", out, PAT4_ADDRESS_OFFSET, *address)
-        chunks = len(pool) // 4
-        bitmap = bytearray(512)
-        for chunk in range(chunks):
-            bitmap[chunk >> 3] |= 1 << (chunk & 7)
-        bitmap[256:] = b"\xff" * 256
-        out[PAT4_BITMAP_OFFSET:PAT4_BITMAP_OFFSET + 512] = bitmap
-        out[PAT4_POOL_OFFSET:PAT4_POOL_OFFSET + len(pool)] = pool
-        struct.pack_into("<I", out, 14, crc32c(bytes(out)))
-        return bytes(out)
+        # Length 0 holds a normal 16-step track on every card seen; pat4
+        # writes it as 16, the length the firmware falls back to for 0.
+        try:
+            return pat4.build(steps, lengths=pattern["lengths"],
+                              shuffles=[pattern["shuffle"]] * NUM_TRACKS)
+        except ValueError as exc:
+            raise RuntimeError(f"{where}: {exc}") from exc
 
 
 def sceneset_text(lengths: list[int]) -> str:
