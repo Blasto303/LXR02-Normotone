@@ -2997,6 +2997,15 @@ afatfsOperationStatus_e afatfs_findNextObject(afatfsFilePtr_t directory,
          */
         if (object->id.displayName[0] == '.' &&
             object->id.displayName[1] == '_') {
+            /*
+             * Forget the skipped object before scanning on. If the next raw
+             * entry is the directory terminator, the loop returns SUCCESS
+             * with this object as the result: without the reset, a trailing
+             * `._x.pat` reached the Scene loader as a second Pattern child
+             * and failed the Scene (hardware Bank Load BKKit14, 2026-11-06).
+             */
+            memset(object, 0, sizeof(*object));
+            object->id.kind = AFATFS_OBJECT_NONE;
             afatfs_objectScanReset(finder);
             continue;
         }
