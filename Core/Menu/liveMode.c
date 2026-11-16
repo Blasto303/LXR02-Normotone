@@ -39,6 +39,7 @@ static uint8_t  live_pendingKit = 0xFFu;    /* kit waiting for the bar    */
 static uint8_t  live_carrier;               /* queue only carries the kit */
 static uint8_t  live_page;                  /* KIT page open              */
 static uint8_t  live_shownQueue = 0xFFu;    /* queued pattern on the LCD  */
+static uint8_t  live_kitHold;               /* 1: kit stays on pattern change */
 
 static uint8_t live_sceneValid(uint8_t scene)
 {
@@ -168,8 +169,12 @@ void live_beforeSceneChange(uint8_t target)
     const scene_t *src;
     uint8_t i;
 
+    uint8_t carry;
+
     if (target == active || !live_sceneValid(target) || active >= SCENE_COUNT)
         return;
+    /* Kit playing now (its source Scene), for the "kit stays" option. */
+    carry = live_currentKit();
     /* The leaving pattern gets its own kit back. */
     live_checkBackup();
     if (live_backupScene == active) {
@@ -177,6 +182,24 @@ void live_beforeSceneChange(uint8_t target)
         live_backupScene = 0xFFu;
     }
     live_kitSource = 0xFFu;
+    /*
+     * Kit stays: the incoming pattern plays the current kit. Its own kit is
+     * kept in the backup (committed back when it is left), and the kit is in
+     * place before the Scene activation applies it, so nothing glitches.
+     */
+    if (live_kitHold && carry < 16u && carry != target &&
+        live_sceneValid(carry)) {
+        const scene_t *own = scene_getConst(target);
+        const scene_t *source = scene_getConst(carry);
+
+        if (own && source) {
+            live_kitBackup = own->kit;
+            live_backupScene = target;
+            live_backupBank = bank_restoreBankSlot();
+            (void)scene_commitKit(target, &source->kit);
+            live_kitSource = carry;
+        }
+    }
 
     src = scene_getConst(active);
     if (!src)
@@ -197,6 +220,20 @@ void live_beforeSceneChange(uint8_t target)
     for (i = 0u; i < SCENE_BUS_COMP_FIELD_COUNT; i++)
         scene_setBusCompSetting(target, i, src->settings.bus_comp[i]);
     scene_setEffectMorphAmount(target, src->settings.effect_morph_amount);
+}
+
+void live_encoder(int8_t inc, uint8_t clicked)
+{
+    uint8_t before = live_kitHold;
+
+    if (clicked)
+        live_kitHold = (uint8_t)!live_kitHold;
+    else if (inc > 0)
+        live_kitHold = 1u;
+    else if (inc < 0)
+        live_kitHold = 0u;
+    if (live_kitHold != before)
+        menu_repaintAll();
 }
 
 uint8_t live_queuedFire(uint8_t scene)
@@ -278,6 +315,8 @@ uint8_t live_formatOverlay(char *row0, char *row1)
         row0[10] = (char)('0' + (live_pendingKit + 1u) / 10u);
         row0[11] = (char)('0' + (live_pendingKit + 1u) % 10u);
     }
+    /* Kit option: "suit" = the pattern brings its kit, "fixe" = kit stays. */
+    memcpy(&row0[12], live_kitHold ? "fixe" : "suit", 4);
     memcpy(row1, "PAT", 3);
     {
         uint8_t pat = (uint8_t)(scene_getActiveIndex() + 1u);

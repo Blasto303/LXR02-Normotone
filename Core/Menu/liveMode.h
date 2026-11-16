@@ -27,6 +27,11 @@ void live_kitPageClose(void);
 uint8_t live_kitPageActive(void);
 /* Step press on the KIT page: kit of Scene `scene` for the playing pattern. */
 void live_kitSelect(uint8_t scene);
+/*
+ * DATA on the KIT page: turn right = kit stays on pattern change ("fixe"),
+ * left = the pattern brings its kit ("suit", stock); click toggles.
+ */
+void live_encoder(int8_t inc, uint8_t clicked);
 /* Repaint the step LEDs of the KIT page. */
 void live_kitPageLeds(void);
 

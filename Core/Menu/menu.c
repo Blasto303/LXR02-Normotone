@@ -15877,6 +15877,19 @@ void menu_parseEncoder(int8_t inc, uint8_t button)
     uint8_t btnClicked = 0;
     uint8_t oldPage = menu_activePage;
     uint8_t oldIndex = menuIndex;
+#if LIVE_MODE
+    /* LIVE: on the KIT page DATA sets the kit option (liveMode.h). */
+    {
+        static uint8_t liveLastButton;
+        uint8_t clicked = (uint8_t)(button && !liveLastButton);
+
+        liveLastButton = button;
+        if (live_kitPageActive()) {
+            live_encoder(inc, clicked);
+            return;
+        }
+    }
+#endif
 
     /* S082 P3: an unlocked background Bank load blocks only Load/Save; other
      * pages take the encoder (menu_backgroundLoadReleasesPanel()). */
