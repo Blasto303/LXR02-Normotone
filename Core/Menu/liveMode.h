@@ -10,6 +10,10 @@
  *   - the Effect, compressor and voice mix (outputs, FX sends, faders) follow
  *     the player across pattern changes, so the rumble on DRUM1 never drops,
  *   - SAVE opens the Bank list only (no Save page, no Scene writing).
+ * Step labels of the LXR-02 panel: LOAD + KIT (8) = KIT page, LOAD +
+ * PROJECT (11) = Bank list, SHIFT/LOAD + PATTERN (16) = PATTERN page,
+ * SHIFT + FX (15) = Effect, SHIFT + CONFIG (12) = settings, SHIFT + RELOAD
+ * (13) = own kit back. SHIFT + steps 1..11 in PERF still queue directly.
  * LIVE_MODE 0 builds the stock Helicase panel.
  */
 #ifndef LIVE_MODE_H_
@@ -32,6 +36,12 @@ void live_kitSelect(uint8_t scene);
  * left = the pattern brings its kit ("suit", stock); click toggles.
  */
 void live_encoder(int8_t inc, uint8_t clicked);
+/* PATTERN page (SHIFT or LOAD + step 16): a step queues pattern N. */
+void live_patternPageOpen(void);
+uint8_t live_patternPageActive(void);
+void live_patternSelect(uint8_t scene);
+/* SHIFT + RELOAD (step 13): the playing pattern gets its own kit back. */
+void live_reloadKit(void);
 /* Repaint the step LEDs of the KIT page. */
 void live_kitPageLeds(void);
 

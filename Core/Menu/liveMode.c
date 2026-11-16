@@ -37,7 +37,7 @@ static uint16_t live_backupBank = 0xFFFFu;  /* Bank slot of that Scene    */
 static uint8_t  live_kitSource = 0xFFu;     /* kit shown on the KIT page  */
 static uint8_t  live_pendingKit = 0xFFu;    /* kit waiting for the bar    */
 static uint8_t  live_carrier;               /* queue only carries the kit */
-static uint8_t  live_page;                  /* KIT page open              */
+static uint8_t  live_page;                  /* 0 none, 1 KIT, 2 PATTERN   */
 static uint8_t  live_shownQueue = 0xFFu;    /* queued pattern on the LCD  */
 static uint8_t  live_kitHold;               /* 1: kit stays on pattern change */
 
@@ -106,6 +106,34 @@ static uint8_t live_applyKit(uint8_t src)
     return 1u;
 }
 
+void live_patternPageOpen(void)
+{
+    if (live_page == 1u)
+        live_kitPageClose();
+    live_page = 2u;
+    menu_refreshPerfSceneLeds();
+    menu_repaintAll();
+}
+
+uint8_t live_patternPageActive(void)
+{
+    return (uint8_t)(live_page == 2u);
+}
+
+void live_patternSelect(uint8_t scene)
+{
+    if (!live_sceneValid(scene))
+        return;
+    live_carrier = 0u;
+    seq_queueSceneChange(scene, parameter_values[PAR_SCENE_QUEUE_DIV]);
+    menu_repaintAll();
+}
+
+void live_reloadKit(void)
+{
+    live_kitSelect(scene_getActiveIndex());
+}
+
 void live_kitPageOpen(void)
 {
     live_page = 1u;
@@ -117,6 +145,7 @@ void live_kitPageClose(void)
 {
     if (!live_page)
         return;
+    /* Closes either page (KIT or PATTERN). */
     live_page = 0u;
     led_clearAllBlinkLeds();
     menu_refreshPerfSceneLeds();
@@ -125,7 +154,7 @@ void live_kitPageClose(void)
 
 uint8_t live_kitPageActive(void)
 {
-    return live_page;
+    return (uint8_t)(live_page == 1u);
 }
 
 void live_kitSelect(uint8_t scene)
@@ -153,7 +182,7 @@ void live_kitPageLeds(void)
     uint8_t current = live_currentKit();
     uint8_t s;
 
-    if (!live_page)
+    if (live_page != 1u)
         return;
     for (s = 0u; s < 16u; s++) {
         uint8_t led = (uint8_t)(LED_SEQ1 + s);
@@ -284,12 +313,13 @@ uint8_t live_formatOverlay(char *row0, char *row1)
 {
     uint8_t kit;
 
-    if (!live_page) {
+    if (live_page != 1u) {
         uint8_t q = live_queuedPattern();
         uint8_t cur = (uint8_t)(scene_getActiveIndex() + 1u);
 
-        /* Stock LXR-02 screen while a pattern waits for the bar. */
-        if (q >= 16u || buttonHandler_getMode() != SELECT_MODE_PERF)
+        /* Stock LXR-02 screen: PATTERN page, or a pattern waiting. */
+        if ((q >= 16u && live_page != 2u) ||
+            buttonHandler_getMode() != SELECT_MODE_PERF)
             return 0u;
         memset(row0, ' ', 16);
         memset(row1, ' ', 16);
@@ -297,11 +327,15 @@ uint8_t live_formatOverlay(char *row0, char *row1)
         memcpy(row1, "Current: ", 9);
         row1[9] = (char)('0' + cur / 10u);
         row1[10] = (char)('0' + cur % 10u);
-        row1[12] = '>';
-        row1[14] = (char)('0' + (q + 1u) / 10u);
-        row1[15] = (char)('0' + (q + 1u) % 10u);
+        if (q < 16u) {
+            row1[12] = '>';
+            row1[14] = (char)('0' + (q + 1u) / 10u);
+            row1[15] = (char)('0' + (q + 1u) % 10u);
+        }
         return 1u;
     }
+    if (buttonHandler_getMode() != SELECT_MODE_PERF)
+        return 0u;
     kit = live_currentKit();
     memset(row0, ' ', 16);
     memset(row1, ' ', 16);
@@ -311,9 +345,9 @@ uint8_t live_formatOverlay(char *row0, char *row1)
         row0[5] = (char)('0' + (kit + 1u) % 10u);
     }
     if (live_pendingKit < 16u) {
-        row0[8] = '>';
-        row0[10] = (char)('0' + (live_pendingKit + 1u) / 10u);
-        row0[11] = (char)('0' + (live_pendingKit + 1u) % 10u);
+        row0[7] = '>';
+        row0[8] = (char)('0' + (live_pendingKit + 1u) / 10u);
+        row0[9] = (char)('0' + (live_pendingKit + 1u) % 10u);
     }
     /* Kit option: "suit" = the pattern brings its kit, "fixe" = kit stays. */
     memcpy(&row0[12], live_kitHold ? "fixe" : "suit", 4);

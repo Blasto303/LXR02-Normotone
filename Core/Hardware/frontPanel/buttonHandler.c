@@ -2859,10 +2859,52 @@ static uint8_t buttonHandler_livePress(uint8_t b)
         live_kitPageOpen();
         return 1u;
     }
+    if (seq >= 0 && bh_liveLoadHeld && !shift &&
+        (seq == 10 || seq == 15)) {
+        buttonHandler_liveConsume(b);
+        live_kitPageClose();
+        if (seq == 10) {                       /* LOAD + PROJECT */
+            handleModeButtons(SELECT_MODE_LOAD_SAVE);
+        } else {                               /* LOAD + PATTERN */
+            if (bh_state.selectButtonMode != SELECT_MODE_PERF)
+                handleModeButtons(SELECT_MODE_PERF);
+            live_patternPageOpen();
+        }
+        return 1u;
+    }
+    /* White labels: SHIFT + CONFIG/RELOAD/FX/PATTERN (not in the sequencer,
+     * where SHIFT+step edits steps; LAST STEP keeps its Helicase meaning). */
+    if (seq >= 11 && seq != 13 && shift &&
+        bh_state.selectButtonMode != SELECT_MODE_STEP) {
+        buttonHandler_liveConsume(b);
+        if (seq != 12)
+            live_kitPageClose();
+        switch (seq) {
+        case 11: handleModeButtons(SELECT_MODE_LOAD_SAVE); break; /* +SHIFT = settings */
+        case 12: live_reloadKit(); break;
+        case 14: handleModeButtons(SELECT_MODE_PERF); break;      /* +SHIFT = Effect */
+        default:
+            if (bh_state.selectButtonMode != SELECT_MODE_PERF) {
+                /* Plain PERF (not SHIFT+PERF = Effect). */
+                btn_held[BUT_SHIFT] = 0;
+                handleModeButtons(SELECT_MODE_PERF);
+                btn_held[BUT_SHIFT] = 1;
+            }
+            live_patternPageOpen();
+            break;
+        }
+        return 1u;
+    }
     if (seq >= 0 && live_kitPageActive() && !shift &&
         bh_state.selectButtonMode == SELECT_MODE_PERF) {
         buttonHandler_liveConsume(b);
         live_kitSelect((uint8_t)seq);
+        return 1u;
+    }
+    if (seq >= 0 && live_patternPageActive() && !shift &&
+        bh_state.selectButtonMode == SELECT_MODE_PERF) {
+        buttonHandler_liveConsume(b);
+        live_patternSelect((uint8_t)seq);
         return 1u;
     }
     if (b == BUT_MODE1 || b == BUT_MODE2 || b == BUT_MODE4)
