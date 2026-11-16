@@ -10,6 +10,7 @@
  *   e:N  DATA encoder N detents (signed)   c    DATA click
  *   k:I:D  knob I (1..4) delta D           S+ / S-  SHIFT down / up
  *   C+ / C-  COPY/CLR down / up            w:MS  idle MS milliseconds
+ *   d:B / u:B  raw button B down / up      K  print kit/effect identity
  * Each action is followed by main-loop passes until storage is idle; the
  * line shows SD reads and simulated foreground time for that gesture.
  */
@@ -30,6 +31,26 @@ extern int ram_load(const char *);
 extern unsigned long sd_reads, sd_writes;
 extern unsigned long long sim_us;
 extern void sim_advance(unsigned int us);
+
+/* Minimal scene-queue model of the sequencer: R starts the transport, B is a
+ * bar boundary (fires a queued change), a stopped transport fires at once. */
+static int h_running, h_queue, h_fire;
+static uint8_t h_target;
+uint8_t seq_isRunning(void) { return (uint8_t)h_running; }
+void seq_queueSceneChange(uint8_t scene, uint8_t div)
+{
+    (void)div; h_target = scene; h_queue = 1; if (!h_running) h_fire = 1;
+}
+void seq_requestSceneChange(uint8_t scene, uint8_t div)
+{
+    (void)div; h_target = scene; h_queue = 0; h_fire = 1;
+}
+uint8_t seq_sceneChangeFirePending(void) { return (uint8_t)h_fire; }
+uint8_t seq_pendingSceneIsQueue(void) { return (uint8_t)h_queue; }
+uint8_t seq_pendingSceneTarget(void) { return h_target; }
+uint8_t seq_queuedSceneTarget(void) { return h_queue ? h_target : 0xFFu; }
+uint8_t seq_pendingSceneIsChain(void) { return 0u; }
+void seq_clearPendingSceneChange(void) { h_fire = 0; h_queue = 0; }
 
 static void loop_pass(void)
 {
@@ -133,6 +154,25 @@ int main(int argc, char **argv)
             int knob = s[2] - '0';
             int d = (int)strtol(s + 4, NULL, 10);
             menu_parseKnobDelta((uint8_t)(knob - 1), (int8_t)d); loop_pass();
+            break; }
+        case 'd': press((uint8_t)atoi(s + 2)); break;
+        case 'u': release((uint8_t)atoi(s + 2)); break;
+        case 'R': h_running = !h_running; break;
+        case 'B': if (h_queue) h_fire = 1; break;
+        case 'K': {
+            /* Which resident Scene's kit / effect equals the active one. */
+            uint8_t a = scene_getActiveIndex(), i;
+            printf("  active=%u kit=", a);
+            for (i = 0; i < 16; i++)
+                if (scene_getConst(i) && !memcmp(&scene_getConst(i)->kit,
+                        &scene_getConst(a)->kit, sizeof(kit_t))) printf("%u ", i);
+            printf(" fx-same-as-active:");
+            for (i = 0; i < 16; i++)
+                if (scene_effectConst(i) && !memcmp(scene_effectConst(i),
+                        scene_effectConst(a), sizeof(effect_record_t))) printf("%u ", i);
+            printf(" send1=%u k0=%02x%02x%02x%02x k4=%02x%02x%02x%02x\n", scene_getVoiceFxSendAmount(a, 0),
+                ((const uint8_t*)&scene_getConst(a)->kit)[8],((const uint8_t*)&scene_getConst(a)->kit)[9],((const uint8_t*)&scene_getConst(a)->kit)[40],((const uint8_t*)&scene_getConst(a)->kit)[41],
+                ((const uint8_t*)&scene_getConst(4)->kit)[8],((const uint8_t*)&scene_getConst(4)->kit)[9],((const uint8_t*)&scene_getConst(4)->kit)[40],((const uint8_t*)&scene_getConst(4)->kit)[41]);
             break; }
         case 'w':
             for (unsigned long long end = sim_us + 1000ull * n; sim_us < end;) loop_pass();

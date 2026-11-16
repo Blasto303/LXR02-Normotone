@@ -248,22 +248,67 @@ class Converter:
             raise RuntimeError(f"{where}: {exc}") from exc
 
 
+# Rumble on DRUM1 (vademecum recipe, 130 BPM): the kick goes to St2 with a
+# full send into DlyVerb, the bus compressor on St1 ducks from track 1.
+RUMBLE = True
+RUMBLE_EFFECT = "\n".join([
+    "format=helicase.effect",
+    "version=2",
+    "type=dvb",
+    "",
+    "[params]",
+    "effect_audio_out=0",      # St1
+    "effect_level=127",
+    "effect_pan=63",
+    "dvb_division=5",          # 1/16
+    "dvb_feedback=80",
+    "dvb_dly_level=80",
+    "dvb_rvb_level=127",
+    "dvb_model=2",             # tap(e)
+    "dvb_stereo=0",            # str
+    "dvb_width=0",
+    "dvb_drive=90",
+    "dvb_lowpass=15",
+    "dvb_highpass=8",
+    "dvb_mod_depth=15",
+    "dvb_mod_rate=30",
+    "dvb_age=0",
+    "dvb_rvb_decay=105",
+    "dvb_rvb_damp=115",
+    "dvb_rvb_route=1",         # ser
+    "",
+])
+
+
 def sceneset_text(lengths: list[int]) -> str:
     length_morph = ",".join(str(value if 1 <= value <= 128 else 16) for value in lengths)
-    return "\n".join([
+    lines = [
         "format=helicase.sceneset",
         "version=1",
         "morph_amount=0",
         "voice_morph_amount=0,0,0,0,0,0",
         "midi_channel=0,0,0,0,0,0,0",
         "midi_note=0,0,0,0,0,0,0",
-        "audio_out=0,0,0,0,0,0",
-        "fx_send_amount=0,0,0,0,0,0",
-        "fader_setting=0,0,0,0,0,0",
-        "fx_send_morph=0,0,0,0,0,0",
-        f"track_morph_length={length_morph}",
-        "",
-    ])
+    ]
+    if RUMBLE:
+        lines += [
+            "audio_out=1,0,0,0,0,0",
+            "fx_send_amount=127,0,0,0,0,0",
+            "fader_setting=0,0,0,0,0,0",
+            "fx_send_morph=127,0,0,0,0,0",
+            "bus_comp_mode=1",
+            "bus_comp_amount=100",
+            "bus_comp_time=50",
+            "bus_comp_sidechain=1",
+        ]
+    else:
+        lines += [
+            "audio_out=0,0,0,0,0,0",
+            "fx_send_amount=0,0,0,0,0,0",
+            "fader_setting=0,0,0,0,0,0",
+            "fx_send_morph=0,0,0,0,0,0",
+        ]
+    return "\n".join(lines + [f"track_morph_length={length_morph}", ""])
 
 
 def bankset_text() -> str:
@@ -292,7 +337,11 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True, help="Helicase card root to write into")
     parser.add_argument("--kit-slot", type=int, default=100, help="first root Kit slot")
     parser.add_argument("--bank-slot", type=int, default=100, help="first root Bank slot")
+    parser.add_argument("--no-rumble", action="store_true",
+                        help="leave the Effect off and DRUM1 dry")
     args = parser.parse_args()
+    global RUMBLE
+    RUMBLE = not args.no_rumble
 
     conv = Converter()
     kit_root = args.out / "Kit"
@@ -367,6 +416,8 @@ def main() -> int:
                 (scene_dir / "sceneset.scg").write_text(
                     sceneset_text(pattern["lengths"]), encoding="ascii"
                 )
+                if RUMBLE:
+                    (scene_dir / "effects.fx").write_text(RUMBLE_EFFECT, encoding="ascii")
                 (scene_dir / f"{pp}-{number:02d}.pat").write_bytes(conv.build_pat4(pattern, where))
                 kit_path = kit_files.get(pattern["kit"])
                 if kit_path is None:

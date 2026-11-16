@@ -26,6 +26,7 @@
  */
 
 
+#include "liveMode.h"
 #include "menu.h"
 #include "CcNr2Text.h"
 #include "screensaver.h"
@@ -9521,6 +9522,13 @@ static uint8_t menu_commitChainParam(uint16_t paramNr, uint8_t value)
 void menu_refreshPerfSceneLeds(void)
 {
     uint8_t scene_index;
+#if LIVE_MODE
+    /* LIVE: the KIT page owns the step row while it is open. */
+    if (live_kitPageActive()) {
+        live_kitPageLeds();
+        return;
+    }
+#endif
     uint8_t active_scene = scene_getActiveIndex();
     uint8_t viewed = menu_getViewedPattern();
     uint16_t present_mask = menu_residentPresentSceneMask();
@@ -9635,6 +9643,11 @@ static void menu_perfSceneChangeExecute(uint8_t scene_index, uint8_t restart)
         !bank_sceneAvailable(scene_index)) {
         return;
     }
+#if LIVE_MODE
+    /* LIVE: the mix and rumble follow the player; the leaving pattern
+     * gets its own kit back. */
+    live_beforeSceneChange(scene_index);
+#endif
     scene_selectActive(scene_index);
     bank_selectActiveSceneForEditMask(scene_index);
     /*
@@ -9792,7 +9805,9 @@ void menu_serviceDeferredSceneChange(void)
              * bank_sceneAvailable(). Affiliates: menu_applyQueuedSceneAction(),
              * menu_perfSceneChangeExecute() (which already drops the change).
              */
-            if (scene < 16u && bank_sceneAvailable(scene)) {
+            if (LIVE_MODE && live_queuedFire(scene)) {
+                /* LIVE: the queue only carried a kit change. */
+            } else if (scene < 16u && bank_sceneAvailable(scene)) {
                 uint8_t flags = menu_applyQueuedSceneAction(scene);
 
                 menu_perfSceneChangeExecute(
@@ -9804,6 +9819,9 @@ void menu_serviceDeferredSceneChange(void)
             menu_perfSceneChangeExecute(scene, pcr);
         }
     }
+#if LIVE_MODE
+    live_service();
+#endif
     menu_syncQueuedSceneLed();
 }
 
@@ -12409,6 +12427,10 @@ void menu_repaint(void)
      */
     if (copyClear_menuVisible())
         copyClear_formatMenu(editDisplayBuffer[0], editDisplayBuffer[1]);
+#if LIVE_MODE
+    else
+        (void)live_formatOverlay(editDisplayBuffer[0], editDisplayBuffer[1]);
+#endif
     if ((menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
         !menu_loadSaveCursorVisible()) {
         uint8_t row;
@@ -12968,10 +12990,19 @@ static void menu_repaintLoadSavePage(void)
              * OK text. Scene and Bank do not live-load; their row must show OK
              * so the user can move to it and click to perform the load.
              */
+#if LIVE_MODE
+            /* LIVE: "<<" marks the Bank that is playing; nothing else. */
+            memcpy(&editDisplayBuffer[1][14],
+                   (menu_saveOptions.what == SAVE_TYPE_BANK &&
+                    menu_currentPresetNr[SAVE_TYPE_BANK] ==
+                        bank_restoreBankSlot()) ? "<<" : "  ",
+                   2);
+#else
             memcpy(&editDisplayBuffer[1][14],
                    (menu_bankPageActive() && menu_bankMergeOn()) ? "mr"
                                                                  : menuText_ok,
                    2);
+#endif
             if ((menu_saveOptions.state == SAVE_STATE_OK) ||
                 (menu_saveOptions.what >= SAVE_TYPE_GLO && menu_saveOptions.state > SAVE_STATE_EDIT_TYPE)) {
                 editDisplayBuffer[1][13] = ARROW_SIGN;
@@ -18525,7 +18556,7 @@ void menu_switchPage(uint8_t pageNr)
             menu_enterFrozenBankLoadPage();
             break;
         }
-        if (menu_activePage == LOAD_PAGE) {
+        if (menu_activePage == LOAD_PAGE && !LIVE_MODE) {
             menu_activePage = SAVE_PAGE;
             menu_instrumentLoadActive = 0u;
         } else {
@@ -18544,6 +18575,11 @@ void menu_switchPage(uint8_t pageNr)
         /* Load/Save page toggles are type transitions, so reload on entry.
          * Bank pages override the Kit scene mask above to 0xFFFF (B2.4). */
         filesystem_clearNameCache();
+#if LIVE_MODE
+        /* LIVE: SAVE opens the Bank list, nothing else. */
+        menu_instrumentLoadActive = 0u;
+        menu_saveOptions.what = SAVE_TYPE_BANK;
+#endif
         menu_resetSaveParameters();
         menu_requestCurrentLoadSaveSelection(0);
         menu_refreshLoadSceneLeds();

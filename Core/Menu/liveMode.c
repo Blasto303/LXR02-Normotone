@@ -1,0 +1,259 @@
+/*
+ * LIVE mode (contract in liveMode.h).
+ *
+ * Kit swap: the playing Scene's kit is replaced by Scene N's kit through the
+ * same retained commit as `copy kit` (scene_commitKit() + the drumset apply
+ * worker). The Scene's own kit is kept in live_kitBackup and committed back
+ * when the pattern changes, so a Bank keeps "pattern N plays kit N".
+ *
+ * Bar quantisation reuses Helicase's queued Scene change: a kit selected
+ * while the transport runs queues a change to the playing Scene itself (the
+ * "carrier") at the qcd division; when it fires, the kit is applied and the
+ * Scene change is skipped. A pattern queued after the kit replaces the
+ * carrier; the kit then lands on that new pattern at the same boundary.
+ *
+ * Mix lock: before any Scene change the incoming Scene takes the outgoing
+ * Scene's Effect record, bus compressor, Effect Morph amount and per-voice
+ * output / FX send / fader settings. The Effect type then matches, so
+ * effects_activateScene() keeps the running delay/reverb tails.
+ *
+ * RAM: one kit_t backup plus 8 bytes.
+ */
+#include "liveMode.h"
+
+#include <string.h>
+
+#include "SceneData.h"
+#include "BankData.h"
+#include "presetManager.h"
+#include "sequencer.h"
+#include "ledHandler.h"
+#include "menu.h"
+
+static kit_t    live_kitBackup;
+static uint8_t  live_backupScene = 0xFFu;   /* Scene whose kit is swapped */
+static uint16_t live_backupBank = 0xFFFFu;  /* Bank slot of that Scene    */
+static uint8_t  live_kitSource = 0xFFu;     /* kit shown on the KIT page  */
+static uint8_t  live_pendingKit = 0xFFu;    /* kit waiting for the bar    */
+static uint8_t  live_carrier;               /* queue only carries the kit */
+static uint8_t  live_page;                  /* KIT page open              */
+
+static uint8_t live_sceneValid(uint8_t scene)
+{
+    return (uint8_t)(scene < SCENE_COUNT && scene < 16u &&
+                     bank_sceneAvailable(scene));
+}
+
+/* Drop a backup that no longer belongs to the resident Bank. */
+static void live_checkBackup(void)
+{
+    if (live_backupScene != 0xFFu &&
+        live_backupBank != bank_restoreBankSlot()) {
+        live_backupScene = 0xFFu;
+        live_kitSource = 0xFFu;
+    }
+}
+
+static uint8_t live_currentKit(void)
+{
+    uint8_t active = scene_getActiveIndex();
+
+    live_checkBackup();
+    if (live_backupScene == active && live_kitSource < 16u)
+        return live_kitSource;
+    return active;
+}
+
+/* Commit kit of `src` onto the active Scene now. 0 = workers busy, retry. */
+static uint8_t live_applyKit(uint8_t src)
+{
+    uint8_t active = scene_getActiveIndex();
+    const scene_t *source;
+
+    if (!preset_applyWorkersIdle() || preset_backgroundBankLoadUnlocked())
+        return 0u;
+    live_checkBackup();
+    if (active >= SCENE_COUNT || !live_sceneValid(src))
+        return 1u;
+    if (src == active || src == live_currentKit()) {
+        /* Own kit asked back: restore it if it was swapped. */
+        if (src == active && live_backupScene == active) {
+            (void)scene_commitKit(active, &live_kitBackup);
+            live_backupScene = 0xFFu;
+            preset_startDrumsetApply();
+        }
+        live_kitSource = src;
+        return 1u;
+    }
+    source = scene_getConst(src);
+    if (!source)
+        return 1u;
+    if (live_backupScene != active) {
+        const scene_t *own = scene_getConst(active);
+
+        if (!own)
+            return 1u;
+        live_kitBackup = own->kit;
+        live_backupScene = active;
+        live_backupBank = bank_restoreBankSlot();
+    }
+    (void)scene_commitKit(active, &source->kit);
+    preset_startDrumsetApply();
+    live_kitSource = src;
+    return 1u;
+}
+
+void live_kitPageOpen(void)
+{
+    live_page = 1u;
+    live_kitPageLeds();
+    menu_repaintAll();
+}
+
+void live_kitPageClose(void)
+{
+    if (!live_page)
+        return;
+    live_page = 0u;
+    led_clearAllBlinkLeds();
+    menu_refreshPerfSceneLeds();
+    menu_repaintAll();
+}
+
+uint8_t live_kitPageActive(void)
+{
+    return live_page;
+}
+
+void live_kitSelect(uint8_t scene)
+{
+    if (!live_sceneValid(scene))
+        return;
+    if (!seq_isRunning()) {
+        live_pendingKit = scene;
+        live_service();
+    } else {
+        live_pendingKit = scene;
+        if (seq_queuedSceneTarget() >= 16u) {
+            live_carrier = 1u;
+            seq_queueSceneChange(scene_getActiveIndex(),
+                                 parameter_values[PAR_SCENE_QUEUE_DIV]);
+        }
+    }
+    live_kitPageLeds();
+    menu_repaintAll();
+}
+
+void live_kitPageLeds(void)
+{
+    uint16_t present = bank_scenePresentMask();
+    uint8_t current = live_currentKit();
+    uint8_t s;
+
+    if (!live_page)
+        return;
+    for (s = 0u; s < 16u; s++) {
+        uint8_t led = (uint8_t)(LED_SEQ1 + s);
+
+        led_setBlinkLed(led, (uint8_t)(s == current || s == live_pendingKit));
+        led_setValue((uint8_t)((present & (uint16_t)(1u << s)) != 0u), led);
+    }
+}
+
+void live_beforeSceneChange(uint8_t target)
+{
+    uint8_t active = scene_getActiveIndex();
+    const scene_t *src;
+    uint8_t i;
+
+    if (target == active || !live_sceneValid(target) || active >= SCENE_COUNT)
+        return;
+    /* The leaving pattern gets its own kit back. */
+    live_checkBackup();
+    if (live_backupScene == active) {
+        (void)scene_commitKit(active, &live_kitBackup);
+        live_backupScene = 0xFFu;
+    }
+    live_kitSource = 0xFFu;
+
+    src = scene_getConst(active);
+    if (!src)
+        return;
+    {
+        const effect_record_t *fx = scene_effectConst(active);
+        const effect_record_t *dst = scene_effectConst(target);
+
+        if (fx && dst && memcmp(fx, dst, sizeof(*fx)) != 0)
+            (void)scene_commitEffectRecord(target, fx);
+    }
+    for (i = 0u; i < INSTRUMENT_SLOT_COUNT; i++) {
+        scene_setVoiceAudioOut(target, i, src->settings.audio_out[i]);
+        scene_setVoiceFxSendAmount(target, i, src->settings.fx_send_amount[i]);
+        scene_setVoiceFxSendMorph(target, i, src->settings.fx_send_morph[i]);
+        scene_setVoiceFaderSetting(target, i, src->settings.fader_setting[i]);
+    }
+    for (i = 0u; i < SCENE_BUS_COMP_FIELD_COUNT; i++)
+        scene_setBusCompSetting(target, i, src->settings.bus_comp[i]);
+    scene_setEffectMorphAmount(target, src->settings.effect_morph_amount);
+}
+
+uint8_t live_queuedFire(uint8_t scene)
+{
+    uint8_t carrier = live_carrier;
+
+    live_carrier = 0u;
+    return (uint8_t)(carrier && scene == scene_getActiveIndex());
+}
+
+void live_service(void)
+{
+    /* A transport stop cancels the queue: the carrier is gone, apply now. */
+    if (live_carrier && seq_queuedSceneTarget() >= 16u &&
+        !seq_sceneChangeFirePending())
+        live_carrier = 0u;
+    if (live_pendingKit != 0xFFu && !live_carrier &&
+        seq_queuedSceneTarget() >= 16u) {
+        if (live_applyKit(live_pendingKit)) {
+            live_pendingKit = 0xFFu;
+            live_kitPageLeds();
+            if (live_page)
+                menu_repaintAll();
+        }
+    }
+}
+
+uint8_t live_formatOverlay(char *row0, char *row1)
+{
+    uint8_t kit;
+
+    if (!live_page)
+        return 0u;
+    kit = live_currentKit();
+    memset(row0, ' ', 16);
+    memset(row1, ' ', 16);
+    memcpy(row0, "KIT", 3);
+    if (kit < 16u) {
+        row0[4] = (char)('0' + (kit + 1u) / 10u);
+        row0[5] = (char)('0' + (kit + 1u) % 10u);
+    }
+    if (live_pendingKit < 16u) {
+        row0[8] = '>';
+        row0[10] = (char)('0' + (live_pendingKit + 1u) / 10u);
+        row0[11] = (char)('0' + (live_pendingKit + 1u) % 10u);
+    }
+    memcpy(row1, "PAT", 3);
+    {
+        uint8_t pat = (uint8_t)(scene_getActiveIndex() + 1u);
+        uint16_t bank = bank_restoreBankSlot();
+
+        row1[4] = (char)('0' + pat / 10u);
+        row1[5] = (char)('0' + pat % 10u);
+        if (bank < 1000u) {
+            memcpy(&row1[9], "BK", 2);
+            row1[12] = (char)('0' + bank / 100u);
+            row1[13] = (char)('0' + (bank / 10u) % 10u);
+            row1[14] = (char)('0' + bank % 10u);
+        }
+    }
+    return 1u;
+}

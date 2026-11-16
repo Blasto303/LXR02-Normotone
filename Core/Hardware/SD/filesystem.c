@@ -59,6 +59,7 @@
  * from filesystem_tick(), including synchronous boot polling.
  */
 
+#include "liveMode.h"
 #include "filesystem.h"
 #include "config.h"
 #include "asyncfatfs.h"
@@ -2794,7 +2795,8 @@ static void filesystem_resetGlobalsToDefaults(void)
     parameter_values[PAR_PERF_VEL_LT] = 0u;
     parameter_values[PAR_PERF_VEL_RT] = 0u;
     parameter_values[PAR_SCENE_CHANGE_DIV] = 0u;
-    parameter_values[PAR_SCENE_QUEUE_DIV] = 0u;
+    /* LIVE: SHIFT+step patterns start at the end of the bar (qcd 1b). */
+    parameter_values[PAR_SCENE_QUEUE_DIV] = LIVE_MODE ? 4u : 0u;
     parameter_values[PAR_SCENE_QUEUE_ACTION] = 0u;
 }
 
@@ -2824,6 +2826,12 @@ static void filesystem_sanitizeLoadedGlobals(void)
      */
     if (parameter_values[PAR_SCENE_QUEUE_DIV] > 17u)
         parameter_values[PAR_SCENE_QUEUE_DIV] = 0u;
+    /* LIVE: the clock follows CLK IN, DIN or USB when one runs (aut). */
+    if (LIVE_MODE && parameter_values[PAR_EXT_SYNC] == SEQ_EXT_SYNC_OFF)
+        parameter_values[PAR_EXT_SYNC] = SEQ_EXT_SYNC_AUTO;
+    /* LIVE: an instant queue (older settings.cfg) becomes end of bar. */
+    if (LIVE_MODE && parameter_values[PAR_SCENE_QUEUE_DIV] == 0u)
+        parameter_values[PAR_SCENE_QUEUE_DIV] = 4u;
     if (parameter_values[PAR_SCENE_CHANGE_DIV] > 9u)
         parameter_values[PAR_SCENE_CHANGE_DIV] = 0u;
     /*

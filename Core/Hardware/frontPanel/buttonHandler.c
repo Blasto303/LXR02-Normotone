@@ -17,6 +17,7 @@
  *   foreground context.
  */
 
+#include "liveMode.h"
 #include "buttonHandler.h"
 #include "menu.h"
 #include "screensaver.h"
@@ -2823,6 +2824,71 @@ static void handleVoiceButton(uint8_t voiceNr)
 }
 
 /* Process one press event */
+#if LIVE_MODE
+/*
+ * LIVE panel layer (liveMode.h).
+ *
+ * What: hold LOAD + step 8 (KIT) opens the KIT page in PERF; there a step
+ * press picks kit N for the playing pattern. A mode button closes the page.
+ * On the Load page (SAVE) the Bank list is the only content: SELECT and
+ * TRACK presses are consumed so no Instrument or type browser opens.
+ * Consumed presses have their release consumed too.
+ */
+static uint8_t bh_liveLoadHeld;
+static uint8_t bh_liveConsumed[(BUT_COUNT + 7u) / 8u];
+
+static void buttonHandler_liveConsume(uint8_t b)
+{
+    bh_liveConsumed[b >> 3] |= (uint8_t)(1u << (b & 7u));
+}
+
+static uint8_t buttonHandler_livePress(uint8_t b)
+{
+    int8_t seq = btn_to_seq(b);
+    uint8_t shift = buttonHandler_getShift();
+
+    if (b == BUT_MODE3) {
+        bh_liveLoadHeld = 1u;
+        live_kitPageClose();
+        return 0u;
+    }
+    if (seq >= 0 && bh_liveLoadHeld && seq == 7 && !shift) {
+        buttonHandler_liveConsume(b);
+        if (bh_state.selectButtonMode != SELECT_MODE_PERF)
+            handleModeButtons(SELECT_MODE_PERF);
+        live_kitPageOpen();
+        return 1u;
+    }
+    if (seq >= 0 && live_kitPageActive() && !shift &&
+        bh_state.selectButtonMode == SELECT_MODE_PERF) {
+        buttonHandler_liveConsume(b);
+        live_kitSelect((uint8_t)seq);
+        return 1u;
+    }
+    if (b == BUT_MODE1 || b == BUT_MODE2 || b == BUT_MODE4)
+        live_kitPageClose();
+    if (bh_state.selectButtonMode == SELECT_MODE_LOAD_SAVE &&
+        (btn_to_voice(b) >= 0 || btn_to_select(b) >= 0)) {
+        buttonHandler_liveConsume(b);
+        return 1u;
+    }
+    return 0u;
+}
+
+static uint8_t buttonHandler_liveRelease(uint8_t b)
+{
+    uint8_t bit = (uint8_t)(1u << (b & 7u));
+
+    if (b == BUT_MODE3)
+        bh_liveLoadHeld = 0u;
+    if (bh_liveConsumed[b >> 3] & bit) {
+        bh_liveConsumed[b >> 3] &= (uint8_t)~bit;
+        return 1u;
+    }
+    return 0u;
+}
+#endif
+
 static void processPress(uint8_t buttonNr)
 {
     /*
@@ -2852,6 +2918,10 @@ static void processPress(uint8_t buttonNr)
         }
         return;
     }
+#if LIVE_MODE
+    if (buttonNr < BUT_COUNT && buttonHandler_livePress(buttonNr))
+        return;
+#endif
     if (btn_to_seq(buttonNr) < 0)
         dblclick_cancel();
     if (perf_heldVoiceMask != 0u &&
@@ -3302,6 +3372,10 @@ void buttonHandler_setLearnLeds(uint8_t on)
 
 static void processRelease(uint8_t buttonNr)
 {
+#if LIVE_MODE
+    if (buttonNr < BUT_COUNT && buttonHandler_liveRelease(buttonNr))
+        return;
+#endif
     if (buttonNr == BUT_COPY) {
         if (bh_bankCopyPressTick) {
             menu_bankCopyReleased();
