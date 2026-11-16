@@ -2874,7 +2874,7 @@ static uint8_t buttonHandler_livePress(uint8_t b)
     }
     /* White labels: SHIFT + CONFIG/RELOAD/FX/PATTERN (not in the sequencer,
      * where SHIFT+step edits steps; LAST STEP keeps its Helicase meaning). */
-    if (seq >= 11 && seq != 13 && shift &&
+    if (seq >= 11 && shift &&
         bh_state.selectButtonMode != SELECT_MODE_STEP) {
         buttonHandler_liveConsume(b);
         if (seq != 12)
@@ -2883,6 +2883,14 @@ static uint8_t buttonHandler_livePress(uint8_t b)
         case 11: handleModeButtons(SELECT_MODE_LOAD_SAVE); break; /* +SHIFT = settings */
         case 12: live_reloadKit(); break;
         case 14: handleModeButtons(SELECT_MODE_PERF); break;      /* +SHIFT = Effect */
+        case 13:                                                   /* LAST STEP = RANDOM */
+            if (bh_state.selectButtonMode != SELECT_MODE_PERF) {
+                btn_held[BUT_SHIFT] = 0;
+                handleModeButtons(SELECT_MODE_PERF);
+                btn_held[BUT_SHIFT] = 1;
+            }
+            live_rndPageOpen();
+            break;
         default:
             if (bh_state.selectButtonMode != SELECT_MODE_PERF) {
                 /* Plain PERF (not SHIFT+PERF = Effect). */
@@ -2899,6 +2907,12 @@ static uint8_t buttonHandler_livePress(uint8_t b)
         bh_state.selectButtonMode == SELECT_MODE_PERF) {
         buttonHandler_liveConsume(b);
         live_kitSelect((uint8_t)seq);
+        return 1u;
+    }
+    if (seq >= 0 && live_rndPageActive() && !shift &&
+        bh_state.selectButtonMode == SELECT_MODE_PERF) {
+        buttonHandler_liveConsume(b);
+        live_rndStep((uint8_t)seq);
         return 1u;
     }
     if (seq >= 0 && live_patternPageActive() && !shift &&

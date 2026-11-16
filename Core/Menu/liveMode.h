@@ -42,6 +42,14 @@ uint8_t live_patternPageActive(void);
 void live_patternSelect(uint8_t scene);
 /* SHIFT + RELOAD (step 13): the playing pattern gets its own kit back. */
 void live_reloadKit(void);
+/*
+ * RANDOM page (SHIFT + LAST STEP, step 14): steps 1/2/3 = pattern, kit or
+ * both, DATA = dose (0 = original), DATA click = new draw for the kit.
+ */
+void live_rndPageOpen(void);
+uint8_t live_rndPageActive(void);
+void live_rndStep(uint8_t step);
+void live_rndPageLeds(void);
 /* Repaint the step LEDs of the KIT page. */
 void live_kitPageLeds(void);
 

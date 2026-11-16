@@ -9528,6 +9528,10 @@ void menu_refreshPerfSceneLeds(void)
         live_kitPageLeds();
         return;
     }
+    if (live_rndPageActive()) {
+        live_rndPageLeds();
+        return;
+    }
 #endif
     uint8_t active_scene = scene_getActiveIndex();
     uint8_t viewed = menu_getViewedPattern();
@@ -15884,7 +15888,7 @@ void menu_parseEncoder(int8_t inc, uint8_t button)
         uint8_t clicked = (uint8_t)(button && !liveLastButton);
 
         liveLastButton = button;
-        if (live_kitPageActive()) {
+        if (live_kitPageActive() || live_rndPageActive()) {
             live_encoder(inc, clicked);
             return;
         }
