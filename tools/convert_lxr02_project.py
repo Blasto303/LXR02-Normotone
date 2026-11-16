@@ -278,6 +278,14 @@ def project_name(project: Path) -> str:
     return display_name(raw) or project.name
 
 
+def short_project_label(name: str, pp: str) -> str:
+    """At most 5 characters naming the project: 'AMTech7' -> 'AM7'."""
+    short = re.sub(r"(?i)tech?", "", name).replace(" ", "")
+    if not short or short.lower() == "unnamed" or short.upper().startswith("PROJ"):
+        short = f"P{pp}"
+    return short[:5]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("card", type=Path, help="stock LXR-02 card root (PROJ00..PROJ09)")
@@ -309,8 +317,15 @@ def main() -> int:
                 init_core = data[KIT_NAME_BYTES:KIT_NAME_BYTES + KIT_CONVERTED_BYTES]
                 break
 
+        # Kits and Scenes carry the project name, so "AMTech7" kit 3 reads
+        # "AM7-03" in the Load list instead of an opaque "09-03".
+        short = short_project_label(project_name(project), pp)
+
         def kit_label(number: int, data: bytes) -> str:
-            return f"{pp}-{display_name(data[:KIT_NAME_BYTES]) or f'{number:02d}'}"[:8]
+            kit_name = display_name(data[:KIT_NAME_BYTES])
+            if kit_name and not kit_name.isdigit():
+                return f"{short[:3]}-{kit_name}"[:8]
+            return f"{short}-{number:02d}"[:8]
 
         # Root Kit library: distinct, non-init kits.
         seen = set()
@@ -347,7 +362,7 @@ def main() -> int:
             (bank_dir / "bankset.bcg").write_text(bankset_text(), encoding="ascii")
             for scene_slot, (number, path, pattern) in enumerate(group):
                 where = f"{project.name}/{path.name}"
-                scene_dir = bank_dir / f"{scene_slot:02d} {pp}-{number:02d}"
+                scene_dir = bank_dir / f"{scene_slot:02d} {short}-{number:02d}"
                 scene_dir.mkdir(parents=True, exist_ok=True)
                 (scene_dir / "sceneset.scg").write_text(
                     sceneset_text(pattern["lengths"]), encoding="ascii"
