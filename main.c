@@ -204,7 +204,20 @@ static void audio_check_and_render(void)
     ** legacy DSP advances in OUTPUT_DMA_SIZE chunks. This keeps EG/LFO/control
     ** cadence aligned with LXR-master even though the F765 codec queue presents
     ** one complete AUDIO_DMA_FRAMES buffer to the I2S DMA layer. */
-    while (audioCodec_queueFreeSlots() > 0) {
+    /*
+     * At most two buffers per call (Normotone, freeze fix).
+     *
+     * What: the queue is refilled by at most two buffers each time the main
+     * loop calls in, instead of until it is full. Why: when the DSP needs more
+     * than real time (heavy kit + DlyVerb), "until full" never ends, the
+     * foreground never runs again and the panel freezes. Bounded, an overload
+     * gives audible underruns while the LCD, buttons and SD keep working, so
+     * the load can be reduced from the panel. The main loop calls this between
+     * every service, so in normal load the queue stays full as before.
+     */
+    uint8_t render_budget = 2u;
+
+    while (render_budget-- > 0u && audioCodec_queueFreeSlots() > 0) {
         sample_mx_t *buf  = audioCodec_getRenderBuffer();
         sample_mx_t *buf2 = audioCodec_getRenderBuffer2();
 

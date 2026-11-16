@@ -147,6 +147,49 @@ void mixer_init()
 #endif
 }
 //-----------------------------------------------------------------------
+/*
+ * Silent-voice sleep (Normotone, CPU).
+ *
+ * What: a voice whose rendered block stayed within +-mixer_sleepLevel (-72 dBFS) for
+ * MIXER_SLEEP_BLOCKS consecutive blocks (about 12 ms) is put to sleep: the
+ * mixer skips its DSP and its bus adds until the next trigger wakes it
+ * (instrumentManager_triggerTrack() -> mixer_wakeVoice()). Why: the voice
+ * engines cost the same whether they sound or not (bench: 76 k host
+ * instructions per block with no trigger at all, 77 k with all six playing),
+ * so in a sparse pattern most of the render budget went to silence. The test
+ * is on the output, so a voice that still sounds (long decay, resonant
+ * filter, drone) never sleeps. Context: render loop (foreground) for the
+ * check, trigger path for the wake (single-byte stores).
+ */
+#define MIXER_SLEEP_BLOCKS 16u
+volatile uint8_t mixer_voiceAsleep[6];
+static uint8_t mixer_voiceQuiet[6];
+uint8_t mixer_sleepEnabled = 1u;
+int16_t mixer_sleepLevel = 8;      /* +-8 of 32767: -72 dBFS per voice */
+uint32_t mixer_sleepBlocks[6];     /* blocks skipped per slot (statistics) */   /* 0 only for the host bench comparison */
+
+void mixer_wakeVoice(uint8_t slot)
+{
+	if (slot < 6u) {
+		mixer_voiceQuiet[slot] = 0u;
+		mixer_voiceAsleep[slot] = 0u;
+	}
+}
+
+static void mixer_updateVoiceSleep(uint8_t slot, const int16_t *buf)
+{
+	uint8_t i;
+
+	for (i = 0u; i < OUTPUT_DMA_SIZE; i++) {
+		if (buf[i] > mixer_sleepLevel || buf[i] < -mixer_sleepLevel) {
+			mixer_voiceQuiet[slot] = 0u;
+			return;
+		}
+	}
+	if (++mixer_voiceQuiet[slot] >= MIXER_SLEEP_BLOCKS && mixer_sleepEnabled)
+		mixer_voiceAsleep[slot] = 1u;
+}
+
 void mixer_decimateBlock(const uint8_t voiceNr, int16_t* buffer)
 {
 	uint8_t i;
@@ -974,8 +1017,14 @@ void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2)
 		uint8_t pan;
 		float voiceGain;
 		float sendGain;
+		/* Silent-voice sleep: a sleeping voice adds nothing to any bus. */
+		if (mixer_voiceAsleep[slot]) {
+			mixer_sleepBlocks[slot]++;
+			continue;
+		}
 		instrumentManager_calcSlotSyncBlock(slot, sampleData, OUTPUT_DMA_SIZE);
 		mixer_decimateBlock(slot,sampleData);
+		mixer_updateVoiceSleep(slot, sampleData);
 		/*
 		 * sampleData is the decimated, pre-volume voice block. The fader mode
 		 * creates parallel dry/send gains: PRE scales both, POST scales only the

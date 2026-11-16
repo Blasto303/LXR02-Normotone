@@ -781,15 +781,24 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
             float vb;
 
             va = dv_ringRead(ring_l, len, wp, al);
-            vb = dv_ringRead(ring_l, len, wp, bl);
             va = ((al + 2.0f) <= (float)valid) ? va : 0.0f;
-            vb = ((bl + 2.0f) <= (float)valid) ? vb : 0.0f;
-            d_l = va + st->xfade * (vb - va);
+            /* The second tap only matters during a dig crossfade (CPU). */
+            if (st->xfade != 0.0f) {
+                vb = dv_ringRead(ring_l, len, wp, bl);
+                vb = ((bl + 2.0f) <= (float)valid) ? vb : 0.0f;
+                d_l = va + st->xfade * (vb - va);
+            } else {
+                d_l = va;
+            }
             va = dv_ringRead(ring_r, len, wp, ar);
-            vb = dv_ringRead(ring_r, len, wp, br);
             va = ((ar + 2.0f) <= (float)valid) ? va : 0.0f;
-            vb = ((br + 2.0f) <= (float)valid) ? vb : 0.0f;
-            d_r = va + st->xfade * (vb - va);
+            if (st->xfade != 0.0f) {
+                vb = dv_ringRead(ring_r, len, wp, br);
+                vb = ((br + 2.0f) <= (float)valid) ? vb : 0.0f;
+                d_r = va + st->xfade * (vb - va);
+            } else {
+                d_r = va;
+            }
         }
 
         /* Echo tone: one-pole low-pass then one-pole high-pass. */

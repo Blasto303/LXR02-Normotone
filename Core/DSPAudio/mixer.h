@@ -106,6 +106,9 @@ enum
 
 void mixer_init();
 void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2);
+/* Silent-voice sleep: a trigger wakes the slot (mixer.c). */
+void mixer_wakeVoice(uint8_t slot);
+extern volatile uint8_t mixer_voiceAsleep[6];
 void mixer_moveDataToOutput(uint8_t dest, const float panL, const float panR, sample_mx_t* data,sample_mx_t* outL,sample_mx_t* outR,sample_mx_t* outL2, sample_mx_t* outR2);
 void mixer_addDataToOutput(uint8_t dest, const float panL, const float panR,  sample_mx_t* data,sample_mx_t* outL,sample_mx_t* outR,sample_mx_t* outL2, sample_mx_t* outR2);
 void mixer_setOutJackDetectPB(uint8_t pb4_high, uint8_t pb6_high);
