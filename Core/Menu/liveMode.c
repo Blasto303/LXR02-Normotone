@@ -29,6 +29,7 @@
 #include "sequencer.h"
 #include "ledHandler.h"
 #include "menu.h"
+#include "buttonHandler.h"
 
 static kit_t    live_kitBackup;
 static uint8_t  live_backupScene = 0xFFu;   /* Scene whose kit is swapped */
@@ -37,6 +38,7 @@ static uint8_t  live_kitSource = 0xFFu;     /* kit shown on the KIT page  */
 static uint8_t  live_pendingKit = 0xFFu;    /* kit waiting for the bar    */
 static uint8_t  live_carrier;               /* queue only carries the kit */
 static uint8_t  live_page;                  /* KIT page open              */
+static uint8_t  live_shownQueue = 0xFFu;    /* queued pattern on the LCD  */
 
 static uint8_t live_sceneValid(uint8_t scene)
 {
@@ -205,8 +207,27 @@ uint8_t live_queuedFire(uint8_t scene)
     return (uint8_t)(carrier && scene == scene_getActiveIndex());
 }
 
+/* Pattern queued by SHIFT+step (not a kit carrier), 0xFF when none. */
+static uint8_t live_queuedPattern(void)
+{
+    uint8_t q = seq_queuedSceneTarget();
+
+    if (q >= 16u || (live_carrier && q == scene_getActiveIndex()))
+        return 0xFFu;
+    return q;
+}
+
 void live_service(void)
 {
+    /* Repaint when the "Select Pattern" screen appears or goes. */
+    {
+        uint8_t q = live_queuedPattern();
+
+        if (q != live_shownQueue) {
+            live_shownQueue = q;
+            menu_repaintAll();
+        }
+    }
     /* A transport stop cancels the queue: the carrier is gone, apply now. */
     if (live_carrier && seq_queuedSceneTarget() >= 16u &&
         !seq_sceneChangeFirePending())
@@ -226,8 +247,24 @@ uint8_t live_formatOverlay(char *row0, char *row1)
 {
     uint8_t kit;
 
-    if (!live_page)
-        return 0u;
+    if (!live_page) {
+        uint8_t q = live_queuedPattern();
+        uint8_t cur = (uint8_t)(scene_getActiveIndex() + 1u);
+
+        /* Stock LXR-02 screen while a pattern waits for the bar. */
+        if (q >= 16u || buttonHandler_getMode() != SELECT_MODE_PERF)
+            return 0u;
+        memset(row0, ' ', 16);
+        memset(row1, ' ', 16);
+        memcpy(row0, "Select Pattern", 14);
+        memcpy(row1, "Current: ", 9);
+        row1[9] = (char)('0' + cur / 10u);
+        row1[10] = (char)('0' + cur % 10u);
+        row1[12] = '>';
+        row1[14] = (char)('0' + (q + 1u) / 10u);
+        row1[15] = (char)('0' + (q + 1u) % 10u);
+        return 1u;
+    }
     kit = live_currentKit();
     memset(row0, ' ', 16);
     memset(row1, ' ', 16);
