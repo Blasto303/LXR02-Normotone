@@ -24,6 +24,10 @@
  * kit is written without an AutoSave mark: a power cut never leaves a
  * converted kit in the Bank.
  *
+ * New Bank: when a Bank load ends, pattern 1 of the new Bank is queued for
+ * the end of the bar (live_service), so the change is heard without a
+ * SHIFT + step.
+ *
  * RAM: two kit_t (backup, conversion) plus a few bytes.
  */
 #include "liveMode.h"
@@ -58,6 +62,8 @@ static uint8_t  live_plaits;                /* PLAITS wanted                  */
 static uint8_t  live_plaitsOn;              /* PLAITS applied on the backup Scene */
 static uint8_t  live_tablesReady;           /* plaitsMode tables built        */
 static kit_t    live_kitTemp;               /* Plaits conversion              */
+static uint8_t  live_bankLoading;           /* background Bank load seen      */
+static uint16_t live_bankBefore = 0xFFFFu;  /* Bank slot when it started      */
 /*
  * RANDOM (SHIFT + LAST STEP): dose 0..127 on the pattern (sequencer layer,
  * seq_liveRndDose), the kit (random Morph target + voice Morph amount =
@@ -568,6 +574,22 @@ uint8_t live_plaitsActive(void)
 
 void live_service(void)
 {
+    /*
+     * New Bank: when a background Bank load (SAVE / LOAD + PROJECT, or MIDI
+     * CC0) ends on another Bank, its pattern 1 is queued for the end of the
+     * bar (at once when stopped). Helicase alone keeps the old pattern
+     * playing from Scene 17 until a pattern is chosen.
+     */
+    if (preset_backgroundBankLoadRunning()) {
+        if (!live_bankLoading) {
+            live_bankLoading = 1u;
+            live_bankBefore = bank_restoreBankSlot();
+        }
+    } else if (live_bankLoading) {
+        live_bankLoading = 0u;
+        if (bank_restoreBankSlot() != live_bankBefore && live_sceneValid(0u))
+            live_patternSelect(0u);
+    }
     /* PLAITS tables: built in the background while the transport is stopped. */
     if (!live_tablesReady && !seq_isRunning())
         live_tablesReady = plaitsMode_service();
@@ -644,8 +666,9 @@ uint8_t live_formatOverlay(char *row0, char *row1)
         memset(row1, ' ', 16);
         memcpy(row0, "Select Pattern", 14);
         memcpy(row1, "Current: ", 9);
-        row1[9] = (char)('0' + cur / 10u);
-        row1[10] = (char)('0' + cur % 10u);
+        /* Scene 17: the old Bank's pattern still playing after a load. */
+        row1[9] = (cur > 16u) ? '-' : (char)('0' + cur / 10u);
+        row1[10] = (cur > 16u) ? '-' : (char)('0' + cur % 10u);
         if (q < 16u) {
             row1[12] = '>';
             row1[14] = (char)('0' + (q + 1u) / 10u);

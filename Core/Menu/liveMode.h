@@ -9,7 +9,8 @@
  *     gives it its own kit back,
  *   - the Effect, compressor and voice mix (outputs, FX sends, faders) follow
  *     the player across pattern changes, so the rumble on DRUM1 never drops,
- *   - SAVE opens the Bank list only (no Save page, no Scene writing).
+ *   - SAVE opens the Bank list only (no Save page, no Scene writing); a
+ *     loaded Bank starts on its pattern 1 at the end of the bar.
  * Step labels of the LXR-02 panel: LOAD + KIT (8) = KIT page, LOAD +
  * PROJECT (11) = Bank list, SHIFT/LOAD + PATTERN (16) = PATTERN page,
  * SHIFT + FX (15) = Effect, SHIFT + CONFIG (12) = settings, SHIFT + RELOAD
