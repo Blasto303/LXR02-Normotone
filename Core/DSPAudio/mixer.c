@@ -193,6 +193,15 @@ static void mixer_updateVoiceSleep(uint8_t slot, const int16_t *buf)
 void mixer_decimateBlock(const uint8_t voiceNr, int16_t* buffer)
 {
 	uint8_t i;
+	/*
+	 * Full rate (Normotone CPU): every sample would be taken, so the block is
+	 * already the output; only the held sample is kept current for a later
+	 * rate change. Output identical, 32 iterations saved per voice.
+	 */
+	if (mixer_decimation_rate[voiceNr] >= 1.0f) {
+		mixer_voice_samples[voiceNr] = buffer[OUTPUT_DMA_SIZE - 1u];
+		return;
+	}
 	for(i=0;i<OUTPUT_DMA_SIZE;i++)
 	{
 		/* S075: the retired global multiplier (former rate[6]) is gone. */

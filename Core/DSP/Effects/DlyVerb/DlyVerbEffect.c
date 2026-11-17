@@ -171,6 +171,8 @@ typedef struct {
     float q_mod;
     float q_rmod;
     uint32_t q_mode;        /* 1 while the rings hold quarter-rate content */
+    float s_mod;            /* str/png/wid: control-rate modulation */
+    float s_rmod;
 } DlyVerbState;
 
 _Static_assert(sizeof(DlyVerbState) <= DLYVERB_STATE_BYTES,
@@ -957,8 +959,38 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
     wp = st->wp;
     valid = st->valid;
     ptr = st->rv_ptr;
+    {
+        float s_mod_inc = 0.0f;
+        float s_rmod_inc = 0.0f;
+
     for (n = 0u; n < half; n++) {
         float in_l;
+        /*
+         * Modulation at control rate (Normotone CPU): every 8 half-rate
+         * samples the shapes are evaluated 8 samples ahead and ramped. All
+         * of them are below 25 Hz; the delay-time error stays under a few
+         * hundredths of a sample at the extreme settings.
+         */
+        if ((n & 7u) == 0u) {
+            float target;
+
+            st->ph_tri += 8.0f * inc_mod;          st->ph_tri -= floorf(st->ph_tri);
+            st->ph_flutter += 8.0f * inc_flutter;  st->ph_flutter -= floorf(st->ph_flutter);
+            st->ph_wow += 8.0f * inc_wow;          st->ph_wow -= floorf(st->ph_wow);
+            st->ph_base_flutter += 8.0f * inc_base_flutter;
+            st->ph_base_flutter -= floorf(st->ph_base_flutter);
+            st->ph_rvb += 8.0f * inc_rvb;          st->ph_rvb -= floorf(st->ph_rvb);
+            target = mod_depth * (w_tri * (1.0f - 4.0f * fabsf(st->ph_tri - 0.5f)) +
+                                  w_wow * dv_sine(st->ph_tri) +
+                                  w_flutter * dv_sine(st->ph_flutter)) +
+                     base_tri * (1.0f - 4.0f * fabsf(st->ph_wow - 0.5f)) +
+                     base_wow * dv_sine(st->ph_wow) +
+                     base_flutter * dv_sine(st->ph_base_flutter);
+            s_mod_inc = 0.125f * (target - st->s_mod);
+            s_rmod_inc = 0.125f * (dv_sine(st->ph_rvb) - st->s_rmod);
+        }
+        st->s_mod += s_mod_inc;
+        st->s_rmod += s_rmod_inc;
         float in_r;
         float mod;
         float d_l;
@@ -995,16 +1027,7 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         in_l = st->drv_lp[0];
         in_r = st->drv_lp[1];
 
-        /*
-         * Modulation (constant cost: every shape every sample): the user's
-         * depth on the model's shape, plus the model's permanent base.
-         */
-        mod = mod_depth * (w_tri * (1.0f - 4.0f * fabsf(st->ph_tri - 0.5f)) +
-                           w_wow * dv_sine(st->ph_tri) +
-                           w_flutter * dv_sine(st->ph_flutter)) +
-              base_tri * (1.0f - 4.0f * fabsf(st->ph_wow - 0.5f)) +
-              base_wow * dv_sine(st->ph_wow) +
-              base_flutter * dv_sine(st->ph_base_flutter);
+        mod = st->s_mod;
 
         /* Two taps per side; reads beyond what was written are silent. */
         {
@@ -1055,7 +1078,7 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         /* Plate: fed by the echoes, or by the driven input (par). */
         rin = 0.5f * ((eo_l + eo_r) + r_par * ((in_l + in_r) - (eo_l + eo_r)));
         dv_plate(st, rv, ptr, 0.5f * rin, decay, dd2, damp,
-                 dv_sine(st->ph_rvb), &rv_l, &rv_r);
+                 st->s_rmod, &rv_l, &rv_r);
         ptr = (ptr - 1u) & DV_RVB_MASK;
 
         /*
@@ -1082,12 +1105,20 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
          * Loop saturation: dig clamps; bbd and tap soft clip after a
          * pre-gain (unity for small signals), tap with a bias.
          */
-        w_l = dv_clamp(w_l, 1.0f) + sat_k *
-              (loop_inv * (dv_soft(loop_k * w_l + loop_bias) - loop_bias_out) -
-               dv_clamp(w_l, 1.0f));
-        w_r = dv_clamp(w_r, 1.0f) + sat_k *
-              (loop_inv * (dv_soft(loop_k * w_r + loop_bias) - loop_bias_out) -
-               dv_clamp(w_r, 1.0f));
+        if (sat_k >= 1.0f) {        /* bbd/tap: the clamp terms cancel */
+            w_l = loop_inv * (dv_soft(loop_k * w_l + loop_bias) - loop_bias_out);
+            w_r = loop_inv * (dv_soft(loop_k * w_r + loop_bias) - loop_bias_out);
+        } else if (sat_k <= 0.0f) { /* dig: clamp only */
+            w_l = dv_clamp(w_l, 1.0f);
+            w_r = dv_clamp(w_r, 1.0f);
+        } else {
+            w_l = dv_clamp(w_l, 1.0f) + sat_k *
+                  (loop_inv * (dv_soft(loop_k * w_l + loop_bias) - loop_bias_out) -
+                   dv_clamp(w_l, 1.0f));
+            w_r = dv_clamp(w_r, 1.0f) + sat_k *
+                  (loop_inv * (dv_soft(loop_k * w_r + loop_bias) - loop_bias_out) -
+                   dv_clamp(w_r, 1.0f));
+        }
         ring_l[wp] = (int16_t)(w_l * 32767.0f);
         ring_r[wp] = (int16_t)(w_r * 32767.0f);
         wp++;
@@ -1109,16 +1140,7 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
             st->xfade_inc = 0.0f;
         }
 
-        st->ph_tri += inc_mod;
-        st->ph_tri -= (st->ph_tri >= 1.0f) ? 1.0f : 0.0f;
-        st->ph_flutter += inc_flutter;
-        st->ph_flutter -= (st->ph_flutter >= 1.0f) ? 1.0f : 0.0f;
-        st->ph_wow += inc_wow;
-        st->ph_wow -= (st->ph_wow >= 1.0f) ? 1.0f : 0.0f;
-        st->ph_base_flutter += inc_base_flutter;
-        st->ph_base_flutter -= (st->ph_base_flutter >= 1.0f) ? 1.0f : 0.0f;
-        st->ph_rvb += inc_rvb;
-        st->ph_rvb -= (st->ph_rvb >= 1.0f) ? 1.0f : 0.0f;
+    }
     }
     /* A model change away from dig mid-fade lets the glide take over. */
     if (model != DLYVERB_MODEL_DIGITAL && st->xfade_inc == 0.0f) {

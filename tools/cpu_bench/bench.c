@@ -109,7 +109,7 @@ static void run(int blocks, uint8_t mask, double *mean, double *worst)
         t0 = now_us();
         mixer_calcNextSampleBlock(outA, outB);
         dt = now_us() - t0;
-        if (dump) fwrite(outA, sizeof(outA[0]), 64, dump);
+        if (dump) { fwrite(outA, sizeof(outA[0]), 64, dump); fwrite(outB, sizeof(outB[0]), 64, dump); }
         if (b >= 24 && n < 20000) { sum += dt; dts[n++] = dt; }
         loop_pass();
     }
@@ -143,7 +143,7 @@ static void run_pattern(uint8_t sc, int blocks)
         }
         voiceControl_processPending();
         mixer_calcNextSampleBlock(outA, outB);
-        if (dump) fwrite(outA, sizeof(outA[0]), 64, dump);
+        if (dump) { fwrite(outA, sizeof(outA[0]), 64, dump); fwrite(outB, sizeof(outB[0]), 64, dump); }
         loop_pass();
     }
 }

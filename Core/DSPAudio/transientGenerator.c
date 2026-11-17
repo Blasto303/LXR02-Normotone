@@ -61,15 +61,30 @@ void transient_trigger(TransientGenerator* transient)
 	transient->phase	= 0;
 }
 //---------------------------------------------------------------
-void transient_calcBlock(TransientGenerator* transient, int16_t* buf, const uint8_t size)
+uint8_t transient_calcBlock(TransientGenerator* transient, int16_t* buf, const uint8_t size)
 {
 	if(transient->waveform<=1)
 	{
 		memset(buf,0,size*sizeof(int16_t));
-		return; //snapEg and offset
+		return 1u; //snapEg and offset
 	}
 
 	uint8_t i;
+	/*
+	 * Finished sample (Normotone CPU): the phase no longer advances, so every
+	 * remaining output is the same value (the last table sample, or 0 past
+	 * the end). Compute it once; returns 1 when the block is silent so the
+	 * voice can skip mixing it. Output identical to the loop below.
+	 */
+	if (transient->phase >= 2311061504u) {
+		const uint32_t phase = transient->phase >> 20;
+		const int16_t v = (int16_t)(transient->volume *
+			(transientData[transient->waveform-2][phase < TRANSIENT_SAMPLE_LENGTH ? phase : 0] << 8) *
+			(phase < TRANSIENT_SAMPLE_LENGTH));
+		for (i = 0; i < size; i++)
+			buf[i] = v;
+		return (uint8_t)(v == 0);
+	}
 	for(i=0;i<size;i++)
 	{
 		uint32_t phase = transient->phase;
@@ -81,6 +96,7 @@ void transient_calcBlock(TransientGenerator* transient, int16_t* buf, const uint
 		transient->phase += (transient->phase<2311061504u) * (transient->pitch*(1<<20)); //2311061504 => 2204<<20
 
 	}
+	return 0u;
 }
 //---------------------------------------------------------------
 void transient_calc(TransientGenerator* transient)
