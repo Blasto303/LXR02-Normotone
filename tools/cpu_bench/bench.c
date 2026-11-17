@@ -384,6 +384,29 @@ int main(int argc, char **argv)
                 printf(" %u", scene_instrumentSlotConst(sc, v)->type);
             printf("\n");
         }
+        /* BENCH_FX="key=val,...": Effect rows by storage key; BENCH_COMP=amount. */
+        if (getenv("BENCH_FX") && *getenv("BENCH_FX")) {
+            char buf[512], *tok, *save = NULL;
+
+            strncpy(buf, getenv("BENCH_FX"), sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = 0;
+            for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+                char *eq = strchr(tok, '=');
+                uint8_t idx;
+
+                if (!eq) continue;
+                *eq = 0;
+                if (effects_descriptorByKey(scene_effectConst(sc)->type, tok, &idx))
+                    scene_setEffectNormalParameter(sc, idx, (uint8_t)atoi(eq + 1));
+                else
+                    printf("unknown fx key %s\n", tok);
+            }
+            settle();
+        }
+        if (getenv("BENCH_COMP"))
+            scene_setBusCompSetting(sc, SCENE_BUS_COMP_AMOUNT, (uint8_t)atoi(getenv("BENCH_COMP")));
+        if (getenv("BENCH_COMPT"))
+            scene_setBusCompSetting(sc, SCENE_BUS_COMP_TIME, (uint8_t)atoi(getenv("BENCH_COMPT")));
         if (!atoi(argv[5])) {
             static effect_record_t off;
             off = *scene_effectConst(sc);

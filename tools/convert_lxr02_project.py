@@ -257,25 +257,26 @@ RUMBLE_EFFECT = "\n".join([
     "type=dvb",
     "",
     "[params]",
+    # Dark rumble: denser, darker and fatter than the first recipe.
     "effect_audio_out=0",      # St1
     "effect_level=127",
     "effect_pan=63",
     "dvb_division=5",          # 1/16
-    "dvb_feedback=80",
-    "dvb_dly_level=80",
+    "dvb_feedback=96",
+    "dvb_dly_level=100",
     "dvb_rvb_level=127",
     "dvb_model=2",             # tap(e)
     "dvb_stereo=3",            # mno: mono echo, stereo plate (CPU)
     "dvb_width=0",
-    "dvb_drive=90",
-    "dvb_lowpass=15",
-    "dvb_highpass=8",
-    "dvb_mod_depth=15",
+    "dvb_drive=120",
+    "dvb_lowpass=10",
+    "dvb_highpass=4",
+    "dvb_mod_depth=22",
     "dvb_mod_rate=30",
     "dvb_age=0",
-    "dvb_rvb_decay=105",
-    "dvb_rvb_damp=115",
-    "dvb_rvb_route=1",         # ser
+    "dvb_rvb_decay=118",
+    "dvb_rvb_damp=124",
+    "dvb_rvb_route=2",         # fbk: the plate feeds the delay back
     "",
 ])
 
@@ -297,8 +298,8 @@ def sceneset_text(lengths: list[int]) -> str:
             "fader_setting=0,0,0,0,0,0",
             "fx_send_morph=127,0,0,0,0,0",
             "bus_comp_mode=1",
-            "bus_comp_amount=100",
-            "bus_comp_time=50",
+            "bus_comp_amount=75",      # pumps without burying the rumble
+            "bus_comp_time=25",
             "bus_comp_sidechain=1",
         ]
     else:

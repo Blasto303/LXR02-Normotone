@@ -19,6 +19,8 @@ RANDOM draws in separate wrappers. `BENCH_DUMP=file` writes the stereo
 output, `BENCH_NOSLEEP=1` disables the silent-voice sleep (for A/B checks).
 `BENCH_PLAITS=1` plays the Scene in PLAITS mode (its kit converted to the
 Plaits engines; `2` builds the conversion tables first, as after boot).
+`BENCH_FX="key=val,..."` sets Effect rows by storage key, `BENCH_COMP` and
+`BENCH_COMPT` the bus compressor amount and time (rumble A/B renders).
 `... plaits` runs the PLAITS scenario: toggle, pattern changes, KIT swap,
 `fixe`, toggle off, own kits intact, and sample p-lock redirections.
 
