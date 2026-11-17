@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
+#include <valgrind/callgrind.h>
 #include "filesystem.h"
 #include "SceneData.h"
 #include "BankData.h"
@@ -77,6 +79,96 @@ __attribute__((noinline)) static void ev_knob(int knob, int d) { ev_knob_raw(kno
 __attribute__((noinline)) static void ev_enc(int d) { menu_parseEncoder((int8_t)d, 0u); }
 __attribute__((noinline)) static void ev_press(uint8_t b) { buttonHandler_buttonPressed(b); }
 __attribute__((noinline)) static void ev_release(uint8_t b) { buttonHandler_buttonReleased(b); }
+
+/* ---- live stress (gestures = 2) ---- */
+static const uint8_t seq_btn[16] = { BUT_SEQ1, BUT_SEQ2, BUT_SEQ3, BUT_SEQ4,
+    BUT_SEQ5, BUT_SEQ6, BUT_SEQ7, BUT_SEQ8, BUT_SEQ9, BUT_SEQ10, BUT_SEQ11,
+    BUT_SEQ12, BUT_SEQ13, BUT_SEQ14, BUT_SEQ15, BUT_SEQ16 };
+static const uint8_t sel_btn[8] = { BUT_SELECT1, BUT_SELECT2, BUT_SELECT3,
+    BUT_SELECT4, BUT_SELECT5, BUT_SELECT6, BUT_SELECT7, BUT_SELECT8 };
+static const uint8_t voice_btn[7] = { BUT_VOICE_1, BUT_VOICE_2, BUT_VOICE_3,
+    BUT_VOICE_4, BUT_VOICE_5, BUT_VOICE_6, BUT_VOICE_7 };
+static uint32_t stress_rng = 12345u;
+static uint32_t srnd(uint32_t n) { stress_rng = stress_rng * 1664525u + 1013904223u; return (stress_rng >> 8) % n; }
+/* A chord pressed now and released 2 ms later (pending list). */
+static uint8_t chord[4]; static uint8_t chord_n; static long chord_release = -1;
+static void hold(long ms, uint8_t a, uint8_t b, uint8_t c)
+{
+    chord_n = 0;
+    if (a != 255) { ev_press(a); chord[chord_n++] = a; }
+    if (b != 255) { ev_press(b); chord[chord_n++] = b; }
+    if (c != 255) { ev_press(c); chord[chord_n++] = c; }
+    chord_release = ms + 2;
+}
+static void stress_tick(long ms)
+{
+    long c = ms % 8000;            /* 8 s cycle */
+    /* Bank change while playing has priority (LOAD+PROJECT, previous Bank). */
+    if (ms >= 30000 && ms < 30200) {
+        if (chord_release >= 0 && ms >= chord_release) {
+            while (chord_n) ev_release(chord[--chord_n]);
+            chord_release = -1;
+        }
+        if (ms == 30000) { while (chord_n) ev_release(chord[--chord_n]); hold(ms, BUT_MODE3, BUT_SEQ11, 255); }
+        if (ms == 30050) ev_enc(-1);
+        if (ms == 30100) { menu_parseEncoder(0, 1u); menu_parseEncoder(0, 0u); printf("t=30.1 s bank load requested\n"); }
+        if (ms == 30150) hold(ms, BUT_MODE2, 255, 255);
+        if (getenv("FG_TRACE") && ms % 25 == 0)
+            printf("t=%ld |%.16s|%.16s| bank %u\n", ms, editDisplayBuffer[0], editDisplayBuffer[1], (unsigned)bank_restoreBankSlot());
+        return;
+    }
+    if (chord_release >= 0 && ms >= chord_release) {
+        while (chord_n) ev_release(chord[--chord_n]);
+        chord_release = -1;
+    }
+    if (chord_release >= 0) return;
+    if (ms % 1846 == 0) { hold(ms, BUT_SHIFT, seq_btn[srnd(11)], 255); return; }   /* pattern / bar */
+    if (ms % 923 == 400) { hold(ms, BUT_MODE3, BUT_SEQ8, 255); return; }          /* KIT page */
+    if (ms % 923 == 410) { hold(ms, seq_btn[srnd(16)], 255, 255); return; }      /* kit swap */
+    if (ms % 923 == 420) { hold(ms, BUT_MODE2, 255, 255); return; }              /* back to PERF */
+    if (c == 2000) { hold(ms, BUT_SHIFT, BUT_SEQ14, 255); return; }              /* RANDOM */
+    if (c == 2010) { hold(ms, BUT_SEQ3, 255, 255); return; }                     /* p+k */
+    if (c == 2020) { ev_enc(32); return; }                                       /* dose 127 */
+    if (c > 2020 && c < 4000 && c % 500 == 0) { menu_parseEncoder(0, 1u); menu_parseEncoder(0, 0u); return; } /* new draws */
+    if (c == 3900) { ev_enc(-16); return; }
+    if (c == 4000) { hold(ms, BUT_SHIFT, BUT_SEQ15, 255); return; }              /* Effect page */
+    if (c > 4000 && c < 6000) {
+        if (c % 250 == 5) { hold(ms, sel_btn[srnd(5)], 255, 255); return; }       /* OSC..CLICK */
+        if (c % 10 == 0) { ev_knob(srnd(4), (int)srnd(9) - 4); return; }          /* pot sweeps */
+    }
+    if (c == 6000) { hold(ms, BUT_MODE2, 255, 255); return; }                    /* PERF */
+    if (c > 6000 && c < 7000 && c % 10 == 0) { ev_knob(srnd(4), (int)srnd(7) - 3); return; } /* morph pots */
+    if (c > 6000 && c % 300 == 150) { hold(ms, voice_btn[srnd(7)], 255, 255); return; }      /* mutes */
+    if (c == 7000) { ev_press(BUT_SELECT3); return; }                            /* looper on */
+    if (c == 7600) { ev_release(BUT_SELECT3); return; }                          /* looper off */
+    if (ms % 1000 == 500) seq_setBpm((uint16_t)(90 + (ms / 1000) * 9 % 91)); /* tempo moves */
+}
+
+/* Render blocks timed one by one (host ns, CLOCK_MONOTONIC). */
+static unsigned rnd_count;
+static float rnd_ns[200000];
+__attribute__((noinline)) static void rnd_block(void)
+{
+    struct timespec a, b;
+    static int win = -1; static unsigned w0, w1;
+    if (win < 0) { const char *e = getenv("FG_DUMPWIN"); float x, y; win = 0;
+        if (e && sscanf(e, "%f,%f", &x, &y) == 2) { win = 1; w0 = (unsigned)(x * 44108 / 32); w1 = (unsigned)(y * 44108 / 32); } }
+    if (win && rnd_count >= w0 && rnd_count < w1) CALLGRIND_ZERO_STATS;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    mixer_calcNextSampleBlock(outA, outB);
+    if (win && rnd_count >= w0 && rnd_count < w1) CALLGRIND_DUMP_STATS;
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    if (rnd_count < 200000u) {
+        float ns = (float)((b.tv_sec - a.tv_sec) * 1e9 + (b.tv_nsec - a.tv_nsec));
+        rnd_ns[rnd_count++] = ns;
+        if (getenv("FG_PEAK") && ns > 30000.0f)
+            printf("peak block %u (t=%.3f s) %.0f ns |%.16s|%.16s| fx type %u stm %u mdl %u\n", rnd_count,
+                   rnd_count * 32.0 / 44108.0, ns, editDisplayBuffer[0], editDisplayBuffer[1],
+                   scene_effectConst(scene_getActiveIndex())->type,
+                   scene_effectConst(scene_getActiveIndex())->normal[8],
+                   scene_effectConst(scene_getActiveIndex())->normal[7]);
+    }
+}
 
 static void map_peripherals(void)
 {
@@ -151,7 +243,11 @@ int main(int argc, char **argv)
         if (st % 4 == 0) isr_lcd();
         if (st % 20 == 0) {
             /* gestures, once per ms boundary */
-            if (gestures) {
+            if (gestures == 2) stress_tick(ms);
+            if (getenv("FG_TRACE") && ms > 30200 && ms % 500 == 0)
+                printf("t=%ld |%.16s|%.16s| bank %u status %d\n", ms, editDisplayBuffer[0], editDisplayBuffer[1],
+                       (unsigned)bank_restoreBankSlot(), (int)preset_getStatus());
+            if (gestures == 1) {
                 if (ms == 3000) { ev_press(BUT_SHIFT); ev_press(BUT_SEQ15); }
                 if (ms == 3001) { ev_release(BUT_SEQ15); ev_release(BUT_SHIFT); }
                 if (ms >= 3200 && ms < 5000 && ms % 20 == 0) ev_knob(1 + (ms / 20) % 3, (ms / 100) % 2 ? 1 : -1);
@@ -175,11 +271,18 @@ int main(int argc, char **argv)
             if (us - last_block >= 725) {
                 last_block = us;
                 ctl_render();
-                mixer_calcNextSampleBlock(outA, outB);   /* keeps voices alive, not counted */
+                rnd_block();   /* render, timed per block */
             }
         }
         sim_advance(50);
     }
-    printf("done: %s s, gestures %d, scene %u\n", argv[3], gestures, scene_getActiveIndex() + 1);
+    printf("final screen |%.16s|%.16s|\n", editDisplayBuffer[0], editDisplayBuffer[1]);
+    printf("done: %s s, gestures %d, scene %u, bank %u, blocks %u\n", argv[3], gestures,
+           scene_getActiveIndex() + 1, (unsigned)bank_restoreBankSlot(), rnd_count);
+    if (getenv("FG_TIMES")) {
+        FILE *f = fopen(getenv("FG_TIMES"), "wb");
+        fwrite(rnd_ns, sizeof(float), rnd_count, f);
+        fclose(f);
+    }
     return 0;
 }
