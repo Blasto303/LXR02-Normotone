@@ -102,7 +102,8 @@ static uint8_t dlyVerb_uiFormatValue3(uint8_t index, uint8_t value, char *out)
     static const char models[DLYVERB_MODEL_MAX + 1u][3] = {
         { 'd', 'i', 'g' }, { 'b', 'b', 'd' }, { 't', 'a', 'p' } };
     static const char stereo[DLYVERB_STEREO_MAX + 1u][3] = {
-        { 's', 't', 'r' }, { 'p', 'n', 'g' }, { 'w', 'i', 'd' } };
+        { 's', 't', 'r' }, { 'p', 'n', 'g' }, { 'w', 'i', 'd' },
+        { 'm', 'n', 'o' } };
     static const char routes[DLYVERB_ROUTE_MAX + 1u][3] = {
         { 'p', 'a', 'r' }, { 's', 'e', 'r' }, { 'f', 'b', 'k' } };
 

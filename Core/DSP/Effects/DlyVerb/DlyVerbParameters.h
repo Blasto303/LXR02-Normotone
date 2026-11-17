@@ -75,7 +75,8 @@ typedef enum {
 #define DLYVERB_STEREO_STEREO   0u
 #define DLYVERB_STEREO_PINGPONG 1u
 #define DLYVERB_STEREO_WIDTH    2u
-#define DLYVERB_STEREO_MAX      2u
+#define DLYVERB_STEREO_MONO     3u  /* mono echo, stereo plate (CPU) */
+#define DLYVERB_STEREO_MAX      3u
 
 /* Reverb routing (row `rrt`). */
 #define DLYVERB_ROUTE_PARALLEL 0u
