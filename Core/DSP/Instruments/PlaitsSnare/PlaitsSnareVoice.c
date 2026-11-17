@@ -47,6 +47,8 @@
 #define PS_PI               3.14159265f
 #define PS_TAN_A            (3.260e-01f * PS_PI * PS_PI * PS_PI)
 #define PS_TAN_B            (1.823e-01f * PS_PI * PS_PI * PS_PI * PS_PI * PS_PI)
+/* SyntheticSnareDrum: 7 ms FM decay, in seconds x the codec rate. */
+#define PSS_FM_DECAY        (1.0f - 1.0f / (0.007f * PS_FS))
 
 static const float ps_mode_ratio[PLAITS_SNARE_MODES] = {
 	1.00f, 2.00f, 3.18f, 4.16f, 5.62f
@@ -99,6 +101,138 @@ static inline float ps_bandPass(float in, float g, float r, float h,
 	return bp;
 }
 
+/* SyntheticSnareDrum::DistortedSine. */
+static inline float pss_distortedSine(float phase)
+{
+	const float triangle = (phase < 0.5f ? phase : 1.0f - phase) * 4.0f - 1.3f;
+
+	return 2.0f * triangle / (1.0f + fabsf(triangle));
+}
+
+/* SyntheticSnareDrum coefficients (SnareDrumEngine AUX mapping). */
+static void pss_calc(PlaitsSnareVoice *voice, float f0, float f0_plaits)
+{
+	const float decay = voice->decay;
+	const float decay_xt = decay * (1.0f + decay * (decay - 1.0f));
+	const float fm_amount = voice->tone * voice->tone;
+	float snappy = voice->snappy;
+	float f;
+	float r;
+
+	voice->ss_fm_amount = fm_amount;
+	voice->ss_f0 = f0;
+	voice->ss_drum_decay = 1.0f - 1.0f / (0.015f * PS_FS) *
+		ps_semitones(-decay_xt * 72.0f - fm_amount * 12.0f + snappy * 7.0f);
+	voice->ss_snare_decay = 1.0f - 1.0f / (0.01f * PS_FS) *
+		ps_semitones(-decay * 60.0f - snappy * 7.0f);
+	snappy = snappy * 1.1f - 0.05f;
+	snappy = (snappy < 0.0f) ? 0.0f : ((snappy > 1.0f) ? 1.0f : snappy);
+	voice->ss_drum_level = sqrtf(1.0f - snappy);
+	voice->ss_snare_level = sqrtf(snappy);
+
+	f = 10.0f * f0;
+	voice->ss_hp_g = ps_tan((f > 0.5f) ? 0.5f : f);
+	f = 35.0f * f0;
+	ps_setFq((f > 0.5f) ? 0.5f : f, 0.5f + 2.0f * snappy,
+	         &voice->ss_lp_g, &voice->ss_lp_r, &voice->ss_lp_h);
+	voice->ss_dlp_g = ps_tan(3.0f * f0);
+
+	r = (0.125f - f0_plaits) * 8.0f;
+	r = (r < 0.0f) ? 0.0f : ((r > 1.0f) ? 1.0f : r);
+	voice->ss_reset_amount = r * r * fm_amount;
+}
+
+/* SyntheticSnareDrum::Render, non-sustain path, int16 out at 0.8 gain. */
+static void pss_render(PlaitsSnareVoice *voice, int16_t *buf, uint8_t size)
+{
+	const float f0 = voice->ss_f0;
+	const float reset_amount = voice->ss_reset_amount;
+	const float f = f0 * 1.0f;
+	const float dlp_g = voice->ss_dlp_g;
+	const float dlp_gi = 1.0f / (1.0f + dlp_g);
+	const float hp_g = voice->ss_hp_g;
+	const float hp_gi = 1.0f / (1.0f + hp_g);
+	const float lg = voice->ss_lp_g;
+	const float lr = voice->ss_lp_r;
+	const float lh = voice->ss_lp_h;
+	uint8_t i;
+
+	if (voice->trigger) {
+		voice->trigger = 0u;
+		voice->ss_snare_amp = voice->ss_drum_amp = 0.3f + 0.7f * voice->accent;
+		voice->ss_fm = 1.0f;
+		voice->ss_phase[0] = voice->ss_phase[1] = 0.0f;
+		voice->ss_hold = (int32_t)((0.04f + voice->decay * 0.03f) * PS_FS);
+	}
+
+	for (i = 0u; i < size; i++) {
+		float reset_noise;
+		float inc;
+		float drum;
+		float noise;
+		float snare;
+		float lp;
+		float hp;
+		float bp;
+		float s;
+
+		/* Envelopes: the drum tail decays every other sample below 0.03. */
+		if (voice->ss_drum_amp > 0.03f || (i & 1u))
+			voice->ss_drum_amp *= voice->ss_drum_decay;
+		if (voice->ss_hold)
+			--voice->ss_hold;
+		else
+			voice->ss_snare_amp *= voice->ss_snare_decay;
+		voice->ss_fm *= PSS_FM_DECAY;
+
+		/* 909 oscillator coupling through the reset line. */
+		reset_noise = (voice->ss_phase[0] > 0.5f ? -1.0f : 1.0f) +
+		              (voice->ss_phase[1] > 0.5f ? -1.0f : 1.0f);
+		reset_noise *= reset_amount * 0.025f;
+		inc = f * (1.0f + voice->ss_fm_amount * (4.0f * voice->ss_fm));
+		voice->ss_phase[0] += inc;
+		voice->ss_phase[1] += inc * 1.47f;
+		if (reset_amount > 0.1f) {
+			if (voice->ss_phase[0] >= 1.0f + reset_noise)
+				voice->ss_phase[0] = 1.0f - voice->ss_phase[0];
+			if (voice->ss_phase[1] >= 1.0f + reset_noise)
+				voice->ss_phase[1] = 1.0f - voice->ss_phase[1];
+		} else {
+			if (voice->ss_phase[0] >= 1.0f)
+				voice->ss_phase[0] -= 1.0f;
+			if (voice->ss_phase[1] >= 1.0f)
+				voice->ss_phase[1] -= 1.0f;
+		}
+
+		drum = -0.1f + pss_distortedSine(voice->ss_phase[0]) * 0.60f +
+		       pss_distortedSine(voice->ss_phase[1]) * 0.25f;
+		drum *= voice->ss_drum_amp * voice->ss_drum_level;
+		/* stmlib OnePole low-pass. */
+		lp = (dlp_g * drum + voice->ss_drum_lp) * dlp_gi;
+		voice->ss_drum_lp = dlp_g * (drum - lp) + lp;
+		drum = lp;
+
+		voice->rng = voice->rng * 1664525u + 1013904223u;
+		noise = (float)voice->rng * (1.0f / 4294967296.0f);
+		/* Svf low-pass, then OnePole high-pass. */
+		hp = (noise - lr * voice->ss_lp_s1 - lg * voice->ss_lp_s1 -
+		      voice->ss_lp_s2) * lh;
+		bp = lg * hp + voice->ss_lp_s1;
+		voice->ss_lp_s1 = lg * hp + bp;
+		snare = lg * bp + voice->ss_lp_s2;
+		voice->ss_lp_s2 = lg * bp + snare;
+		lp = (hp_g * snare + voice->ss_snare_hp) * hp_gi;
+		voice->ss_snare_hp = hp_g * (snare - lp) + lp;
+		snare -= lp;
+		snare = (snare + 0.1f) * (voice->ss_snare_amp + voice->ss_fm) *
+		        voice->ss_snare_level;
+
+		s = (snare + drum) * PS_OUT_GAIN * 32767.0f;
+		s = (s > 32767.0f) ? 32767.0f : ((s < -32768.0f) ? -32768.0f : s);
+		buf[i] = (int16_t)s;
+	}
+}
+
 void PlaitsSnare_initVoice(PlaitsSnareVoice *voice, uint8_t seed_index)
 {
 	/*
@@ -119,6 +253,7 @@ void PlaitsSnare_initVoice(PlaitsSnareVoice *voice, uint8_t seed_index)
 	voice->volumeMod = 1u;
 	voice->velo = 1.0f;
 	voice->accent = 1.0f;
+	voice->model = PLAITS_SNARE_MODEL_ANALOG;
 	lfo_init(&voice->lfo);
 	slopeEg2_init(&voice->oscVolEg);
 	setDistortionShape(&voice->distortion, 0u);
@@ -173,6 +308,9 @@ void PlaitsSnare_calcVoiceAsync(PlaitsSnareVoice *voice)
 	f0_hz = 440.0f * ps_semitones(n - 69.0f);
 	f0 = f0_hz * (1.0f / PS_FS);
 	f0_plaits = f0_hz * (1.0f / PS_PLAITS_FS);
+
+	if (voice->model == PLAITS_SNARE_MODEL_SYNTH)
+		pss_calc(voice, f0, f0_plaits);
 
 	decay = voice->decay;
 	snappy = voice->snappy;
@@ -251,6 +389,14 @@ void PlaitsSnare_calcVoiceSyncBlock(PlaitsSnareVoice *voice, int16_t *buf,
 
 	if (!voice || !buf || size == 0u || size > OUTPUT_DMA_SIZE)
 		return;
+
+	if (voice->model == PLAITS_SNARE_MODEL_SYNTH) {
+		pss_render(voice, buf, size);
+		voicePost_drum(buf, voice->ampFilterInput, voice->lastGain,
+		               voice->volumeMod ? voice->velo : 1.0f,
+		               &voice->distortion, size);
+		return;
+	}
 
 	if (voice->trigger) {
 		voice->trigger = 0u;

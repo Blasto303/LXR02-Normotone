@@ -10,7 +10,7 @@
  * Plaits snare instrument. Basic tier: five fixed-coefficient resonators
  * and a noise band-pass, about the cost of the LXR Snare. Affiliates: PlaitsSnareVoice.c/.h, InstrumentManager registry.
  */
-#define PLAITS_SNARE_PARAM_DESCRIPTOR_COUNT 27u
+#define PLAITS_SNARE_PARAM_DESCRIPTOR_COUNT 28u
 #define PLAITS_SNARE_MENU_PAGE_COUNT       8u
 #define PLAITS_SNARE_INSTRUMENT_TYPE_FLAGS INSTRUMENT_FLAG_BASIC
 

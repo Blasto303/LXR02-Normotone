@@ -2859,6 +2859,15 @@ static uint8_t buttonHandler_livePress(uint8_t b)
         live_kitPageOpen();
         return 1u;
     }
+    if (seq == 12 && bh_liveLoadHeld && !shift) {        /* LOAD + RELOAD */
+        /* PLAITS on/off; the KIT page shows PLT / LXR. */
+        buttonHandler_liveConsume(b);
+        if (bh_state.selectButtonMode != SELECT_MODE_PERF)
+            handleModeButtons(SELECT_MODE_PERF);
+        live_kitPageOpen();
+        live_plaitsToggle();
+        return 1u;
+    }
     if (seq == 11 && bh_liveLoadHeld && !shift) {        /* LOAD + CONFIG */
         buttonHandler_liveConsume(b);
         live_kitPageClose();

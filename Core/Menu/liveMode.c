@@ -17,7 +17,14 @@
  * output / FX send / fader settings. The Effect type then matches, so
  * effects_activateScene() keeps the running delay/reverb tails.
  *
- * RAM: one kit_t backup plus 8 bytes.
+ * PLAITS (DATA click on the KIT page, or LOAD + RELOAD): the playing kit is
+ * replaced by its Plaits conversion (plaitsMode.c) and every pattern change
+ * converts the incoming kit, so the patterns play on Plaits engines. The
+ * pattern's own kit stays in live_kitBackup, as for a kit swap. The Plaits
+ * kit is written without an AutoSave mark: a power cut never leaves a
+ * converted kit in the Bank.
+ *
+ * RAM: two kit_t (backup, conversion) plus a few bytes.
  */
 #include "liveMode.h"
 
@@ -34,6 +41,7 @@
 #include "Autosave.h"
 #include "random.h"
 #include "cpuProfile.h"
+#include "plaitsMode.h"
 
 static kit_t    live_kitBackup;
 static uint8_t  live_backupScene = 0xFFu;   /* Scene whose kit is swapped */
@@ -46,6 +54,10 @@ static uint8_t  live_cpuEntry;              /* first entry on the CPU page */
 static uint8_t  live_cpuSerial;
 static uint8_t  live_shownQueue = 0xFFu;    /* queued pattern on the LCD  */
 static uint8_t  live_kitHold;               /* 1: kit stays on pattern change */
+static uint8_t  live_plaits;                /* PLAITS wanted                  */
+static uint8_t  live_plaitsOn;              /* PLAITS applied on the backup Scene */
+static uint8_t  live_tablesReady;           /* plaitsMode tables built        */
+static kit_t    live_kitTemp;               /* Plaits conversion              */
 /*
  * RANDOM (SHIFT + LAST STEP): dose 0..127 on the pattern (sequencer layer,
  * seq_liveRndDose), the kit (random Morph target + voice Morph amount =
@@ -164,7 +176,69 @@ static void live_checkBackup(void)
         live_backupBank != bank_restoreBankSlot()) {
         live_backupScene = 0xFFu;
         live_kitSource = 0xFFu;
+        live_plaitsOn = 0u;
+        plaitsMode_mapOff();
     }
+}
+
+/* Kit write without an AutoSave mark (Plaits kits never reach the card). */
+static void live_commitQuiet(uint8_t scene, const kit_t *kit)
+{
+    scene_t *s = scene_get(scene);
+
+    if (!s || &s->kit == kit)
+        return;
+    s->kit = *kit;
+    bank_invalidateSdCleanScene(scene);
+}
+
+/*
+ * Put on `scene` the kit of Scene `src`, as a Plaits conversion when PLAITS
+ * is on. The Scene's own kit is kept in live_kitBackup while it plays
+ * anything else, and committed back when it plays its own kit again.
+ */
+static uint8_t live_install(uint8_t scene, uint8_t src)
+{
+    const scene_t *own = scene_getConst(scene);
+    const kit_t *source;
+
+    if (!own)
+        return 0u;
+    if (src == scene && !live_plaits) {
+        if (live_backupScene == scene) {
+            (void)scene_commitKit(scene, &live_kitBackup);
+            live_backupScene = 0xFFu;
+        }
+        plaitsMode_mapOff();
+        live_kitSource = src;
+        live_plaitsOn = 0u;
+        return 1u;
+    }
+    if (live_backupScene != scene) {
+        live_kitBackup = own->kit;
+        live_backupScene = scene;
+        live_backupBank = bank_restoreBankSlot();
+    }
+    if (src == scene) {
+        source = &live_kitBackup;
+    } else {
+        const scene_t *other = scene_getConst(src);
+
+        if (!other)
+            return 0u;
+        source = &other->kit;
+    }
+    if (live_plaits) {
+        plaitsMode_convertKit(&live_kitTemp, source);
+        live_commitQuiet(scene, &live_kitTemp);
+        plaitsMode_mapOn(&live_kitBackup);
+    } else {
+        (void)scene_commitKit(scene, source);
+        plaitsMode_mapOff();
+    }
+    live_kitSource = src;
+    live_plaitsOn = live_plaits;
+    return 1u;
 }
 
 static uint8_t live_currentKit(void)
@@ -178,41 +252,33 @@ static uint8_t live_currentKit(void)
 }
 
 /* Commit kit of `src` onto the active Scene now. 0 = workers busy, retry. */
+/* PLAITS state of the playing kit matches the wish. */
+static uint8_t live_plaitsSettled(void)
+{
+    uint8_t active = scene_getActiveIndex();
+
+    live_checkBackup();
+    if (!live_plaits)
+        return (uint8_t)(!live_plaitsOn || live_backupScene != active);
+    return (uint8_t)(live_plaitsOn && live_backupScene == active);
+}
+
 static uint8_t live_applyKit(uint8_t src)
 {
     uint8_t active = scene_getActiveIndex();
-    const scene_t *source;
 
     if (!preset_applyWorkersIdle() || preset_backgroundBankLoadUnlocked())
         return 0u;
     live_checkBackup();
     if (active >= SCENE_COUNT || !live_sceneValid(src))
         return 1u;
-    if (src == active || src == live_currentKit()) {
-        /* Own kit asked back: restore it if it was swapped. */
-        if (src == active && live_backupScene == active) {
-            (void)scene_commitKit(active, &live_kitBackup);
-            live_backupScene = 0xFFu;
-            preset_startDrumsetApply();
-        }
+    if (src == live_currentKit() && live_plaitsSettled()) {
         live_kitSource = src;
         return 1u;
     }
-    source = scene_getConst(src);
-    if (!source)
+    if (!live_install(active, src))
         return 1u;
-    if (live_backupScene != active) {
-        const scene_t *own = scene_getConst(active);
-
-        if (!own)
-            return 1u;
-        live_kitBackup = own->kit;
-        live_backupScene = active;
-        live_backupBank = bank_restoreBankSlot();
-    }
-    (void)scene_commitKit(active, &source->kit);
     preset_startDrumsetApply();
-    live_kitSource = src;
     if (live_rndKitOn())
         live_rndApply(1u);
     return 1u;
@@ -380,21 +446,22 @@ void live_beforeSceneChange(uint8_t target)
     }
     live_kitSource = 0xFFu;
     /*
-     * Kit stays: the incoming pattern plays the current kit. Its own kit is
-     * kept in the backup (committed back when it is left), and the kit is in
-     * place before the Scene activation applies it, so nothing glitches.
+     * Kit stays: the incoming pattern plays the current kit. PLAITS: the
+     * incoming kit is converted. Either way its own kit is kept in the backup
+     * (committed back when it is left), and the kit is in place before the
+     * Scene activation applies it, so nothing glitches.
      */
-    if (live_kitHold && carry < 16u && carry != target &&
-        live_sceneValid(carry)) {
-        const scene_t *own = scene_getConst(target);
-        const scene_t *source = scene_getConst(carry);
+    {
+        uint8_t src = target;
 
-        if (own && source) {
-            live_kitBackup = own->kit;
-            live_backupScene = target;
-            live_backupBank = bank_restoreBankSlot();
-            (void)scene_commitKit(target, &source->kit);
-            live_kitSource = carry;
+        if (live_kitHold && carry < 16u && carry != target &&
+            live_sceneValid(carry))
+            src = carry;
+        if (src != target || live_plaits) {
+            (void)live_install(target, src);
+        } else {
+            live_plaitsOn = 0u;
+            plaitsMode_mapOff();
         }
     }
 
@@ -456,9 +523,11 @@ void live_encoder(int8_t inc, uint8_t clicked)
         return;
     }
 
-    if (clicked)
-        live_kitHold = (uint8_t)!live_kitHold;
-    else if (inc > 0)
+    if (clicked) {
+        live_plaitsToggle();
+        return;
+    }
+    if (inc > 0)
         live_kitHold = 1u;
     else if (inc < 0)
         live_kitHold = 0u;
@@ -484,8 +553,29 @@ static uint8_t live_queuedPattern(void)
     return q;
 }
 
+void live_plaitsToggle(void)
+{
+    live_plaits = (uint8_t)!live_plaits;
+    /* Same path as a kit choice: now when stopped, at the bar when playing. */
+    live_kitSelect(live_currentKit());
+    menu_repaintAll();
+}
+
+uint8_t live_plaitsActive(void)
+{
+    return live_plaits;
+}
+
 void live_service(void)
 {
+    /* PLAITS tables: built in the background while the transport is stopped. */
+    if (!live_tablesReady && !seq_isRunning())
+        live_tablesReady = plaitsMode_service();
+    /* PLAITS on and a new Bank (or Scene) came in: convert its kit too. */
+    if (live_plaits && live_pendingKit == 0xFFu && !live_carrier &&
+        seq_queuedSceneTarget() >= 16u && scene_getActiveIndex() < 16u &&
+        !live_plaitsSettled())
+        live_kitSelect(live_currentKit());
     /* CPU page: a new snapshot every second. */
     if (live_page == 4u && prof_snapshotSerial() != live_cpuSerial) {
         live_cpuSerial = prof_snapshotSerial();
@@ -580,19 +670,21 @@ uint8_t live_formatOverlay(char *row0, char *row1)
     }
     /* Kit option: "suit" = the pattern brings its kit, "fixe" = kit stays. */
     memcpy(&row0[12], live_kitHold ? "fixe" : "suit", 4);
+    /* Row 2: "PAT03 BK207 PLT" (PLT = Plaits engines, LXR = the kit's). */
     memcpy(row1, "PAT", 3);
     {
         uint8_t pat = (uint8_t)(scene_getActiveIndex() + 1u);
         uint16_t bank = bank_restoreBankSlot();
 
-        row1[4] = (char)('0' + pat / 10u);
-        row1[5] = (char)('0' + pat % 10u);
+        row1[3] = (char)('0' + pat / 10u);
+        row1[4] = (char)('0' + pat % 10u);
         if (bank < 1000u) {
-            memcpy(&row1[9], "BK", 2);
-            row1[12] = (char)('0' + bank / 100u);
-            row1[13] = (char)('0' + (bank / 10u) % 10u);
-            row1[14] = (char)('0' + bank % 10u);
+            memcpy(&row1[6], "BK", 2);
+            row1[8] = (char)('0' + bank / 100u);
+            row1[9] = (char)('0' + (bank / 10u) % 10u);
+            row1[10] = (char)('0' + bank % 10u);
         }
+        memcpy(&row1[12], live_plaits ? "PLT" : "LXR", 3);
     }
     return 1u;
 }

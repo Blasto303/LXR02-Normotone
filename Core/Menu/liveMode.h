@@ -33,13 +33,20 @@ uint8_t live_kitPageActive(void);
 void live_kitSelect(uint8_t scene);
 /*
  * DATA on the KIT page: turn right = kit stays on pattern change ("fixe"),
- * left = the pattern brings its kit ("suit", stock); click toggles.
+ * left = the pattern brings its kit ("suit", stock); click = PLAITS on/off.
  */
 void live_encoder(int8_t inc, uint8_t clicked);
 /* PATTERN page (SHIFT or LOAD + step 16): a step queues pattern N. */
 void live_patternPageOpen(void);
 uint8_t live_patternPageActive(void);
 void live_patternSelect(uint8_t scene);
+/*
+ * PLAITS mode (plaitsMode.h): every kit plays on Plaits engines, the patterns
+ * stay. Toggled by DATA click on the KIT page or LOAD + RELOAD (step 13);
+ * applied at the bar while playing, at once when stopped.
+ */
+void live_plaitsToggle(void);
+uint8_t live_plaitsActive(void);
 /* SHIFT + RELOAD (step 13): the playing pattern gets its own kit back. */
 void live_reloadKit(void);
 /*

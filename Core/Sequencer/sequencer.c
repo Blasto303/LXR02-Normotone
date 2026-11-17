@@ -47,6 +47,7 @@
 #include "MidiVoiceControl.h"
 #include "CymbalVoice.h"
 #include "sequencer.h"
+#include "plaitsMode.h"
 #include <string.h>
 #include "usb_manager.h"
 #include "clockSync.h"
@@ -3619,6 +3620,22 @@ void seq_drainPendingAutomation(void)
              * automation records; Effect overlays are last-writer-wins.
              */
             if ((identity & SEQ_PENDING_TYPE_AUTOMATION_BIT) != 0u) {
+                /*
+                 * PLAITS mode (LIVE): the pattern's p-locks were written for
+                 * its own kit; redirect them to the matching Plaits row, or
+                 * drop them when there is none. Ramps are off while it runs.
+                 */
+                uint8_t plaitsMapped = 0u;
+
+                if (plaitsMode_mapActive &&
+                    instrumentParam_isVoiceParameter(target) &&
+                    owner_scene == scene_getActiveIndex()) {
+                    if (!plaitsMode_remap(&target, &value)) {
+                        i++;
+                        continue;
+                    }
+                    plaitsMapped = 1u;
+                }
                 if (instrumentParam_isVoiceParameter(target) &&
                     instrumentManager_targetValid(owner_scene, target,
                                                   INSTRUMENT_TARGET_AUTOMATION)) {
@@ -3654,7 +3671,7 @@ void seq_drainPendingAutomation(void)
                             seq_writeInstrumentAutomation(owner_scene, target,
                                                           value);
 
-                        if (descriptor)
+                        if (descriptor && !plaitsMapped)
                             seq_rampStartIfPaired(owner_track, owner_scene,
                                 (uint8_t)((identity & SEQ_PENDING_STEP_ID_MASK) %
                                           NUM_STEPS),
@@ -4324,6 +4341,10 @@ void seq_rampService(void)
 
         if (r->id == 0u)
             continue;
+        if (plaitsMode_mapActive) {
+            r->id = 0u;                 /* PLAITS mode: no ramps */
+            continue;
+        }
         key = (uint16_t)(r->id - 1u);
         track = (uint8_t)(key >> 9u);
         target = (uint16_t)(key & 0x01FFu);

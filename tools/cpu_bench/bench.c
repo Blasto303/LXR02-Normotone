@@ -29,6 +29,7 @@
 #include "MidiVoiceControl.h"
 #include "modulationNode.h"
 #include "liveMode.h"
+#include "plaitsMode.h"
 #include "PatternData.h"
 
 /* The DTCM FX/voice arena of the device (126,592 B, .dtcm_fxbuf). */
@@ -66,6 +67,9 @@ static void settle(void)
             quiet++;
     }
 }
+
+/* Sequencer is stubbed: no Scene queued (LIVE kit choices apply at once). */
+uint8_t seq_queuedSceneTarget(void) { return 0xFFu; }
 
 static double now_us(void)
 {
@@ -183,6 +187,23 @@ static void activate(uint8_t s)
     settle();
 }
 
+/* Kit equality without the runtime Morph interpolation image. */
+static int kit_same(const kit_t *a, const kit_t *b)
+{
+    int k;
+
+    if (memcmp(&a->settings, &b->settings, sizeof(a->settings)))
+        return 0;
+    for (k = 0; k < 6; k++)
+        if (a->instruments[k].type != b->instruments[k].type ||
+            memcmp(a->instruments[k].parameter_images.instrument_parameters,
+                   b->instruments[k].parameter_images.instrument_parameters, 64) ||
+            memcmp(a->instruments[k].parameter_images.morph_instrument_parameters,
+                   b->instruments[k].parameter_images.morph_instrument_parameters, 64))
+            return 0;
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     int blocks = (argc > 3) ? atoi(argv[3]) : 600;
@@ -221,6 +242,69 @@ int main(int argc, char **argv)
         printf(" %u", scene_effectConst(v) ? scene_effectConst(v)->type : 99);
     printf("\n");
 
+    /* PLAITS scenario: bench card bank 1 plaits */
+    if (argc > 4 && !strcmp(argv[4], "plaits")) {
+        uint8_t sc;
+        int g, k;
+        static kit_t orig[16];
+
+        for (sc = 0; sc < 16; sc++)
+            orig[sc] = scene_getConst(sc)->kit;
+#define TYPES(sc_) do { printf("  scene %2u:", (sc_) + 1); \
+            for (k = 0; k < 6; k++) printf(" %u", scene_instrumentSlotConst((sc_), k)->type); \
+            printf("  own kit %s\n", kit_same(&scene_getConst(sc_)->kit, &orig[sc_]) ? "intact" : "CHANGED"); } while (0)
+#define PUMP() for (g = 0; g < 60; g++) { live_service(); settle(); }
+        activate(0);
+        printf("start\n"); TYPES(0);
+        {
+            const kit_t *a = &scene_getConst(0)->kit, *b = &orig[0];
+            if (memcmp(&a->settings, &b->settings, sizeof(a->settings))) printf("  settings differ\n");
+            for (k = 0; k < 6; k++) if (a->instruments[k].type != b->instruments[k].type) printf("  type %d: %u vs %u\n", k, a->instruments[k].type, b->instruments[k].type);
+            printf("  kit_same %d sizeof settings %u\n", kit_same(a, b), (unsigned)sizeof(a->settings));
+            for (k = 0; k < 6; k++) for (g = 0; g < 64; g++) {
+                if (a->instruments[k].parameter_images.instrument_parameters[g] != b->instruments[k].parameter_images.instrument_parameters[g])
+                    printf("  slot %d row %d main %u -> %u\n", k, g, b->instruments[k].parameter_images.instrument_parameters[g], a->instruments[k].parameter_images.instrument_parameters[g]);
+                if (a->instruments[k].parameter_images.morph_instrument_parameters[g] != b->instruments[k].parameter_images.morph_instrument_parameters[g])
+                    printf("  slot %d row %d morph %u -> %u\n", k, g, b->instruments[k].parameter_images.morph_instrument_parameters[g], a->instruments[k].parameter_images.morph_instrument_parameters[g]);
+            }
+        }
+        live_plaitsToggle(); PUMP();
+        printf("PLAITS on\n"); TYPES(0);
+        {
+            static const uint8_t tests[][3] = {   /* slot, Drum row, value */
+                {0, 1, 40}, {0, 1, 4}, {0, 7, 100}, {0, 12, 43}, {0, 13, 103},
+                {0, 8, 90}, {0, 17, 100}, {0, 18, 20}, {3, 1, 40}, {5, 1, 74}, {4, 17, 43} };
+            unsigned t;
+
+            for (t = 0; t < sizeof(tests) / 3; t++) {
+                uint16_t id = instrumentParam_make(tests[t][0], tests[t][1]);
+                uint8_t val = tests[t][2];
+                const ParamDescriptor *sd = instrumentManager_descriptor(orig[0].instruments[tests[t][0]].type, tests[t][1]);
+                uint8_t ok = plaitsMode_remap(&id, &val);
+                const ParamDescriptor *dd = ok ? instrumentManager_descriptor(scene_instrumentSlotConst(0, tests[t][0])->type, instrumentParam_local(id)) : 0;
+
+                printf("  p-lock slot %u %-20s %3u -> %s %u\n", tests[t][0], sd ? sd->file_key : "?", tests[t][2],
+                       ok ? (dd ? dd->file_key : "?") : "(dropped)", ok ? val : 0);
+            }
+        }
+        ev_scene(4); activate(4); PUMP();
+        printf("pattern 5\n"); TYPES(4); TYPES(0);
+        live_kitPageOpen(); live_kitSelect(8); PUMP();
+        printf("KIT 9 on pattern 5 (Plaits)\n"); TYPES(4); TYPES(8);
+        live_encoder(1, 0);  /* fixe */
+        ev_scene(6); activate(6); PUMP();
+        printf("fixe, pattern 7\n"); TYPES(6); TYPES(4);
+        live_encoder(-1, 0); /* suit */
+        live_plaitsToggle(); PUMP();
+        printf("PLAITS off\n"); TYPES(6);
+        ev_scene(1); activate(1); PUMP();
+        printf("pattern 2\n"); TYPES(1); TYPES(6);
+        for (sc = 0; sc < 16; sc++)
+            if (!kit_same(&scene_getConst(sc)->kit, &orig[sc]) && sc != 1)
+                printf("  scene %u kit differs from the card!\n", sc + 1);
+        printf("map active %u\n", plaitsMode_mapActive);
+        return 0;
+    }
     /* Peak mode: bench card bank blocks peaks. Run under callgrind; each
      * block is rendered by the wrapper named after the event before it. */
     if (argc > 4 && !strcmp(argv[4], "peaks")) {
@@ -284,6 +368,22 @@ int main(int argc, char **argv)
         double m, w;
 
         activate(sc);
+        if (getenv("BENCH_PLAITS") && *getenv("BENCH_PLAITS")) {
+            /* PLAITS mode: the kit is converted, the pattern stays. */
+            int g;
+
+            if (atoi(getenv("BENCH_PLAITS")) == 2)
+                while (!plaitsMode_service()) {}   /* tables built at boot */
+            live_plaitsToggle();
+            for (g = 0; g < 50; g++) {
+                live_service();
+                settle();
+            }
+            printf("plaits: slot types");
+            for (v = 0; v < 6; v++)
+                printf(" %u", scene_instrumentSlotConst(sc, v)->type);
+            printf("\n");
+        }
         if (!atoi(argv[5])) {
             static effect_record_t off;
             off = *scene_effectConst(sc);

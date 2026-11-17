@@ -10,7 +10,7 @@
  * Plaits kick instrument. Basic tier: one resonator, about the cost of the
  * LXR Drum. Affiliates: PlaitsKickVoice.c/.h, InstrumentManager registry.
  */
-#define PLAITS_KICK_PARAM_DESCRIPTOR_COUNT 27u
+#define PLAITS_KICK_PARAM_DESCRIPTOR_COUNT 28u
 #define PLAITS_KICK_MENU_PAGE_COUNT       8u
 #define PLAITS_KICK_INSTRUMENT_TYPE_FLAGS INSTRUMENT_FLAG_BASIC
 

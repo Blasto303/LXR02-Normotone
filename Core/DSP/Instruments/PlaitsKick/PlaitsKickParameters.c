@@ -78,6 +78,7 @@ typedef enum {
     PK_PARAM_LFO_TARGET_PARAM,
     PK_PARAM_LFO_TARGET_VOICE_2,
     PK_PARAM_LFO_TARGET_PARAM_2,
+    PK_PARAM_SYNTH,
     PK_PARAM_COUNT
 } plaits_kick_param_index_t;
 
@@ -112,6 +113,8 @@ const ParamDescriptor plaits_kick_param_descriptors[] = {
     ROW_NOBIND("lfo_target_param", "LFO", "DstParam", "ds1", DTYPE_TARGET_SELECTION_LFO, INSTRUMENT_BIND_LFO_TARGET_PARAM),
     ROW_NOBIND("lfo_target_voice_2", "LFO", "DstVoice2", "vo2", DTYPE_VOICE_LFO, INSTRUMENT_BIND_LFO_TARGET_VOICE_2),
     ROW_NOBIND("lfo_target_param_2", "LFO", "DstParam2", "ds2", DTYPE_TARGET_SELECTION_LFO, INSTRUMENT_BIND_LFO_TARGET_PARAM_2),
+    /* Model: off = AnalogBassDrum (Plaits OUT), on = SyntheticBassDrum (AUX). */
+    { "kick_synth", "syn", "Synth", "Plaits", DTYPE_ON_OFF, INSTRUMENT_PARAM_FLAG_MORPHABLE | INSTRUMENT_PARAM_FLAG_AUTOMATABLE, MOD_NONE, BIND(model, TYPE_UINT8) },
 };
 
 const uint8_t plaits_kick_param_descriptor_count =
@@ -127,14 +130,14 @@ _Static_assert(sizeof(plaits_kick_param_descriptors) /
 /*
  * Menu layout on the eight VOICE sub-pages, in the LXR Drum's positions:
  * 1 oscillator (note, fine, Plaits macros), 2 amp EG, 3 velocity (cells 4..6
- * as on Drum), 4 the Plaits macros, 5 and 6 tuning and macros again (the Drum
+ * as on Drum), 4 the model and the Plaits macros, 5 and 6 tuning and macros again (the Drum
  * transient and filter pages), 7 LFO, 8 voice mix.
  */
 const instrument_menu_page_t plaits_kick_menu_pages[] = {
     {{ PK_PARAM_NOTE, PK_PARAM_FINE, PK_PARAM_TONE, PK_PARAM_DECAY, E, E, E, E, E, E, E, E, E, E, E, E }},
     {{ PK_PARAM_AMP_ENVELOPE_ATTACK, PK_PARAM_AMP_ENVELOPE_DECAY, PK_PARAM_AMP_ENVELOPE_SLOPE, E, E, E, E, E, E, E, E, E, E, E, E, E }},
     {{ PK_PARAM_HARMONICS, PK_PARAM_TONE, PK_PARAM_DECAY, INSTRUMENT_MENU_SKIP, PK_PARAM_VELO_MOD_DEST, PK_PARAM_VELO_MOD_AMOUNT, PK_PARAM_VELO_VOL_ON_OFF, E, E, E, E, E, E, E, E, E }},
-    {{ PK_PARAM_HARMONICS, PK_PARAM_TONE, PK_PARAM_DECAY, E, E, E, E, E, E, E, E, E, E, E, E, E }},
+    {{ PK_PARAM_SYNTH, PK_PARAM_HARMONICS, PK_PARAM_TONE, PK_PARAM_DECAY, E, E, E, E, E, E, E, E, E, E, E, E }},
     {{ PK_PARAM_NOTE, PK_PARAM_FINE, E, E, E, E, E, E, E, E, E, E, E, E, E, E }},
     {{ PK_PARAM_TONE, PK_PARAM_DECAY, PK_PARAM_HARMONICS, E, E, E, E, E, E, E, E, E, E, E, E, E }},
     {{ PK_PARAM_LFO_RATE, PK_PARAM_LFO_SYNC, PK_PARAM_LFO_WAVE, PK_PARAM_LFO_OFFSET, PK_PARAM_LFO_RETRIGGER_VOICE, PK_PARAM_LFO_POLARITY, PK_PARAM_LFO_AMOUNT, PK_PARAM_LFO_AMOUNT_2, PK_PARAM_LFO_TARGET_VOICE, PK_PARAM_LFO_TARGET_PARAM, PK_PARAM_LFO_TARGET_VOICE_2, PK_PARAM_LFO_TARGET_PARAM_2, E, E, E, E }},

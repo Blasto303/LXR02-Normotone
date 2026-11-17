@@ -17,6 +17,10 @@ Modes: `... <scene> <fx> pat` plays the Scene's pattern at 130 BPM;
 `every` blocks; `... peaks` renders after rumble edits, pattern changes and
 RANDOM draws in separate wrappers. `BENCH_DUMP=file` writes the stereo
 output, `BENCH_NOSLEEP=1` disables the silent-voice sleep (for A/B checks).
+`BENCH_PLAITS=1` plays the Scene in PLAITS mode (its kit converted to the
+Plaits engines; `2` builds the conversion tables first, as after boot).
+`... plaits` runs the PLAITS scenario: toggle, pattern changes, KIT swap,
+`fixe`, toggle off, own kits intact, and sample p-lock redirections.
 
 Budget: 216 MHz / 44,108 Hz x 32 frames = 156,700 cycles per block. Host
 instructions are not device cycles; the device `cpu` reading of 94 % on a

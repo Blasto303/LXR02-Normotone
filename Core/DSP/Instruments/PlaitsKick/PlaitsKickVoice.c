@@ -3,8 +3,8 @@
  *
  *  Created on: 21.10.2026
  * -----------------------------------------------------------------------------
- *  The kick DSP is a C translation of Plaits' AnalogBassDrum, BassDrumEngine
- *  parameter mapping and Overdrive. Copyright 2016 Emilie Gillet, MIT license
+ *  The kick DSP is a C translation of Plaits' AnalogBassDrum,
+ *  SyntheticBassDrum, BassDrumEngine parameter mapping and Overdrive. Copyright 2016 Emilie Gillet, MIT license
  *  (full notice in PlaitsKickVoice.h).
  * -----------------------------------------------------------------------------
  *  This file is part of the LXR02 Open-Source software.
@@ -49,6 +49,25 @@
 #define PK_OUT_GAIN         0.8f
 #define PK_PI               3.14159265f
 #define PK_TAN_A            (3.736e-01f * PK_PI * PK_PI * PK_PI)
+/*
+ * SyntheticBassDrum constants. Plaits' fixed per-sample one-pole and slope
+ * coefficients are re-derived for the codec rate: c' = 1 - (1 - c)^(48/44.1).
+ * PKS_TAN_A/B          stmlib FREQUENCY_FAST tangent coefficients.
+ * PKS_CLICK_G/R/H      click low-pass Svf, 5 kHz, Q 2 (FREQUENCY_FAST).
+ */
+#define PK_RATE_RATIO       (PK_PLAITS_FS / PK_FS)
+#define PKS_ENV_LP          0.10833f    /* ONE_POLE 0.1    */
+#define PKS_PHASE_NOISE_LP  0.0021763f  /* ONE_POLE 0.002  */
+#define PKS_NOISE_LP        0.05429f    /* ONE_POLE 0.05   */
+#define PKS_NOISE_HP        0.0054400f  /* ONE_POLE 0.005  */
+#define PKS_CLICK_HP        0.043452f   /* ONE_POLE 0.04   */
+#define PKS_CLICK_UP        0.52966f    /* SLOPE +0.5      */
+#define PKS_CLICK_DOWN      0.10833f    /* SLOPE -0.1      */
+#define PKS_BODY_PULSE      ((int32_t)(1.0e-3f * PK_FS))
+#define PKS_FM_PULSE        ((int32_t)(1.3e-3f * PK_FS))
+#define PKS_TRANSIENT_DECAY (1.0f - 1.0f / (0.005f * PK_FS))
+#define PKS_TAN_A           (3.260e-01f * PK_PI * PK_PI * PK_PI)
+#define PKS_TAN_B           (1.823e-01f * PK_PI * PK_PI * PK_PI * PK_PI * PK_PI)
 
 /* stmlib SemitonesToRatio. */
 static inline float pk_semitones(float s)
@@ -77,6 +96,143 @@ static inline float pk_softClip(float x)
 	return x * (27.0f + x * x) / (27.0f + 9.0f * x * x);
 }
 
+/* sin(2 pi x) for x in [0, 1): odd 7th-order fit, |error| < 2e-4. */
+static inline float pk_sin2pi(float x)
+{
+	float y;
+	float y2;
+
+	x = (x < 0.5f) ? x : x - 1.0f;          /* [-0.5, 0.5) */
+	y = (x > 0.25f) ? 0.5f - x : ((x < -0.25f) ? -0.5f - x : x);
+	y *= 2.0f * PK_PI;
+	y2 = y * y;
+	return y * (1.0f - y2 * (0.16666667f - y2 * (0.0083333f -
+	            y2 * 0.00019841f)));
+}
+
+/* SyntheticBassDrum::DistortedSine. */
+static inline float pk_distortedSine(float phase, float phase_noise,
+                                     float dirtiness)
+{
+	float triangle;
+	float sine;
+	float clean;
+	float c;
+
+	phase += phase_noise * dirtiness;
+	phase -= floorf(phase);
+	triangle = (phase < 0.5f ? phase : 1.0f - phase) * 4.0f - 1.0f;
+	sine = 2.0f * triangle / (1.0f + fabsf(triangle));
+	c = phase + 0.75f;
+	clean = pk_sin2pi(c - (float)(int32_t)c);
+	return sine + (1.0f - dirtiness) * (clean - sine);
+}
+
+/* SyntheticBassDrum::TransistorVCA. */
+static inline float pk_transistorVca(float s, float gain)
+{
+	s = (s - 0.6f) * gain;
+	return 3.0f * s / (2.0f + fabsf(s)) + gain * 0.3f;
+}
+
+/* SyntheticBassDrum::Render, non-sustain path, into out[]. */
+static void pk_renderSynth(PlaitsKickVoice *voice, float *out, uint8_t size)
+{
+	/* Click Svf: 5 kHz low-pass, Q 2, FREQUENCY_FAST at the codec rate. */
+	const float cf = 5000.0f / PK_FS;
+	const float cf2 = cf * cf;
+	const float cg = cf * (PK_PI + cf2 * (PKS_TAN_A + PKS_TAN_B * cf2));
+	const float cr = 0.5f;
+	const float ch = 1.0f / (1.0f + cr * cg + cg * cg);
+	const float f0 = voice->f0;
+	const float tone_level = voice->tone;
+	uint8_t i;
+
+	if (voice->trigger) {
+		voice->trigger = 0u;
+		voice->s_fm = 1.0f;
+		voice->s_body_env = voice->s_transient_env =
+			0.3f + 0.7f * voice->accent;
+		voice->s_body_pw = PKS_BODY_PULSE;
+		voice->s_fm_pw = PKS_FM_PULSE;
+	}
+
+	for (i = 0u; i < size; i++) {
+		float noise;
+		float mix;
+		float body;
+		float click_in;
+		float transient;
+		float hp;
+		float bp;
+
+		voice->rng = voice->rng * 1664525u + 1013904223u;
+		noise = (float)voice->rng * (1.0f / 4294967296.0f);
+		voice->s_phase_noise += PKS_PHASE_NOISE_LP *
+		                        (noise - 0.5f - voice->s_phase_noise);
+
+		if (voice->s_fm_pw) {
+			--voice->s_fm_pw;
+			voice->s_phase = 0.25f;
+		} else {
+			float inc;
+
+			voice->s_fm *= voice->s_fm_decay;
+			inc = f0 * (1.0f + voice->s_fm_amount * 3.5f * voice->s_fm_lp);
+			voice->s_phase += (inc < 0.5f) ? inc : 0.5f;
+			if (voice->s_phase >= 1.0f)
+				voice->s_phase -= 1.0f;
+		}
+
+		if (voice->s_body_pw) {
+			--voice->s_body_pw;
+		} else {
+			voice->s_body_env *= voice->s_body_decay;
+			voice->s_transient_env *= PKS_TRANSIENT_DECAY;
+		}
+
+		voice->s_body_env_lp += PKS_ENV_LP *
+		                        (voice->s_body_env - voice->s_body_env_lp);
+		voice->s_transient_env_lp += PKS_ENV_LP *
+			(voice->s_transient_env - voice->s_transient_env_lp);
+		voice->s_fm_lp += PKS_ENV_LP * (voice->s_fm - voice->s_fm_lp);
+
+		body = pk_distortedSine(voice->s_phase, voice->s_phase_noise,
+		                        voice->s_dirt);
+
+		/* SyntheticBassDrumClick: slope, one-pole high-pass, Svf LP. */
+		click_in = voice->s_body_pw ? 0.0f : 1.0f;
+		{
+			const float e = click_in - voice->s_click_lp;
+
+			voice->s_click_lp += (e > 0.0f ? PKS_CLICK_UP : PKS_CLICK_DOWN) * e;
+		}
+		voice->s_click_hp += PKS_CLICK_HP *
+		                     (voice->s_click_lp - voice->s_click_hp);
+		hp = ((voice->s_click_lp - voice->s_click_hp) -
+		      cr * voice->s_click_s1 - cg * voice->s_click_s1 -
+		      voice->s_click_s2) * ch;
+		bp = cg * hp + voice->s_click_s1;
+		voice->s_click_s1 = cg * hp + bp;
+		transient = cg * bp + voice->s_click_s2;
+		voice->s_click_s2 = cg * bp + transient;
+
+		/* SyntheticBassDrumAttackNoise. */
+		voice->rng = voice->rng * 1664525u + 1013904223u;
+		noise = (float)voice->rng * (1.0f / 4294967296.0f);
+		voice->s_noise_lp += PKS_NOISE_LP * (noise - voice->s_noise_lp);
+		voice->s_noise_hp += PKS_NOISE_HP *
+		                     (voice->s_noise_lp - voice->s_noise_hp);
+		transient += voice->s_noise_lp - voice->s_noise_hp;
+
+		mix = -pk_transistorVca(body, voice->s_body_env_lp);
+		mix -= transient * voice->s_transient_env_lp * tone_level;
+
+		voice->s_tone_lp += voice->tone_f * (mix - voice->s_tone_lp);
+		out[i] = voice->s_tone_lp;
+	}
+}
+
 void PlaitsKick_initVoice(PlaitsKickVoice *voice)
 {
 	/*
@@ -98,6 +254,8 @@ void PlaitsKick_initVoice(PlaitsKickVoice *voice)
 	voice->volumeMod = 1u;
 	voice->velo = 1.0f;
 	voice->accent = 1.0f;
+	voice->model = PLAITS_KICK_MODEL_ANALOG;
+	voice->rng = 0x5EEDu;
 	lfo_init(&voice->lfo);
 	slopeEg2_init(&voice->oscVolEg);
 	setDistortionShape(&voice->distortion, 0u);
@@ -175,6 +333,30 @@ void PlaitsKick_calcVoiceAsync(PlaitsKickVoice *voice)
 		voice->drive *= (limit < 0.0f) ? 0.0f : limit;
 	}
 
+	/*
+	 * SyntheticBassDrum (BassDrumEngine AUX): Tone = timbre, Decay = morph,
+	 * dirtiness = 0.4 - 0.25 morph^2, FM envelope amount and decay from
+	 * Harmonics. Time constants are in seconds x the codec rate.
+	 */
+	if (voice->model == PLAITS_KICK_MODEL_SYNTH) {
+		const float d = voice->decay * voice->decay;
+		float fm_env_decay = voice->harmonics * 2.0f - 1.0f;
+		float dirt = 0.4f - 0.25f * d;
+		const float dlim = 1.0f - 8.0f * f0_plaits;
+
+		fm_env_decay = (fm_env_decay < 0.0f) ? 0.0f : fm_env_decay;
+		fm_env_decay *= fm_env_decay;
+		voice->s_fm_amount = voice->harmonics * 2.0f;
+		voice->s_fm_amount = (voice->s_fm_amount > 1.0f) ? 1.0f
+		                                                 : voice->s_fm_amount;
+		dirt *= (dlim < 0.0f) ? 0.0f : dlim;
+		voice->s_dirt = dirt;
+		voice->s_fm_decay = 1.0f - 1.0f /
+			(0.008f * (1.0f + fm_env_decay * 4.0f) * PK_FS);
+		voice->s_body_decay = 1.0f - 1.0f / (0.02f * PK_FS) *
+			pk_semitones(-d * 60.0f);
+	}
+
 	/* Shared amp envelope, as Drum_calcVoiceAsync (AMP_EG_SYNC == 0). */
 	if ((voice->oscVolEg.attack == 1) &&
 	    ((voice->oscVolEg.state == EG_A) ||
@@ -208,6 +390,21 @@ void PlaitsKick_calcVoiceSyncBlock(PlaitsKickVoice *voice, int16_t *buf,
 
 	if (!voice || !buf || size == 0u || size > OUTPUT_DMA_SIZE)
 		return;
+
+	if (voice->model == PLAITS_KICK_MODEL_SYNTH) {
+		/* Plaits' AUX: no overdrive, the engine's 0.8 output gain. */
+		pk_renderSynth(voice, out, size);
+		for (i = 0u; i < size; i++) {
+			float s = out[i] * PK_OUT_GAIN * 32767.0f;
+
+			s = (s > 32767.0f) ? 32767.0f : ((s < -32768.0f) ? -32768.0f : s);
+			buf[i] = (int16_t)s;
+		}
+		voicePost_drum(buf, voice->ampFilterInput, voice->lastGain,
+		               voice->volumeMod ? voice->velo : 1.0f,
+		               &voice->distortion, size);
+		return;
+	}
 
 	if (voice->trigger) {
 		voice->trigger = 0u;
