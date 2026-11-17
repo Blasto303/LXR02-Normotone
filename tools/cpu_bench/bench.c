@@ -242,6 +242,42 @@ int main(int argc, char **argv)
         printf(" %u", scene_effectConst(v) ? scene_effectConst(v)->type : 99);
     printf("\n");
 
+    /*
+     * Chain demo: bench card bank blocks_per_pattern chain 1,5,9 [plaits]
+     * plays the patterns in turn through the LIVE pattern change (the
+     * Effect and its tails carry over), writing BENCH_DUMP.
+     */
+    if (argc > 5 && !strcmp(argv[4], "chain")) {
+        char list[128], *tok, *save = NULL;
+        int first = 1, g;
+
+        if (getenv("BENCH_DUMP"))
+            dump = fopen(getenv("BENCH_DUMP"), "wb");
+        strncpy(list, argv[5], sizeof(list) - 1);
+        list[sizeof(list) - 1] = 0;
+        for (tok = strtok_r(list, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+            uint8_t sc = (uint8_t)(atoi(tok) - 1);
+
+            if (first) {
+                activate(sc);
+                if (argc > 6 && !strcmp(argv[6], "plaits")) {
+                    live_plaitsToggle();
+                    for (g = 0; g < 50; g++) { live_service(); settle(); }
+                }
+                first = 0;
+            } else {
+                ev_scene(sc);
+                activate(sc);
+                for (g = 0; g < 4; g++) { live_service(); settle(); }
+            }
+            printf("pattern %u types", sc + 1);
+            for (v = 0; v < 6; v++) printf(" %u", scene_instrumentSlotConst(sc, v)->type);
+            printf("\n");
+            run_pattern(sc, blocks);
+        }
+        return 0;
+    }
+
     /* PLAITS scenario: bench card bank 1 plaits */
     if (argc > 4 && !strcmp(argv[4], "plaits")) {
         uint8_t sc;
