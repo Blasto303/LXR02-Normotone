@@ -166,12 +166,11 @@ typedef struct {
     uint32_t rv_ptr;
     uint32_t noise;
     uint32_t primed;
-    /* mno: half-rate plate (input pair sum, previous / current output). */
-    float hp_acc;
-    float hp_prev[2];
-    float hp_cur[2];
-    float hp_lp[2][2];      /* two one-poles per side: image removal */
-    uint32_t hp_phase;
+    /* mno (quarter rate): output smoothing, control-rate modulation. */
+    float hp_lp[2][2];
+    float q_mod;
+    float q_rmod;
+    uint32_t q_mode;        /* 1 while the rings hold quarter-rate content */
 } DlyVerbState;
 
 _Static_assert(sizeof(DlyVerbState) <= DLYVERB_STATE_BYTES,
@@ -788,18 +787,167 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         st->rvl = rvl_to;
     }
 
+    /*
+     * mno: the whole rumble path at a quarter of the codec rate (Normotone).
+     *
+     * What: one mono echo chain (drive, tap, tone, bump, loop saturation)
+     * and the stereo plate (dv_plateHalf) run at 11,027 Hz on the 4-sample
+     * mean of the L+R input; every one-pole is converted (pole squared), taps
+     * and modulation are in quarter-rate samples, the gain ramps step twice
+     * as far, and wow/flutter/plate modulation are computed once per block and
+     * ramped (all below 10 Hz). The output is interpolated back to the codec
+     * rate and smoothed by a one-pole near 5 kHz. Why: the rumble echo is
+     * low-passed near 600 Hz and its plate heavily damped, so nothing it
+     * produces lives above 5 kHz; running it at a quarter rate keeps that
+     * sound and halves the cost again. The dig crossfade is replaced by the
+     * glide in this mode.
+     */
+    if (stereo == DLYVERB_STEREO_MONO && (io->frames & 3u) == 0u) {
+        const uint32_t q = io->frames / 4u;
+        const float lp4 = 1.0f - (1.0f - lp_a) * (1.0f - lp_a);
+        const float hp4 = hp_r * hp_r;
+        const float bump4 = 1.0f - (1.0f - bump_a) * (1.0f - bump_a);
+        const float dlp4 = 1.0f - (1.0f - drive_lp_a) * (1.0f - drive_lp_a);
+        const float glide4 = 1.0f - (1.0f - glide_k) * (1.0f - glide_k);
+        const float damp2 = damp * damp;
+        const float tq = 0.5f * t_l;
+        const float adv = (float)half;   /* half-rate samples per block */
+        float mod;
+        float mod_inc;
+        float rmod;
+        float rmod_inc;
+        uint32_t i;
+
+        if (!st->q_mode) {          /* rings held codec-rate content */
+            st->q_mode = 1u;
+            st->valid = 0u;
+            st->tap_a[0] = tq;
+            st->q_mod = 0.0f;
+            st->q_rmod = 0.0f;
+        }
+        st->ph_tri += inc_mod * adv;          st->ph_tri -= floorf(st->ph_tri);
+        st->ph_flutter += inc_flutter * adv;  st->ph_flutter -= floorf(st->ph_flutter);
+        st->ph_wow += inc_wow * adv;          st->ph_wow -= floorf(st->ph_wow);
+        st->ph_base_flutter += inc_base_flutter * adv;
+        st->ph_base_flutter -= floorf(st->ph_base_flutter);
+        st->ph_rvb += inc_rvb * adv;          st->ph_rvb -= floorf(st->ph_rvb);
+        mod = 0.5f * (mod_depth * (w_tri * (1.0f - 4.0f * fabsf(st->ph_tri - 0.5f)) +
+                                   w_wow * dv_sine(st->ph_tri) +
+                                   w_flutter * dv_sine(st->ph_flutter)) +
+                      base_tri * (1.0f - 4.0f * fabsf(st->ph_wow - 0.5f)) +
+                      base_wow * dv_sine(st->ph_wow) +
+                      base_flutter * dv_sine(st->ph_base_flutter));
+        rmod = dv_sine(st->ph_rvb);
+        mod_inc = (mod - st->q_mod) / (float)q;
+        rmod_inc = (rmod - st->q_rmod) / (float)q;
+        mod = st->q_mod;
+        rmod = st->q_rmod;
+        st->q_mod += mod_inc * (float)q;
+        st->q_rmod += rmod_inc * (float)q;
+
+        wp = st->wp;
+        valid = st->valid;
+        ptr = st->rv_ptr;
+        for (i = 0u; i < q; i++) {
+            const float *li = &left[4u * i];
+            const float *ri = right ? &right[4u * i] : li;
+            const float x = 0.125f * (li[0] + li[1] + li[2] + li[3] +
+                                      ri[0] + ri[1] + ri[2] + ri[3]);
+            float in_m;
+            float e_m;
+            float eo_m;
+            float rv_l;
+            float rv_r;
+            float w_m;
+            float nz;
+            float y_l;
+            float y_r;
+            uint32_t j;
+
+            fb += 2.0f * fb_inc;
+            dlv += 2.0f * dlv_inc;
+            rvl += 2.0f * rvl_inc;
+            mod += mod_inc;
+            rmod += rmod_inc;
+
+            in_m = x + drive_mix *
+                   (drive_makeup * (dv_soft(drive_gain * x + drive_bias) -
+                                    drive_bias_out) - x);
+            st->drv_lp[0] += dlp4 * (in_m - st->drv_lp[0]);
+            in_m = st->drv_lp[0];
+
+            {
+                const float al = st->tap_a[0] + mod;
+                float va = dv_ringRead(ring_l, len, wp, al);
+
+                va = ((al + 2.0f) <= (float)valid) ? va : 0.0f;
+                st->lp[0] += lp4 * (va - st->lp[0]);
+            }
+            st->hp_y[0] = hp4 * (st->hp_y[0] + st->lp[0] - st->hp_x[0]);
+            st->hp_x[0] = st->lp[0];
+            e_m = st->hp_y[0];
+            st->bump[0] += bump4 * (e_m - st->bump[0]);
+            eo_m = e_m + bump_g * st->bump[0];
+
+            dv_plateHalf(st, rv, ptr, 0.5f * (eo_m + r_par * (in_m - eo_m)),
+                         decay, dd2, damp2, rmod, &rv_l, &rv_r);
+            ptr = (ptr - 1u) & DV_RVB_MASK;
+
+            nz = dv_noise(&st->noise);
+            nz = (hiss + floor_nz) * nz +
+                 ((fabsf(nz) < crackle_p) ? crackle_amp : 0.0f);
+            w_m = in_m + fb * (e_m + r_fbk * rvl * (0.25f * (rv_l + rv_r) - e_m)) + nz;
+            if (sat_k >= 1.0f)
+                w_m = loop_inv * (dv_soft(loop_k * w_m + loop_bias) - loop_bias_out);
+            else
+                w_m = dv_clamp(w_m, 1.0f) + sat_k *
+                      (loop_inv * (dv_soft(loop_k * w_m + loop_bias) - loop_bias_out) -
+                       dv_clamp(w_m, 1.0f));
+            ring_l[wp] = (int16_t)(w_m * 32767.0f);
+            wp++;
+            wp -= (wp >= len) ? len : 0u;
+            valid += (valid < len) ? 1u : 0u;
+            st->tap_a[0] += (tq - st->tap_a[0]) * glide4;
+
+            y_l = DV_LIMIT_INV * dv_soft(DV_LIMIT * (dlv * eo_m + rvl * rv_l));
+            y_r = DV_LIMIT_INV * dv_soft(DV_LIMIT * (dlv * eo_m + rvl * rv_r));
+            for (j = 0u; j < 4u; j++) {
+                const float k = 0.25f * (float)(j + 1u);
+                const float ol = st->prev_out[0] + k * (y_l - st->prev_out[0]);
+                const float orr = st->prev_out[1] + k * (y_r - st->prev_out[1]);
+
+                st->hp_lp[0][0] += 0.5f * (ol - st->hp_lp[0][0]);
+                st->hp_lp[1][0] += 0.5f * (orr - st->hp_lp[1][0]);
+                if (right) {
+                    left[4u * i + j] = st->hp_lp[0][0];
+                    right[4u * i + j] = st->hp_lp[1][0];
+                } else {
+                    left[4u * i + j] = 0.5f * (st->hp_lp[0][0] + st->hp_lp[1][0]);
+                }
+            }
+            st->prev_out[0] = y_l;
+            st->prev_out[1] = y_r;
+        }
+        st->tap_a[1] = st->tap_a[0];
+        st->tap_b[0] = st->tap_a[0];
+        st->tap_b[1] = st->tap_a[0];
+        st->xfade = 0.0f;
+        st->xfade_inc = 0.0f;
+        st->wp = wp;
+        st->valid = valid;
+        st->rv_ptr = ptr;
+        return;
+    }
+    if (st->q_mode) {               /* rings held quarter-rate content */
+        st->q_mode = 0u;
+        st->valid = 0u;
+    }
+
     /* 2:1 decimation behind the 9 kHz image filter. */
     for (n = 0u; n < half; n++) {
         const float r0 = right ? right[2u * n] : left[2u * n];
         const float r1 = right ? right[2u * n + 1u] : left[2u * n + 1u];
 
-        if (stereo == DLYVERB_STEREO_MONO) {
-            /* mno: one decimator on the mix; xs_r = xs_l so (l+r)/2 = mix. */
-            (void)dv_biquad(0.5f * (left[2u * n] + r0), st->dec_z[0]);
-            xs_l[n] = dv_biquad(0.5f * (left[2u * n + 1u] + r1), st->dec_z[0]);
-            xs_r[n] = xs_l[n];
-            continue;
-        }
         (void)dv_biquad(left[2u * n], st->dec_z[0]);
         (void)dv_biquad(r0, st->dec_z[1]);
         xs_l[n] = dv_biquad(left[2u * n + 1u], st->dec_z[0]);
@@ -809,143 +957,6 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
     wp = st->wp;
     valid = st->valid;
     ptr = st->rv_ptr;
-    if (stereo == DLYVERB_STEREO_MONO) {
-        /*
-         * Mono echo, stereo plate (`mno`, Normotone CPU).
-         *
-         * What: one delay chain (drive, tap, tone, bump, loop saturation)
-         * runs on the L+R mix; the right ring mirrors the left one so a later
-         * switch to a stereo mode finds coherent content. The plate keeps its
-         * two output tap sets, so the reverb stays wide. Why: for a mono
-         * source (the rumble kick) the two chains computed almost the same
-         * thing; this halves the echo-path cost. Modulation is in phase.
-         */
-        for (n = 0u; n < half; n++) {
-            float x;
-            float in_m;
-            float mod;
-            float d_m;
-            float e_m;
-            float eo_m;
-            float rv_l;
-            float rv_r;
-            float s_m;
-            float w_m;
-            float nz;
-
-            fb += fb_inc;
-            dlv += dlv_inc;
-            rvl += rvl_inc;
-
-            x = 0.5f * (xs_l[n] + xs_r[n]);
-            in_m = x + drive_mix *
-                   (drive_makeup * (dv_soft(drive_gain * x + drive_bias) -
-                                    drive_bias_out) - x);
-            st->drv_lp[0] += drive_lp_a * (in_m - st->drv_lp[0]);
-            in_m = st->drv_lp[0];
-
-            mod = mod_depth * (w_tri * (1.0f - 4.0f * fabsf(st->ph_tri - 0.5f)) +
-                               w_wow * dv_sine(st->ph_tri) +
-                               w_flutter * dv_sine(st->ph_flutter)) +
-                  base_tri * (1.0f - 4.0f * fabsf(st->ph_wow - 0.5f)) +
-                  base_wow * dv_sine(st->ph_wow) +
-                  base_flutter * dv_sine(st->ph_base_flutter);
-
-            {
-                const float al = st->tap_a[0] + mod;
-                float va = dv_ringRead(ring_l, len, wp, al);
-
-                va = ((al + 2.0f) <= (float)valid) ? va : 0.0f;
-                if (st->xfade != 0.0f) {
-                    const float bl = st->tap_b[0] + mod;
-                    float vb = dv_ringRead(ring_l, len, wp, bl);
-
-                    vb = ((bl + 2.0f) <= (float)valid) ? vb : 0.0f;
-                    d_m = va + st->xfade * (vb - va);
-                } else {
-                    d_m = va;
-                }
-            }
-
-            st->lp[0] += lp_a * (d_m - st->lp[0]);
-            st->hp_y[0] = hp_r * (st->hp_y[0] + st->lp[0] - st->hp_x[0]);
-            st->hp_x[0] = st->lp[0];
-            e_m = st->hp_y[0];
-            st->bump[0] += bump_a * (e_m - st->bump[0]);
-            eo_m = e_m + bump_g * st->bump[0];
-
-            /* Plate every second sample on the pair sum, linear between. */
-            st->hp_acc += 0.5f * (eo_m + r_par * (in_m - eo_m));
-            if (st->hp_phase) {
-                st->hp_prev[0] = st->hp_cur[0];
-                st->hp_prev[1] = st->hp_cur[1];
-                dv_plateHalf(st, rv, ptr, 0.5f * st->hp_acc, decay, dd2,
-                             damp * damp, dv_sine(st->ph_rvb),
-                             &st->hp_cur[0], &st->hp_cur[1]);
-                ptr = (ptr - 1u) & DV_RVB_MASK;
-                st->hp_acc = 0.0f;
-                rv_l = st->hp_cur[0];
-                rv_r = st->hp_cur[1];
-            } else {
-                rv_l = 0.5f * (st->hp_prev[0] + st->hp_cur[0]);
-                rv_r = 0.5f * (st->hp_prev[1] + st->hp_cur[1]);
-            }
-            st->hp_phase ^= 1u;
-            /*
-             * Image removal: a two-tap average (a zero at 11 kHz, where the
-             * quarter-rate plate leaves its image) then a one-pole near
-             * 4 kHz. The rumble plate carries nothing up there.
-             */
-            {
-                const float al = 0.5f * (rv_l + st->hp_lp[0][0]);
-                const float ar = 0.5f * (rv_r + st->hp_lp[1][0]);
-
-                st->hp_lp[0][0] = rv_l;
-                st->hp_lp[1][0] = rv_r;
-                st->hp_lp[0][1] += 0.68f * (al - st->hp_lp[0][1]);
-                st->hp_lp[1][1] += 0.68f * (ar - st->hp_lp[1][1]);
-            }
-            rv_l = st->hp_lp[0][1];
-            rv_r = st->hp_lp[1][1];
-
-            s_m = e_m + r_fbk * rvl * (0.25f * (rv_l + rv_r) - e_m);
-            nz = dv_noise(&st->noise);
-            nz = (hiss + floor_nz) * nz +
-                 ((fabsf(nz) < crackle_p) ? crackle_amp : 0.0f);
-            w_m = in_m + fb * s_m + nz;
-            w_m = dv_clamp(w_m, 1.0f) + sat_k *
-                  (loop_inv * (dv_soft(loop_k * w_m + loop_bias) - loop_bias_out) -
-                   dv_clamp(w_m, 1.0f));
-            ring_l[wp] = (int16_t)(w_m * 32767.0f);
-            ring_r[wp] = ring_l[wp];
-            wp++;
-            wp -= (wp >= len) ? len : 0u;
-            valid += (valid < len) ? 1u : 0u;
-
-            ys_l[n] = DV_LIMIT_INV * dv_soft(DV_LIMIT * (dlv * eo_m + rvl * rv_l));
-            ys_r[n] = DV_LIMIT_INV * dv_soft(DV_LIMIT * (dlv * eo_m + rvl * rv_r));
-
-            st->tap_a[0] += (t_l - st->tap_a[0]) * glide_k;
-            st->tap_a[1] = st->tap_a[0];
-            st->xfade += st->xfade_inc;
-            if (st->xfade >= 1.0f) {
-                st->tap_a[0] = st->tap_b[0];
-                st->tap_a[1] = st->tap_b[1];
-                st->xfade = 0.0f;
-                st->xfade_inc = 0.0f;
-            }
-            st->ph_tri += inc_mod;
-            st->ph_tri -= (st->ph_tri >= 1.0f) ? 1.0f : 0.0f;
-            st->ph_flutter += inc_flutter;
-            st->ph_flutter -= (st->ph_flutter >= 1.0f) ? 1.0f : 0.0f;
-            st->ph_wow += inc_wow;
-            st->ph_wow -= (st->ph_wow >= 1.0f) ? 1.0f : 0.0f;
-            st->ph_base_flutter += inc_base_flutter;
-            st->ph_base_flutter -= (st->ph_base_flutter >= 1.0f) ? 1.0f : 0.0f;
-            st->ph_rvb += inc_rvb;
-            st->ph_rvb -= (st->ph_rvb >= 1.0f) ? 1.0f : 0.0f;
-        }
-    } else
     for (n = 0u; n < half; n++) {
         float in_l;
         float in_r;
