@@ -127,6 +127,7 @@
  *   For now the audible impact is negligible.
  */
 
+#include "cpuProfile.h"
 #include "AudioCodecManager.h"
 #include <string.h>
 #include <math.h>
@@ -475,7 +476,7 @@ static void pack_audio_half(uint8_t half)
 ** Stream 7 (IRQ47) is the slave for DAC1 (I2S3). It only clears flags.
 */
 
-void DMA1_Stream4_IRQHandler(void)
+void DMA1_Stream4_IRQHandler_body(void)
 {
     uint32_t hisr = DMA1_HISR;
     if (hisr & DMA_HISR_TCIF4) {
@@ -488,7 +489,7 @@ void DMA1_Stream4_IRQHandler(void)
     }
 }
 
-void DMA1_Stream7_IRQHandler(void)
+void DMA1_Stream7_IRQHandler_body(void)
 {
     uint32_t hisr = DMA1_HISR;
     if (hisr & DMA_HISR_TCIF7) {
@@ -791,3 +792,9 @@ void audioCodec_renderSineBlock(void)
     }
     audioCodec_commitRenderBuffer();
 }
+
+/* Normotone CPU profile: timed wrapper (cpuProfile.h). */
+PROF_ISR_WRAP(DMA1_Stream4_IRQHandler, PROF_DMA)
+
+/* Normotone CPU profile: timed wrapper (cpuProfile.h). */
+PROF_ISR_WRAP(DMA1_Stream7_IRQHandler, PROF_DMA)

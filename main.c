@@ -34,6 +34,7 @@
  * ------------------------------------------------------------------------------------------------------------------------
  */
 
+#include "cpuProfile.h"
 #include "config.h"
 #include "clocks.h"
 #include "AudioCodecManager.h"
@@ -1456,7 +1457,7 @@ boot_filesystem_done:
 	for (;;) {
 		// audio check and render each operation
 		// to see if there is one of 2 forward buffer slots free to calc
-		audio_check_and_render();
+		PROF_FG(PROF_RND, audio_check_and_render());
 		/*
 		 * TIM3 owns MIDI realtime, CLK/RST jack events, and seq_tick(), so it
 		 * can mark sequencer LED state dirty while playback advances.
@@ -1466,65 +1467,66 @@ boot_filesystem_done:
 		 * the foreground main loop instead of doing LED/menu reads from the
 		 * sequencer timer path.
 		 */
-		led_processSeqLedState();
-        audio_check_and_render();        
+		PROF_FG(PROF_LED, led_processSeqLedState());
+        PROF_FG(PROF_RND, audio_check_and_render());        
         // foreground front-panel hardware service, scheduled by TIM6 at 500Hz
-        timebase_serviceFrontPanel();
-        audio_check_and_render();
+        PROF_FG(PROF_FPN, timebase_serviceFrontPanel());
+        PROF_FG(PROF_RND, audio_check_and_render());
         // service DIN/USB MIDI input and flush USB MIDI output
-        midi_service();
-        audio_check_and_render();
+        PROF_FG(PROF_MID, midi_service());
+        PROF_FG(PROF_RND, audio_check_and_render());
         // main encoder touch
-        main_encoder_check();    
-        audio_check_and_render();
+        PROF_FG(PROF_ENC, main_encoder_check());    
+        PROF_FG(PROF_RND, audio_check_and_render());
         // 4 front endless pots touch NB: how expensive is tan calc?
-        endless_pot_check();
-        audio_check_and_render();
+        PROF_FG(PROF_POT, endless_pot_check());
+        PROF_FG(PROF_RND, audio_check_and_render());
         // repaint visible knob/external-MIDI parameter changes at a capped LCD rate
-        service_knob_repaint();
-        audio_check_and_render();
+        PROF_FG(PROF_KNB, service_knob_repaint());
+        PROF_FG(PROF_RND, audio_check_and_render());
         // refresh read-only runtime widgets at their own display cadence
-        menu_serviceRuntimeWidgets();
-        audio_check_and_render();
+        PROF_FG(PROF_MNU, menu_serviceRuntimeWidgets());
+        PROF_FG(PROF_RND, audio_check_and_render());
         // always-on slider gain refresh (applied as separate multiply in mixer)
-        adc_checkPots();
-        audio_check_and_render();
+        PROF_FG(PROF_ADC, adc_checkPots());
+        PROF_FG(PROF_RND, audio_check_and_render());
         // start screensaver?
-        screensaver_check();
-        audio_check_and_render();
+        PROF_FG(PROF_SCR, screensaver_check());
+        PROF_FG(PROF_RND, audio_check_and_render());
         // tick the update leds async
-        led_tickHandler();
-        audio_check_and_render();
+        PROF_FG(PROF_LED, led_tickHandler());
+        PROF_FG(PROF_RND, audio_check_and_render());
         // if a button changed, resolve it
-        buttonHandler_processEvents();
-        audio_check_and_render();
+        PROF_FG(PROF_BTN, buttonHandler_processEvents());
+        PROF_FG(PROF_RND, audio_check_and_render());
         // tick the update buttons async
-        buttonHandler_tick();
-        audio_check_and_render();
+        PROF_FG(PROF_BTN, buttonHandler_tick());
+        PROF_FG(PROF_RND, audio_check_and_render());
         /*
          * Drain one successor event after the hold-timer poll. A timer
          * cancellation can make the next queued release immediately eligible
          * for normal tap processing; keeping this second bounded drain here
          * preserves the audio interleave while doubling foreground throughput.
          */
-        buttonHandler_processEvents();
-        audio_check_and_render();
+        PROF_FG(PROF_BTN, buttonHandler_processEvents());
+        PROF_FG(PROF_RND, audio_check_and_render());
         // tick the preset change async
-        menu_pollPresetStatus();
-        audio_check_and_render();
+        PROF_FG(PROF_PRS, menu_pollPresetStatus());
+        PROF_FG(PROF_RND, audio_check_and_render());
         // tick one queued morph parameter
-        preset_morphTick();
-        audio_check_and_render();
+        PROF_FG(PROF_MRP, preset_morphTick());
+        PROF_FG(PROF_RND, audio_check_and_render());
         // tick the SD read async
-        filesystem_tick();
-        audio_check_and_render();
+        PROF_FG(PROF_SD, filesystem_tick());
+        PROF_FG(PROF_RND, audio_check_and_render());
         /*
          * Background Bank load: use the full-queue idle window for extra
          * filesystem steps (S082 P2 fix 3); returns at once otherwise. The
          * loop returns to its render check at the top of the next pass, so a
          * slot that freed during the window is served promptly.
          */
-        main_serviceBackgroundLoadIdle();
+        PROF_FG(PROF_BGL, main_serviceBackgroundLoadIdle());
+        prof_service();
     }
 }
 

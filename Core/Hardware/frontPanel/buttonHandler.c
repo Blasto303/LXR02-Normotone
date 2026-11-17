@@ -2859,6 +2859,14 @@ static uint8_t buttonHandler_livePress(uint8_t b)
         live_kitPageOpen();
         return 1u;
     }
+    if (seq == 11 && bh_liveLoadHeld && !shift) {        /* LOAD + CONFIG */
+        buttonHandler_liveConsume(b);
+        live_kitPageClose();
+        if (bh_state.selectButtonMode != SELECT_MODE_PERF)
+            handleModeButtons(SELECT_MODE_PERF);
+        live_cpuPageOpen();
+        return 1u;
+    }
     if (seq >= 0 && bh_liveLoadHeld && !shift &&
         (seq == 10 || seq == 15)) {
         buttonHandler_liveConsume(b);

@@ -44,6 +44,7 @@
  * LCD, SD, encoder, or foreground MIDI parsing work.
  */
 
+#include "cpuProfile.h"
 #include "sequencerTimer.h"
 #include "MidiTransport.h"
 #include "sequencer.h"
@@ -88,7 +89,7 @@ void sequencerTimer_init(void)
 	TIM3_CR1 = 1;               /* CEN */
 }
 
-void TIM3_IRQHandler(void)
+void TIM3_IRQHandler_body(void)
 {
 	if (TIM3_SR & 1u) {
 		TIM3_SR = 0;
@@ -102,3 +103,6 @@ void TIM3_IRQHandler(void)
 		seq_tick();
 	}
 }
+
+/* Normotone CPU profile: timed wrapper (cpuProfile.h). */
+PROF_ISR_WRAP(TIM3_IRQHandler, PROF_SEQ)

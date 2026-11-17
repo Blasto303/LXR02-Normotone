@@ -15888,7 +15888,8 @@ void menu_parseEncoder(int8_t inc, uint8_t button)
         uint8_t clicked = (uint8_t)(button && !liveLastButton);
 
         liveLastButton = button;
-        if (live_kitPageActive() || live_rndPageActive()) {
+        if (live_kitPageActive() || live_rndPageActive() ||
+            live_cpuPageActive()) {
             live_encoder(inc, clicked);
             return;
         }

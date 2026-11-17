@@ -33,6 +33,7 @@
 #include "InstrumentManager.h"
 #include "Autosave.h"
 #include "random.h"
+#include "cpuProfile.h"
 
 static kit_t    live_kitBackup;
 static uint8_t  live_backupScene = 0xFFu;   /* Scene whose kit is swapped */
@@ -40,7 +41,9 @@ static uint16_t live_backupBank = 0xFFFFu;  /* Bank slot of that Scene    */
 static uint8_t  live_kitSource = 0xFFu;     /* kit shown on the KIT page  */
 static uint8_t  live_pendingKit = 0xFFu;    /* kit waiting for the bar    */
 static uint8_t  live_carrier;               /* queue only carries the kit */
-static uint8_t  live_page;                  /* 0 none, 1 KIT, 2 PATTERN   */
+static uint8_t  live_page;                  /* 0 none, 1 KIT, 2 PATTERN, 3 RND, 4 CPU */
+static uint8_t  live_cpuEntry;              /* first entry on the CPU page */
+static uint8_t  live_cpuSerial;
 static uint8_t  live_shownQueue = 0xFFu;    /* queued pattern on the LCD  */
 static uint8_t  live_kitHold;               /* 1: kit stays on pattern change */
 /*
@@ -246,6 +249,19 @@ void live_reloadKit(void)
     live_kitSelect(scene_getActiveIndex());
 }
 
+void live_cpuPageOpen(void)
+{
+    if (live_page == 1u)
+        live_kitPageClose();
+    live_page = 4u;
+    menu_repaintAll();
+}
+
+uint8_t live_cpuPageActive(void)
+{
+    return (uint8_t)(live_page == 4u);
+}
+
 void live_rndPageOpen(void)
 {
     if (live_page == 1u)
@@ -413,6 +429,18 @@ void live_encoder(int8_t inc, uint8_t clicked)
 {
     uint8_t before = live_kitHold;
 
+    if (live_page == 4u) {
+        int16_t e = (int16_t)live_cpuEntry + inc;
+        int16_t last = (int16_t)prof_entryCount() - 2;
+
+        if (e < 0) e = 0;
+        if (e > last) e = last;
+        if (e != live_cpuEntry) {
+            live_cpuEntry = (uint8_t)e;
+            menu_repaintAll();
+        }
+        return;
+    }
     if (live_page == 3u) {
         int16_t d = (int16_t)live_rndDose + (int16_t)inc * 4;
 
@@ -458,6 +486,11 @@ static uint8_t live_queuedPattern(void)
 
 void live_service(void)
 {
+    /* CPU page: a new snapshot every second. */
+    if (live_page == 4u && prof_snapshotSerial() != live_cpuSerial) {
+        live_cpuSerial = prof_snapshotSerial();
+        menu_repaintAll();
+    }
     /* Repaint when the "Select Pattern" screen appears or goes. */
     {
         uint8_t q = live_queuedPattern();
@@ -486,6 +519,13 @@ uint8_t live_formatOverlay(char *row0, char *row1)
 {
     uint8_t kit;
 
+    if (live_page == 4u) {
+        if (buttonHandler_getMode() != SELECT_MODE_PERF)
+            return 0u;
+        prof_formatEntry(live_cpuEntry, row0);
+        prof_formatEntry((uint8_t)(live_cpuEntry + 1u), row1);
+        return 1u;
+    }
     if (live_page == 3u) {
         static const char names[4][5] = {"    ", "pat ", "kit ", "p+k "};
 

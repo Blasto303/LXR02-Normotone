@@ -47,6 +47,9 @@ void live_reloadKit(void);
  * both, DATA = dose (0 = original), DATA click = new draw for the kit.
  */
 void live_rndPageOpen(void);
+/* CPU page (LOAD + CONFIG, step 12): DATA scrolls (cpuProfile.h). */
+void live_cpuPageOpen(void);
+uint8_t live_cpuPageActive(void);
 uint8_t live_rndPageActive(void);
 void live_rndStep(uint8_t step);
 void live_rndPageLeds(void);

@@ -97,6 +97,7 @@ SRCS = \
   Core/Menu/menu.c \
   Core/Menu/menuEffects.c \
   Core/Menu/liveMode.c \
+  Core/Hardware/cpuProfile.c \
   Core/Sequencer/StepScale.c \
   Core/Menu/Cc2Text.c \
   Core/Menu/CopyClear/copyClearSession.c \
