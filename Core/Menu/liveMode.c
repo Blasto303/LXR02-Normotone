@@ -46,6 +46,7 @@
 #include "random.h"
 #include "cpuProfile.h"
 #include "plaitsMode.h"
+#include "adcPots.h"
 
 static kit_t    live_kitBackup;
 static uint8_t  live_backupScene = 0xFFu;   /* Scene whose kit is swapped */
@@ -504,10 +505,11 @@ void live_encoder(int8_t inc, uint8_t clicked)
 
     if (live_page == 4u) {
         int16_t e = (int16_t)live_cpuEntry + inc;
-        int16_t last = (int16_t)prof_entryCount() - 2;
+        int16_t last = (int16_t)prof_entryCount() - 1;  /* + fader line */
 
-        if (e < 0) e = 0;
+        if (last < 0) last = 0;
         if (e > last) e = last;
+        if (e < 0) e = 0;
         if (e != live_cpuEntry) {
             live_cpuEntry = (uint8_t)e;
             menu_repaintAll();
@@ -599,6 +601,19 @@ void live_service(void)
         !live_plaitsSettled())
         live_kitSelect(live_currentKit());
     /* CPU page: a new snapshot every second. */
+    /* CPU page fader line: repaint as soon as a fader moves one step. */
+    if (live_page == 4u && live_cpuEntry == 0u) {
+        static uint32_t shown;
+        uint32_t sig = 0u;
+        uint8_t i;
+
+        for (i = 0u; i < 6u; i++)
+            sig = sig * 10u + (uint32_t)(slider_vol[i] * 9.0f + 0.5f);
+        if (sig != shown) {
+            shown = sig;
+            menu_repaintAll();
+        }
+    }
     if (live_page == 4u && prof_snapshotSerial() != live_cpuSerial) {
         live_cpuSerial = prof_snapshotSerial();
         menu_repaintAll();
@@ -634,8 +649,25 @@ uint8_t live_formatOverlay(char *row0, char *row1)
     if (live_page == 4u) {
         if (buttonHandler_getMode() != SELECT_MODE_PERF)
             return 0u;
-        prof_formatEntry(live_cpuEntry, row0);
-        prof_formatEntry((uint8_t)(live_cpuEntry + 1u), row1);
+        /*
+         * First line: the six faders as read from the ADC, 0..9 each
+         * ("Fdr 9 9 9 9 9 9"), DRUM1 .. HIHATS, to check a dead fader.
+         */
+        if (live_cpuEntry == 0u) {
+            uint8_t i;
+
+            memset(row0, ' ', 16);
+            memcpy(row0, "Fdr", 3);
+            for (i = 0u; i < 6u; i++) {
+                uint8_t v = (uint8_t)(slider_vol[i] * 9.0f + 0.5f);
+
+                row0[4u + 2u * i] = (char)('0' + (v > 9u ? 9u : v));
+            }
+            prof_formatEntry(0u, row1);
+        } else {
+            prof_formatEntry((uint8_t)(live_cpuEntry - 1u), row0);
+            prof_formatEntry(live_cpuEntry, row1);
+        }
         return 1u;
     }
     if (live_page == 3u) {
