@@ -22,11 +22,18 @@
 #include "BankData.h"
 #include "InstrumentManager.h"
 #include "EffectsManager.h"
+#include "FxBuffer.h"
+#include "liveMode.h"
 #include "buttonHandler.h"
 #include "menu.h"
 #include "presetManager.h"
 #include "BankData.h"
 #include "sequencer.h"
+
+/* The MCU linker supplies this DTCM arena. Reserve its guaranteed minimum
+ * here so selecting a real effect exercises the same allocator on the host. */
+__asm__(".pushsection .bss\n.balign 32\n.globl _sfxbuf\n_sfxbuf:\n"
+        ".space 0x1e000\n.globl _efxbuf\n_efxbuf:\n.popsection");
 
 extern int ram_load(const char *);
 extern unsigned long sd_reads, sd_writes;
@@ -111,6 +118,7 @@ int main(int argc, char **argv)
         printf("usage: menu_harness card.img bank actions...\n");
         return 1;
     }
+    fxbuf_init();
     scene_initAll(); bank_init(); instrumentManager_runtimeInit(); effects_init();
     if (!filesystem_initCardAndMountBlocking()) { printf("mount failed\n"); return 1; }
     filesystem_requestScanKits(NULL); settle(); filesystem_ack();
@@ -125,15 +133,19 @@ int main(int argc, char **argv)
     filesystem_requestLoadBankIndex(NULL); settle(); filesystem_ack();
     filesystem_requestLoadBank((uint16_t)atoi(argv[2]), 0xFFFFu, 0u, 0x03u, NULL);
     settle(); filesystem_ack();
+    if (argc > 3 && !strcmp(argv[3], "--rumble")) {
+        live_initFactoryRumble();
+        effects_activateScene(scene_getActiveIndex());
+    }
     menu_init();
     settle();
     show("boot", sd_reads, sim_us);
 
-    for (int a = 3; a < argc; a++) {
+    for (int a = argc > 3 && !strcmp(argv[3], "--rumble") ? 4 : 3; a < argc; a++) {
         const char *s = argv[a];
         unsigned long r0 = sd_reads;
         unsigned long long t0 = sim_us;
-        int n = (int)strtol(s + 2, NULL, 10);
+        int n = s[1] == ':' ? (int)strtol(s + 2, NULL, 10) : 0;
 
         switch (s[0]) {
         case 'm': tap(mode_btn[n]); break;

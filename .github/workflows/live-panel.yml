@@ -26,4 +26,9 @@ jobs:
       - name: Boot RAM card and exercise front panel
         run: |
           bash tools/fs_test/mkimg.sh SD_CARD "$RUNNER_TEMP/card.img" 512
-          build/fs_test/menu/harness "$RUNNER_TEMP/card.img" 0 m:1 d:29 q:8 u:29 e:1 m:1 d:29 q:11 u:29
+          build/fs_test/menu/harness "$RUNNER_TEMP/card.img" 0 --rumble m:1 v:1 S+ q:15 S- s:1 s:1 s:6 s:8 k:2:4 m:1 d:29 q:8 u:29 m:1 d:29 q:11 u:29 | tee panel.log
+          grep -Eiq 'mdl +div +fbk +dlv' panel.log
+          grep -Eiq 'drv +lpf +hpf +age' panel.log
+          grep -Eiq 'stm +wid +mod +mrt' panel.log
+          grep -Eiq 'rvl +rdc +rdp +rrt' panel.log
+          grep -Eiq 'cmp +cam +ctm +csc' panel.log
