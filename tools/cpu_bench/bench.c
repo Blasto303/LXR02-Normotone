@@ -218,6 +218,14 @@ int main(int argc, char **argv)
     mixer_init(); parameterArray_init();
     for (v = 0; v < 6; v++)
         slider_vol[v] = 0.8f;   /* the six sliders (ADC is not simulated) */
+    if (getenv("BENCH_SLIDERS")) {      /* BENCH_SLIDERS="0.8,0.8,0.8,0.8,0,0" */
+        char *p = getenv("BENCH_SLIDERS");
+        for (v = 0; v < 6 && p; v++) {
+            slider_vol[v] = (float)atof(p);
+            p = strchr(p, ',');
+            if (p) p++;
+        }
+    }
     for (v = 0; v < 6; v++)
         modNode_init(&velocityModulators[v]);
     if (!filesystem_initCardAndMountBlocking()) { printf("mount failed\n"); return 1; }
@@ -418,6 +426,25 @@ int main(int argc, char **argv)
             printf("plaits: slot types");
             for (v = 0; v < 6; v++)
                 printf(" %u", scene_instrumentSlotConst(sc, v)->type);
+            printf("\n");
+        }
+        /* BENCH_OUT="slot:route,...": per-voice output (0 St1, 1 St2, 2 L1, 3 R1, 4 L2, 5 R2). */
+        if (getenv("BENCH_OUT") && *getenv("BENCH_OUT")) {
+            char buf[128], *tok, *save = NULL;
+
+            strncpy(buf, getenv("BENCH_OUT"), sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = 0;
+            for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+                uint8_t sl = (uint8_t)atoi(tok);
+                char *c = strchr(tok, ':');
+
+                if (!c || sl > 5) continue;
+                scene_setVoiceAudioOut(sc, sl, (uint8_t)atoi(c + 1));
+                (void)preset_applyKitAudioRouting(sc, sl);
+            }
+            settle();
+            printf("routing:");
+            for (v = 0; v < 6; v++) printf(" %u", mixer_audioRouting[v]);
             printf("\n");
         }
         /* BENCH_FX="key=val,...": Effect rows by storage key; BENCH_COMP=amount. */

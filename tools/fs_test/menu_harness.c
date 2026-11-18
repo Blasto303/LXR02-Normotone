@@ -171,6 +171,7 @@ int main(int argc, char **argv)
             for (i = 0; i < 16; i++)
                 if (scene_effectConst(i) && !memcmp(scene_effectConst(i),
                         scene_effectConst(a), sizeof(effect_record_t))) printf("%u ", i);
+            { extern uint8_t mixer_audioRouting[6]; printf(" route="); for (i = 0; i < 6; i++) printf("%u", mixer_audioRouting[i]); printf(" scene_out="); for (i = 0; i < 6; i++) printf("%u", scene_getVoiceAudioOut(a, i)); printf(" types="); for (i = 0; i < 6; i++) printf("%u", scene_instrumentSlotConst(a, i)->type); }
             printf(" vm2=%u vm1=%u rnd=%u", scene_getVoiceMorphAmount(a, 1), scene_getVoiceMorphAmount(a, 0), seq_liveRndDose);
             printf(" send1=%u k0=%02x%02x%02x%02x k4=%02x%02x%02x%02x\n", scene_getVoiceFxSendAmount(a, 0),
                 ((const uint8_t*)&scene_getConst(a)->kit)[8],((const uint8_t*)&scene_getConst(a)->kit)[9],((const uint8_t*)&scene_getConst(a)->kit)[40],((const uint8_t*)&scene_getConst(a)->kit)[41],

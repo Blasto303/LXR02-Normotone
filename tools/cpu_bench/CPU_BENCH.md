@@ -21,6 +21,8 @@ output, `BENCH_NOSLEEP=1` disables the silent-voice sleep (for A/B checks).
 Plaits engines; `2` builds the conversion tables first, as after boot).
 `BENCH_FX="key=val,..."` sets Effect rows by storage key, `BENCH_COMP` and
 `BENCH_COMPT` the bus compressor amount and time (rumble A/B renders).
+`BENCH_OUT="slot:route,..."` sets per-voice outputs (0 St1, 1 St2, 2 L1, 3 R1,
+4 L2, 5 R2); `BENCH_SLIDERS="0.8,..."` sets the six faders.
 `<bank> <blocks per pattern> chain 1,5,9 [plaits]` plays patterns in turn
 through the LIVE pattern change (Effect tails carry over) into BENCH_DUMP.
 `... plaits` runs the PLAITS scenario: toggle, pattern changes, KIT swap,
