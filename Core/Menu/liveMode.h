@@ -4,14 +4,14 @@
  * A Bank is played the way the stock LXR-02 plays a commercial project:
  * Scene N = pattern N + kit N. On top of Helicase's PERF page:
  *   - SHIFT + step queues pattern N for the end of the bar (Helicase qcd),
- *   - hold LOAD + step 8 (KIT) opens the KIT page: a step press puts kit N
+ *   - hold LOAD + step 7 opens the live scene-kit page: a step press puts kit N
  *     on the playing pattern at the end of the bar; leaving that pattern
  *     gives it its own kit back,
  *   - the Effect, compressor and voice mix (outputs, FX sends, faders) follow
  *     the player across pattern changes, so the rumble on DRUM1 never drops,
  *   - SAVE opens the Bank list only (no Save page, no Scene writing); a
  *     loaded Bank starts on its pattern 1 at the end of the bar.
- * Step labels of the LXR-02 panel: LOAD + KIT (8) = KIT page, LOAD +
+ * Step labels of the LXR-02 panel: LOAD + KIT (8) = SD kit library, LOAD +
  * PROJECT (11) = Bank list, SHIFT/LOAD + PATTERN (16) = PATTERN page,
  * SHIFT + FX (15) = Effect, SHIFT + CONFIG (12) = settings, SHIFT + RELOAD
  * (13) = own kit back. SHIFT + steps 1..11 in PERF still queue directly.
@@ -26,9 +26,13 @@
 #define LIVE_MODE 1
 #endif
 
+/* Seed the unsaved factory mix before boot activates the first Scene. */
+void live_initFactoryRumble(void);
+
 /* KIT page state, owned by liveMode.c, driven by buttonHandler.c. */
 void live_kitPageOpen(void);
 void live_kitPageClose(void);
+void live_kitLoadCommitted(uint16_t scene_mask);
 uint8_t live_kitPageActive(void);
 /* Step press on the KIT page: kit of Scene `scene` for the playing pattern. */
 void live_kitSelect(uint8_t scene);

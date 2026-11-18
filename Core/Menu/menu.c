@@ -110,6 +110,7 @@ static uint8_t menu_storageBusy = 0;
  */
 #define MENU_PENDING_PAGE_NONE 0u
 static uint8_t menu_pendingPageSwitch;
+static menu_library_target_t menu_pendingLibrary;
 /*
  * Accepted OK/OW presentation/ownership state (existing Menu byte; no S058
  * allocation). Inputs: only an accepted Load/Save confirmation request may set
@@ -4794,8 +4795,14 @@ static menu_cell_t menu_resolveCell(uint8_t subPage, uint8_t position)
         cell.text_id = TEXT_EMPTY;
         cell.descriptor_index = INSTRUMENT_MENU_EMPTY;
         if (menuEffects_resolveCell(subPage, position, &cell.fx)) {
-            cell.kind = MENU_CELL_EFFECT;
-            cell.descriptor = cell.fx.descriptor;
+            if (cell.fx.kind == MENU_FX_CELL_BUS_COMP) {
+                cell.kind = MENU_CELL_STATIC;
+                cell.static_param = PAR_BUS_COMP_MODE + cell.fx.index;
+                cell.text_id = TEXT_BUS_COMP_MODE + cell.fx.index;
+            } else {
+                cell.kind = MENU_CELL_EFFECT;
+                cell.descriptor = cell.fx.descriptor;
+            }
         }
         return cell;
     }
@@ -8901,8 +8908,19 @@ static void menu_bankLoadPreviewComplete(void)
     if ((menu_activePage != LOAD_PAGE && menu_activePage != SAVE_PAGE) ||
         menu_instrumentLoadActive ||
         menu_saveOptions.what != SAVE_TYPE_BANK ||
-        menu_bankLoadPreviewSlot != slot ||
-        !preview_ok) {
+        menu_bankLoadPreviewSlot != slot) {
+        menu_repaintAll();
+        return;
+    }
+    if (!preview_ok) {
+        /* A cancelled scan is retried for the latest selection by its owner. */
+        if (!menu_deferSelectionRequest && menu_bankLoadAfterPreview) {
+            menu_bankLoadAfterPreview = 0u;
+            if (!menu_storageBusy) {
+                menu_showFilesystemErrorOverlay();
+                return;
+            }
+        }
         menu_repaintAll();
         return;
     }
@@ -12824,7 +12842,7 @@ static void menu_repaintLoadSavePage(void)
     case SAVE_TYPE_KIT:         toptxt = "Kit     "; break;
     case SAVE_TYPE_KIT_MORPH:   toptxt = "KitMrp  "; break;
     case SAVE_TYPE_SCENE:       toptxt = "Scene   "; break;
-    case SAVE_TYPE_BANK:        toptxt = "Bank    "; break;
+    case SAVE_TYPE_BANK:        toptxt = LIVE_MODE ? "Project " : "Bank    "; break;
     case SAVE_TYPE_PATTERN:     toptxt = "Pattern "; break;
     case SAVE_TYPE_GLO:         toptxt = "Settings"; break;
     case SAVE_TYPE_SAMPLES:     toptxt = "Samples "; break;
@@ -12995,12 +13013,11 @@ static void menu_repaintLoadSavePage(void)
              * so the user can move to it and click to perform the load.
              */
 #if LIVE_MODE
-            /* LIVE: "<<" marks the Bank that is playing; nothing else. */
-            memcpy(&editDisplayBuffer[1][14],
-                   (menu_saveOptions.what == SAVE_TYPE_BANK &&
-                    menu_currentPresetNr[SAVE_TYPE_BANK] ==
-                        bank_restoreBankSlot()) ? "<<" : "  ",
-                   2);
+            /* Keep the action visible and mark the resident project separately. */
+            if (menu_saveOptions.what == SAVE_TYPE_BANK &&
+                menu_currentPresetNr[SAVE_TYPE_BANK] == bank_restoreBankSlot())
+                editDisplayBuffer[0][15] = '*';
+            memcpy(&editDisplayBuffer[1][14], menuText_ok, 2);
 #else
             memcpy(&editDisplayBuffer[1][14],
                    (menu_bankPageActive() && menu_bankMergeOn()) ? "mr"
@@ -15670,6 +15687,8 @@ static void menu_loadSaveExecute(void)
         if (!filesystem_bankSlotExists(slot))
             return;
         menu_bankLoadAfterPreview = 1u;
+        /* An earlier scan may have failed before or after the first click. */
+        menu_scheduleBankChildPreview(slot);
         if (menu_bankPreviewPending && !menu_storageBusy &&
             filesystem_status() == FS_STATUS_IDLE) {
             menu_bankPreviewPending = 0u;
@@ -15881,20 +15900,6 @@ void menu_parseEncoder(int8_t inc, uint8_t button)
     uint8_t btnClicked = 0;
     uint8_t oldPage = menu_activePage;
     uint8_t oldIndex = menuIndex;
-#if LIVE_MODE
-    /* LIVE: on the KIT page DATA sets the kit option (liveMode.h). */
-    {
-        static uint8_t liveLastButton;
-        uint8_t clicked = (uint8_t)(button && !liveLastButton);
-
-        liveLastButton = button;
-        if (live_kitPageActive() || live_rndPageActive() ||
-            live_cpuPageActive()) {
-            live_encoder(inc, clicked);
-            return;
-        }
-    }
-#endif
 
     /* S082 P3: an unlocked background Bank load blocks only Load/Save; other
      * pages take the encoder (menu_backgroundLoadReleasesPanel()). */
@@ -15971,6 +15976,14 @@ void menu_parseEncoder(int8_t inc, uint8_t button)
             copyClear_encoderTurned(inc);
         return;
     }
+#if LIVE_MODE
+    if (live_patternPageActive())
+        return;
+    if (live_kitPageActive() || live_rndPageActive() || live_cpuPageActive()) {
+        live_encoder(inc, btnClicked);
+        return;
+    }
+#endif
 
     /*
      * STEP automation owns encoder clicks while its custom page is active.
@@ -17423,6 +17436,9 @@ void menu_pollPresetStatus(void)
     {
         uint8_t selection_stale = (uint8_t)(
             menu_selectionGenerationSnapshot != menu_selectionGeneration);
+#if LIVE_MODE
+        live_kitLoadCommitted(preset_getKitRequestSceneMask());
+#endif
 
         if ((menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
             (!menu_isLoadSaveSelectionCurrent() || selection_stale)) {
@@ -18279,7 +18295,7 @@ static void menu_enterFrozenBankLoadPage(void)
 /* -----------------------------------------------------------------------
 ** menu_switchPage — exact port (sequencer/LED calls stubbed where needed)
 ** ----------------------------------------------------------------------- */
-void menu_switchPage(uint8_t pageNr)
+static void menu_switchPageTarget(uint8_t pageNr, menu_library_target_t library)
 {
     uint8_t end_resident_name_session;
     uint8_t old_page = menu_activePage;
@@ -18310,6 +18326,12 @@ void menu_switchPage(uint8_t pageNr)
      */
     if (pageNr != menu_activePage)
         midiLearn_cancel();
+    if ((menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
+        pageNr != LOAD_PAGE) {
+        menu_bankLoadAfterPreview = 0u;
+        menu_bankLoadAfterPreviewReady = 0u;
+        menu_loadSaveClickPending = 0u;
+    }
     if (preset_backgroundBankLoadUnlocked() && pageNr == LOAD_PAGE &&
         menu_activePage == LOAD_PAGE)
         return;
@@ -18327,12 +18349,20 @@ void menu_switchPage(uint8_t pageNr)
          * exit, and deliberately remains unavailable until the owner releases.
          * Affiliate: menu_processPendingPageSwitch() at the next safe poll.
          */
-        if ((menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
-            pageNr != LOAD_PAGE) {
+        if (((menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
+             pageNr != LOAD_PAGE) ||
+            (library != MENU_LIBRARY_DEFAULT && !menu_loadSaveCommandActive)) {
             /* Invalidate any live browser completion before the queued exit. */
             if (menu_pendingPageSwitch == MENU_PENDING_PAGE_NONE)
                 menu_selectionGeneration++;
             menu_pendingPageSwitch = (uint8_t)(pageNr + 1u);
+            menu_pendingLibrary = library;
+            if (library != MENU_LIBRARY_DEFAULT) {
+                menu_bankLoadAfterPreview = 0u;
+                menu_bankLoadAfterPreviewReady = 0u;
+                menu_loadSaveClickPending = 0u;
+                menu_kitLoadArmed = 0u;
+            }
         }
         return;
     }
@@ -18594,9 +18624,10 @@ void menu_switchPage(uint8_t pageNr)
          * Bank pages override the Kit scene mask above to 0xFFFF (B2.4). */
         filesystem_clearNameCache();
 #if LIVE_MODE
-        /* LIVE: SAVE opens the Bank list, nothing else. */
+        /* A physical SAVE press still opens the project library. */
         menu_instrumentLoadActive = 0u;
-        menu_saveOptions.what = SAVE_TYPE_BANK;
+        menu_saveOptions.what = library == MENU_LIBRARY_KIT
+            ? SAVE_TYPE_KIT : SAVE_TYPE_BANK;
 #endif
         menu_resetSaveParameters();
         menu_requestCurrentLoadSaveSelection(0);
@@ -18733,6 +18764,16 @@ void menu_switchPage(uint8_t pageNr)
         menu_repaintAll();
 }
 
+void menu_switchPage(uint8_t pageNr)
+{
+    menu_switchPageTarget(pageNr, MENU_LIBRARY_DEFAULT);
+}
+
+void menu_openLibrary(menu_library_target_t target)
+{
+    menu_switchPageTarget(LOAD_PAGE, target);
+}
+
 static void menu_processPendingPageSwitch(void)
 {
     uint8_t pending = menu_pendingPageSwitch;
@@ -18754,7 +18795,7 @@ static void menu_processPendingPageSwitch(void)
         return;
     menu_pendingPageSwitch = MENU_PENDING_PAGE_NONE;
     pageNr = (uint8_t)(pending - 1u);
-    menu_switchPage(pageNr);
+    menu_switchPageTarget(pageNr, menu_pendingLibrary);
 }
 
 /* -----------------------------------------------------------------------
@@ -18801,6 +18842,8 @@ static void menu_resetSaveParametersEx(uint8_t after_command)
     menu_saveOptions.state = menu_loadSaveHomeState(menu_saveOptions.what);
     menu_saveDraftValid = 0u;
     menu_loadSaveClickPending = 0u;
+    menu_bankLoadAfterPreview = 0u;
+    menu_bankLoadAfterPreviewReady = 0u;
     if (menu_saveOptions.what == SAVE_TYPE_BANK)
         menu_currentPresetNr[SAVE_TYPE_BANK] = bank_restoreBankSlot();
     if (!(after_command && menu_activePage == LOAD_PAGE &&

@@ -423,6 +423,12 @@ void menu_init(void);
 void menu_start(void);
 void menu_parseEncoder(int8_t inc, uint8_t button);
 void menu_switchPage(uint8_t pageNr);
+typedef enum {
+    MENU_LIBRARY_DEFAULT,
+    MENU_LIBRARY_PROJECT,
+    MENU_LIBRARY_KIT
+} menu_library_target_t;
+void menu_openLibrary(menu_library_target_t target);
 void menu_switchSubPage(uint8_t subPageNr);
 /*
  * Enter nested Instrument Load/Save for one physical voice.
