@@ -1,0 +1,29 @@
+name: Live panel and ARM firmware
+on:
+  pull_request:
+    branches: [compat-fixes]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
+      - run: make clean && make -j2 img
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LXR02-Normotone
+          path: build/LXRV2_lxr02.img
+          if-no-files-found: error
+  panel:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y gcc-multilib dosfstools mtools
+      - run: MENU=1 bash tools/fs_test/build.sh
+      - name: Boot RAM card and exercise front panel
+        run: |
+          bash tools/fs_test/mkimg.sh SD_CARD "$RUNNER_TEMP/card.img" 512
+          build/fs_test/menu/harness "$RUNNER_TEMP/card.img" 0 m:1 d:29 q:8 u:29 e:1 m:1 d:29 q:11 u:29

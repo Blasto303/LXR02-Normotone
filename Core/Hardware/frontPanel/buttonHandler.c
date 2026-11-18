@@ -2920,7 +2920,8 @@ static uint8_t buttonHandler_livePress(uint8_t b)
             handleModeButtons(SELECT_MODE_PERF);
             if (kick && bh_state.selectButtonMode == SELECT_MODE_FX &&
                 effects_activeType() == EFFECT_TYPE_DLYVERB) {
-                menu_switchSubPage(1u); /* AEG: div, fbk, dlv, rvl */
+                menu_switchSubPage(0u);
+                menuEffects_openRumble();
                 menuEffects_renderSelectLeds(menu_getSubPage());
                 menu_repaintAll();
             }

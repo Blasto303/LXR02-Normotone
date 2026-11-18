@@ -4795,8 +4795,14 @@ static menu_cell_t menu_resolveCell(uint8_t subPage, uint8_t position)
         cell.text_id = TEXT_EMPTY;
         cell.descriptor_index = INSTRUMENT_MENU_EMPTY;
         if (menuEffects_resolveCell(subPage, position, &cell.fx)) {
-            cell.kind = MENU_CELL_EFFECT;
-            cell.descriptor = cell.fx.descriptor;
+            if (cell.fx.kind == MENU_FX_CELL_BUS_COMP) {
+                cell.kind = MENU_CELL_STATIC;
+                cell.static_param = PAR_BUS_COMP_MODE + cell.fx.index;
+                cell.text_id = TEXT_BUS_COMP_MODE + cell.fx.index;
+            } else {
+                cell.kind = MENU_CELL_EFFECT;
+                cell.descriptor = cell.fx.descriptor;
+            }
         }
         return cell;
     }

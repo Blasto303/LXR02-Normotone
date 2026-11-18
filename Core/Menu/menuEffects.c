@@ -27,6 +27,7 @@
  * CrumpBit (`cbt`) is the first user.
  */
 #include "menuEffects.h"
+#include "DlyVerbParameters.h"
 #include "menu.h"
 #include "MenuText.h"
 #include "SceneData.h"
@@ -87,6 +88,24 @@ static const char *const menuEffects_runLong[EFFECT_SEQ_RUN_MODE_COUNT] = {
     "forward", "reverse", "pingpong", "random", "select"
 };
 
+/* Physical SELECT indexes: OSC, FILTER and MIX. */
+enum { RUMBLE_DELAY = 0, RUMBLE_REVERB = 5, RUMBLE_COMP = 7 };
+static uint8_t rumbleEditor;
+static const uint8_t delayRows[][4] = {
+    {DLYVERB_PARAM_MODEL, DLYVERB_PARAM_DIVISION, DLYVERB_PARAM_FEEDBACK, DLYVERB_PARAM_DLY_LEVEL},
+    {DLYVERB_PARAM_DRIVE, DLYVERB_PARAM_LOWPASS, DLYVERB_PARAM_HIGHPASS, DLYVERB_PARAM_AGE},
+    {DLYVERB_PARAM_STEREO, DLYVERB_PARAM_WIDTH, DLYVERB_PARAM_MOD_DEPTH, DLYVERB_PARAM_MOD_RATE}
+};
+static const uint8_t reverbRows[4] = {
+    DLYVERB_PARAM_RVB_LEVEL, DLYVERB_PARAM_RVB_DECAY, DLYVERB_PARAM_RVB_DAMP, DLYVERB_PARAM_RVB_ROUTE
+};
+
+void menuEffects_openRumble(void)
+{
+    rumbleEditor = 1u;
+    menuEffects_screen[RUMBLE_DELAY] = 0u;
+}
+
 /* Active Scene's retained record and registry row (`off` fallback). */
 static const effect_record_t *menuEffects_record(void)
 {
@@ -128,6 +147,11 @@ static uint8_t menuEffects_screenCount(uint8_t sub_page)
 
     if (sub_page >= MENU_FX_SELECT_COUNT)
         return 0u;
+    if (rumbleEditor) {
+        if (sub_page == RUMBLE_DELAY)
+            return sizeof(delayRows) / sizeof(delayRows[0]);
+        return sub_page == RUMBLE_REVERB || sub_page == RUMBLE_COMP;
+    }
     if (sub_page == 0u)
         return 2u;
     if (entry->select_layout) {
@@ -157,7 +181,14 @@ static uint8_t menuEffects_cellAt(uint8_t sub_page, uint8_t screen,
     if (sub_page >= MENU_FX_SELECT_COUNT || column >= MENU_FX_CELLS ||
         screen >= menuEffects_screenCount(sub_page))
         return 0u;
-    if (sub_page == 0u) {
+    if (rumbleEditor) {
+        if (sub_page == RUMBLE_COMP) {
+            out->kind = MENU_FX_CELL_BUS_COMP;
+            out->index = column;
+            return 1u;
+        }
+        index = sub_page == RUMBLE_DELAY ? delayRows[screen][column] : reverbRows[column];
+    } else if (sub_page == 0u) {
         static const uint8_t second[MENU_FX_CELLS] = {
             MENU_FX_CELL_RUN, MENU_FX_CELL_LENGTH,
             MENU_FX_CELL_SCALE, MENU_FX_CELL_MORPH_AMOUNT
@@ -218,6 +249,7 @@ void menuEffects_enter(uint8_t *sub_page, uint8_t *column)
 {
     const effect_record_t *record = menuEffects_record();
 
+    rumbleEditor = 0u;
     memset(menuEffects_screen, 0, sizeof(menuEffects_screen));
     menuEffects_typeEdit = 0u;
     menuEffects_showMorphFlag = 0u;
@@ -237,7 +269,10 @@ void menuEffects_enter(uint8_t *sub_page, uint8_t *column)
 void menuEffects_toggleFirstScreen(uint8_t *sub_page, uint8_t *column)
 {
     menuEffects_typeEdit = 0u;
-    menuEffects_screen[0] = (uint8_t)(menuEffects_screen[0] ? 0u : 1u);
+    if (rumbleEditor)
+        menuEffects_screen[0] = 0u;
+    else
+        menuEffects_screen[0] = (uint8_t)(menuEffects_screen[0] ? 0u : 1u);
     *sub_page = 0u;
     *column = 0u;
 }
@@ -749,6 +784,8 @@ uint8_t menuEffects_service(void)
     effect_type_id_t type = record ? record->type : EFFECT_TYPE_OFF;
     uint8_t actions = 0u;
 
+    if (type != EFFECT_TYPE_DLYVERB)
+        rumbleEditor = 0u;
     if (scene_index != menuEffects_lastScene || type != menuEffects_lastType) {
         menuEffects_lastScene = scene_index;
         menuEffects_lastType = type;
