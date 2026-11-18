@@ -31,4 +31,7 @@ jobs:
           grep -Eiq 'drv +lpf +hpf +age' panel.log
           grep -Eiq 'stm +wid +mod +mrt' panel.log
           grep -Eiq 'rvl +rdc +rdp +rrt' panel.log
-          grep -Eiq 'cmp +cam +ctm +csc' panel.log
+          grep -Eiq '^s:8 .*St1 +75 +25 +1' panel.log
+          grep -Eiq '^k:2:4 .*St1 +79 +25 +1' panel.log
+          grep -F 'Load: Kit' panel.log
+          grep -F 'Load: Project' panel.log

@@ -69,6 +69,7 @@ static void loop_pass(void)
     preset_morphTick();
     filesystem_tick();
     preset_tickBackgroundBankLoad();
+    menu_serviceKnobRepaint();
     menu_serviceRuntimeWidgets();
     sim_advance(50); /* foreground bookkeeping per pass */
 }
@@ -138,6 +139,7 @@ int main(int argc, char **argv)
         effects_activateScene(scene_getActiveIndex());
     }
     menu_init();
+    preset_syncBusCompMirrors();
     settle();
     show("boot", sd_reads, sim_us);
 
