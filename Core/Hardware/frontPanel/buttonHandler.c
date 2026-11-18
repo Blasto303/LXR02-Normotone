@@ -2839,6 +2839,8 @@ static void handleVoiceButton(uint8_t voiceNr)
  */
 static uint8_t bh_liveLoadHeld;
 static uint8_t bh_liveLoadSolo;
+static uint8_t bh_liveSaveHeld;
+static uint8_t bh_liveSaveSolo;
 static uint8_t bh_liveConsumed[(BUT_COUNT + 7u) / 8u];
 
 static void buttonHandler_liveConsume(uint8_t b)
@@ -2858,6 +2860,25 @@ static uint8_t buttonHandler_livePress(uint8_t b)
     }
     if (bh_liveLoadHeld)
         bh_liveLoadSolo = 0u;
+    /*
+     * SAVE as on the stock LXR-02: SAVE alone (press and release) opens
+     * Save: Project, SAVE + KIT opens Save: Kit, SAVE + PROJECT Save: Project.
+     * SHIFT + SAVE keeps the settings page.
+     */
+    if (b == BUT_MODE4 && !shift) {
+        bh_liveSaveHeld = 1u;
+        bh_liveSaveSolo = 1u;
+        return 1u;
+    }
+    if (bh_liveSaveHeld)
+        bh_liveSaveSolo = 0u;
+    if (bh_liveSaveHeld && !shift && (seq == 7 || seq == 10)) {
+        buttonHandler_liveConsume(b);
+        live_kitPageClose();
+        handleModeButtonsForLibrary(SELECT_MODE_LOAD_SAVE,
+            seq == 7 ? MENU_LIBRARY_SAVE_KIT : MENU_LIBRARY_SAVE_PROJECT);
+        return 1u;
+    }
     if (bh_liveLoadHeld && !shift && (seq == 7 || seq == 10)) {
         buttonHandler_liveConsume(b);
         live_kitPageClose();
@@ -2988,6 +3009,16 @@ static uint8_t buttonHandler_liveRelease(uint8_t b)
 {
     uint8_t bit = (uint8_t)(1u << (b & 7u));
 
+    if (b == BUT_MODE4 && bh_liveSaveHeld) {
+        bh_liveSaveHeld = 0u;
+        if (bh_liveSaveSolo) {
+            live_kitPageClose();
+            handleModeButtonsForLibrary(SELECT_MODE_LOAD_SAVE,
+                                        MENU_LIBRARY_SAVE_PROJECT);
+        }
+        bh_liveSaveSolo = 0u;
+        return 1u;
+    }
     if (b == BUT_MODE3 && bh_liveLoadHeld) {
         bh_liveLoadHeld = 0u;
         if (bh_liveLoadSolo) {
@@ -3916,6 +3947,8 @@ void buttonHandler_processEvents(void)
 #if LIVE_MODE
         bh_liveLoadHeld = 0u;
         bh_liveLoadSolo = 0u;
+        bh_liveSaveHeld = 0u;
+        bh_liveSaveSolo = 0u;
         memset(bh_liveConsumed, 0, sizeof(bh_liveConsumed));
 #endif
         /*

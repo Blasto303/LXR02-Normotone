@@ -15285,10 +15285,18 @@ static void menu_handleLoadSaveMenu(int8_t inc, uint8_t btnClicked)
                         AUTOSAVE_TRACE_SAVE_LIFECYCLE_TYPE_BANK,
                         (uint32_t)menu_currentPresetNr[SAVE_TYPE_BANK] <<
                         AUTOSAVE_TRACE_SAVE_LIFECYCLE_SLOT_SHIFT);
+#if LIVE_MODE
+                    /* A project keeps its own kits, never PLAITS or lent kits. */
+                    live_beforeProjectSave();
+#endif
                     if (preset_saveBank(
                             menu_currentPresetNr[SAVE_TYPE_BANK],
                             act, empty))
                         commandAccepted = 1u;
+#if LIVE_MODE
+                    else
+                        live_afterProjectSave();
+#endif
                     break; }
                 case SAVE_TYPE_PATTERN:
                     /* Pattern Save exports the active resident Scene's v4
@@ -17372,6 +17380,10 @@ void menu_pollPresetStatus(void)
         return;
     }
 
+#if LIVE_MODE
+    if (preset_getCompletedOp() == PRESET_OP_BANK_SAVE)
+        live_afterProjectSave();
+#endif
     if (!preset_getCompletedOk() &&
         !menu_completedOpIsTest(preset_getCompletedOp())) {
         /*
@@ -18616,7 +18628,12 @@ static void menu_switchPageTarget(uint8_t pageNr, menu_library_target_t library)
             menu_enterFrozenBankLoadPage();
             break;
         }
-        if (menu_activePage == LOAD_PAGE && !LIVE_MODE) {
+        if (LIVE_MODE && (library == MENU_LIBRARY_SAVE_PROJECT ||
+                          library == MENU_LIBRARY_SAVE_KIT)) {
+            /* LIVE: explicit Save page (SAVE alone or SAVE + KIT). */
+            menu_activePage = SAVE_PAGE;
+            menu_instrumentLoadActive = 0u;
+        } else if (menu_activePage == LOAD_PAGE && !LIVE_MODE) {
             menu_activePage = SAVE_PAGE;
             menu_instrumentLoadActive = 0u;
         } else {
@@ -18638,7 +18655,8 @@ static void menu_switchPageTarget(uint8_t pageNr, menu_library_target_t library)
 #if LIVE_MODE
         /* A physical SAVE press still opens the project library. */
         menu_instrumentLoadActive = 0u;
-        menu_saveOptions.what = library == MENU_LIBRARY_KIT
+        menu_saveOptions.what = (library == MENU_LIBRARY_KIT ||
+                                 library == MENU_LIBRARY_SAVE_KIT)
             ? SAVE_TYPE_KIT : SAVE_TYPE_BANK;
 #endif
         menu_resetSaveParameters();
@@ -18784,6 +18802,45 @@ void menu_switchPage(uint8_t pageNr)
 void menu_openLibrary(menu_library_target_t target)
 {
     menu_switchPageTarget(LOAD_PAGE, target);
+}
+
+/*
+ * LIVE Save: Kit starts on the first free kit number. Run from the
+ * foreground service; acts once per page entry, as soon as the kit names
+ * are known, so a used number chosen afterwards (to overwrite) stays.
+ */
+void menu_liveKitSaveAutoSlot(void)
+{
+#if LIVE_MODE
+    static uint8_t done;
+    uint16_t slot;
+    const char *name;
+    uint8_t i;
+    uint8_t blank = 1u;
+
+    if (menu_activePage != SAVE_PAGE || menu_saveOptions.what != SAVE_TYPE_KIT ||
+        menu_instrumentLoadActive) {
+        done = 0u;
+        return;
+    }
+    if (done || menu_storageBusy)
+        return;
+    slot = menu_currentPresetNr[SAVE_TYPE_KIT];
+    name = filesystem_kitSlotName(slot);
+    for (i = 0u; i < 8u && name; i++)
+        if (name[i] != ' ')
+            blank = 0u;
+    if (!name || blank)
+        return;                 /* names not known yet */
+    done = 1u;
+    while (slot < 999u && filesystem_kitSlotExists(slot))
+        slot++;
+    if (slot != menu_currentPresetNr[SAVE_TYPE_KIT]) {
+        /* Only the number moves: the name stays the playing kit's. */
+        menu_currentPresetNr[SAVE_TYPE_KIT] = slot;
+        menu_repaintAll();
+    }
+#endif
 }
 
 /* LIVE: the SD kit library (LOAD + KIT) is on screen. */

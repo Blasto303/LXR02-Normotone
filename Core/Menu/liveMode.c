@@ -634,6 +634,36 @@ static uint8_t live_queuedPattern(void)
     return q;
 }
 
+/*
+ * Project Save in LIVE: the playing Scene goes back to its own kit for the
+ * save (PLAITS and lent kits are never written to a project), then the
+ * performance state comes back when the save completes.
+ */
+static uint8_t live_saveSrc = 0xFFu;
+
+void live_beforeProjectSave(void)
+{
+    uint8_t active = scene_getActiveIndex();
+    uint8_t keep = live_plaits;
+
+    live_checkBackup();
+    if (active >= 16u || live_backupScene != active)
+        return;
+    live_saveSrc = live_currentKit();
+    live_plaits = 0u;
+    (void)live_install(active, active);
+    live_plaits = keep;
+    preset_startDrumsetApply();
+}
+
+void live_afterProjectSave(void)
+{
+    if (live_saveSrc == 0xFFu)
+        return;
+    live_pendingKit = live_saveSrc;
+    live_saveSrc = 0xFFu;
+}
+
 void live_kitHoldToggle(void)
 {
     live_kitHold = (uint8_t)!live_kitHold;
@@ -657,6 +687,7 @@ uint8_t live_plaitsActive(void)
 
 void live_service(void)
 {
+    menu_liveKitSaveAutoSlot();
     /* Kit library step LEDs follow the page (it may open a few ms late). */
     if (menu_liveKitLibraryActive() != live_libLeds) {
         if (live_libLeds)
@@ -690,6 +721,7 @@ void live_service(void)
         live_tablesReady = plaitsMode_service();
     /* PLAITS on and a new Bank (or Scene) came in: convert its kit too. */
     if (live_plaits && live_pendingKit == 0xFFu && !live_carrier &&
+        live_saveSrc == 0xFFu &&
         seq_queuedSceneTarget() >= 16u && scene_getActiveIndex() < 16u &&
         !live_plaitsSettled())
         live_kitSelect(live_currentKit());

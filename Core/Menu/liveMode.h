@@ -53,6 +53,9 @@ void live_patternSelect(uint8_t scene);
 void live_plaitsToggle(void);
 /* Kit option suit / fixe (SHIFT + DATA click in the kit library). */
 void live_kitHoldToggle(void);
+/* Project Save: own kits around the save (menu.c). */
+void live_beforeProjectSave(void);
+void live_afterProjectSave(void);
 uint8_t live_plaitsActive(void);
 /* SHIFT + RELOAD (step 13): the playing pattern gets its own kit back. */
 void live_reloadKit(void);

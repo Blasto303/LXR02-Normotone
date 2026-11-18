@@ -426,10 +426,13 @@ void menu_switchPage(uint8_t pageNr);
 typedef enum {
     MENU_LIBRARY_DEFAULT,
     MENU_LIBRARY_PROJECT,
-    MENU_LIBRARY_KIT
+    MENU_LIBRARY_KIT,
+    MENU_LIBRARY_SAVE_PROJECT,  /* LIVE: SAVE alone      */
+    MENU_LIBRARY_SAVE_KIT       /* LIVE: SAVE + KIT      */
 } menu_library_target_t;
 void menu_openLibrary(menu_library_target_t target);
 uint8_t menu_liveKitLibraryActive(void);
+void menu_liveKitSaveAutoSlot(void);
 void menu_switchSubPage(uint8_t subPageNr);
 /*
  * Enter nested Instrument Load/Save for one physical voice.
