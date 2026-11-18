@@ -66,6 +66,15 @@ void live_reloadKit(void);
 void live_rndPageOpen(void);
 /* CPU page (LOAD + CONFIG, step 12): DATA scrolls (cpuProfile.h). */
 void live_cpuPageOpen(void);
+/*
+ * EUCLID page (LOAD + LAST STEP, step 14): pots 1/2/3 = length / hits /
+ * rotation of the selected track (track buttons), DATA = hits. The first
+ * turn rewrites the track's triggers; the track loop length follows len.
+ */
+void live_euclidPageOpen(void);
+uint8_t live_euclidPageActive(void);
+void live_euclidTrack(uint8_t track);
+void live_euclidKnob(uint8_t knob, int8_t delta);
 uint8_t live_cpuPageActive(void);
 uint8_t live_rndPageActive(void);
 void live_rndStep(uint8_t step);

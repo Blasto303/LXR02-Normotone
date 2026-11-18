@@ -24,6 +24,7 @@
 #include "EffectsManager.h"
 #include "FxBuffer.h"
 #include "liveMode.h"
+#include "PatternData.h"
 #include "buttonHandler.h"
 #include "menu.h"
 #include "presetManager.h"
@@ -190,6 +191,16 @@ int main(int argc, char **argv)
             printf(" send1=%u k0=%02x%02x%02x%02x k4=%02x%02x%02x%02x\n", scene_getVoiceFxSendAmount(a, 0),
                 ((const uint8_t*)&scene_getConst(a)->kit)[8],((const uint8_t*)&scene_getConst(a)->kit)[9],((const uint8_t*)&scene_getConst(a)->kit)[40],((const uint8_t*)&scene_getConst(a)->kit)[41],
                 ((const uint8_t*)&scene_getConst(4)->kit)[8],((const uint8_t*)&scene_getConst(4)->kit)[9],((const uint8_t*)&scene_getConst(4)->kit)[40],((const uint8_t*)&scene_getConst(4)->kit)[41]);
+            break; }
+        case 'P': {
+            /* Pattern probe: bar 1 of every track of the active Scene. */
+            uint8_t a = scene_getActiveIndex(), t, st;
+            const pat_scene_region_t *r = pat_sceneRegion(a);
+            for (t = 0; t < 7; t++) {
+                printf("  trk%u len%3u ", t + 1, r ? r->track_length[t] : 0);
+                for (st = 0; st < 16; st++) putchar(pat_isStepActive(t, st, a) ? 'x' : '.');
+                putchar('\n');
+            }
             break; }
         case 'w':
             for (unsigned long long end = sim_us + 1000ull * n; sim_us < end;) loop_pass();

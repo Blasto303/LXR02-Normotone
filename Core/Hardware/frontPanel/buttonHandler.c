@@ -2906,6 +2906,24 @@ static uint8_t buttonHandler_livePress(uint8_t b)
         live_kitPageLeds();
         return 1u;
     }
+    if (seq == 13 && bh_liveLoadHeld && !shift) {        /* LOAD + LAST STEP */
+        buttonHandler_liveConsume(b);
+        if (bh_state.selectButtonMode != SELECT_MODE_PERF)
+            handleModeButtons(SELECT_MODE_PERF);
+        live_euclidPageOpen();
+        return 1u;
+    }
+    if (btn_to_voice(b) >= 0 && live_euclidPageActive() && !shift &&
+        bh_state.selectButtonMode == SELECT_MODE_PERF) {
+        buttonHandler_liveConsume(b);
+        live_euclidTrack((uint8_t)btn_to_voice(b));
+        return 1u;
+    }
+    if (seq >= 0 && live_euclidPageActive() && !shift &&
+        bh_state.selectButtonMode == SELECT_MODE_PERF) {
+        buttonHandler_liveConsume(b);   /* steps show the rhythm only */
+        return 1u;
+    }
     if (seq == 12 && bh_liveLoadHeld && !shift) {        /* LOAD + RELOAD */
         /* PLAITS on/off where you are; one-second message, 'P' corner mark. */
         buttonHandler_liveConsume(b);

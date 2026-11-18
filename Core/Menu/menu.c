@@ -15999,7 +15999,8 @@ void menu_parseEncoder(int8_t inc, uint8_t button)
     }
     if (live_patternPageActive())
         return;
-    if (live_kitPageActive() || live_rndPageActive() || live_cpuPageActive()) {
+    if (live_kitPageActive() || live_rndPageActive() || live_cpuPageActive() ||
+        live_euclidPageActive()) {
         live_encoder(inc, btnClicked);
         return;
     }
@@ -16608,6 +16609,12 @@ static void menu_liveRecRecordCell(uint8_t subPage, uint8_t position)
 
 void menu_parseKnobDelta(uint8_t knobNr, int8_t delta)
 {
+#if LIVE_MODE
+    if (live_euclidPageActive()) {
+        live_euclidKnob(knobNr, delta);
+        return;
+    }
+#endif
     /* S082 P3: pots stay locked only on Load/Save during an unlocked load. */
     if (menu_storageBusy && !menu_backgroundLoadReleasesPanel()) return;
 

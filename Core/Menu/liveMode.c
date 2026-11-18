@@ -48,6 +48,8 @@
 #include "plaitsMode.h"
 #include "adcPots.h"
 #include "timebase.h"
+#include "EuklidGenerator.h"
+#include "PatternData.h"
 #include "DlyVerbParameters.h"
 
 static kit_t    live_kitBackup;
@@ -56,7 +58,12 @@ static uint16_t live_backupBank = 0xFFFFu;  /* Bank slot of that Scene    */
 static uint8_t  live_kitSource = 0xFFu;     /* kit shown on the KIT page  */
 static uint8_t  live_pendingKit = 0xFFu;    /* kit waiting for the bar    */
 static uint8_t  live_carrier;               /* queue only carries the kit */
-static uint8_t  live_page;                  /* 0 none, 1 KIT, 2 PATTERN, 3 RND, 4 CPU */
+static uint8_t  live_page;                  /* 0 none, 1 KIT, 2 PATTERN, 3 RND, 4 CPU, 5 EUCLID */
+/* EUCLID page (LOAD + LAST STEP): track and the three generator values. */
+static uint8_t  live_eucTrack;
+static uint8_t  live_eucLen = 16u;
+static uint8_t  live_eucHit = 4u;
+static uint8_t  live_eucRot;
 static uint8_t  live_cpuEntry;              /* first entry on the CPU page */
 static uint8_t  live_cpuSerial;
 static uint8_t  live_shownQueue = 0xFFu;    /* queued pattern on the LCD  */
@@ -389,6 +396,112 @@ void live_reloadKit(void)
     live_kitSelect(scene_getActiveIndex());
 }
 
+/* EUCLID: step LEDs show bar 1 of the track being generated. */
+static void live_eucLeds(void)
+{
+    uint8_t scene = scene_getActiveIndex();
+    uint8_t s;
+
+    if (live_page != 5u)
+        return;
+    for (s = 0u; s < 16u; s++) {
+        led_setBlinkLed((uint8_t)(LED_SEQ1 + s), 0u);
+        led_setValue(pat_isStepActive(live_eucTrack, s, scene),
+                     (uint8_t)(LED_SEQ1 + s));
+    }
+}
+
+/* Read the track's present length and hit count; nothing is rewritten. */
+static void live_eucRead(void)
+{
+    uint8_t scene = scene_getActiveIndex();
+    const pat_scene_region_t *r = pat_sceneRegion(scene);
+    uint8_t len = (r && live_eucTrack < NUM_TRACKS && r->track_length[live_eucTrack])
+        ? r->track_length[live_eucTrack] : 16u;
+    uint8_t hits = 0u;
+    uint8_t s;
+
+    if (len > NUM_STEPS)
+        len = NUM_STEPS;
+    for (s = 0u; s < len; s++)
+        hits = (uint8_t)(hits + (pat_isStepActive(live_eucTrack, s, scene) ? 1u : 0u));
+    live_eucLen = len;
+    /* An empty or full track gives no hint: start from 4 hits. */
+    live_eucHit = (hits == 0u || hits >= len) ? (len < 4u ? len : 4u) : hits;
+    live_eucRot = 0u;
+}
+
+/* Write the Euclidean rhythm: track loop length = len, then the triggers. */
+static void live_eucApply(void)
+{
+    uint8_t scene = scene_getActiveIndex();
+
+    if (scene >= SCENE_COUNT || live_eucTrack >= NUM_TRACKS)
+        return;
+    if (live_eucHit > live_eucLen)
+        live_eucHit = live_eucLen;
+    if (live_eucRot >= live_eucLen)
+        live_eucRot = (uint8_t)(live_eucRot % live_eucLen);
+    pat_setTrackLength(scene, live_eucTrack, live_eucLen);
+    euklid_setLength(live_eucTrack, live_eucLen);
+    euklid_setSteps(live_eucTrack, live_eucHit, scene);
+    euklid_setRotation(live_eucTrack, live_eucRot, scene);
+    live_eucLeds();
+    menu_repaintAll();
+}
+
+void live_euclidPageOpen(void)
+{
+    if (live_page == 1u)
+        live_kitPageClose();
+    live_page = 5u;
+    live_eucTrack = menu_getActiveVoice();
+    if (live_eucTrack >= NUM_TRACKS)
+        live_eucTrack = 0u;
+    live_eucRead();
+    live_eucLeds();
+    menu_repaintAll();
+}
+
+uint8_t live_euclidPageActive(void)
+{
+    return (uint8_t)(live_page == 5u);
+}
+
+void live_euclidTrack(uint8_t track)
+{
+    if (track >= NUM_TRACKS)
+        return;
+    live_eucTrack = track;
+    live_eucRead();
+    live_eucLeds();
+    menu_repaintAll();
+}
+
+/* Pot 1 len, pot 2 hits, pot 3 rotation (endless deltas). */
+void live_euclidKnob(uint8_t knob, int8_t delta)
+{
+    int16_t v;
+
+    if (delta == 0)
+        return;
+    if (knob == 0u) {
+        v = (int16_t)live_eucLen + delta;
+        live_eucLen = (uint8_t)(v < 1 ? 1 : (v > NUM_STEPS ? NUM_STEPS : v));
+    } else if (knob == 1u) {
+        v = (int16_t)live_eucHit + delta;
+        live_eucHit = (uint8_t)(v < 1 ? 1 : (v > live_eucLen ? live_eucLen : v));
+    } else if (knob == 2u) {
+        v = (int16_t)live_eucRot + delta;
+        while (v < 0)
+            v += live_eucLen;
+        live_eucRot = (uint8_t)(v % live_eucLen);
+    } else {
+        return;
+    }
+    live_eucApply();
+}
+
 void live_cpuPageOpen(void)
 {
     if (live_page == 1u)
@@ -589,6 +702,10 @@ void live_encoder(int8_t inc, uint8_t clicked)
         }
         return;
     }
+    if (live_page == 5u) {
+        live_euclidKnob(1u, inc);       /* DATA = hits */
+        return;
+    }
     if (live_page == 3u) {
         int16_t d = (int16_t)live_rndDose + (int16_t)inc * 4;
 
@@ -782,6 +899,31 @@ uint8_t live_formatOverlay(char *row0, char *row1)
         return 1u;
     }
 
+    if (live_page == 5u) {
+        static const char trk[NUM_TRACKS][4] = {
+            "DR1", "DR2", "DR3", "SNR", "CYM", "CHH", "OHH" };
+        uint8_t v;
+
+        if (buttonHandler_getMode() != SELECT_MODE_PERF)
+            return 0u;
+        memset(row0, ' ', 16);
+        memset(row1, ' ', 16);
+        memcpy(row0, "LEN HIT ROT EUC", 15);
+        v = live_eucLen;
+        row1[0] = (char)(v >= 100u ? '0' + v / 100u : ' ');
+        row1[1] = (char)(v >= 10u ? '0' + (v / 10u) % 10u : ' ');
+        row1[2] = (char)('0' + v % 10u);
+        v = live_eucHit;
+        row1[4] = (char)(v >= 100u ? '0' + v / 100u : ' ');
+        row1[5] = (char)(v >= 10u ? '0' + (v / 10u) % 10u : ' ');
+        row1[6] = (char)('0' + v % 10u);
+        v = live_eucRot;
+        row1[8] = (char)(v >= 100u ? '0' + v / 100u : ' ');
+        row1[9] = (char)(v >= 10u ? '0' + (v / 10u) % 10u : ' ');
+        row1[10] = (char)('0' + v % 10u);
+        memcpy(&row1[12], trk[live_eucTrack < NUM_TRACKS ? live_eucTrack : 0], 3);
+        return 1u;
+    }
     if (live_page == 4u) {
         if (buttonHandler_getMode() != SELECT_MODE_PERF)
             return 0u;
