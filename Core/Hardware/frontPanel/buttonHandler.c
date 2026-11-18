@@ -28,6 +28,7 @@
 #include "BankData.h"
 #include "SceneData.h"
 #include "menuEffects.h"
+#include "EffectsManager.h"
 #if ENABLE_EUKLID_PAGE
 #include "EuklidGenerator.h"
 #endif
@@ -1975,7 +1976,7 @@ static void buttonHandler_closeLatchedSurfaces(uint8_t restore_page,
         buttonHandler_loopForceRelease();
 }
 
-static void handleModeButtons(uint8_t mode)
+static void handleModeButtonsForLibrary(uint8_t mode, menu_library_target_t library)
 {
     if (menu_loadInstrumentTransactionBusy()) {
         /*
@@ -2072,9 +2073,6 @@ static void handleModeButtons(uint8_t mode)
 
     switch (bh_state.selectButtonMode) {
     case SELECT_MODE_PERF:
-        /* Arm the fill hold timer (S079 §3.3); fill activates after the hold. */
-        bh_fillArmed = 1u;
-        bh_fillPressTick = time_sysTick;
         led_clearSequencerLeds();
         led_clearSelectLeds();
         lastActiveSubPage = menu_getSubPage();
@@ -2115,7 +2113,7 @@ static void handleModeButtons(uint8_t mode)
         break;
 
     case SELECT_MODE_LOAD_SAVE:
-        menu_switchPage(LOAD_PAGE);
+        menu_openLibrary(library);
         break;
 
     case SELECT_MODE_MENU:
@@ -2152,6 +2150,11 @@ static void handleModeButtons(uint8_t mode)
         led_setValue(0u, LED_BAR1);
         led_setValue(0u, LED_BAR2);
     }
+}
+
+static void handleModeButtons(uint8_t mode)
+{
+    handleModeButtonsForLibrary(mode, MENU_LIBRARY_DEFAULT);
 }
 
 static void handleSelectButton(uint8_t selectNr)
@@ -2828,13 +2831,14 @@ static void handleVoiceButton(uint8_t voiceNr)
 /*
  * LIVE panel layer (liveMode.h).
  *
- * What: hold LOAD + step 8 (KIT) opens the KIT page in PERF; there a step
+ * What: hold LOAD + step 7 opens the scene-kit page in PERF; there a step
  * press picks kit N for the playing pattern. A mode button closes the page.
  * On the Load page (SAVE) the Bank list is the only content: SELECT and
  * TRACK presses are consumed so no Instrument or type browser opens.
  * Consumed presses have their release consumed too.
  */
 static uint8_t bh_liveLoadHeld;
+static uint8_t bh_liveLoadSolo;
 static uint8_t bh_liveConsumed[(BUT_COUNT + 7u) / 8u];
 
 static void buttonHandler_liveConsume(uint8_t b)
@@ -2847,12 +2851,22 @@ static uint8_t buttonHandler_livePress(uint8_t b)
     int8_t seq = btn_to_seq(b);
     uint8_t shift = buttonHandler_getShift();
 
-    if (b == BUT_MODE3) {
+    if (b == BUT_MODE3 && !shift) {
         bh_liveLoadHeld = 1u;
-        live_kitPageClose();
-        return 0u;
+        bh_liveLoadSolo = 1u;
+        return 1u;
     }
-    if (seq >= 0 && bh_liveLoadHeld && seq == 7 && !shift) {
+    if (bh_liveLoadHeld)
+        bh_liveLoadSolo = 0u;
+    if (bh_liveLoadHeld && !shift && (seq == 7 || seq == 10)) {
+        buttonHandler_liveConsume(b);
+        live_kitPageClose();
+        handleModeButtonsForLibrary(SELECT_MODE_LOAD_SAVE,
+            seq == 7 ? MENU_LIBRARY_KIT : MENU_LIBRARY_PROJECT);
+        return 1u;
+    }
+    /* Adjacent to KIT: recall a kit already resident in one of the 16 scenes. */
+    if (bh_liveLoadHeld && seq == 6 && !shift) {
         buttonHandler_liveConsume(b);
         if (bh_state.selectButtonMode != SELECT_MODE_PERF)
             handleModeButtons(SELECT_MODE_PERF);
@@ -2876,21 +2890,22 @@ static uint8_t buttonHandler_livePress(uint8_t b)
         live_cpuPageOpen();
         return 1u;
     }
-    if (seq >= 0 && bh_liveLoadHeld && !shift &&
-        (seq == 10 || seq == 15)) {
+    if (bh_liveLoadHeld && !shift && seq == 15) {  /* LOAD + PATTERN */
         buttonHandler_liveConsume(b);
         live_kitPageClose();
-        if (seq == 10) {                       /* LOAD + PROJECT */
-            handleModeButtons(SELECT_MODE_LOAD_SAVE);
-        } else {                               /* LOAD + PATTERN */
-            if (bh_state.selectButtonMode != SELECT_MODE_PERF)
-                handleModeButtons(SELECT_MODE_PERF);
-            live_patternPageOpen();
-        }
+        if (bh_state.selectButtonMode != SELECT_MODE_PERF)
+            handleModeButtons(SELECT_MODE_PERF);
+        live_patternPageOpen();
         return 1u;
     }
     /* White labels: SHIFT + CONFIG/RELOAD/FX/PATTERN (not in the sequencer,
      * where SHIFT+step edits steps; LAST STEP keeps its Helicase meaning). */
+    /* In PERF, SHIFT+PLAY+step belongs to the chain editor on all 16 steps. */
+    if (seq >= 0 && shift && bh_chainPlayArmed &&
+        bh_state.selectButtonMode == SELECT_MODE_PERF) {
+        live_kitPageClose();
+        return 0u;
+    }
     if (seq >= 11 && shift &&
         bh_state.selectButtonMode != SELECT_MODE_STEP) {
         buttonHandler_liveConsume(b);
@@ -2899,7 +2914,18 @@ static uint8_t buttonHandler_livePress(uint8_t b)
         switch (seq) {
         case 11: handleModeButtons(SELECT_MODE_LOAD_SAVE); break; /* +SHIFT = settings */
         case 12: live_reloadKit(); break;
-        case 14: handleModeButtons(SELECT_MODE_PERF); break;      /* +SHIFT = Effect */
+        case 14: { /* SHIFT + FX: on DRUM1, go straight to DlyVerb's delay controls. */
+            uint8_t kick = (uint8_t)(bh_state.selectButtonMode == SELECT_MODE_VOICE &&
+                                     menu_getActiveVoice() == 0u);
+            handleModeButtons(SELECT_MODE_PERF);
+            if (kick && bh_state.selectButtonMode == SELECT_MODE_FX &&
+                effects_activeType() == EFFECT_TYPE_DLYVERB) {
+                menu_switchSubPage(1u); /* AEG: div, fbk, dlv, rvl */
+                menuEffects_renderSelectLeds(menu_getSubPage());
+                menu_repaintAll();
+            }
+            break;
+        }
         case 13:                                                   /* LAST STEP = RANDOM */
             if (bh_state.selectButtonMode != SELECT_MODE_PERF) {
                 btn_held[BUT_SHIFT] = 0;
@@ -2938,7 +2964,7 @@ static uint8_t buttonHandler_livePress(uint8_t b)
         live_patternSelect((uint8_t)seq);
         return 1u;
     }
-    if (b == BUT_MODE1 || b == BUT_MODE2 || b == BUT_MODE4)
+    if (b == BUT_MODE1 || b == BUT_MODE2 || b == BUT_MODE3 || b == BUT_MODE4)
         live_kitPageClose();
     if (bh_state.selectButtonMode == SELECT_MODE_LOAD_SAVE &&
         (btn_to_voice(b) >= 0 || btn_to_select(b) >= 0)) {
@@ -2952,8 +2978,15 @@ static uint8_t buttonHandler_liveRelease(uint8_t b)
 {
     uint8_t bit = (uint8_t)(1u << (b & 7u));
 
-    if (b == BUT_MODE3)
+    if (b == BUT_MODE3 && bh_liveLoadHeld) {
         bh_liveLoadHeld = 0u;
+        if (bh_liveLoadSolo) {
+            live_kitPageClose();
+            handleModeButtons(SELECT_MODE_STEP);
+        }
+        bh_liveLoadSolo = 0u;
+        return 1u;
+    }
     if (bh_liveConsumed[b >> 3] & bit) {
         bh_liveConsumed[b >> 3] &= (uint8_t)~bit;
         return 1u;
@@ -3109,6 +3142,11 @@ static void processPress(uint8_t buttonNr)
     case BUT_MODE4:
         /* BUT_MODE1=31, BUT_MODE4=28: mode = 31 - buttonNr */
         handleModeButtons((uint8_t)(BUT_MODE1 - buttonNr));
+        if (buttonNr == BUT_MODE2 && !buttonHandler_getShift() &&
+            bh_state.selectButtonMode == SELECT_MODE_PERF) {
+            bh_fillArmed = 1u;
+            bh_fillPressTick = time_sysTick;
+        }
         if (buttonNr == BUT_MODE1 &&
             bh_state.selectButtonMode == SELECT_MODE_VOICE) {
             /*
@@ -3865,6 +3903,11 @@ void buttonHandler_processEvents(void)
 {
     if (evt_overflow_flag) {
         evt_overflow_flag = 0;
+#if LIVE_MODE
+        bh_liveLoadHeld = 0u;
+        bh_liveLoadSolo = 0u;
+        memset(bh_liveConsumed, 0, sizeof(bh_liveConsumed));
+#endif
         /*
          * Reconcile a dropped edge in the held-COPY owner before ordinary
          * pairing masks are reset. Inputs: event-ring overflow. Output: the

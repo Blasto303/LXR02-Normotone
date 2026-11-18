@@ -47,6 +47,7 @@
 #include "cpuProfile.h"
 #include "plaitsMode.h"
 #include "adcPots.h"
+#include "DlyVerbParameters.h"
 
 static kit_t    live_kitBackup;
 static uint8_t  live_backupScene = 0xFFu;   /* Scene whose kit is swapped */
@@ -76,6 +77,46 @@ static uint8_t  live_rndTarget = 3u;        /* 1 pattern, 2 kit, 3 both    */
 static uint8_t  live_rndScene = 0xFFu;
 static uint16_t live_rndBank = 0xFFFFu;
 static uint8_t  live_rndSavedAmt[INSTRUMENT_SLOT_COUNT];
+
+/* Called before audio starts, only when no saved Bank or Scene owns the mix. */
+void live_initFactoryRumble(void)
+{
+    /* Same dark rumble as the converted kits. Both Morph endpoints start alike. */
+    static const uint8_t values[DLYVERB_PARAM_COUNT] = {
+        [DLYVERB_PARAM_DIVISION] = 5u, /* 1/16 */
+        [DLYVERB_PARAM_FEEDBACK] = 96u,
+        [DLYVERB_PARAM_DLY_LEVEL] = 100u,
+        [DLYVERB_PARAM_RVB_LEVEL] = 127u,
+        [DLYVERB_PARAM_MODEL] = DLYVERB_MODEL_TAPE,
+        [DLYVERB_PARAM_STEREO] = DLYVERB_STEREO_MONO,
+        [DLYVERB_PARAM_WIDTH] = 64u,
+        [DLYVERB_PARAM_DRIVE] = 120u,
+        [DLYVERB_PARAM_LOWPASS] = 10u,
+        [DLYVERB_PARAM_HIGHPASS] = 4u,
+        [DLYVERB_PARAM_MOD_DEPTH] = 22u,
+        [DLYVERB_PARAM_MOD_RATE] = 30u,
+        [DLYVERB_PARAM_AGE] = 0u,
+        [DLYVERB_PARAM_RVB_DECAY] = 118u,
+        [DLYVERB_PARAM_RVB_DAMP] = 124u,
+        [DLYVERB_PARAM_RVB_ROUTE] = DLYVERB_ROUTE_FEEDBACK
+    };
+
+    for (uint8_t i = 0; i < SCENE_COUNT; ++i) {
+        scene_t *scene = scene_get(i);
+        effects_recordDefaultsForType(&scene->effect, EFFECT_TYPE_DLYVERB);
+        for (uint8_t row = DLYVERB_PARAM_DIVISION; row < DLYVERB_PARAM_COUNT; ++row) {
+            scene->effect.normal[row] = values[row];
+            scene->effect.morph[row] = values[row];
+        }
+        scene->settings.audio_out[0] = 1u; /* DRUM1 dry on St2, FX return on St1. */
+        scene->settings.fx_send_amount[0] = 127u;
+        scene->settings.fx_send_morph[0] = 127u;
+        scene->settings.bus_comp[SCENE_BUS_COMP_MODE] = SCENE_BUS_COMP_MODE_ST1;
+        scene->settings.bus_comp[SCENE_BUS_COMP_AMOUNT] = 75u;
+        scene->settings.bus_comp[SCENE_BUS_COMP_TIME] = 25u;
+        scene->settings.bus_comp[SCENE_BUS_COMP_SIDECHAIN] = 1u; /* DRUM1 */
+    }
+}
 
 static uint8_t live_rndKitOn(void)
 {
@@ -246,6 +287,24 @@ static uint8_t live_install(uint8_t scene, uint8_t src)
     live_kitSource = src;
     live_plaitsOn = live_plaits;
     return 1u;
+}
+
+/* A successfully loaded SD kit becomes the scene's own kit. The
+ * performance substitution may no longer restore its previous backup. */
+void live_kitLoadCommitted(uint16_t scene_mask)
+{
+    uint8_t active = scene_getActiveIndex();
+
+    live_checkBackup();
+    if (active < 16u && (scene_mask & (uint16_t)(1u << active)))
+        live_pendingKit = 0xFFu;
+    if (live_backupScene < 16u &&
+        (scene_mask & (uint16_t)(1u << live_backupScene))) {
+        live_backupScene = 0xFFu;
+        live_kitSource = 0xFFu;
+        live_plaitsOn = 0u;
+        plaitsMode_mapOff();
+    }
 }
 
 static uint8_t live_currentKit(void)

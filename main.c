@@ -79,6 +79,7 @@
 #include "presetManager.h"
 #include "BankData.h"
 #include "SceneData.h"
+#include "liveMode.h"
 #include "InstrumentManager.h"
 #include "FxBuffer.h"
 #include "EffectsManager.h"
@@ -1173,6 +1174,10 @@ int main(void)
                         if (filesystem_status() != FS_STATUS_DONE)
                             goto boot_filesystem_failure;
                         filesystem_ack();
+#if LIVE_MODE
+                        /* A standalone Kit has no Scene mix of its own. */
+                        live_initFactoryRumble();
+#endif
                         preset_loadFirstAvailableSceneOrKit();
                     }
                 }
@@ -1291,7 +1296,9 @@ int main(void)
              */
             filesystem_enableRuntimeSettingsWrites();
         } else {
-            /* SD card not detected — menu_init already ran above */
+#if LIVE_MODE
+            live_initFactoryRumble();
+#endif
         }
 
         goto boot_filesystem_done;
