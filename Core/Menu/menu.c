@@ -18812,7 +18812,8 @@ void menu_openLibrary(menu_library_target_t target)
 }
 
 /*
- * LIVE Save: Kit starts on the first free kit number. Run from the
+ * LIVE Save: Kit starts on the first free kit number, and the kit library
+ * opens on a real kit instead of an empty number. Run from the
  * foreground service; acts once per page entry, as soon as the kit names
  * are known, so a used number chosen afterwards (to overwrite) stays.
  */
@@ -18825,8 +18826,8 @@ void menu_liveKitSaveAutoSlot(void)
     uint8_t i;
     uint8_t blank = 1u;
 
-    if (menu_activePage != SAVE_PAGE || menu_saveOptions.what != SAVE_TYPE_KIT ||
-        menu_instrumentLoadActive) {
+    if ((menu_activePage != SAVE_PAGE && menu_activePage != LOAD_PAGE) ||
+        menu_saveOptions.what != SAVE_TYPE_KIT || menu_instrumentLoadActive) {
         done = 0u;
         return;
     }
@@ -18840,6 +18841,22 @@ void menu_liveKitSaveAutoSlot(void)
     if (!name || blank)
         return;                 /* names not known yet */
     done = 1u;
+    if (menu_activePage == LOAD_PAGE) {
+        /* Kit library: open on a real kit (the first one) if this is empty. */
+        if (filesystem_kitSlotExists(slot))
+            return;
+        slot = 0u;
+        while (slot < 999u && !filesystem_kitSlotExists(slot))
+            slot++;
+        if (slot >= 999u)
+            return;
+        menu_currentPresetNr[SAVE_TYPE_KIT] = slot;
+        menu_requestCurrentLoadSaveSelection(0);
+        menu_repaintAll();
+        return;
+    }
+    if (slot == 0u)
+        slot = 1u;              /* numbers start at 001, as the projects */
     while (slot < 999u && filesystem_kitSlotExists(slot))
         slot++;
     if (slot != menu_currentPresetNr[SAVE_TYPE_KIT]) {

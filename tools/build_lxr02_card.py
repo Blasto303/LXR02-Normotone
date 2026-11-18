@@ -4,7 +4,9 @@
 The stock card content is kept as it is, so the stock firmware still finds its
 projects after a switch back. Added beside it: the Helicase image (the only
 .img at the root), the repository SD_CARD content, and the stock projects
-converted by convert_lxr02_project.py (Kits and Banks).
+converted by convert_lxr02_project.py (Kits and Banks, numbered from 001; the
+Helicase demo Banks, Kits, Scenes and Patterns go to /helicase_demos, out of
+the lists).
 
     python3 tools/build_lxr02_card.py <stock card copy> <output dir>
 """
@@ -17,6 +19,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# Demo content kept in /helicase_demos (not listed); the owner's projects and
+# kits are numbered from FIRST_SLOT.
+DEMO_DIRS = {"Bank", "Kit", "Scene", "Pattern"}
+FIRST_SLOT = 1
 IGNORED = shutil.ignore_patterns("._*", ".DS_Store", ".Spotlight-V100", ".Trashes", ".fseventsd")
 
 
@@ -41,6 +47,13 @@ def main() -> int:
     for src in (ROOT / "SD_CARD").iterdir():
         if src.name.lower() == "samples":
             continue
+        if src.name in DEMO_DIRS:
+            # Helicase demo Banks/Kits/Scenes/Patterns stay on the card, out of
+            # the lists: the owner's projects come first, numbered from 001.
+            shutil.copytree(src, out / "helicase_demos" / src.name,
+                            dirs_exist_ok=True, ignore=IGNORED)
+            (out / src.name).mkdir(exist_ok=True)
+            continue
         dst = existing.get(src.name.lower(), out / src.name)
         if src.is_dir():
             shutil.copytree(src, dst, dirs_exist_ok=True, ignore=IGNORED)
@@ -49,9 +62,16 @@ def main() -> int:
     shutil.copy2(ROOT / "build" / "LXRV2_lxr02.img", out / "LXRV2_lxr02.img")
 
     subprocess.run(
-        [sys.executable, "-I", str(ROOT / "tools" / "convert_lxr02_project.py"), str(backup), "--out", str(out)],
+        [sys.executable, "-I", str(ROOT / "tools" / "convert_lxr02_project.py"), str(backup),
+         "--out", str(out), "--kit-slot", str(FIRST_SLOT), "--bank-slot", str(FIRST_SLOT)],
         check=True,
     )
+    # First boot opens the owner's first project.
+    settings = out / "settings.cfg"
+    if settings.exists():
+        lines = settings.read_text(encoding="ascii").splitlines()
+        lines = [f"active_bank={FIRST_SLOT}" if l.startswith("active_bank=") else l for l in lines]
+        settings.write_text("\n".join(lines) + "\n", encoding="ascii")
     # Directory indexes are rebuilt by the firmware at boot.
     for index in (out / "Kit" / ".hcindex", out / "Bank" / ".hcindex"):
         index.unlink(missing_ok=True)

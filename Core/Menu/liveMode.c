@@ -624,6 +624,15 @@ void live_beforeSceneChange(uint8_t target)
 
     uint8_t carry;
 
+    /*
+     * From Scene 17 (the old project still playing after a project load):
+     * no mix to carry, but PLAITS must already sound on the first pattern.
+     */
+    if (active >= SCENE_COUNT && live_plaits && live_sceneValid(target)) {
+        live_checkBackup();
+        (void)live_install(target, target);
+        return;
+    }
     if (target == active || !live_sceneValid(target) || active >= SCENE_COUNT)
         return;
     /* Kit playing now (its source Scene), for the "kit stays" option. */
