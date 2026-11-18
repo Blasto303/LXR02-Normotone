@@ -2865,20 +2865,29 @@ static uint8_t buttonHandler_livePress(uint8_t b)
             seq == 7 ? MENU_LIBRARY_KIT : MENU_LIBRARY_PROJECT);
         return 1u;
     }
-    /* Adjacent to KIT: recall a kit already resident in one of the 16 scenes. */
+    /*
+     * One KIT page: the SD library opened by LOAD + KIT also takes the kit
+     * of another pattern on steps 1..16 (temporary, at the end of the bar).
+     * LOAD + step 7, the former resident-kit page, opens the same library.
+     */
     if (bh_liveLoadHeld && seq == 6 && !shift) {
         buttonHandler_liveConsume(b);
-        if (bh_state.selectButtonMode != SELECT_MODE_PERF)
-            handleModeButtons(SELECT_MODE_PERF);
-        live_kitPageOpen();
+        live_kitPageClose();
+        handleModeButtonsForLibrary(SELECT_MODE_LOAD_SAVE, MENU_LIBRARY_KIT);
+        live_kitPageLeds();
+        return 1u;
+    }
+    if (seq >= 0 && !shift && !bh_liveLoadHeld &&
+        bh_state.selectButtonMode == SELECT_MODE_LOAD_SAVE &&
+        menu_liveKitLibraryActive()) {
+        buttonHandler_liveConsume(b);
+        live_kitSelect((uint8_t)seq);
+        live_kitPageLeds();
         return 1u;
     }
     if (seq == 12 && bh_liveLoadHeld && !shift) {        /* LOAD + RELOAD */
-        /* PLAITS on/off; the KIT page shows PLT / LXR. */
+        /* PLAITS on/off where you are; one-second message, 'P' corner mark. */
         buttonHandler_liveConsume(b);
-        if (bh_state.selectButtonMode != SELECT_MODE_PERF)
-            handleModeButtons(SELECT_MODE_PERF);
-        live_kitPageOpen();
         live_plaitsToggle();
         return 1u;
     }

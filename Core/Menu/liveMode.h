@@ -51,6 +51,8 @@ void live_patternSelect(uint8_t scene);
  * applied at the bar while playing, at once when stopped.
  */
 void live_plaitsToggle(void);
+/* Kit option suit / fixe (SHIFT + DATA click in the kit library). */
+void live_kitHoldToggle(void);
 uint8_t live_plaitsActive(void);
 /* SHIFT + RELOAD (step 13): the playing pattern gets its own kit back. */
 void live_reloadKit(void);

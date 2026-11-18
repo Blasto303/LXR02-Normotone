@@ -26,7 +26,7 @@ mkdir -p $OUT/obj
 INC=$(grep -oE '\-I[^ ]+' Makefile | sort -u | tr '\n' ' ')
 for f in $(cat $SOURCES); do
   b=$(echo $f | tr '/' '_')
-  gcc -m32 -fshort-enums -E -w $INC -include stddef.h $f \
+  gcc -m32 -fshort-enums -E -w $INC $EXTRA_CFLAGS -include stddef.h $f \
     | perl -0pe 's/__asm\s+(volatile\s*)?\((?:[^;])*?\)\s*;/;/gs; s/__asm__\s+(__volatile__\s*)?\((?:[^;])*?\)\s*;/;/gs' > $OUT/obj/$b.i
   gcc -m32 -fshort-enums -O0 -g -w -c -o $OUT/obj/$b.o $OUT/obj/$b.i
 done

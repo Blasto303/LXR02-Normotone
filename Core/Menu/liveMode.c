@@ -47,6 +47,7 @@
 #include "cpuProfile.h"
 #include "plaitsMode.h"
 #include "adcPots.h"
+#include "timebase.h"
 #include "DlyVerbParameters.h"
 
 static kit_t    live_kitBackup;
@@ -60,6 +61,9 @@ static uint8_t  live_cpuEntry;              /* first entry on the CPU page */
 static uint8_t  live_cpuSerial;
 static uint8_t  live_shownQueue = 0xFFu;    /* queued pattern on the LCD  */
 static uint8_t  live_kitHold;               /* 1: kit stays on pattern change */
+static uint8_t  live_libLeds;               /* step LEDs drawn for the kit library */
+static uint8_t  live_flash;                 /* 1: PLAITS on/off message showing */
+static uint16_t live_flashStart;
 static uint8_t  live_plaits;                /* PLAITS wanted                  */
 static uint8_t  live_plaitsOn;              /* PLAITS applied on the backup Scene */
 static uint8_t  live_tablesReady;           /* plaitsMode tables built        */
@@ -305,6 +309,10 @@ void live_kitLoadCommitted(uint16_t scene_mask)
         live_plaitsOn = 0u;
         plaitsMode_mapOff();
     }
+    /* PLAITS on: the new kit is converted at once, not at the bar. */
+    if (live_plaits && active < 16u && (scene_mask & (uint16_t)(1u << active))) {
+        live_pendingKit = active;
+    }
 }
 
 static uint8_t live_currentKit(void)
@@ -440,6 +448,11 @@ void live_kitPageOpen(void)
 
 void live_kitPageClose(void)
 {
+    if (live_libLeds) {
+        live_libLeds = 0u;
+        led_clearAllBlinkLeds();
+        menu_refreshPerfSceneLeds();
+    }
     if (!live_page)
         return;
     /* Closes either page (KIT or PATTERN). */
@@ -479,8 +492,9 @@ void live_kitPageLeds(void)
     uint8_t current = live_currentKit();
     uint8_t s;
 
-    if (live_page != 1u)
+    if (live_page != 1u && !menu_liveKitLibraryActive())
         return;
+    live_libLeds = (uint8_t)(live_page != 1u);
     for (s = 0u; s < 16u; s++) {
         uint8_t led = (uint8_t)(LED_SEQ1 + s);
 
@@ -620,9 +634,17 @@ static uint8_t live_queuedPattern(void)
     return q;
 }
 
+void live_kitHoldToggle(void)
+{
+    live_kitHold = (uint8_t)!live_kitHold;
+    menu_repaintAll();
+}
+
 void live_plaitsToggle(void)
 {
     live_plaits = (uint8_t)!live_plaits;
+    live_flash = 1u;
+    live_flashStart = time_sysTick;
     /* Same path as a kit choice: now when stopped, at the bar when playing. */
     live_kitSelect(live_currentKit());
     menu_repaintAll();
@@ -635,6 +657,18 @@ uint8_t live_plaitsActive(void)
 
 void live_service(void)
 {
+    /* Kit library step LEDs follow the page (it may open a few ms late). */
+    if (menu_liveKitLibraryActive() != live_libLeds) {
+        if (live_libLeds)
+            live_kitPageClose();
+        else
+            live_kitPageLeds();
+    }
+    /* PLAITS on/off message: about one second. */
+    if (live_flash && (uint16_t)(time_sysTick - live_flashStart) > 1200u) {
+        live_flash = 0u;
+        menu_repaintAll();
+    }
     /*
      * New Bank: when a background Bank load (SAVE / LOAD + PROJECT, or MIDI
      * CC0) ends on another Bank, its pattern 1 is queued for the end of the
@@ -704,6 +738,17 @@ void live_service(void)
 uint8_t live_formatOverlay(char *row0, char *row1)
 {
     uint8_t kit;
+
+    if (live_flash) {
+        memset(row0, ' ', 16);
+        memcpy(row0, live_plaits ? "Mode Plaits  ON" : "Mode Plaits OFF", 15);
+        return 1u;
+    }
+    /* Kit library: the kit option, top right ("Load: Kit   suit"). */
+    if (menu_liveKitLibraryActive()) {
+        memcpy(&row0[12], live_kitHold ? "fixe" : "suit", 4);
+        return 1u;
+    }
 
     if (live_page == 4u) {
         if (buttonHandler_getMode() != SELECT_MODE_PERF)

@@ -12452,6 +12452,12 @@ void menu_repaint(void)
 #if LIVE_MODE
     else
         (void)live_formatOverlay(editDisplayBuffer[0], editDisplayBuffer[1]);
+    /*
+     * PLAITS indicator: a 'P' in the bottom-right corner, a cell every page
+     * leaves blank (value rows are 15 characters wide), whatever the page.
+     */
+    if (live_plaitsActive() && editDisplayBuffer[1][15] == ' ')
+        editDisplayBuffer[1][15] = 'P';
 #endif
     if ((menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
         !menu_loadSaveCursorVisible()) {
@@ -15977,6 +15983,12 @@ void menu_parseEncoder(int8_t inc, uint8_t button)
         return;
     }
 #if LIVE_MODE
+    /* Kit library: SHIFT + DATA click = kit option suit / fixe. */
+    if (menu_liveKitLibraryActive() && buttonHandler_getShift()) {
+        if (btnClicked)
+            live_kitHoldToggle();
+        return;
+    }
     if (live_patternPageActive())
         return;
     if (live_kitPageActive() || live_rndPageActive() || live_cpuPageActive()) {
@@ -18772,6 +18784,18 @@ void menu_switchPage(uint8_t pageNr)
 void menu_openLibrary(menu_library_target_t target)
 {
     menu_switchPageTarget(LOAD_PAGE, target);
+}
+
+/* LIVE: the SD kit library (LOAD + KIT) is on screen. */
+uint8_t menu_liveKitLibraryActive(void)
+{
+#if LIVE_MODE
+    return (uint8_t)(menu_activePage == LOAD_PAGE &&
+                     menu_saveOptions.what == SAVE_TYPE_KIT &&
+                     !menu_instrumentLoadActive);
+#else
+    return 0u;
+#endif
 }
 
 static void menu_processPendingPageSwitch(void)
