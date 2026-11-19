@@ -133,22 +133,25 @@ static void run_pattern(uint8_t sc, int blocks)
     int b, t;
     int step = -1;
 
-    /* BENCH_CHANGE="block:key=val": one Effect row change mid-run. */
-    int change_at = -1; uint8_t change_idx = 0, change_val = 0;
+    /* BENCH_CHANGE="block:key=val;block:key=val": Effect row moves mid-run. */
+    int change_at[8]; uint8_t change_idx[8], change_val[8]; int nchg = 0, ci;
     if (getenv("BENCH_CHANGE")) {
-        char buf[64]; char *c, *e;
+        char buf[256]; char *tok, *save = NULL;
         strncpy(buf, getenv("BENCH_CHANGE"), sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
-        c = strchr(buf, ':'); e = c ? strchr(c, '=') : NULL;
-        if (c && e) {
+        for (tok = strtok_r(buf, ";", &save); tok && nchg < 8; tok = strtok_r(NULL, ";", &save)) {
+            char *c = strchr(tok, ':'), *e = c ? strchr(c, '=') : NULL;
+            if (!c || !e) continue;
             *c = 0; *e = 0;
-            change_at = atoi(buf); change_val = (uint8_t)atoi(e + 1);
-            if (!effects_descriptorByKey(scene_effectConst(sc)->type, c + 1, &change_idx))
-                change_at = -1;
+            if (!effects_descriptorByKey(scene_effectConst(sc)->type, c + 1, &change_idx[nchg]))
+                continue;
+            change_at[nchg] = atoi(tok); change_val[nchg] = (uint8_t)atoi(e + 1);
+            nchg++;
         }
     }
     for (b = 0; b < blocks; b++) {
-        if (b == change_at)
-            scene_setEffectNormalParameter(sc, change_idx, change_val);
+        for (ci = 0; ci < nchg; ci++)
+            if (b == change_at[ci])
+                scene_setEffectNormalParameter(sc, change_idx[ci], change_val[ci]);
         if (b % 159 == 0) {
             step++;
             for (t = 0; t < 7; t++) {

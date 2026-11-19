@@ -75,6 +75,12 @@
 #define DV_TAP_MIN            (DV_MOD_MAX + DV_MOD_BASE_MAX + 4.0f)
 #define DV_FADE_INC           (1.0f / 1024.0f)
 #define DV_FEEDBACK_MAX       1.05f
+/*
+ * fbk route: share of the plate in the delay feedback (the rest is the echo).
+ * Fixed, so rvl only sets the reverb's output level (it used to set this mix
+ * too, which made rvl change the delay's sustain and silenced fbk at 127).
+ */
+#define DV_FBK_MIX            0.5f
 #define DV_INV16              (1.0f / 32768.0f)
 #define DV_RVB_SCALE          8192.0f
 #define DV_RVB_INV            (1.0f / 8192.0f)
@@ -173,6 +179,10 @@ typedef struct {
     uint32_t q_mode;        /* 1 while the rings hold quarter-rate content */
     float s_mod;            /* str/png/wid: control-rate modulation */
     float s_rmod;
+    /* mno: output tone (lpf / hpf on the whole rumble, echo and plate). */
+    float o_lp[2];
+    float o_hpx[2];
+    float o_hpy[2];
 } DlyVerbState;
 
 _Static_assert(sizeof(DlyVerbState) <= DLYVERB_STATE_BYTES,
@@ -591,6 +601,8 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
     float drive_bias_out;
     float drive_makeup;
     float drive_lp_a;
+    float model_lp_hz;
+    float user_lp_hz;
 
     if (!rt || !io || !io->l || io->frames == 0u ||
         io->frames > DV_HALF_FRAMES_MAX)
@@ -705,9 +717,11 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
     inc_wow = 0.55f / DV_FS;
     inc_base_flutter = 6.5f / DV_FS;
     bump_a = 1.0f - expf(-DV_TWO_PI * 90.0f / DV_FS);
+    model_lp_hz = lp_hz;
     {
         const float user_hz = dv_expHz(DV_ROW(rt, DLYVERB_PARAM_LOWPASS),
                                        400.0f, 10500.0f);
+        user_lp_hz = user_hz;
         lp_hz = (user_hz < lp_hz) ? user_hz : lp_hz;
     }
     lp_a = 1.0f - expf(-DV_TWO_PI * lp_hz / DV_FS);
@@ -806,8 +820,19 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
      */
     if (stereo == DLYVERB_STEREO_MONO && (io->frames & 3u) == 0u) {
         const uint32_t q = io->frames / 4u;
-        const float lp4 = 1.0f - (1.0f - lp_a) * (1.0f - lp_a);
-        const float hp4 = hp_r * hp_r;
+        /*
+         * Tone in mno acts on the whole rumble at the output (echo and
+         * plate), so lpf / hpf are heard at once instead of pass by pass;
+         * inside the loop only the model's own low-pass and a 15 Hz DC
+         * guard remain. Coefficients are for the quarter rate (11 kHz).
+         */
+        const float mlp = 1.0f - expf(-DV_TWO_PI * model_lp_hz / DV_FS);
+        const float lp4 = 1.0f - (1.0f - mlp) * (1.0f - mlp);
+        const float hp_dc = expf(-DV_TWO_PI * 15.0f / DV_FS);
+        const float hp4 = hp_dc * hp_dc;
+        const float olp1 = 1.0f - expf(-DV_TWO_PI * user_lp_hz / DV_FS);
+        const float olp4 = 1.0f - (1.0f - olp1) * (1.0f - olp1);
+        const float ohp4 = hp_r * hp_r;
         const float bump4 = 1.0f - (1.0f - bump_a) * (1.0f - bump_a);
         const float dlp4 = 1.0f - (1.0f - drive_lp_a) * (1.0f - drive_lp_a);
         const float glide4 = 1.0f - (1.0f - glide_k) * (1.0f - glide_k);
@@ -898,7 +923,7 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
             nz = dv_noise(&st->noise);
             nz = (hiss + floor_nz) * nz +
                  ((fabsf(nz) < crackle_p) ? crackle_amp : 0.0f);
-            w_m = in_m + fb * (e_m + r_fbk * rvl * (0.25f * (rv_l + rv_r) - e_m)) + nz;
+            w_m = in_m + fb * (e_m + r_fbk * DV_FBK_MIX * (0.25f * (rv_l + rv_r) - e_m)) + nz;
             if (sat_k >= 1.0f)
                 w_m = loop_inv * (dv_soft(loop_k * w_m + loop_bias) - loop_bias_out);
             else
@@ -911,8 +936,17 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
             valid += (valid < len) ? 1u : 0u;
             st->tap_a[0] += (tq - st->tap_a[0]) * glide4;
 
-            y_l = DV_LIMIT_INV * dv_soft(DV_LIMIT * (dlv * eo_m + rvl * rv_l));
-            y_r = DV_LIMIT_INV * dv_soft(DV_LIMIT * (dlv * eo_m + rvl * rv_r));
+            y_l = dlv * eo_m + rvl * rv_l;
+            y_r = dlv * eo_m + rvl * rv_r;
+            /* Output tone: one-pole low-pass (lpf), then high-pass (hpf). */
+            st->o_lp[0] += olp4 * (y_l - st->o_lp[0]);
+            st->o_lp[1] += olp4 * (y_r - st->o_lp[1]);
+            st->o_hpy[0] = ohp4 * (st->o_hpy[0] + st->o_lp[0] - st->o_hpx[0]);
+            st->o_hpx[0] = st->o_lp[0];
+            st->o_hpy[1] = ohp4 * (st->o_hpy[1] + st->o_lp[1] - st->o_hpx[1]);
+            st->o_hpx[1] = st->o_lp[1];
+            y_l = DV_LIMIT_INV * dv_soft(DV_LIMIT * st->o_hpy[0]);
+            y_r = DV_LIMIT_INV * dv_soft(DV_LIMIT * st->o_hpy[1]);
             for (j = 0u; j < 4u; j++) {
                 const float k = 0.25f * (float)(j + 1u);
                 const float ol = st->prev_out[0] + k * (y_l - st->prev_out[0]);
@@ -1086,8 +1120,8 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
          * level, because the plate's resonant modes have more than unity
          * gain and would self-oscillate the loop at moderate feedback.
          */
-        s_l = e_l + r_fbk * rvl * (0.5f * rv_l - e_l);
-        s_r = e_r + r_fbk * rvl * (0.5f * rv_r - e_r);
+        s_l = e_l + r_fbk * DV_FBK_MIX * (0.5f * rv_l - e_l);
+        s_r = e_r + r_fbk * DV_FBK_MIX * (0.5f * rv_r - e_r);
 
         /*
          * Age (hiss, sparse crackle) and the model's noise floor enter the
