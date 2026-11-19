@@ -133,7 +133,22 @@ static void run_pattern(uint8_t sc, int blocks)
     int b, t;
     int step = -1;
 
+    /* BENCH_CHANGE="block:key=val": one Effect row change mid-run. */
+    int change_at = -1; uint8_t change_idx = 0, change_val = 0;
+    if (getenv("BENCH_CHANGE")) {
+        char buf[64]; char *c, *e;
+        strncpy(buf, getenv("BENCH_CHANGE"), sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+        c = strchr(buf, ':'); e = c ? strchr(c, '=') : NULL;
+        if (c && e) {
+            *c = 0; *e = 0;
+            change_at = atoi(buf); change_val = (uint8_t)atoi(e + 1);
+            if (!effects_descriptorByKey(scene_effectConst(sc)->type, c + 1, &change_idx))
+                change_at = -1;
+        }
+    }
     for (b = 0; b < blocks; b++) {
+        if (b == change_at)
+            scene_setEffectNormalParameter(sc, change_idx, change_val);
         if (b % 159 == 0) {
             step++;
             for (t = 0; t < 7; t++) {
@@ -489,6 +504,12 @@ int main(int argc, char **argv)
         }
         run(blocks, mask, &m, &w);
         printf("scene %u fx %s mask %02x: %.1f us mean\n", sc + 1, argv[5], mask, m);
+        if (getenv("BENCH_FX")) {
+            uint8_t i;
+            printf("runtime rows 3..18:");
+            for (i = 3; i < 19; i++) printf(" %u", effects_lastApplied(i));
+            printf("\n");
+        }
         return 0;
     }
     printf("bank %s, %d blocks, host us per 32-frame block (mean/worst)\n",

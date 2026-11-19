@@ -72,6 +72,7 @@ static void loop_pass(void)
     preset_tickBackgroundBankLoad();
     menu_serviceKnobRepaint();
     menu_serviceRuntimeWidgets();
+    effects_service();   /* the mixer runs it every render block */
     sim_advance(50); /* foreground bookkeeping per pass */
 }
 
@@ -135,10 +136,9 @@ int main(int argc, char **argv)
     filesystem_requestLoadBankIndex(NULL); settle(); filesystem_ack();
     filesystem_requestLoadBank((uint16_t)atoi(argv[2]), 0xFFFFu, 0u, 0x03u, NULL);
     settle(); filesystem_ack();
-    if (argc > 3 && !strcmp(argv[3], "--rumble")) {
+    if (argc > 3 && !strcmp(argv[3], "--rumble"))
         live_initFactoryRumble();
-        effects_activateScene(scene_getActiveIndex());
-    }
+    effects_activateScene(scene_getActiveIndex());
     menu_init();
     preset_syncBusCompMirrors();
     settle();
@@ -191,6 +191,17 @@ int main(int argc, char **argv)
             printf(" send1=%u k0=%02x%02x%02x%02x k4=%02x%02x%02x%02x\n", scene_getVoiceFxSendAmount(a, 0),
                 ((const uint8_t*)&scene_getConst(a)->kit)[8],((const uint8_t*)&scene_getConst(a)->kit)[9],((const uint8_t*)&scene_getConst(a)->kit)[40],((const uint8_t*)&scene_getConst(a)->kit)[41],
                 ((const uint8_t*)&scene_getConst(4)->kit)[8],((const uint8_t*)&scene_getConst(4)->kit)[9],((const uint8_t*)&scene_getConst(4)->kit)[40],((const uint8_t*)&scene_getConst(4)->kit)[41]);
+            break; }
+        case 'F': {
+            /* Effect probe: rows 3.. of the active Scene record vs runtime. */
+            uint8_t a = scene_getActiveIndex(), i;
+            const effect_record_t *r = scene_effectConst(a);
+            printf("  fx scene %u runtime-scene %u type %u mrp %u\n   row:", a, effects_runtimeScene(), r ? r->type : 99, scene_getEffectMorphAmount(a));
+            for (i = 3; i < 19; i++) printf(" %3u", i);
+            printf("\n   nrm:"); for (i = 3; i < 19; i++) printf(" %3u", r ? r->normal[i] : 0);
+            printf("\n   mrp:"); for (i = 3; i < 19; i++) printf(" %3u", r ? r->morph[i] : 0);
+            printf("\n   run:"); for (i = 3; i < 19; i++) printf(" %3u", effects_lastApplied(i));
+            printf("\n");
             break; }
         case 'P': {
             /* Pattern probe: bar 1 of every track of the active Scene. */

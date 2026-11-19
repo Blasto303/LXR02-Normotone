@@ -502,6 +502,9 @@ uint8_t effects_changeType(uint8_t scene_index, effect_type_id_t type);
 void effects_service(void);
 void effects_process(effect_io_t *io);
 effect_type_id_t effects_activeType(void);
+/* Diagnostics: value last pushed to the runtime, and the runtime's Scene. */
+uint8_t effects_lastApplied(uint8_t index);
+uint8_t effects_runtimeScene(void);
 uint8_t effects_activeIoFlags(void);
 const effects_common_runtime_t *effects_commonRuntime(void);
 

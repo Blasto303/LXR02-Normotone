@@ -2011,6 +2011,17 @@ void effects_process(effect_io_t *io)
         entry->ops->process(effects_runtimeMember(), io);
 }
 
+/* Diagnostic: the value effects_service() last pushed to the runtime. */
+uint8_t effects_lastApplied(uint8_t index)
+{
+    return (index < EFFECT_PARAM_COUNT) ? effects_state.last_applied[index] : 0u;
+}
+
+uint8_t effects_runtimeScene(void)
+{
+    return effects_state.scene_index;
+}
+
 effect_type_id_t effects_activeType(void)
 {
     return effects_state.runtime_type;
