@@ -16,6 +16,7 @@
 #include "BusCompressor.h"
 #include "config.h"
 #include "SceneData.h"
+#include "EffectsManager.h"
 #include <math.h>
 
 /*
@@ -199,6 +200,9 @@ void busComp_sidechainTrigger(uint8_t track, uint8_t velocity)
         return;
     v = (velocity >= 127u) ? 1.0f : (float)velocity * (1.0f / 127.0f);
     weight = v * v * v;
+    /* Normotone: with DlyVerb running, the cut dips the rumble alone (dck). */
+    if (effects_duckTrigger(weight))
+        return;
     if (weight > busComp.sc_pending)
         busComp.sc_pending = weight;
 }

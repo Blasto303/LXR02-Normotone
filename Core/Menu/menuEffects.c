@@ -157,7 +157,9 @@ static uint8_t menuEffects_screenCount(uint8_t sub_page)
             return sizeof(delayRows) / sizeof(delayRows[0]);
         if (sub_page == RUMBLE_PLATE)
             return sizeof(plateRows) / sizeof(plateRows[0]);
-        return sub_page == RUMBLE_REVERB || sub_page == RUMBLE_COMP;
+        if (sub_page == RUMBLE_COMP)
+            return 2u;                  /* compressor, then the duck */
+        return sub_page == RUMBLE_REVERB;
     }
     if (sub_page == 0u)
         return 2u;
@@ -189,11 +191,18 @@ static uint8_t menuEffects_cellAt(uint8_t sub_page, uint8_t screen,
         screen >= menuEffects_screenCount(sub_page))
         return 0u;
     if (rumbleEditor) {
-        if (sub_page == RUMBLE_COMP) {
+        if (sub_page == RUMBLE_COMP && screen == 0u) {
             out->kind = MENU_FX_CELL_BUS_COMP;
             out->index = column;
             return 1u;
         }
+        if (sub_page == RUMBLE_COMP) {
+            static const uint8_t duckRows[4] = {
+                DLYVERB_PARAM_DUCK, DLYVERB_PARAM_DUCK_REL,
+                EFFECT_LANE_NONE, EFFECT_LANE_NONE
+            };
+            index = duckRows[column];
+        } else
         index = sub_page == RUMBLE_DELAY ? delayRows[screen][column]
               : sub_page == RUMBLE_PLATE ? plateRows[screen][column]
               : reverbRows[column];

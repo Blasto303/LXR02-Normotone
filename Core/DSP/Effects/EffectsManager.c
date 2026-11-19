@@ -2025,6 +2025,18 @@ uint8_t effects_plateSend(uint8_t slot)
     return effects_state.last_applied[DLYVERB_PARAM_PLATE_D2 + slot - 1u];
 }
 
+uint8_t effects_duckTrigger(float weight)
+{
+    DlyVerbRuntime *rt;
+
+    if (effects_state.runtime_type != EFFECT_TYPE_DLYVERB)
+        return 0u;
+    rt = (DlyVerbRuntime *)effects_runtimeMember();
+    if (weight > rt->duck_pending)
+        rt->duck_pending = weight;
+    return 1u;
+}
+
 uint8_t effects_runtimeScene(void)
 {
     return effects_state.scene_index;

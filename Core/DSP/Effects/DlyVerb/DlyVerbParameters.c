@@ -35,7 +35,7 @@ const char dlyVerb_full8[] = "DlyVerb";
  *   because every DTYPE_MENU table id is already in use (as CrumpBit `sub`).
  * - every other row is a 0..127 continuous control with Morph, LFO and
  *   Pattern automation, like voice rows.
- * Inputs: none (const). Output: 26 rows. Accessors: EffectsManager
+ * Inputs: none (const). Output: 28 rows. Accessors: EffectsManager
  * (resolution, clamps), menuEffects/menu.c (labels), `.fx` and AutoSave
  * (file keys). Affiliates: DlyVerbEffect.c write_param().
  */
@@ -93,6 +93,10 @@ const effect_param_descriptor_t dlyVerb_descriptors[] = {
                EFFECT_FLAGS_IMAGE, EFFECT_MOD_0_127, 100u, 127u),
     EFFECT_ROW("dvb_plate_tone", "Reverb", "PlTone", "ptn", DTYPE_0B127,
                EFFECT_FLAGS_IMAGE, EFFECT_MOD_0_127, 64u, 127u),
+    EFFECT_ROW("dvb_duck", "Delay", "Duck", "dck", DTYPE_0B127,
+               EFFECT_FLAGS_IMAGE, EFFECT_MOD_0_127, 90u, 127u),
+    EFFECT_ROW("dvb_duck_release", "Delay", "DuckRel", "dkr", DTYPE_0B127,
+               EFFECT_FLAGS_IMAGE, EFFECT_MOD_0_127, 40u, 127u),
 };
 
 _Static_assert(sizeof(dlyVerb_descriptors) /

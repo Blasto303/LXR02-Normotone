@@ -30,8 +30,8 @@
  * Affiliates: DlyVerbEffect.c/.h, EffectParamRows.h, StepScale.h.
  */
 
-/* Descriptor rows: common rows 0..2 plus type rows 3..25. */
-#define DLYVERB_PARAM_COUNT 26u
+/* Descriptor rows: common rows 0..2 plus type rows 3..27. */
+#define DLYVERB_PARAM_COUNT 28u
 
 /*
  * Local descriptor indices.
@@ -76,6 +76,14 @@ typedef enum {
     DLYVERB_PARAM_PLATE_HH,
     DLYVERB_PARAM_PLATE_LEVEL,
     DLYVERB_PARAM_PLATE_TONE,
+    /*
+     * Normotone rumble duck (26..27): the sidechain cut (csc track) dips the
+     * DlyVerb's own return only, by up to 30 dB (dck) with a 3 ms attack
+     * and a dkr release. The bus compressor no longer ducks while DlyVerb
+     * runs, so the kick and the other tracks are never cut.
+     */
+    DLYVERB_PARAM_DUCK,
+    DLYVERB_PARAM_DUCK_REL,
     DLYVERB_PARAM_ENUM_COUNT
 } dlyverb_param_t;
 

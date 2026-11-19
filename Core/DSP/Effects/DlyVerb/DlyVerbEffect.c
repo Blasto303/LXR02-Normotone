@@ -196,6 +196,10 @@ typedef struct {
     float q_tb;             /* destination tap */
     float q_xf;             /* 0..1 progress, 0 = idle */
     float dec_a[2];         /* str/png/wid: plate-bus image filter */
+    /* Rumble duck (dck/dkr): reduction in dB, its target, last linear gain. */
+    float dk_db;
+    float dk_target;
+    float dk_gain;
 } DlyVerbState;
 
 _Static_assert(sizeof(DlyVerbState) <= DLYVERB_STATE_BYTES,
@@ -583,7 +587,7 @@ static inline float dv_expHz(uint8_t v, float lo, float hi)
  * stereo io (frames <= 32, even). Output: io in place, rings in the share.
  * Caller: effects_process(). Affiliates: seq_getBpm(), stepScale_ticksQ8().
  */
-static void dlyVerb_process(void *rt_void, effect_io_t *io)
+static void dlyVerb_processCore(void *rt_void, effect_io_t *io)
 {
     DlyVerbRuntime *rt = (DlyVerbRuntime *)rt_void;
     DlyVerbState *st;
@@ -1379,6 +1383,72 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
 }
 
 /* Share change: re-seat (clears the reverb, mutes the delay rings). */
+/*
+ * Rumble duck (Normotone): the csc sidechain hit dips the DlyVerb return.
+ *
+ * What: a hit of weight w = (v/127)^3 sets the target to -dck x 30/127 x w
+ * dB; the reduction falls to it with a 3 ms one-pole, then the target goes
+ * back to 0 and it recovers with the dkr time (20 ms..1 s). The gain is
+ * ramped across the block. Why here: the bus compressor's cut dipped all of
+ * MAIN, so the kick (on MAIN when OUT 2 is free, as with headphones) and the
+ * tracks under it were cut too and clicked; now only the rumble moves.
+ */
+#define DV_DUCK_ATTACK_MS 3.0f
+
+static inline float dv_blockCoef(float tau_ms, uint32_t frames)
+{
+    const float t = 1000.0f * (float)frames / DV_FS;
+
+    return t / (tau_ms + 0.5f * t);
+}
+
+static void dlyVerb_process(void *rt_void, effect_io_t *io)
+{
+    DlyVerbRuntime *rt = (DlyVerbRuntime *)rt_void;
+    DlyVerbState *st;
+    float g0;
+    float g1;
+    float step;
+    uint32_t n;
+
+    dlyVerb_processCore(rt_void, io);
+    if (!rt || !io || !io->l || !rt->state)
+        return;
+    st = (DlyVerbState *)rt->state;
+    if (rt->duck_pending > 0.0f) {
+        const float t = -(float)DV_ROW(rt, DLYVERB_PARAM_DUCK) *
+                        (30.0f / 127.0f) * rt->duck_pending;
+
+        rt->duck_pending = 0.0f;
+        if (t < st->dk_target)
+            st->dk_target = t;
+    }
+    if (st->dk_target < 0.0f && st->dk_db <= st->dk_target + 0.5f)
+        st->dk_target = 0.0f;                  /* depth reached: release */
+    if (st->dk_target < st->dk_db)
+        st->dk_db += dv_blockCoef(DV_DUCK_ATTACK_MS, io->frames) *
+                     (st->dk_target - st->dk_db);
+    else
+        st->dk_db += dv_blockCoef(dv_expHz(DV_ROW(rt, DLYVERB_PARAM_DUCK_REL),
+                                           20.0f, 1000.0f), io->frames) *
+                     (st->dk_target - st->dk_db);
+    if (st->dk_db > -0.01f && st->dk_target == 0.0f)
+        st->dk_db = 0.0f;
+    g0 = (st->dk_gain > 0.0f) ? st->dk_gain : 1.0f;
+    g1 = exp2f(st->dk_db * 0.16609640f);
+    st->dk_gain = g1;
+    if (g0 == 1.0f && g1 == 1.0f)
+        return;
+    step = (g1 - g0) / (float)io->frames;
+    for (n = 0u; n < io->frames; n++) {
+        const float g = g0 + step * (float)(n + 1u);
+
+        io->l[n] *= g;
+        if (io->r)
+            io->r[n] *= g;
+    }
+}
+
 static void dlyVerb_bufferChanged(void *rt_void, const fx_share_t *share)
 {
     (void)dv_seat((DlyVerbRuntime *)rt_void, share);

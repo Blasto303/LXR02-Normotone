@@ -507,6 +507,8 @@ effect_type_id_t effects_activeType(void);
 uint8_t effects_lastApplied(uint8_t index);
 /* Plate send 0..127 of mixer slot 1..5 (0 unless DlyVerb runs). */
 uint8_t effects_plateSend(uint8_t slot);
+/* Sidechain hit for the DlyVerb duck; returns 0 when DlyVerb is not running. */
+uint8_t effects_duckTrigger(float weight);
 uint8_t effects_runtimeScene(void);
 uint8_t effects_activeIoFlags(void);
 const effects_common_runtime_t *effects_commonRuntime(void);
