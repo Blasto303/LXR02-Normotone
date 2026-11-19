@@ -367,6 +367,38 @@ int main(int argc, char **argv)
         printf("map active %u\n", plaitsMode_mapActive);
         return 0;
     }
+    /* RANDOM restore check: bench card bank blocks rndtest. */
+    if (argc > 4 && !strcmp(argv[4], "rndtest")) {
+        static kit_t own0, own4;
+        int g;
+#define PUMPR() for (g = 0; g < 60; g++) { live_service(); settle(); }
+        activate(0); PUMPR();
+        own0 = scene_getConst(0)->kit;
+        own4 = scene_getConst(4)->kit;
+        live_rndPageOpen();
+        ev_rnd(); PUMPR();
+        printf("rnd on, scene 1 morph changed: %s\n",
+               kit_same(&scene_getConst(0)->kit, &own0) ? "no (BAD)" : "yes");
+        live_beforeProjectSave();
+        printf("before save, scene 1 kit = own: %s\n",
+               kit_same(&scene_getConst(0)->kit, &own0) ? "yes" : "NO");
+        live_afterProjectSave(); PUMPR();
+        printf("after save, random back: %s\n",
+               kit_same(&scene_getConst(0)->kit, &own0) ? "no (BAD)" : "yes");
+        live_kitPageOpen(); live_kitSelect(8); PUMPR();
+        live_kitSelect(0); PUMPR();
+        live_kitPageClose();
+        ev_scene(4); PUMPR();
+        printf("after lend + pattern change, scene 1 kit = own: %s\n",
+               kit_same(&scene_getConst(0)->kit, &own0) ? "yes" : "NO");
+        ev_scene(0); PUMPR();
+        printf("back on 1 (new draw), scene 5 kit = own: %s\n",
+               kit_same(&scene_getConst(4)->kit, &own4) ? "yes" : "NO");
+        live_rndStep(0); PUMPR();   /* pattern only: kit random off */
+        printf("kit random off, scene 1 kit = own: %s\n",
+               kit_same(&scene_getConst(0)->kit, &own0) ? "yes" : "NO");
+        return 0;
+    }
     /* Peak mode: bench card bank blocks peaks. Run under callgrind; each
      * block is rendered by the wrapper named after the event before it. */
     if (argc > 4 && !strcmp(argv[4], "peaks")) {

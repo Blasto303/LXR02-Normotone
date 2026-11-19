@@ -88,6 +88,14 @@ static uint8_t  live_rndTarget = 3u;        /* 1 pattern, 2 kit, 3 both    */
 static uint8_t  live_rndScene = 0xFFu;
 static uint16_t live_rndBank = 0xFFFFu;
 static uint8_t  live_rndSavedAmt[INSTRUMENT_SLOT_COUNT];
+/*
+ * The Morph endpoints RANDOM overwrote on live_rndScene (slots 2..6), with
+ * the slot types they belong to. They are restored with the amounts, and the
+ * random values are never marked for AutoSave: the player's own Morph sounds
+ * (and any lent or Plaits kit) never reach the card through RANDOM.
+ */
+static instrument_param_value_t live_rndSavedMorph[INSTRUMENT_SLOT_COUNT][INSTRUMENT_PARAM_COUNT];
+static uint8_t  live_rndSavedType[INSTRUMENT_SLOT_COUNT];
 
 /* Called before audio starts, only when no saved Bank or Scene owns the mix. */
 void live_initFactoryRumble(void)
@@ -137,10 +145,15 @@ static uint8_t live_rndKitOn(void)
     return (uint8_t)(live_rndDose && (live_rndTarget & 2u));
 }
 
+static void live_rndSetAmounts(uint8_t scene, uint8_t amount);
+static void live_rndTake(uint8_t scene);
+
 /* New random Morph target for slots 2..6 of `scene`. */
 static void live_rndRollKit(uint8_t scene)
 {
     uint8_t slot;
+
+    live_rndTake(scene);
 
     for (slot = 1u; slot < INSTRUMENT_SLOT_COUNT; slot++) {
         kit_instrument_slot_t *inst = scene_instrumentSlot(scene, slot);
@@ -175,7 +188,6 @@ static void live_rndRollKit(uint8_t scene)
             inst->parameter_images.morph_instrument_parameters[i] =
                 (instrument_param_value_t)v;
         }
-        autosave_markInstrumentMorphDirty(scene, slot);
     }
     bank_invalidateSdCleanScene(scene);
 }
@@ -186,24 +198,56 @@ static void live_rndRestoreAmounts(void)
     uint8_t slot;
 
     if (live_rndScene != 0xFFu && live_rndBank == bank_restoreBankSlot()) {
+        /* Morph endpoints back, on slots that still hold the same type. */
+        for (slot = 1u; slot < INSTRUMENT_SLOT_COUNT; slot++) {
+            kit_instrument_slot_t *inst =
+                scene_instrumentSlot(live_rndScene, slot);
+
+            if (inst && inst->type == live_rndSavedType[slot])
+                memcpy(inst->parameter_images.morph_instrument_parameters,
+                       live_rndSavedMorph[slot], INSTRUMENT_PARAM_COUNT);
+        }
+        if (live_rndScene == scene_getActiveIndex())
+            preset_rebuildMorph();
         for (slot = 1u; slot < INSTRUMENT_SLOT_COUNT; slot++)
             preset_morphVoiceScene(live_rndScene, slot, live_rndSavedAmt[slot]);
     }
     live_rndScene = 0xFFu;
 }
 
+/*
+ * Make `scene` the RANDOM Scene: the previous one gets its values back, then
+ * the amounts and Morph endpoints of `scene` are kept for the restore. A
+ * re-roll on the same Scene keeps the first saved values.
+ */
+static void live_rndTake(uint8_t scene)
+{
+    uint8_t slot;
+
+    if (live_rndScene == scene)
+        return;
+    live_rndRestoreAmounts();
+    for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++) {
+        const kit_instrument_slot_t *inst = scene_instrumentSlotConst(scene, slot);
+
+        live_rndSavedAmt[slot] = scene_getVoiceMorphAmount(scene, slot);
+        live_rndSavedType[slot] = inst ? (uint8_t)inst->type : 0xFFu;
+        if (inst)
+            memcpy(live_rndSavedMorph[slot],
+                   inst->parameter_images.morph_instrument_parameters,
+                   INSTRUMENT_PARAM_COUNT);
+    }
+    live_rndScene = scene;
+    live_rndBank = bank_restoreBankSlot();
+}
+
+
 /* Voice Morph amount = dose on slots 2..6 of `scene`. */
 static void live_rndSetAmounts(uint8_t scene, uint8_t amount)
 {
     uint8_t slot;
 
-    if (live_rndScene != scene) {
-        live_rndRestoreAmounts();
-        for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++)
-            live_rndSavedAmt[slot] = scene_getVoiceMorphAmount(scene, slot);
-        live_rndScene = scene;
-        live_rndBank = bank_restoreBankSlot();
-    }
+    live_rndTake(scene);
     for (slot = 1u; slot < INSTRUMENT_SLOT_COUNT; slot++)
         preset_morphVoiceScene(scene, slot, amount);
 }
@@ -310,6 +354,10 @@ void live_kitLoadCommitted(uint16_t scene_mask)
     uint8_t active = scene_getActiveIndex();
 
     live_checkBackup();
+    /* RANDOM: the saved Morph belonged to the replaced kit; keep the new one. */
+    if (live_rndScene < 16u && (scene_mask & (uint16_t)(1u << live_rndScene)))
+        for (uint8_t slot = 1u; slot < INSTRUMENT_SLOT_COUNT; slot++)
+            live_rndSavedType[slot] = 0xFFu;
     if (active < 16u && (scene_mask & (uint16_t)(1u << active)))
         live_pendingKit = 0xFFu;
     if (live_backupScene < 16u &&
@@ -360,6 +408,9 @@ static uint8_t live_applyKit(uint8_t src)
         live_kitSource = src;
         return 1u;
     }
+    /* RANDOM: the kit gets its own Morph back before it is kept as backup. */
+    if (live_rndScene == active)
+        live_rndRestoreAmounts();
     if (!live_install(active, src))
         return 1u;
     preset_startDrumsetApply();
@@ -770,11 +821,19 @@ static uint8_t live_queuedPattern(void)
  */
 static uint8_t live_saveSrc = 0xFFu;
 
+static uint8_t live_saveRnd;
+
 void live_beforeProjectSave(void)
 {
     uint8_t active = scene_getActiveIndex();
     uint8_t keep = live_plaits;
 
+    /*
+     * RANDOM: its Morph sounds and amounts stay out of the project. The
+     * pattern gets its own values back for the save; a new draw follows it.
+     */
+    live_saveRnd = (uint8_t)(live_rndScene != 0xFFu);
+    live_rndRestoreAmounts();
     live_checkBackup();
     if (active >= 16u || live_backupScene != active)
         return;
@@ -787,6 +846,13 @@ void live_beforeProjectSave(void)
 
 void live_afterProjectSave(void)
 {
+    if (live_saveRnd) {
+        live_saveRnd = 0u;
+        /* A lent or Plaits kit comes back below and re-draws in
+         * live_applyKit; the pattern's own kit re-draws here. */
+        if (live_saveSrc == 0xFFu && live_rndKitOn())
+            live_rndApply(1u);
+    }
     if (live_saveSrc == 0xFFu)
         return;
     live_pendingKit = live_saveSrc;
