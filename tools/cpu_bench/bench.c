@@ -195,6 +195,10 @@ __attribute__((noinline)) static void ev_rnd(void)
     live_encoder(0, 1);       /* new draw */
 }
 
+__attribute__((noinline)) static void pm_cold(kit_t *t, const kit_t *k) { plaitsMode_convertKit(t, k); plaitsMode_mapOn(k); }
+__attribute__((noinline)) static void pm_warm(kit_t *t, const kit_t *k) { plaitsMode_convertKit(t, k); plaitsMode_mapOn(k); }
+__attribute__((noinline)) static uint8_t pm_step(void) { return plaitsMode_service(); }
+
 static void activate(uint8_t s)
 {
     scene_selectActive(s);
@@ -365,6 +369,23 @@ int main(int argc, char **argv)
             if (!kit_same(&scene_getConst(sc)->kit, &orig[sc]) && sc != 1)
                 printf("  scene %u kit differs from the card!\n", sc + 1);
         printf("map active %u\n", plaitsMode_mapActive);
+        return 0;
+    }
+    /* PLAITS cold build cost: bench card bank blocks pmcold (under callgrind). */
+    if (argc > 4 && !strcmp(argv[4], "pmcold")) {
+        static kit_t tmp, own;
+        int n = 0;
+
+        activate(0);
+        own = scene_getConst(0)->kit;
+        if (getenv("PM_STEPS")) {           /* background path, one table per call */
+            while (!pm_step()) n++;
+            printf("service steps %d\n", n);
+        } else {
+            pm_cold(&tmp, &own);
+            pm_warm(&tmp, &own);
+            printf("cold/warm done\n");
+        }
         return 0;
     }
     /* RANDOM restore check: bench card bank blocks rndtest. */
