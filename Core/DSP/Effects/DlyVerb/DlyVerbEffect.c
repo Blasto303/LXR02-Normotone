@@ -192,6 +192,9 @@ typedef struct {
     float plv;              /* plate-bus return ramp end */
     uint32_t p2_hold;       /* blocks left before the idle plate sleeps */
     uint32_t p2_clean;      /* 1 while its lines hold only its own content */
+    /* mno, dig model: tap crossfade on a `div` change (quarter-rate taps). */
+    float q_tb;             /* destination tap */
+    float q_xf;             /* 0..1 progress, 0 = idle */
 } DlyVerbState;
 
 _Static_assert(sizeof(DlyVerbState) <= DLYVERB_STATE_BYTES,
@@ -927,6 +930,7 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         const float plv_inc = (plv_to - plv) / (float)(io->frames / 4u);
         const float *aux = io->aux;
         const float tq = 0.5f * t_l;
+        const uint32_t dig = (model == DLYVERB_MODEL_DIGITAL);
         const float adv = (float)half;   /* half-rate samples per block */
         float mod;
         float mod_inc;
@@ -965,6 +969,17 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         wp = st->wp;
         valid = st->valid;
         ptr = st->rv_ptr;
+        /*
+         * dig has no glide: a new `div` crossfades from the playing tap to
+         * the new one over 1,024 half-rate samples (about 46 ms), as in the
+         * codec-rate modes. A change during a fade waits for its end.
+         */
+        if (!dig)
+            st->q_xf = 0.0f;
+        else if (st->q_xf == 0.0f && fabsf(tq - st->tap_a[0]) > 0.5f) {
+            st->q_tb = tq;
+            st->q_xf = 1e-6f;
+        }
         if (p2_run && !st->p2_clean) {
             dv_plate2Clear(rv, ptr);
             st->p2_bw = 0.0f;
@@ -1007,6 +1022,18 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
                 float va = dv_ringRead(ring_l, len, wp, al);
 
                 va = ((al + 2.0f) <= (float)valid) ? va : 0.0f;
+                if (st->q_xf != 0.0f) {
+                    const float bl = st->q_tb + mod;
+                    float vb = dv_ringRead(ring_l, len, wp, bl);
+
+                    vb = ((bl + 2.0f) <= (float)valid) ? vb : 0.0f;
+                    va += st->q_xf * (vb - va);
+                    st->q_xf += 2.0f * DV_FADE_INC;
+                    if (st->q_xf >= 1.0f) {
+                        st->tap_a[0] = st->q_tb;
+                        st->q_xf = 0.0f;
+                    }
+                }
                 st->lp[0] += lp4 * (va - st->lp[0]);
             }
             st->hp_y[0] = hp4 * (st->hp_y[0] + st->lp[0] - st->hp_x[0]);
