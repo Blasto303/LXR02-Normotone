@@ -195,6 +195,7 @@ typedef struct {
     /* mno, dig model: tap crossfade on a `div` change (quarter-rate taps). */
     float q_tb;             /* destination tap */
     float q_xf;             /* 0..1 progress, 0 = idle */
+    float dec_a[2];         /* str/png/wid: plate-bus image filter */
 } DlyVerbState;
 
 _Static_assert(sizeof(DlyVerbState) <= DLYVERB_STATE_BYTES,
@@ -592,6 +593,7 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
     int16_t *ring_l;
     int16_t *ring_r;
     float xs_l[DV_HALF_FRAMES_MAX / 2u];
+    float xa[DV_HALF_FRAMES_MAX / 2u];
     float xs_r[DV_HALF_FRAMES_MAX / 2u];
     float ys_l[DV_HALF_FRAMES_MAX / 2u];
     float ys_r[DV_HALF_FRAMES_MAX / 2u];
@@ -661,6 +663,7 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
     float model_lp_hz;
     float user_lp_hz;
     uint32_t aux_on;
+    uint8_t mno;
     float pdamp;
     float plv;
     float plv_to;
@@ -789,8 +792,24 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
     hp_r = expf(-DV_TWO_PI * dv_expHz(DV_ROW(rt, DLYVERB_PARAM_HIGHPASS),
                                       15.0f, 2000.0f) / DV_FS);
 
+    /*
+     * Leaving mno: the taps hold quarter-rate samples; the codec-rate path
+     * reads half-rate samples, so double them (and mute the rings, as
+     * before). In mno the trigger below is skipped: it would compare a
+     * quarter-rate tap with a half-rate target.
+     */
+    mno = (uint8_t)(stereo == DLYVERB_STEREO_MONO && (io->frames & 3u) == 0u);
+    if (!mno && st->q_mode) {
+        st->q_mode = 0u;
+        st->valid = 0u;
+        st->tap_a[0] = st->tap_a[1] = st->tap_b[0] = st->tap_b[1] =
+            2.0f * st->tap_a[0];
+        st->xfade = 0.0f;
+        st->xfade_inc = 0.0f;
+    }
+
     /* Digital model: a new target starts a crossfade to a second tap. */
-    if (st->xfade_inc == 0.0f) {
+    if (!mno && st->xfade_inc == 0.0f) {
         if (model == DLYVERB_MODEL_DIGITAL &&
             (fabsf(t_l - st->tap_a[0]) > 0.5f ||
              fabsf(t_r - st->tap_a[1]) > 0.5f)) {
@@ -906,7 +925,7 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
      * sound and halves the cost again. The dig crossfade is replaced by the
      * glide in this mode.
      */
-    if (stereo == DLYVERB_STEREO_MONO && (io->frames & 3u) == 0u) {
+    if (mno) {
         const uint32_t q = io->frames / 4u;
         /*
          * Tone in mno acts on the whole rumble at the output (echo and
@@ -926,7 +945,7 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         const float glide4 = 1.0f - (1.0f - glide_k) * (1.0f - glide_k);
         const float damp2 = damp * damp;
         const float pdamp2 = pdamp * pdamp;
-        const uint32_t p2_run = (st->p2_hold != 0u) && io->aux;
+        const uint32_t p2_run = (st->p2_hold != 0u);   /* tail runs on after the sends stop */
         const float plv_inc = (plv_to - plv) / (float)(io->frames / 4u);
         const float *aux = io->aux;
         const float tq = 0.5f * t_l;
@@ -945,6 +964,8 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
             st->q_mod = 0.0f;
             st->q_rmod = 0.0f;
             st->p2_clean = 0u;      /* the full plate wrote over its lines */
+            st->q_xf = 0.0f;
+            st->q_tb = tq;
         }
         st->ph_tri += inc_mod * adv;          st->ph_tri -= floorf(st->ph_tri);
         st->ph_flutter += inc_flutter * adv;  st->ph_flutter -= floorf(st->ph_flutter);
@@ -1049,10 +1070,10 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
             p2_r = 0.0f;
             plv += plv_inc;
             if (p2_run) {
-                const float *ai = &aux[4u * i];
+                const float *ai = aux ? &aux[4u * i] : 0;
 
                 dv_plateHalf(&st->p2_bw, st->p2_damp, st->p2_tank, rv, ptr, 1,
-                             0.125f * (ai[0] + ai[1] + ai[2] + ai[3]),
+                             ai ? 0.125f * (ai[0] + ai[1] + ai[2] + ai[3]) : 0.0f,
                              decay, dd2, pdamp2, -rmod, &p2_l, &p2_r);
                 p2_l *= plv;
                 p2_r *= plv;
@@ -1085,8 +1106,13 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
             st->o_hpy[1] = ohp4 * (st->o_hpy[1] + st->o_lp[1] - st->o_hpx[1]);
             st->o_hpx[1] = st->o_lp[1];
             /* The plate bus joins after the rumble's tone stage. */
-            y_l = DV_LIMIT_INV * dv_soft(DV_LIMIT * (st->o_hpy[0] + p2_l));
-            y_r = DV_LIMIT_INV * dv_soft(DV_LIMIT * (st->o_hpy[1] + p2_r));
+            /* ...with its own soft clip, so a hot plate never ducks the rumble. */
+            y_l = DV_LIMIT_INV * dv_soft(DV_LIMIT * st->o_hpy[0]);
+            y_r = DV_LIMIT_INV * dv_soft(DV_LIMIT * st->o_hpy[1]);
+            if (p2_run) {
+                y_l += DV_LIMIT_INV * dv_soft(DV_LIMIT * p2_l);
+                y_r += DV_LIMIT_INV * dv_soft(DV_LIMIT * p2_r);
+            }
             for (j = 0u; j < 4u; j++) {
                 const float k = 0.25f * (float)(j + 1u);
                 const float ol = st->prev_out[0] + k * (y_l - st->prev_out[0]);
@@ -1114,11 +1140,6 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         st->rv_ptr = ptr;
         return;
     }
-    if (st->q_mode) {               /* rings held quarter-rate content */
-        st->q_mode = 0u;
-        st->valid = 0u;
-    }
-
     /* 2:1 decimation behind the 9 kHz image filter. */
     for (n = 0u; n < half; n++) {
         const float r0 = right ? right[2u * n] : left[2u * n];
@@ -1128,6 +1149,10 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         (void)dv_biquad(r0, st->dec_z[1]);
         xs_l[n] = dv_biquad(left[2u * n + 1u], st->dec_z[0]);
         xs_r[n] = dv_biquad(r1, st->dec_z[1]);
+        if (io->aux) {
+            (void)dv_biquad(io->aux[2u * n], st->dec_a);
+            xa[n] = dv_biquad(io->aux[2u * n + 1u], st->dec_a);
+        }
     }
 
     wp = st->wp;
@@ -1252,9 +1277,10 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         /* Plate: fed by the echoes, or by the driven input (par). */
         rin = 0.5f * ((eo_l + eo_r) + r_par * ((in_l + in_r) - (eo_l + eo_r)));
         /* str/png/wid: the full plate fills the ring, so the plate bus
-         * feeds the shared plate (scaled by plv). */
+         * feeds the shared plate, filtered like the main input and at the
+         * mno input scale (0.5 x plv); its return then follows rvl. */
         if (io->aux)
-            rin += plv_to * (io->aux[2u * n] + io->aux[2u * n + 1u]);
+            rin += plv_to * xa[n];
         dv_plate(st, rv, ptr, 0.5f * rin, decay, dd2, damp,
                  st->s_rmod, &rv_l, &rv_r);
         ptr = (ptr - 1u) & DV_RVB_MASK;

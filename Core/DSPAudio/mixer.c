@@ -114,9 +114,20 @@ static uint8_t mixer_addVoiceToPlateBus(uint8_t slot, uint8_t scene_index,
 	float last = mixer_plate_last_gain[slot];
 
 	if (send) {
-		gain = (float)send * (1.0f / 127.0f) * instrumentManager_gateGain(slot);
-		if (scene_getVoiceFaderSetting(scene_index, slot) != MIXER_FADER_POST)
-			gain *= slider_vol[slot];
+		/* The same fader laws as the FX send (mixer_faderGains). */
+		const float amount = (float)send * (1.0f / 127.0f);
+		const float fader = slider_vol[slot];
+		const uint8_t mode = scene_getVoiceFaderSetting(scene_index, slot);
+
+		if (mode == MIXER_FADER_POST)
+			gain = amount;
+		else if (mode == MIXER_FADER_XFD)
+			gain = amount * adc_sliderGainMirrored(fader);
+		else if (mode == MIXER_FADER_DW)
+			gain = instrumentManager_runtimeVolume(slot) * fader * sqrtf(amount);
+		else
+			gain = amount * fader;
+		gain *= instrumentManager_gateGain(slot);
 	}
 	mixer_plate_last_gain[slot] = gain;
 	if (gain <= 0.0f && last <= 0.0f)
