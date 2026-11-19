@@ -30,7 +30,7 @@
  * two 4,096-sample delay rings.
  */
 #define DLYVERB_HALF_RATE_HZ      22054u
-#define DLYVERB_STATE_BYTES       256u
+#define DLYVERB_STATE_BYTES       288u
 #define DLYVERB_RVB_SAMPLES       16384u
 #define DLYVERB_RVB_BYTES         (DLYVERB_RVB_SAMPLES * 2u)
 #define DLYVERB_BUFFER_MIN_BYTES  (DLYVERB_STATE_BYTES + DLYVERB_RVB_BYTES + \
@@ -40,7 +40,7 @@
 #define DLYVERB_DIVISION_COUNT    14u
 
 /* Type rows 3..18 kept raw in the runtime. */
-#define DLYVERB_TYPE_ROWS         16u
+#define DLYVERB_TYPE_ROWS         23u
 
 /*
  * DlyVerb runtime (a member of EffectsManager's 76 B DTCM runtime union).

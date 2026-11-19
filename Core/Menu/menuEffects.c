@@ -88,8 +88,8 @@ static const char *const menuEffects_runLong[EFFECT_SEQ_RUN_MODE_COUNT] = {
     "forward", "reverse", "pingpong", "random", "select"
 };
 
-/* Physical SELECT indexes: OSC, FILTER and MIX. */
-enum { RUMBLE_DELAY = 0, RUMBLE_REVERB = 5, RUMBLE_COMP = 7 };
+/* Physical SELECT indexes: OSC, FILTER, LFO (plate bus) and MIX. */
+enum { RUMBLE_DELAY = 0, RUMBLE_REVERB = 5, RUMBLE_PLATE = 6, RUMBLE_COMP = 7 };
 static uint8_t rumbleEditor;
 static const uint8_t delayRows[][4] = {
     {DLYVERB_PARAM_MODEL, DLYVERB_PARAM_DIVISION, DLYVERB_PARAM_FEEDBACK, DLYVERB_PARAM_DLY_LEVEL},
@@ -98,6 +98,11 @@ static const uint8_t delayRows[][4] = {
 };
 static const uint8_t reverbRows[4] = {
     DLYVERB_PARAM_RVB_LEVEL, DLYVERB_PARAM_RVB_DECAY, DLYVERB_PARAM_RVB_DAMP, DLYVERB_PARAM_RVB_ROUTE
+};
+/* Plate bus: sends of DRUM2, DRUM3, SNARE, CLP/CYM, then HIHATS, level, tone. */
+static const uint8_t plateRows[2][4] = {
+    {DLYVERB_PARAM_PLATE_D2, DLYVERB_PARAM_PLATE_D3, DLYVERB_PARAM_PLATE_SN, DLYVERB_PARAM_PLATE_CY},
+    {DLYVERB_PARAM_PLATE_HH, DLYVERB_PARAM_PLATE_LEVEL, DLYVERB_PARAM_PLATE_TONE, EFFECT_LANE_NONE}
 };
 
 void menuEffects_openRumble(void)
@@ -150,6 +155,8 @@ static uint8_t menuEffects_screenCount(uint8_t sub_page)
     if (rumbleEditor) {
         if (sub_page == RUMBLE_DELAY)
             return sizeof(delayRows) / sizeof(delayRows[0]);
+        if (sub_page == RUMBLE_PLATE)
+            return sizeof(plateRows) / sizeof(plateRows[0]);
         return sub_page == RUMBLE_REVERB || sub_page == RUMBLE_COMP;
     }
     if (sub_page == 0u)
@@ -187,7 +194,9 @@ static uint8_t menuEffects_cellAt(uint8_t sub_page, uint8_t screen,
             out->index = column;
             return 1u;
         }
-        index = sub_page == RUMBLE_DELAY ? delayRows[screen][column] : reverbRows[column];
+        index = sub_page == RUMBLE_DELAY ? delayRows[screen][column]
+              : sub_page == RUMBLE_PLATE ? plateRows[screen][column]
+              : reverbRows[column];
     } else if (sub_page == 0u) {
         static const uint8_t second[MENU_FX_CELLS] = {
             MENU_FX_CELL_RUN, MENU_FX_CELL_LENGTH,

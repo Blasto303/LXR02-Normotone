@@ -109,7 +109,10 @@ void live_initFactoryRumble(void)
         [DLYVERB_PARAM_AGE] = 0u,
         [DLYVERB_PARAM_RVB_DECAY] = 118u,
         [DLYVERB_PARAM_RVB_DAMP] = 124u,
-        [DLYVERB_PARAM_RVB_ROUTE] = DLYVERB_ROUTE_FEEDBACK
+        [DLYVERB_PARAM_RVB_ROUTE] = DLYVERB_ROUTE_FEEDBACK,
+        /* Plate bus: sends closed, return and tone ready. */
+        [DLYVERB_PARAM_PLATE_LEVEL] = 100u,
+        [DLYVERB_PARAM_PLATE_TONE] = 64u
     };
 
     for (uint8_t i = 0; i < SCENE_COUNT; ++i) {

@@ -98,6 +98,40 @@ typedef union {
 static INDTCMZ mixer_fx_bus_t mixer_fx_bus;
 
 /*
+ * Normotone plate bus: mono, normalized float (1.0 = int16 full scale), fed
+ * by the DlyVerb plate sends of slots 1..5 (pl2 pl3 pl4 pl5 plh) and handed
+ * to the Effect as io.aux. The send follows the track fader like the FX send
+ * (post mode: fader ignored) and the roll gate. 128 B DTCM + 24 B.
+ */
+static INDTCMZ float mixer_plate_bus[OUTPUT_DMA_SIZE];
+static float mixer_plate_last_gain[6];
+
+static uint8_t mixer_addVoiceToPlateBus(uint8_t slot, uint8_t scene_index,
+		const int16_t *data)
+{
+	const uint8_t send = effects_plateSend(slot);
+	float gain = 0.0f;
+	float last = mixer_plate_last_gain[slot];
+
+	if (send) {
+		gain = (float)send * (1.0f / 127.0f) * instrumentManager_gateGain(slot);
+		if (scene_getVoiceFaderSetting(scene_index, slot) != MIXER_FADER_POST)
+			gain *= slider_vol[slot];
+	}
+	mixer_plate_last_gain[slot] = gain;
+	if (gain <= 0.0f && last <= 0.0f)
+		return 0u;
+	{
+		const float k = 1.0f / 32767.0f;
+		const float delta = (gain - last) * (1.0f / (OUTPUT_DMA_SIZE - 1.f));
+
+		for (uint8_t i = 0u; i < OUTPUT_DMA_SIZE; i++)
+			mixer_plate_bus[i] += (float)data[i] * k * (last + (float)i * delta);
+	}
+	return 1u;
+}
+
+/*
  * Last effective per-slot FX send gain at the end of the previous block.
  *
  * What: send amount x send-side fader, one float per slot (24 B DTCM). Why:
@@ -991,8 +1025,12 @@ void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2)
 	const uint8_t fx_scene = scene_getActiveIndex();
 	const effects_common_runtime_t *fx_common = effects_commonRuntime();
 	const uint8_t fx_route = mixer_checkOutJackAvailable(fx_common->route);
-	if (fx_active)
+	uint8_t plate_used = 0u;
+	if (fx_active) {
 		bufferTool_clearBuffer32(&mixer_fx_bus.mx[0][0], OUTPUT_DMA_SIZE * 2);
+		for (uint8_t i = 0u; i < OUTPUT_DMA_SIZE; i++)
+			mixer_plate_bus[i] = 0.0f;
+	}
 
 	// //---------------------------------------
 	// // TEST BLOCK - Calc and add test sine tone
@@ -1078,6 +1116,9 @@ void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2)
 					&output[pos],&output[pos+1],&output2[pos],&output2[pos+1]);
 		mixer_voice_last_gain[slot] = voiceGain;
 		mixer_send_last_gain[slot] = sendGain;
+		if (fx_active && slot != 0u)
+			plate_used |= mixer_addVoiceToPlateBus(slot,
+					preset_getSlotPlayedScene(slot), sampleData);
 	}
 
 	if (fx_active) {
@@ -1112,6 +1153,7 @@ void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2)
 		io.frames = OUTPUT_DMA_SIZE;
 		io.channels = fx_channels_in;
 		io.share = &share;
+		io.aux = plate_used ? mixer_plate_bus : 0;
 		effects_process(&io);
 
 		/*

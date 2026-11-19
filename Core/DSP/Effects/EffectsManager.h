@@ -118,6 +118,7 @@ typedef struct {
     uint8_t frames;
     uint8_t channels;
     const fx_share_t *share;
+    const float *aux;   /* Normotone plate bus (mono, frames), or NULL */
 } effect_io_t;
 
 /*
@@ -504,6 +505,8 @@ void effects_process(effect_io_t *io);
 effect_type_id_t effects_activeType(void);
 /* Diagnostics: value last pushed to the runtime, and the runtime's Scene. */
 uint8_t effects_lastApplied(uint8_t index);
+/* Plate send 0..127 of mixer slot 1..5 (0 unless DlyVerb runs). */
+uint8_t effects_plateSend(uint8_t slot);
 uint8_t effects_runtimeScene(void);
 uint8_t effects_activeIoFlags(void);
 const effects_common_runtime_t *effects_commonRuntime(void);

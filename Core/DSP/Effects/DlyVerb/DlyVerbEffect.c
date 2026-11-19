@@ -98,6 +98,8 @@
  */
 #define DV_RVB_MASK   (DLYVERB_RVB_SAMPLES - 1u)
 #define DV_RVB_EXC    16
+/* Plate-bus sleep delay: 12 s of 32-frame blocks. */
+#define DV_P2_HOLD_BLOCKS ((uint32_t)(12.0f * DV_FS / 32.0f))
 #define DV_L_IN1      102
 #define DV_L_IN2      77
 #define DV_L_IN3      273
@@ -183,6 +185,13 @@ typedef struct {
     float o_lp[2];
     float o_hpx[2];
     float o_hpy[2];
+    /* mno: the Normotone plate bus (second plate, see dv_plateHalf). */
+    float p2_bw;
+    float p2_damp[2];
+    float p2_tank[2];
+    float plv;              /* plate-bus return ramp end */
+    uint32_t p2_hold;       /* blocks left before the idle plate sleeps */
+    uint32_t p2_clean;      /* 1 while its lines hold only its own content */
 } DlyVerbState;
 
 _Static_assert(sizeof(DlyVerbState) <= DLYVERB_STATE_BYTES,
@@ -365,12 +374,25 @@ static inline void dv_plate(DlyVerbState *st, int16_t *rv, uint32_t ptr,
  * Inputs/outputs as dv_plate().
  */
 #define DV_H(x) ((x) / 2)
-static inline void dv_plateHalf(DlyVerbState *st, int16_t *rv, uint32_t ptr,
+/*
+ * Second plate (Normotone plate bus). At the quarter rate each line uses
+ * only the first half of its region, so a second plate fits in the upper
+ * halves: base DV_H(L) + 1 (all-pass 1: + the doubled excursion), length
+ * DV_H(L) - 1 so it ends inside the region even when L is even. Same loop
+ * times within one sample, so the same decay; the 1-sample offset also
+ * decorrelates it from the rumble plate. sec is a compile-time constant.
+ */
+#define DV_PB(b, L)  ((b) + (sec ? DV_H(L) + 1 : 0))
+#define DV_PBA(b, L) ((b) + (sec ? DV_H(L) + 2 * DV_H(DV_RVB_EXC) + 1 : 0))
+#define DV_PL(L)     (DV_H(L) - (sec ? 1 : 0))
+__attribute__((always_inline))
+static inline void dv_plateHalf(float *bw, float *dz, float *tk,
+                                int16_t *rv, uint32_t ptr, const int sec,
                                 float x, float decay, float dd2, float damp2,
                                 float mod, float *out_l, float *out_r)
 {
-    const float tank_l = st->rv_tank[0];
-    const float tank_r = st->rv_tank[1];
+    const float tank_l = tk[0];
+    const float tank_r = tk[1];
     float a;
     float d;
     float pos;
@@ -378,53 +400,85 @@ static inline void dv_plateHalf(DlyVerbState *st, int16_t *rv, uint32_t ptr,
     float f;
     float w;
 
-    st->rv_bw += 0.9775f * (x - st->rv_bw);   /* 0.85 at twice the rate */
-    a = dv_allpass(rv, ptr, DV_B_IN1, DV_H(DV_L_IN1), 0.75f, st->rv_bw);
-    a = dv_allpass(rv, ptr, DV_B_IN2, DV_H(DV_L_IN2), 0.75f, a);
-    a = dv_allpass(rv, ptr, DV_B_IN3, DV_H(DV_L_IN3), 0.625f, a);
-    a = dv_allpass(rv, ptr, DV_B_IN4, DV_H(DV_L_IN4), 0.625f, a);
+    *bw += 0.9775f * (x - *bw);   /* 0.85 at twice the rate */
+    a = dv_allpass(rv, ptr, DV_PB(DV_B_IN1, DV_L_IN1), DV_PL(DV_L_IN1), 0.75f, *bw);
+    a = dv_allpass(rv, ptr, DV_PB(DV_B_IN2, DV_L_IN2), DV_PL(DV_L_IN2), 0.75f, a);
+    a = dv_allpass(rv, ptr, DV_PB(DV_B_IN3, DV_L_IN3), DV_PL(DV_L_IN3), 0.625f, a);
+    a = dv_allpass(rv, ptr, DV_PB(DV_B_IN4, DV_L_IN4), DV_PL(DV_L_IN4), 0.625f, a);
 
-    pos = (float)(DV_H(DV_L_AP1L) + DV_H(DV_RVB_EXC)) +
+    pos = (float)(DV_PL(DV_L_AP1L) + DV_H(DV_RVB_EXC)) +
           (float)DV_H(DV_RVB_EXC) * 0.75f * mod;
     i = (int)pos;
     f = pos - (float)i;
-    d = DV_RD(DV_B_AP1L, i) + f * (DV_RD(DV_B_AP1L, i + 1) -
-                                   DV_RD(DV_B_AP1L, i));
+    d = DV_RD(DV_PBA(DV_B_AP1L, DV_L_AP1L), i) +
+        f * (DV_RD(DV_PBA(DV_B_AP1L, DV_L_AP1L), i + 1) -
+             DV_RD(DV_PBA(DV_B_AP1L, DV_L_AP1L), i));
     w = a + decay * dv_soft(tank_r) + 0.7f * d;
-    DV_WR(DV_B_AP1L, w);
-    DV_WR(DV_B_D1L, d - 0.7f * w);
-    d = DV_RD(DV_B_D1L, DV_H(DV_L_D1L));
-    st->rv_damp[0] = d + damp2 * (st->rv_damp[0] - d);
-    d = dv_allpass(rv, ptr, DV_B_AP2L, DV_H(DV_L_AP2L), dd2,
-                   st->rv_damp[0] * decay);
-    DV_WR(DV_B_D2L, d);
+    DV_WR(DV_PBA(DV_B_AP1L, DV_L_AP1L), w);
+    DV_WR(DV_PB(DV_B_D1L, DV_L_D1L), d - 0.7f * w);
+    d = DV_RD(DV_PB(DV_B_D1L, DV_L_D1L), DV_PL(DV_L_D1L));
+    dz[0] = d + damp2 * (dz[0] - d);
+    d = dv_allpass(rv, ptr, DV_PB(DV_B_AP2L, DV_L_AP2L), DV_PL(DV_L_AP2L), dd2,
+                   dz[0] * decay);
+    DV_WR(DV_PB(DV_B_D2L, DV_L_D2L), d);
 
-    pos = (float)(DV_H(DV_L_AP1R) + DV_H(DV_RVB_EXC)) -
+    pos = (float)(DV_PL(DV_L_AP1R) + DV_H(DV_RVB_EXC)) -
           (float)DV_H(DV_RVB_EXC) * 0.75f * mod;
     i = (int)pos;
     f = pos - (float)i;
-    d = DV_RD(DV_B_AP1R, i) + f * (DV_RD(DV_B_AP1R, i + 1) -
-                                   DV_RD(DV_B_AP1R, i));
+    d = DV_RD(DV_PBA(DV_B_AP1R, DV_L_AP1R), i) +
+        f * (DV_RD(DV_PBA(DV_B_AP1R, DV_L_AP1R), i + 1) -
+             DV_RD(DV_PBA(DV_B_AP1R, DV_L_AP1R), i));
     w = a + decay * dv_soft(tank_l) + 0.7f * d;
-    DV_WR(DV_B_AP1R, w);
-    DV_WR(DV_B_D1R, d - 0.7f * w);
-    d = DV_RD(DV_B_D1R, DV_H(DV_L_D1R));
-    st->rv_damp[1] = d + damp2 * (st->rv_damp[1] - d);
-    d = dv_allpass(rv, ptr, DV_B_AP2R, DV_H(DV_L_AP2R), dd2,
-                   st->rv_damp[1] * decay);
-    DV_WR(DV_B_D2R, d);
+    DV_WR(DV_PBA(DV_B_AP1R, DV_L_AP1R), w);
+    DV_WR(DV_PB(DV_B_D1R, DV_L_D1R), d - 0.7f * w);
+    d = DV_RD(DV_PB(DV_B_D1R, DV_L_D1R), DV_PL(DV_L_D1R));
+    dz[1] = d + damp2 * (dz[1] - d);
+    d = dv_allpass(rv, ptr, DV_PB(DV_B_AP2R, DV_L_AP2R), DV_PL(DV_L_AP2R), dd2,
+                   dz[1] * decay);
+    DV_WR(DV_PB(DV_B_D2R, DV_L_D2R), d);
 
-    st->rv_tank[0] = DV_RD(DV_B_D2L, DV_H(DV_L_D2L));
-    st->rv_tank[1] = DV_RD(DV_B_D2R, DV_H(DV_L_D2R));
+    tk[0] = DV_RD(DV_PB(DV_B_D2L, DV_L_D2L), DV_PL(DV_L_D2L));
+    tk[1] = DV_RD(DV_PB(DV_B_D2R, DV_L_D2R), DV_PL(DV_L_D2R));
 
-    *out_l = 0.6f * (DV_RD(DV_B_D1R, DV_H(192)) + DV_RD(DV_B_D1R, DV_H(2141))
-                     - DV_RD(DV_B_AP2R, DV_H(1377)) + DV_RD(DV_B_D2R, DV_H(1437))
-                     - DV_RD(DV_B_D1L, DV_H(1433)) - DV_RD(DV_B_AP2L, DV_H(135))
-                     - DV_RD(DV_B_D2L, DV_H(768)));
-    *out_r = 0.6f * (DV_RD(DV_B_D1L, DV_H(254)) + DV_RD(DV_B_D1L, DV_H(2611))
-                     - DV_RD(DV_B_AP2L, DV_H(884)) + DV_RD(DV_B_D2L, DV_H(1925))
-                     - DV_RD(DV_B_D1R, DV_H(1520)) - DV_RD(DV_B_AP2R, DV_H(241))
-                     - DV_RD(DV_B_D2R, DV_H(87)));
+#define DV_T(b, L, t) DV_RD(DV_PB(b, L), DV_H(t))
+    *out_l = 0.6f * (DV_T(DV_B_D1R, DV_L_D1R, 192) + DV_T(DV_B_D1R, DV_L_D1R, 2141)
+                     - DV_T(DV_B_AP2R, DV_L_AP2R, 1377) + DV_T(DV_B_D2R, DV_L_D2R, 1437)
+                     - DV_T(DV_B_D1L, DV_L_D1L, 1433) - DV_T(DV_B_AP2L, DV_L_AP2L, 135)
+                     - DV_T(DV_B_D2L, DV_L_D2L, 768));
+    *out_r = 0.6f * (DV_T(DV_B_D1L, DV_L_D1L, 254) + DV_T(DV_B_D1L, DV_L_D1L, 2611)
+                     - DV_T(DV_B_AP2L, DV_L_AP2L, 884) + DV_T(DV_B_D2L, DV_L_D2L, 1925)
+                     - DV_T(DV_B_D1R, DV_L_D1R, 1520) - DV_T(DV_B_AP2R, DV_L_AP2R, 241)
+                     - DV_T(DV_B_D2R, DV_L_D2R, 87));
+#undef DV_T
+}
+
+/* Zero the second plate's lines (their place is relative to the pointer). */
+static void dv_plate2Clear(int16_t *rv, uint32_t ptr)
+{
+    static const uint16_t base[12] = {
+        DV_B_IN1 + DV_H(DV_L_IN1) + 1, DV_B_IN2 + DV_H(DV_L_IN2) + 1,
+        DV_B_IN3 + DV_H(DV_L_IN3) + 1, DV_B_IN4 + DV_H(DV_L_IN4) + 1,
+        DV_B_AP1L + DV_H(DV_L_AP1L) + 2 * DV_H(DV_RVB_EXC) + 1,
+        DV_B_D1L + DV_H(DV_L_D1L) + 1, DV_B_AP2L + DV_H(DV_L_AP2L) + 1,
+        DV_B_D2L + DV_H(DV_L_D2L) + 1,
+        DV_B_AP1R + DV_H(DV_L_AP1R) + 2 * DV_H(DV_RVB_EXC) + 1,
+        DV_B_D1R + DV_H(DV_L_D1R) + 1, DV_B_AP2R + DV_H(DV_L_AP2R) + 1,
+        DV_B_D2R + DV_H(DV_L_D2R) + 1
+    };
+    static const uint16_t span[12] = {
+        DV_H(DV_L_IN1), DV_H(DV_L_IN2), DV_H(DV_L_IN3), DV_H(DV_L_IN4),
+        DV_H(DV_L_AP1L) + 2 * DV_H(DV_RVB_EXC), DV_H(DV_L_D1L),
+        DV_H(DV_L_AP2L), DV_H(DV_L_D2L),
+        DV_H(DV_L_AP1R) + 2 * DV_H(DV_RVB_EXC), DV_H(DV_L_D1R),
+        DV_H(DV_L_AP2R), DV_H(DV_L_D2R)
+    };
+    uint32_t k;
+    uint32_t j;
+
+    for (k = 0u; k < 12u; k++)
+        for (j = 0u; j < span[k]; j++)
+            rv[(ptr + base[k] + j) & DV_RVB_MASK] = 0;
 }
 
 /*
@@ -497,7 +551,7 @@ static void dlyVerb_exportHandoff(const void *rt_void, fxbuf_handoff_t *out)
         out->state_flags |= FXBUF_STATE_EFFECT_WRITTEN;
 }
 
-/* Store one resolved row value (rows 3..18); conversions happen per block. */
+/* Store one resolved row value (rows 3..25); conversions happen per block. */
 static void dlyVerb_writeParam(void *rt_void, uint8_t index, uint8_t value)
 {
     DlyVerbRuntime *rt = (DlyVerbRuntime *)rt_void;
@@ -603,6 +657,10 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
     float drive_lp_a;
     float model_lp_hz;
     float user_lp_hz;
+    uint32_t aux_on;
+    float pdamp;
+    float plv;
+    float plv_to;
 
     if (!rt || !io || !io->l || io->frames == 0u ||
         io->frames > DV_HALF_FRAMES_MAX)
@@ -782,6 +840,33 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
                        (1.0f / 127.0f);
     }
 
+    /*
+     * Plate bus: ptn sets the second plate's damping (127 = brightest),
+     * plv its return level (ramped). The plate sleeps after about 12 s
+     * without input, which is longer than its tail at rdc 127.
+     */
+    {
+        const float* aux = io->aux;
+        uint32_t k;
+
+        aux_on = 0u;
+        if (aux)
+            for (k = 0u; k < io->frames; k++)
+                if (aux[k] != 0.0f) {
+                    aux_on = 1u;
+                    break;
+                }
+        if (aux_on)
+            st->p2_hold = DV_P2_HOLD_BLOCKS;
+        else if (st->p2_hold)
+            st->p2_hold--;
+        pdamp = 0.05f + 0.85f * (1.0f - (float)DV_ROW(rt, DLYVERB_PARAM_PLATE_TONE) *
+                                        (1.0f / 127.0f));
+        plv = st->plv;
+        plv_to = (float)DV_ROW(rt, DLYVERB_PARAM_PLATE_LEVEL) * (1.0f / 127.0f);
+        st->plv = plv_to;
+    }
+
     /* Gain ramps across the block's half-rate frames. */
     fb = st->fb;
     dlv = st->dlv;
@@ -837,6 +922,10 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         const float dlp4 = 1.0f - (1.0f - drive_lp_a) * (1.0f - drive_lp_a);
         const float glide4 = 1.0f - (1.0f - glide_k) * (1.0f - glide_k);
         const float damp2 = damp * damp;
+        const float pdamp2 = pdamp * pdamp;
+        const uint32_t p2_run = (st->p2_hold != 0u) && io->aux;
+        const float plv_inc = (plv_to - plv) / (float)(io->frames / 4u);
+        const float *aux = io->aux;
         const float tq = 0.5f * t_l;
         const float adv = (float)half;   /* half-rate samples per block */
         float mod;
@@ -851,6 +940,7 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
             st->tap_a[0] = tq;
             st->q_mod = 0.0f;
             st->q_rmod = 0.0f;
+            st->p2_clean = 0u;      /* the full plate wrote over its lines */
         }
         st->ph_tri += inc_mod * adv;          st->ph_tri -= floorf(st->ph_tri);
         st->ph_flutter += inc_flutter * adv;  st->ph_flutter -= floorf(st->ph_flutter);
@@ -875,6 +965,13 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         wp = st->wp;
         valid = st->valid;
         ptr = st->rv_ptr;
+        if (p2_run && !st->p2_clean) {
+            dv_plate2Clear(rv, ptr);
+            st->p2_bw = 0.0f;
+            st->p2_damp[0] = st->p2_damp[1] = 0.0f;
+            st->p2_tank[0] = st->p2_tank[1] = 0.0f;
+            st->p2_clean = 1u;
+        }
         for (i = 0u; i < q; i++) {
             const float *li = &left[4u * i];
             const float *ri = right ? &right[4u * i] : li;
@@ -889,6 +986,8 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
             float nz;
             float y_l;
             float y_r;
+            float p2_l;
+            float p2_r;
             uint32_t j;
 
             fb += 2.0f * fb_inc;
@@ -916,8 +1015,21 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
             st->bump[0] += bump4 * (e_m - st->bump[0]);
             eo_m = e_m + bump_g * st->bump[0];
 
-            dv_plateHalf(st, rv, ptr, 0.5f * (eo_m + r_par * (in_m - eo_m)),
+            dv_plateHalf(&st->rv_bw, st->rv_damp, st->rv_tank, rv, ptr, 0,
+                         0.5f * (eo_m + r_par * (in_m - eo_m)),
                          decay, dd2, damp2, rmod, &rv_l, &rv_r);
+            p2_l = 0.0f;
+            p2_r = 0.0f;
+            plv += plv_inc;
+            if (p2_run) {
+                const float *ai = &aux[4u * i];
+
+                dv_plateHalf(&st->p2_bw, st->p2_damp, st->p2_tank, rv, ptr, 1,
+                             0.125f * (ai[0] + ai[1] + ai[2] + ai[3]),
+                             decay, dd2, pdamp2, -rmod, &p2_l, &p2_r);
+                p2_l *= plv;
+                p2_r *= plv;
+            }
             ptr = (ptr - 1u) & DV_RVB_MASK;
 
             nz = dv_noise(&st->noise);
@@ -945,8 +1057,9 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
             st->o_hpx[0] = st->o_lp[0];
             st->o_hpy[1] = ohp4 * (st->o_hpy[1] + st->o_lp[1] - st->o_hpx[1]);
             st->o_hpx[1] = st->o_lp[1];
-            y_l = DV_LIMIT_INV * dv_soft(DV_LIMIT * st->o_hpy[0]);
-            y_r = DV_LIMIT_INV * dv_soft(DV_LIMIT * st->o_hpy[1]);
+            /* The plate bus joins after the rumble's tone stage. */
+            y_l = DV_LIMIT_INV * dv_soft(DV_LIMIT * (st->o_hpy[0] + p2_l));
+            y_r = DV_LIMIT_INV * dv_soft(DV_LIMIT * (st->o_hpy[1] + p2_r));
             for (j = 0u; j < 4u; j++) {
                 const float k = 0.25f * (float)(j + 1u);
                 const float ol = st->prev_out[0] + k * (y_l - st->prev_out[0]);
@@ -1111,6 +1224,10 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
 
         /* Plate: fed by the echoes, or by the driven input (par). */
         rin = 0.5f * ((eo_l + eo_r) + r_par * ((in_l + in_r) - (eo_l + eo_r)));
+        /* str/png/wid: the full plate fills the ring, so the plate bus
+         * feeds the shared plate (scaled by plv). */
+        if (io->aux)
+            rin += plv_to * (io->aux[2u * n] + io->aux[2u * n + 1u]);
         dv_plate(st, rv, ptr, 0.5f * rin, decay, dd2, damp,
                  st->s_rmod, &rv_l, &rv_r);
         ptr = (ptr - 1u) & DV_RVB_MASK;

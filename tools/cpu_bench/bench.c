@@ -509,8 +509,8 @@ int main(int argc, char **argv)
         printf("scene %u fx %s mask %02x: %.1f us mean\n", sc + 1, argv[5], mask, m);
         if (getenv("BENCH_FX")) {
             uint8_t i;
-            printf("runtime rows 3..18:");
-            for (i = 3; i < 19; i++) printf(" %u", effects_lastApplied(i));
+            printf("runtime rows 3..25:");
+            for (i = 3; i < 26; i++) printf(" %u", effects_lastApplied(i));
             printf("\n");
         }
         return 0;

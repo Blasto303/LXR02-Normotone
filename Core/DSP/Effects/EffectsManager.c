@@ -2017,6 +2017,14 @@ uint8_t effects_lastApplied(uint8_t index)
     return (index < EFFECT_PARAM_COUNT) ? effects_state.last_applied[index] : 0u;
 }
 
+uint8_t effects_plateSend(uint8_t slot)
+{
+    if (effects_state.runtime_type != EFFECT_TYPE_DLYVERB ||
+        slot == 0u || slot > 5u)
+        return 0u;
+    return effects_state.last_applied[DLYVERB_PARAM_PLATE_D2 + slot - 1u];
+}
+
 uint8_t effects_runtimeScene(void)
 {
     return effects_state.scene_index;
