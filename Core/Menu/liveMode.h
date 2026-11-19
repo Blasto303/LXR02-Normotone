@@ -28,6 +28,8 @@
 
 /* Seed the unsaved factory mix before boot activates the first Scene. */
 void live_initFactoryRumble(void);
+/* Build every PLAITS conversion table now (boot, before audio). */
+void live_buildPlaitsTables(void);
 
 /* KIT page state, owned by liveMode.c, driven by buttonHandler.c. */
 void live_kitPageOpen(void);

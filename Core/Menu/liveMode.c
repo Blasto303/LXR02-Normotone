@@ -875,6 +875,13 @@ void live_plaitsToggle(void)
     menu_repaintAll();
 }
 
+void live_buildPlaitsTables(void)
+{
+    while (!plaitsMode_service())
+        ;
+    live_tablesReady = 1u;
+}
+
 uint8_t live_plaitsActive(void)
 {
     return live_plaits;

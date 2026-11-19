@@ -17,6 +17,7 @@
  * whether or not the kick is sounding.
  */
 
+#include "plaitsOut.h"
 #include "PlaitsKickVoice.h"
 #include "BufferTools.h"
 #include "modulationNode.h"
@@ -397,8 +398,7 @@ void PlaitsKick_calcVoiceSyncBlock(PlaitsKickVoice *voice, int16_t *buf,
 		for (i = 0u; i < size; i++) {
 			float s = out[i] * PK_OUT_GAIN * 32767.0f;
 
-			s = (s > 32767.0f) ? 32767.0f : ((s < -32768.0f) ? -32768.0f : s);
-			buf[i] = (int16_t)s;
+			buf[i] = plaitsOut_toInt16(s);
 		}
 		voicePost_drum(buf, voice->ampFilterInput, voice->lastGain,
 		               voice->volumeMod ? voice->velo : 1.0f,
@@ -501,8 +501,7 @@ void PlaitsKick_calcVoiceSyncBlock(PlaitsKickVoice *voice, int16_t *buf,
 		pre += pre_inc;
 		post += post_inc;
 		s = pk_softClip(pre * out[i]) * post * PK_OUT_GAIN * 32767.0f;
-		s = (s > 32767.0f) ? 32767.0f : ((s < -32768.0f) ? -32768.0f : s);
-		buf[i] = (int16_t)s;
+		buf[i] = plaitsOut_toInt16(s);
 	}
 	voice->od_pre = pre_gain;
 	voice->od_post = post_gain;

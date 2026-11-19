@@ -17,6 +17,7 @@
  * post-chain run on every sample.
  */
 
+#include "plaitsOut.h"
 #include "PlaitsSnareVoice.h"
 #include "BufferTools.h"
 #include "modulationNode.h"
@@ -228,8 +229,7 @@ static void pss_render(PlaitsSnareVoice *voice, int16_t *buf, uint8_t size)
 		        voice->ss_snare_level;
 
 		s = (snare + drum) * PS_OUT_GAIN * 32767.0f;
-		s = (s > 32767.0f) ? 32767.0f : ((s < -32768.0f) ? -32768.0f : s);
-		buf[i] = (int16_t)s;
+		buf[i] = plaitsOut_toInt16(s);
 	}
 }
 
@@ -453,8 +453,7 @@ void PlaitsSnare_calcVoiceSyncBlock(PlaitsSnareVoice *voice, int16_t *buf,
 		/* IC13 */
 		s = (noise + shell * (1.0f - voice->snappy_mix)) *
 		    PS_OUT_GAIN * 32767.0f;
-		s = (s > 32767.0f) ? 32767.0f : ((s < -32768.0f) ? -32768.0f : s);
-		buf[i] = (int16_t)s;
+		buf[i] = plaitsOut_toInt16(s);
 	}
 
 	/* Shared LXR post-chain: amp envelope ramp, velocity, distortion. */

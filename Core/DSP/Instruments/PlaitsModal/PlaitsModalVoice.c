@@ -18,6 +18,7 @@
  * modes run on every sample (constant CPU): this is an Advanced type.
  */
 
+#include "plaitsOut.h"
 #include "PlaitsModalVoice.h"
 #include "BufferTools.h"
 #include "modulationNode.h"
@@ -330,8 +331,7 @@ void PlaitsModal_calcVoiceSyncBlock(PlaitsModalVoice *voice, int16_t *buf,
 		y = s * ((voice->limiter_peak <= 1.0f) ? 1.0f
 		                                       : 1.0f / voice->limiter_peak);
 		y *= 0.8f * 32767.0f;
-		y = (y > 32767.0f) ? 32767.0f : ((y < -32768.0f) ? -32768.0f : y);
-		buf[i] = (int16_t)y;
+		buf[i] = plaitsOut_toInt16(y);
 	}
 
 	voicePost_drum(buf, voice->ampFilterInput, voice->lastGain,

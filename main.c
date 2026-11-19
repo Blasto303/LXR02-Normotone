@@ -1401,6 +1401,14 @@ boot_filesystem_done:
      * used to assess in-situ file procedures.
      */
     boot_showFilesystemStage(14u);  /* pre-audio filesystem boot completed */
+    /*
+     * PLAITS conversion tables (48, about 17 ms): built before audio starts,
+     * so the first PLAITS toggle during playback (a MIDI clock running at
+     * power-up) never builds them in the main loop, which stalled it for
+     * about 2.8 ms and underran the audio queue. live_service() keeps its
+     * background build as a fallback.
+     */
+    live_buildPlaitsTables();
     audioCodec_init();
     /*
      * Replay the selected boot Scene through the exact runtime Scene-switch
