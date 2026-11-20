@@ -30,6 +30,7 @@
 #include "modulationNode.h"
 #include "liveMode.h"
 #include "plaitsMode.h"
+#include "DlyVerbParameters.h"
 #include "storageTypes.h"
 #include "PatternData.h"
 
@@ -370,6 +371,25 @@ int main(int argc, char **argv)
             if (!kit_same(&scene_getConst(sc)->kit, &orig[sc]) && sc != 1)
                 printf("  scene %u kit differs from the card!\n", sc + 1);
         printf("map active %u\n", plaitsMode_mapActive);
+        return 0;
+    }
+    /* Effect edit at full Effect Morph: bench card bank blocks fxlink. */
+    if (argc > 4 && !strcmp(argv[4], "fxlink")) {
+        live_initFactoryRumble();
+        effects_activateScene(0); settle(); effects_service();
+        scene_setEffectMorphAmount(0, 255); settle(); effects_service();
+        printf("fxm 255, lpf runtime before: %u\n", effects_lastApplied(DLYVERB_PARAM_LOWPASS));
+        effects_setParameter(0, DLYVERB_PARAM_LOWPASS, EFFECT_IMAGE_NORMAL, 90); settle(); effects_service();
+        printf("after a normal edit to 90: runtime %u (normal %u, morph %u)\n",
+               effects_lastApplied(DLYVERB_PARAM_LOWPASS),
+               scene_effectConst(0)->normal[DLYVERB_PARAM_LOWPASS],
+               scene_effectConst(0)->morph[DLYVERB_PARAM_LOWPASS]);
+        effects_setParameter(0, DLYVERB_PARAM_LOWPASS, EFFECT_IMAGE_MORPH, 30); settle(); effects_service();
+        effects_setParameter(0, DLYVERB_PARAM_LOWPASS, EFFECT_IMAGE_NORMAL, 60); settle(); effects_service();
+        printf("designed morph 30, normal edit to 60: normal %u morph %u runtime %u\n",
+               scene_effectConst(0)->normal[DLYVERB_PARAM_LOWPASS],
+               scene_effectConst(0)->morph[DLYVERB_PARAM_LOWPASS],
+               effects_lastApplied(DLYVERB_PARAM_LOWPASS));
         return 0;
     }
     /* Starting Morph check: bench card bank blocks morphcheck. */

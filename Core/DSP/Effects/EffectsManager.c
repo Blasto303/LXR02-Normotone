@@ -676,8 +676,23 @@ uint8_t effects_setParameter(uint8_t scene_index, uint8_t index,
      * cell/card-clean state; the active runtime is rescanned by service.
      */
     for (s = 0u; s < SCENE_SLOT_TOTAL; s++) {
-        if ((mask & (1ul << s)) != 0u)
+        if ((mask & (1ul << s)) != 0u) {
+            /*
+             * Normotone: while a row's two endpoints are equal (no Morph
+             * designed for it), a normal edit moves both, so it is heard
+             * whatever the Effect Morph amount. Before, at fxm/mrp 255 the
+             * Morph endpoint played alone and normal edits were silent.
+             */
+            const effect_record_t *rec = scene_effectConst(s);
+            const uint8_t linked = (uint8_t)(image == EFFECT_IMAGE_NORMAL &&
+                rec && index < EFFECT_PARAM_COUNT &&
+                rec->normal[index] == rec->morph[index]);
+
             changed |= effects_setParameterScene(s, index, image, value);
+            if (linked)
+                changed |= effects_setParameterScene(s, index,
+                                                     EFFECT_IMAGE_MORPH, value);
+        }
     }
     /*
      * Menu edit of an Effect parameter clears its overlay and sets menuHold
