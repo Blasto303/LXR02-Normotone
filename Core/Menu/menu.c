@@ -12459,6 +12459,15 @@ void menu_repaint(void)
     if (live_plaitsActive() && editDisplayBuffer[1][15] == ' ')
         editDisplayBuffer[1][15] = 'P';
 #endif
+    /*
+     * Morph view (SHIFT + VOICE): an 'M' in the same corner while the VOICE
+     * pages show and edit the Morph endpoint, so the mode is visible on the
+     * screen and not only by the blinking VOICE LED. It wins over the 'P'.
+     */
+    if (voiceModeShowMorph && menu_activePage <= VOICE7_PAGE &&
+        !copyClear_menuVisible() &&
+        (editDisplayBuffer[1][15] == ' ' || editDisplayBuffer[1][15] == 'P'))
+        editDisplayBuffer[1][15] = 'M';
     if ((menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
         !menu_loadSaveCursorVisible()) {
         uint8_t row;

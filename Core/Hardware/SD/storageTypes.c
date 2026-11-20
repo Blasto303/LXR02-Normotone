@@ -2428,6 +2428,71 @@ storage_status_t storage_instrumentFinalize(const storage_instrument_state_t *st
      * cells are single-endpoint runtime values and Scene MIDI settings live
      * outside the kit, so neither class is touched here.
  */
+/*
+ * Starting Morph (Normotone).
+ *
+ * What: when a loaded instrument's Morph endpoint equals its normal sound on
+ * every Morphable row (no [morph] section, or a converted kit whose Morph
+ * was a copy), the Morph endpoint becomes a darker, longer variant: decays
+ * up, filter and tone down, a little more drive, resonance and modulation.
+ * Pitch, levels, routing and LFO rows are left alone. Why: with identical
+ * endpoints the PERF 1vm..6vm, MRP and RANDOM amounts did nothing audible.
+ * A kit that already has its own Morph is never touched. Values stay inside
+ * each row's modulation domain. Inputs: type and the staged instrument.
+ */
+typedef struct {
+    const char *key;
+    int8_t delta;
+} storage_start_morph_t;
+
+static const storage_start_morph_t storage_startMorph[] = {
+    { "amp_envelope_decay", 20 }, { "amp_envelope_decay_choke", 20 },
+    { "pitch_envelope_decay", 12 }, { "kick_decay", 20 },
+    { "snare_decay", 20 }, { "phat_decay", 20 }, { "phat_decay_choke", 20 },
+    { "modal_damping", -16 },
+    { "filter_freq", -24 }, { "kick_tone", -20 }, { "snare_tone", -20 },
+    { "phat_tone", -20 }, { "modal_bright", -20 },
+    { "filter_drive", 16 }, { "instrument_drive", 8 }, { "filter_reso", 10 },
+    { "osc2_mod_amount", 10 }, { "osc3_mod_amount", 10 },
+    { "kick_harmonics", 12 }, { "snare_snappy", 12 },
+};
+
+void storage_instrumentStartMorph(storage_instrument_type_t type,
+                                  kit_instrument_slot_t *instrument)
+{
+    const instrument_registry_entry_t *entry =
+        instrumentManager_registryEntry(type);
+    instrument_parameter_images_t *im;
+    uint8_t i;
+    uint8_t k;
+
+    if (!entry || !instrument)
+        return;
+    im = &instrument->parameter_images;
+    for (i = 0u; i < entry->descriptor_count; i++)
+        if ((entry->descriptors[i].flags & INSTRUMENT_PARAM_FLAG_MORPHABLE) &&
+            im->morph_instrument_parameters[i] != im->instrument_parameters[i])
+            return;                     /* it has its own Morph */
+    for (i = 0u; i < entry->descriptor_count; i++) {
+        const ParamDescriptor *d = &entry->descriptors[i];
+        const int16_t lo = d->mod_domain.min_value;
+        const int16_t hi = d->mod_domain.max_value;
+        int16_t v;
+
+        if (!(d->flags & INSTRUMENT_PARAM_FLAG_MORPHABLE) || hi <= lo ||
+            !d->file_key)
+            continue;
+        for (k = 0u; k < sizeof(storage_startMorph) / sizeof(storage_startMorph[0]); k++)
+            if (!strcmp(d->file_key, storage_startMorph[k].key))
+                break;
+        if (k == sizeof(storage_startMorph) / sizeof(storage_startMorph[0]))
+            continue;
+        v = (int16_t)im->instrument_parameters[i] + storage_startMorph[k].delta;
+        v = (v < lo) ? lo : ((v > hi) ? hi : v);
+        im->morph_instrument_parameters[i] = (instrument_param_value_t)v;
+    }
+}
+
 void storage_instrumentCopyMainToMorphFallback(storage_instrument_type_t type,
                                                uint8_t slot,
                                                kit_instrument_slot_t *instrument)

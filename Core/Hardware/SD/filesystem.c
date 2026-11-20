@@ -12587,6 +12587,7 @@ static void filesystem_loadKitDirectory_tick(void)
                         (uint8_t)(op_instrument_slot + 1u),
                         &op_staged_kit.instruments[op_instrument_slot]);
                 }
+                storage_instrumentStartMorph(op_kitset.instrument_type[op_instrument_slot], &op_staged_kit.instruments[op_instrument_slot]);
                 op_close_status = FS_STATUS_DONE;
             }
             op_phase = 20;
@@ -13412,6 +13413,7 @@ static void filesystem_loadSceneDirectory_tick(void)
                         (uint8_t)(op_instrument_slot + 1u),
                         &fs_stage_workspace.scene_stage.kit.instruments[op_instrument_slot]);
                 }
+                storage_instrumentStartMorph(op_kitset.instrument_type[op_instrument_slot], &fs_stage_workspace.scene_stage.kit.instruments[op_instrument_slot]);
                 op_close_status = FS_STATUS_DONE;
             }
             op_phase = 30;
@@ -17169,6 +17171,7 @@ static void filesystem_loadInstrument_tick(void)
                         (uint8_t)(op_instrument_load_destination_slot + 1u),
                         &op_staged_instrument);
                 }
+                storage_instrumentStartMorph(op_instrument_load_type, &op_staged_instrument);
                 /*
                  * Pair the validated Instrument with its one identity row.
                  *
@@ -30204,6 +30207,8 @@ static uint8_t filesystem_bootReaderParseInstrumentFile(
                 storage_instrumentCopyMainToMorphFallback(
                     type, one_based_voice, destination);
             }
+            if (ok)
+                storage_instrumentStartMorph(type, destination);
             break;
         }
     }

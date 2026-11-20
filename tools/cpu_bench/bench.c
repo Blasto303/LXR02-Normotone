@@ -30,6 +30,7 @@
 #include "modulationNode.h"
 #include "liveMode.h"
 #include "plaitsMode.h"
+#include "storageTypes.h"
 #include "PatternData.h"
 
 /* The DTCM FX/voice arena of the device (126,592 B, .dtcm_fxbuf). */
@@ -369,6 +370,44 @@ int main(int argc, char **argv)
             if (!kit_same(&scene_getConst(sc)->kit, &orig[sc]) && sc != 1)
                 printf("  scene %u kit differs from the card!\n", sc + 1);
         printf("map active %u\n", plaitsMode_mapActive);
+        return 0;
+    }
+    /* Starting Morph check: bench card bank blocks morphcheck. */
+    if (argc > 4 && !strcmp(argv[4], "morphcheck")) {
+        static kit_t k, pk;
+        int pass;
+
+        k = scene_getConst(0)->kit;
+        plaitsMode_convertKit(&pk, &k);
+        for (pass = 0; pass < 2; pass++) {
+            kit_t *kk = pass ? &pk : &k;
+
+            for (v = 0; v < 6; v++) {
+                kit_instrument_slot_t *in = &kk->instruments[v];
+                const instrument_registry_entry_t *e = instrumentManager_registryEntry(in->type);
+                int i;
+
+                memcpy(in->parameter_images.morph_instrument_parameters,
+                       in->parameter_images.instrument_parameters, INSTRUMENT_PARAM_COUNT);
+                storage_instrumentStartMorph((storage_instrument_type_t)in->type, in);
+                printf("type %u:", in->type);
+                for (i = 0; e && i < e->descriptor_count; i++)
+                    if (in->parameter_images.morph_instrument_parameters[i] !=
+                        in->parameter_images.instrument_parameters[i])
+                        printf(" %s %u>%u", e->descriptors[i].file_key,
+                               in->parameter_images.instrument_parameters[i],
+                               in->parameter_images.morph_instrument_parameters[i]);
+                printf("\n");
+                /* second call: endpoints now differ, must not change */
+                {
+                    uint8_t before[INSTRUMENT_PARAM_COUNT];
+                    memcpy(before, in->parameter_images.morph_instrument_parameters, sizeof(before));
+                    storage_instrumentStartMorph((storage_instrument_type_t)in->type, in);
+                    if (memcmp(before, in->parameter_images.morph_instrument_parameters, sizeof(before)))
+                        printf("  second call changed it (BAD)\n");
+                }
+            }
+        }
         return 0;
     }
     /* PLAITS cold build cost: bench card bank blocks pmcold (under callgrind). */
