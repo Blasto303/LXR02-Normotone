@@ -738,10 +738,23 @@ void menuEffects_typeBrowse(int8_t inc)
 
     if (!menuEffects_typeEdit || count == 0u)
         return;
-    if (inc > 0 && menuEffects_typeCandidate + 1u < count)
-        menuEffects_typeCandidate++;
-    else if (inc < 0 && menuEffects_typeCandidate > 0u)
-        menuEffects_typeCandidate--;
+    /*
+     * Normotone: StFilter and CrumpBit are left out of the choice (off, dvb,
+     * dst remain); a Scene saved with them still loads and plays them.
+     */
+    {
+        uint8_t c = menuEffects_typeCandidate;
+
+        do {
+            if (inc > 0 && c + 1u < count)
+                c++;
+            else if (inc < 0 && c > 0u)
+                c--;
+            else
+                return;
+        } while (c == EFFECT_TYPE_STEREO_FILTER || c == EFFECT_TYPE_CRUMPBIT);
+        menuEffects_typeCandidate = c;
+    }
 }
 
 /* Momentary SHIFT Morph view. */

@@ -373,6 +373,25 @@ int main(int argc, char **argv)
         printf("map active %u\n", plaitsMode_mapActive);
         return 0;
     }
+    /* Loaded kits: Morph rows that differ from normal. bench card bank blocks morphload */
+    if (argc > 4 && !strcmp(argv[4], "morphload")) {
+        uint8_t sc;
+
+        for (sc = 0u; sc < 4u; sc++) {
+            printf("scene %u rows morph != normal:", sc + 1);
+            for (v = 0; v < 6; v++) {
+                const kit_instrument_slot_t *in = scene_instrumentSlotConst(sc, v);
+                int i, n = 0;
+
+                for (i = 0; in && i < INSTRUMENT_PARAM_COUNT; i++)
+                    n += in->parameter_images.morph_instrument_parameters[i] !=
+                         in->parameter_images.instrument_parameters[i];
+                printf(" %2d", n);
+            }
+            printf("\n");
+        }
+        return 0;
+    }
     /* Effect edit at full Effect Morph: bench card bank blocks fxlink. */
     if (argc > 4 && !strcmp(argv[4], "fxlink")) {
         live_initFactoryRumble();
@@ -576,6 +595,22 @@ int main(int argc, char **argv)
             printf("routing:");
             for (v = 0; v < 6; v++) printf(" %u", mixer_audioRouting[v]);
             printf("\n");
+        }
+        /* BENCH_DVB=1: the factory dark rumble on every Scene. */
+        if (getenv("BENCH_DVB")) {
+            live_initFactoryRumble();
+            effects_activateScene(sc);
+            settle();
+        }
+        /* BENCH_DST=1: the Scene's Effect becomes `dst` (defaults). */
+        if (getenv("BENCH_DST")) {
+            static effect_record_t rec;
+
+            rec = *scene_effectConst(sc);
+            effects_recordDefaultsForType(&rec, EFFECT_TYPE_DESTROY);
+            (void)scene_commitEffectRecord(sc, &rec);
+            effects_activateScene(sc);
+            settle();
         }
         /* BENCH_FX="key=val,...": Effect rows by storage key; BENCH_COMP=amount. */
         if (getenv("BENCH_FX") && *getenv("BENCH_FX")) {

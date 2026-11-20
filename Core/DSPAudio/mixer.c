@@ -1032,7 +1032,9 @@ void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2)
 	 */
 	const uint8_t fx_io = effects_activeIoFlags();
 	const uint8_t fx_stereo_in = (uint8_t)((fx_io & EFFECT_IO_STEREO_IN) != 0u);
-	const uint8_t fx_active = (uint8_t)(fx_io != 0u);
+	/* Normotone: a MAIN-insert type gets no FX bus and no sends. */
+	const uint8_t fx_insert = (uint8_t)((fx_io & EFFECT_IO_MAIN_INSERT) != 0u);
+	const uint8_t fx_active = (uint8_t)(fx_io != 0u && !fx_insert);
 	const uint8_t fx_scene = scene_getActiveIndex();
 	const effects_common_runtime_t *fx_common = effects_commonRuntime();
 	const uint8_t fx_route = mixer_checkOutJackAvailable(fx_common->route);
@@ -1219,6 +1221,35 @@ void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2)
 	 * Output: only the selected buffer is compressed in place.
 	 * Affiliate: BusCompressor.h and voiceControl_triggerNow().
 	 */
+	/*
+	 * Normotone MAIN insert (`dst`): MAIN (St1 = output2) goes through the
+	 * Effect in place, after every voice, before the compressor. The
+	 * Effect's own mix row is the dry/wet; `vol` scales the result.
+	 */
+	if (fx_insert) {
+		const float inv_mx = 1.0f / 8388352.0f;
+		const float g = fx_common->level * 8388352.0f;
+		fx_share_t share;
+		effect_io_t io;
+
+		for (uint8_t i = 0u; i < OUTPUT_DMA_SIZE; i++) {
+			mixer_fx_bus.f[0][i] = (float)output2[pos + 2u * i] * inv_mx;
+			mixer_fx_bus.f[1][i] = (float)output2[pos + 2u * i + 1u] * inv_mx;
+		}
+		fxbuf_effectShare(&share);
+		io.l = mixer_fx_bus.f[0];
+		io.r = mixer_fx_bus.f[1];
+		io.frames = OUTPUT_DMA_SIZE;
+		io.channels = 2u;
+		io.share = &share;
+		io.aux = 0;
+		effects_process(&io);
+		for (uint8_t i = 0u; i < OUTPUT_DMA_SIZE; i++) {
+			output2[pos + 2u * i] = (sample_mx_t)(mixer_fx_bus.f[0][i] * g);
+			output2[pos + 2u * i + 1u] = (sample_mx_t)(mixer_fx_bus.f[1][i] * g);
+		}
+	}
+
 	busComp_processBlock(&output2[pos], &output[pos], fx_scene);
 
 }

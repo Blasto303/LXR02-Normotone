@@ -22,6 +22,8 @@
 /* S074: CrumpBit (`cbt`), the first buffer-using Effect type. */
 #include "CrumpBitParameters.h"
 #include "CrumpBitEffect.h"
+#include "DestroyParameters.h"
+#include "DestroyEffect.h"
 /* DlyVerb (`dvb`): tempo-synced character delay into a plate reverb. */
 #include "DlyVerbParameters.h"
 #include "DlyVerbEffect.h"
@@ -146,12 +148,33 @@ static const effect_registry_entry_t effects_registry[EFFECT_TYPE_COUNT] = {
         (uint16_t)sizeof(DlyVerbRuntime),
         DLYVERB_BUFFER_MIN_BYTES, DLYVERB_BUFFER_MIN_BYTES
     },
+    /*
+     * Destroy (`dst`, Normotone): MAIN insert, stereo in place. State and the
+     * plate ring use the Effect share. Lanes: drive, fold, sub, cross, tone,
+     * mix, plate, plate decay, vol.
+     */
+    {
+        destroy_token3, destroy_abbrev5, destroy_full8,
+        EFFECT_IO_STEREO_IN | EFFECT_IO_STEREO_OUT | EFFECT_IO_MAIN_INSERT,
+        destroy_descriptors, DESTROY_PARAM_COUNT,
+        { EFFECT_LANE_MORPH_SOURCE,
+          DESTROY_PARAM_DRIVE, DESTROY_PARAM_FOLD, DESTROY_PARAM_SUB,
+          DESTROY_PARAM_CROSS, DESTROY_PARAM_TONE, DESTROY_PARAM_MIX,
+          DESTROY_PARAM_PLATE, DESTROY_PARAM_PLATE_DECAY, DESTROY_PARAM_LEVEL,
+          EFFECT_LANE_NONE, EFFECT_LANE_NONE, EFFECT_LANE_NONE,
+          EFFECT_LANE_NONE, EFFECT_LANE_NONE, EFFECT_LANE_NONE },
+        NULL, &destroy_ops, NULL,
+        (uint16_t)sizeof(DestroyRuntime),
+        DESTROY_BUFFER_MIN_BYTES, DESTROY_BUFFER_MIN_BYTES
+    },
 };
 
 _Static_assert(sizeof(StereoFilterRuntime) <= sizeof(effects_runtime_t),
                "Effect runtime union must hold StereoFilter");
 _Static_assert(sizeof(CrumpBitRuntime) <= sizeof(effects_runtime_t),
                "Effect runtime union must hold CrumpBit");
+_Static_assert(sizeof(DestroyRuntime) <= sizeof(effects_runtime_t),
+               "DestroyRuntime must fit the Effect runtime union");
 _Static_assert(sizeof(DlyVerbRuntime) <= sizeof(effects_runtime_t),
                "Effect runtime union must hold DlyVerb");
 /*

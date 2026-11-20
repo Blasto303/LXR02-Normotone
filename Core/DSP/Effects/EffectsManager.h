@@ -66,7 +66,9 @@
 #define EFFECT_TYPE_STEREO_FILTER        1u
 #define EFFECT_TYPE_CRUMPBIT             2u
 #define EFFECT_TYPE_DLYVERB              3u
-#define EFFECT_TYPE_COUNT                4u
+/* Normotone `dst`: multi-stage distortion inserted on MAIN (dry/wet). */
+#define EFFECT_TYPE_DESTROY              4u
+#define EFFECT_TYPE_COUNT                5u
 
 /* Extra descriptor capability flags used by Effect-specific owners. */
 #define EFFECT_PARAM_FLAG_WIDE8              0x01u
@@ -81,6 +83,8 @@
 #define EFFECT_IO_STEREO_IN              0x02u
 #define EFFECT_IO_MONO_OUT               0x04u
 #define EFFECT_IO_STEREO_OUT             0x08u
+/* Normotone: the type processes MAIN in place (no FX bus, no sends). */
+#define EFFECT_IO_MAIN_INSERT            0x10u
 
 /* Convert a Pattern's seven-bit value to an Effect's stored domain. */
 typedef uint8_t (*effect_expand7_fn)(uint8_t value7);

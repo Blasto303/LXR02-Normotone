@@ -461,6 +461,20 @@ static inline void dv_plateHalf(float *bw, float *dz, float *tk,
 #undef DV_T
 }
 
+/*
+ * The quarter-rate plate for another Effect (Normotone `dst`): same lines and
+ * tank, its own 5-float state (bw, damp[2], tank[2]) and its own 16,384-
+ * sample ring; the caller decrements ptr (mask DLYVERB_RVB_SAMPLES - 1) once
+ * per call.
+ */
+void dlyVerb_plateQuarter(float *pst, int16_t *rv, uint32_t ptr, float x,
+                          float decay, float dd2, float damp2, float mod,
+                          float *out_l, float *out_r)
+{
+    dv_plateHalf(&pst[0], &pst[1], &pst[3], rv, ptr, 0, x, decay, dd2, damp2,
+                 mod, out_l, out_r);
+}
+
 /* Zero the second plate's lines (their place is relative to the pointer). */
 static void dv_plate2Clear(int16_t *rv, uint32_t ptr)
 {

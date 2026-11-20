@@ -27,10 +27,12 @@ Core/DSP/Instruments/PlaitsSnare/PlaitsSnareParameters.c
 Core/DSP/Instruments/Snare/SnareParameters.c
 Core/DSP/Effects/CrumpBit/CrumpBitParameters.c
 Core/DSP/Effects/DlyVerb/DlyVerbParameters.c
+Core/DSP/Effects/Destroy/DestroyParameters.c
 Core/DSP/Effects/EffectsManager.c
 Core/DSP/Effects/FxBuffer.c
 Core/DSP/Effects/StereoFilter/StereoFilterParameters.c
 Core/DSP/Effects/CrumpBit/CrumpBitEffect.c
 Core/DSP/Effects/DlyVerb/DlyVerbEffect.c
+Core/DSP/Effects/Destroy/DestroyEffect.c
 Core/DSP/Effects/StereoFilter/StereoFilterEffect.c
 Core/Sequencer/StepScale.c

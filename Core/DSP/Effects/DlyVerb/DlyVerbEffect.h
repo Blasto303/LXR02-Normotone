@@ -78,4 +78,9 @@ extern const effect_type_ops_t dlyVerb_ops;
  */
 uint8_t dlyVerb_divisionCc(uint8_t division);
 
+/* Quarter-rate plate reused by `dst` (state: bw, damp[2], tank[2]). */
+void dlyVerb_plateQuarter(float *pst, int16_t *rv, uint32_t ptr, float x,
+                          float decay, float dd2, float damp2, float mod,
+                          float *out_l, float *out_r);
+
 #endif /* DLY_VERB_EFFECT_H_ */

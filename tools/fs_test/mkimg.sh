@@ -1,7 +1,7 @@
 #!/bin/bash
 # mkimg.sh <card dir> <image>  : MBR + FAT32 partition at 1 MiB, card dir copied in
 set -e
-D=$1; IMG=$2; SIZE_MB=${3:-160}
+D=$1; IMG=$2; SIZE_MB=${3:-400}   # FAT32 needs >= 65,525 clusters (4 KiB): >= 270 MB
 rm -f $IMG; truncate -s ${SIZE_MB}M $IMG
 python3 -I - "$IMG" "$SIZE_MB" <<'PY'
 import sys,struct
