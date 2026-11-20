@@ -483,7 +483,9 @@ static void buttonHandler_setMorphVoiceMode(uint8_t onOff)
      * mode. Risk: this is not a distinct selectButtonMode; SELECT_MODE_VOICE
      * branches must continue to handle subpages and voice selection normally.
      */
-    buttonHandler_morphVoiceModeActive = (uint8_t)(onOff != 0u);
+    /* Normotone simple Morph: the latch never turns on. */
+    (void)onOff;
+    buttonHandler_morphVoiceModeActive = 0u;
     menu_setVoiceModeShowMorph(buttonHandler_morphVoiceModeActive);
     led_setBlinkLed(LED_MODE1, buttonHandler_morphVoiceModeActive);
     if (buttonHandler_morphVoiceModeActive)
@@ -2896,6 +2898,25 @@ static uint8_t buttonHandler_livePress(uint8_t b)
         live_kitPageClose();
         handleModeButtonsForLibrary(SELECT_MODE_LOAD_SAVE, MENU_LIBRARY_KIT);
         live_kitPageLeds();
+        return 1u;
+    }
+    /*
+     * Simple Morph: LOAD + MORPH (step 9) opens the KitMrp library. Steps
+     * 1..16 take the kit of pattern N as the Morph target (again = none);
+     * DATA browses the card kits and a click loads one as the target.
+     */
+    if (bh_liveLoadHeld && seq == 8 && !shift) {
+        buttonHandler_liveConsume(b);
+        live_kitPageClose();
+        handleModeButtonsForLibrary(SELECT_MODE_LOAD_SAVE, MENU_LIBRARY_KIT_MORPH);
+        live_morphLeds();
+        return 1u;
+    }
+    if (seq >= 0 && !shift && !bh_liveLoadHeld &&
+        bh_state.selectButtonMode == SELECT_MODE_LOAD_SAVE &&
+        menu_liveMorphLibraryActive()) {
+        buttonHandler_liveConsume(b);
+        live_morphSelect((uint8_t)seq);
         return 1u;
     }
     if (seq >= 0 && !shift && !bh_liveLoadHeld &&

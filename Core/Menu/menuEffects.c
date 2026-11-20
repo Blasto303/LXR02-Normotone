@@ -209,9 +209,12 @@ static uint8_t menuEffects_cellAt(uint8_t sub_page, uint8_t screen,
     } else if (sub_page == 0u) {
         static const uint8_t second[MENU_FX_CELLS] = {
             MENU_FX_CELL_RUN, MENU_FX_CELL_LENGTH,
-            MENU_FX_CELL_SCALE, MENU_FX_CELL_MORPH_AMOUNT
+            MENU_FX_CELL_SCALE, MENU_FX_CELL_NONE
         };
         if (screen == 1u) {
+            /* Normotone simple Morph: no Effect Morph cell (`mrp`). */
+            if (second[column] == MENU_FX_CELL_NONE)
+                return 0u;
             out->kind = second[column];
             return 1u;
         }
@@ -760,7 +763,9 @@ void menuEffects_typeBrowse(int8_t inc)
 /* Momentary SHIFT Morph view. */
 void menuEffects_setShowMorph(uint8_t on)
 {
-    menuEffects_showMorphFlag = (uint8_t)(on != 0u);
+    /* Normotone simple Morph: no Effect Morph view; SHIFT edits nothing. */
+    (void)on;
+    menuEffects_showMorphFlag = 0u;
 }
 
 uint8_t menuEffects_showMorph(void)

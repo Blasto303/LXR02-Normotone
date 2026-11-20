@@ -1322,7 +1322,8 @@ uint8_t preset_getEffectiveFxSendAmount(uint8_t scene_index, uint8_t slot)
         return fx_send_step_override[slot].amount;
     normal = scene_getVoiceFxSendAmount(scene_index, slot);
     morph = scene_getVoiceFxSendMorph(scene_index, slot);
-    if (normal == morph)
+    /* Normotone simple Morph: MRP never moves the FX sends. */
+    if (normal == morph || 1)
         return normal;
     amount = presetMorph_getResolvedVoiceAmount(scene_index, slot);
     /* 127 * 255 + 127 fits uint16_t. */
@@ -4470,7 +4471,7 @@ void preset_morphScene(uint8_t scene_index, uint8_t morph)
      * menu edit of this one Scene (Rule A override clear, menuHoldMorph on
      * the active Scene), never recorded, like the per-voice amounts below.
      */
-    (void)effects_setMorphAmountFromGlobal(scene_index, morph);
+    /* Normotone simple Morph: MRP moves the sound engine only. */
     /*
      * S076 Rule A: bulk Morph set from PERF / global MIDI CC1 supersedes
      * every active step-automation Morph override. Each slot is cleared

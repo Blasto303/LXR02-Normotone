@@ -1983,6 +1983,8 @@ void effects_service(void)
         morph = scene_getEffectMorphAmount(effects_state.scene_index);
     }
     morph = effects_lfoResolve(EFFECT_LFO_TARGET_MORPH, morph, 0u, 255u);
+    /* Normotone simple Morph: Effects always play their normal settings. */
+    morph = 0u;
     lfo_mask = effects_lfoTargetMask();
     fxbuf_effectShare(&share);
     for (index = 0u; index < entry->descriptor_count; index++) {

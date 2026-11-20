@@ -84,8 +84,22 @@ static uint16_t live_bankBefore = 0xFFFFu;  /* Bank slot when it started      */
  * voice Morph amounts were changed keeps their old values for restore.
  */
 static uint8_t  live_rndDose;
-static uint8_t  live_rndTarget = 3u;        /* 1 pattern, 2 kit, 3 both    */
+static uint8_t  live_rndTarget = 1u;        /* pattern only (simple Morph) */
 static uint8_t  live_rndScene = 0xFFu;
+/*
+ * Simple Morph (LOAD + MORPH): one target kit for the whole machine. MRP
+ * slides every voice of the playing kit towards it (sound engine only). The
+ * target is the kit of a pattern (steps 1..16) or a card kit (KitMrp load,
+ * captured in live_morphKit). It follows the player: each kit put in place
+ * gets the target in its Morph endpoints, which are runtime-only (reset to
+ * normal at every load, never marked for AutoSave).
+ */
+#define LIVE_MORPH_NONE  0xFFu
+#define LIVE_MORPH_CARD  0xFEu
+static kit_t    live_morphKit;
+static uint8_t  live_morphSrc = LIVE_MORPH_NONE;
+static uint8_t  live_morphLibLeds;
+static void live_morphApply(uint8_t scene);
 static uint16_t live_rndBank = 0xFFFFu;
 static uint8_t  live_rndSavedAmt[INSTRUMENT_SLOT_COUNT];
 /*
@@ -145,7 +159,8 @@ void live_initFactoryRumble(void)
 
 static uint8_t live_rndKitOn(void)
 {
-    return (uint8_t)(live_rndDose && (live_rndTarget & 2u));
+    /* Normotone simple Morph: RANDOM never touches the kit's Morph. */
+    return 0u;
 }
 
 static void live_rndSetAmounts(uint8_t scene, uint8_t amount);
@@ -321,6 +336,7 @@ static uint8_t live_install(uint8_t scene, uint8_t src)
         plaitsMode_mapOff();
         live_kitSource = src;
         live_plaitsOn = 0u;
+        live_morphApply(scene);
         return 1u;
     }
     if (live_backupScene != scene) {
@@ -347,7 +363,103 @@ static uint8_t live_install(uint8_t scene, uint8_t src)
     }
     live_kitSource = src;
     live_plaitsOn = live_plaits;
+    live_morphApply(scene);
     return 1u;
+}
+
+/*
+ * Put the Morph target in the Morph endpoints of `scene`'s kit. Slots whose
+ * instrument type differs from the target's stay on their normal sound (no
+ * Morph). With PLAITS sounding on that Scene, the target is converted first.
+ */
+static void live_morphApply(uint8_t scene)
+{
+    scene_t *s = scene_get(scene);
+    const kit_t *t = NULL;
+    uint8_t slot;
+
+    if (!s || scene >= 16u)
+        return;
+    if (live_morphSrc < 16u && live_sceneValid(live_morphSrc)) {
+        const scene_t *src = scene_getConst(live_morphSrc);
+
+        t = (live_morphSrc == live_backupScene) ? &live_kitBackup
+            : (src ? &src->kit : NULL);
+    } else if (live_morphSrc == LIVE_MORPH_CARD) {
+        t = &live_morphKit;
+    }
+    if (t && live_plaitsOn && live_backupScene == scene) {
+        plaitsMode_convertKit(&live_kitTemp, t);
+        t = &live_kitTemp;
+    }
+    for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++) {
+        kit_instrument_slot_t *in = &s->kit.instruments[slot];
+        const instrument_param_value_t *from =
+            (t && t->instruments[slot].type == in->type)
+            ? t->instruments[slot].parameter_images.instrument_parameters
+            : in->parameter_images.instrument_parameters;
+
+        memcpy(in->parameter_images.morph_instrument_parameters, from,
+               INSTRUMENT_PARAM_COUNT);
+    }
+    s->kit.settings.slot6_track7_morph_amp_envelope_decay =
+        (t && t->instruments[INSTRUMENT_SLOT_COUNT - 1u].type ==
+                  s->kit.instruments[INSTRUMENT_SLOT_COUNT - 1u].type)
+        ? t->settings.slot6_track7_amp_envelope_decay
+        : s->kit.settings.slot6_track7_amp_envelope_decay;
+    if (scene == scene_getActiveIndex())
+        preset_rebuildMorph();
+}
+
+void live_morphLeds(void)
+{
+    uint16_t present = bank_scenePresentMask();
+    uint8_t s;
+
+    live_morphLibLeds = menu_liveMorphLibraryActive();
+    if (!live_morphLibLeds)
+        return;
+    for (s = 0u; s < 16u; s++) {
+        uint8_t led = (uint8_t)(LED_SEQ1 + s);
+
+        led_setBlinkLed(led, (uint8_t)(s == live_morphSrc));
+        led_setValue((uint8_t)((present & (uint16_t)(1u << s)) != 0u), led);
+    }
+}
+
+/* Step N in the Morph library: the kit of pattern N; again = no target. */
+void live_morphSelect(uint8_t step)
+{
+    if (step >= 16u || !live_sceneValid(step))
+        return;
+    live_morphSrc = (live_morphSrc == step) ? LIVE_MORPH_NONE : step;
+    live_morphApply(scene_getActiveIndex());
+    live_morphLeds();
+    menu_repaintAll();
+}
+
+/* A KitMrp load from the card just filled the playing kit's Morph side. */
+void live_morphCaptured(void)
+{
+    const scene_t *s = scene_getConst(scene_getActiveIndex());
+    uint8_t slot;
+
+    if (!s)
+        return;
+    live_morphKit = s->kit;
+    for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++)
+        memcpy(live_morphKit.instruments[slot].parameter_images.instrument_parameters,
+               s->kit.instruments[slot].parameter_images.morph_instrument_parameters,
+               INSTRUMENT_PARAM_COUNT);
+    live_morphKit.settings.slot6_track7_amp_envelope_decay =
+        s->kit.settings.slot6_track7_morph_amp_envelope_decay;
+    live_morphSrc = LIVE_MORPH_CARD;
+    live_morphLeds();
+}
+
+uint8_t live_morphSource(void)
+{
+    return live_morphSrc;
 }
 
 /* A successfully loaded SD kit becomes the scene's own kit. The
@@ -370,6 +482,9 @@ void live_kitLoadCommitted(uint16_t scene_mask)
         live_plaitsOn = 0u;
         plaitsMode_mapOff();
     }
+    /* The loaded kit's Morph side was reset: the target goes back on. */
+    if (active < 16u && (scene_mask & (uint16_t)(1u << active)))
+        live_morphApply(active);
     /* PLAITS on: the new kit is converted at once, not at the bar. */
     if (live_plaits && active < 16u && (scene_mask & (uint16_t)(1u << active))) {
         live_pendingKit = active;
@@ -594,16 +709,15 @@ void live_rndPageLeds(void)
         return;
     for (s = 0u; s < 16u; s++) {
         led_setBlinkLed((uint8_t)(LED_SEQ1 + s), 0u);
-        led_setValue((uint8_t)(s < 3u && (uint8_t)(s + 1u) == live_rndTarget),
-                     (uint8_t)(LED_SEQ1 + s));
+        led_setValue((uint8_t)(s == 0u), (uint8_t)(LED_SEQ1 + s));
     }
 }
 
 void live_rndStep(uint8_t step)
 {
-    if (step > 2u)
-        return;
-    live_rndTarget = (uint8_t)(step + 1u);
+    /* Pattern only: the kit modes used the Morph endpoints. */
+    (void)step;
+    live_rndTarget = 1u;
     live_rndApply(0u);
     live_rndPageLeds();
     menu_repaintAll();
@@ -721,7 +835,10 @@ void live_beforeSceneChange(uint8_t target)
         } else {
             live_plaitsOn = 0u;
             plaitsMode_mapOff();
+            live_morphApply(target);
         }
+        /* MRP follows the player like the mix. */
+        preset_morphScene(target, scene_getVoiceMorphAmount(active, 0u));
     }
 
     /* RANDOM on the kit follows the player: new draw for the new pattern. */
@@ -900,6 +1017,16 @@ void live_service(void)
         else
             live_kitPageLeds();
     }
+    /* Morph library step LEDs follow the page the same way. */
+    if (menu_liveMorphLibraryActive() != live_morphLibLeds) {
+        if (live_morphLibLeds) {
+            live_morphLibLeds = 0u;
+            led_clearAllBlinkLeds();
+            menu_refreshPerfSceneLeds();
+        } else {
+            live_morphLeds();
+        }
+    }
     /* PLAITS on/off message: about one second. */
     if (live_flash && (uint16_t)(time_sysTick - live_flashStart) > 1200u) {
         live_flash = 0u;
@@ -1044,12 +1171,12 @@ uint8_t live_formatOverlay(char *row0, char *row1)
         memset(row0, ' ', 16);
         memset(row1, ' ', 16);
         memcpy(row0, "RND", 3);
-        memcpy(&row0[4], names[live_rndTarget & 3u], 4);
+        memcpy(&row0[4], names[1], 4);
         memcpy(&row0[8], "dose", 4);
         row0[13] = (char)('0' + live_rndDose / 100u);
         row0[14] = (char)('0' + (live_rndDose / 10u) % 10u);
         row0[15] = (char)('0' + live_rndDose % 10u);
-        memcpy(row1, "1pat 2kit 3p+k", 14);
+        memcpy(row1, "pattern", 7);
         return 1u;
     }
     if (live_page != 1u) {

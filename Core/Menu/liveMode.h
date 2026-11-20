@@ -30,6 +30,11 @@
 void live_initFactoryRumble(void);
 /* Build every PLAITS conversion table now (boot, before audio). */
 void live_buildPlaitsTables(void);
+/* Simple Morph (LOAD + MORPH): step = kit of pattern N, again = none. */
+void live_morphSelect(uint8_t step);
+void live_morphLeds(void);
+void live_morphCaptured(void);
+uint8_t live_morphSource(void);
 
 /* KIT page state, owned by liveMode.c, driven by buttonHandler.c. */
 void live_kitPageOpen(void);

@@ -755,6 +755,8 @@ static void menu_startInstrumentApply(uint8_t scene_index,
     bank_revalidateVoiceEditMasks();
 }
 
+static uint8_t menu_kitMorphApplyRunning;
+
 static void menu_startKitMorphApply(void)
 {
     /*
@@ -770,6 +772,7 @@ static void menu_startKitMorphApply(void)
     menu_instrumentApplyActive = 1u;
     menu_instrumentApplySlot = 0u;
     menu_storageBusy = 1u;
+    menu_kitMorphApplyRunning = 1u;
     preset_startKitMorphApply();
 }
 
@@ -808,6 +811,12 @@ static uint8_t menu_tickInstrumentApply(void)
     if (preset_tickInstrumentApply())
         return 1u;
     menu_instrumentApplyActive = 0u;
+#if LIVE_MODE
+    /* Simple Morph: a KitMrp load from the card becomes the Morph target. */
+    if (menu_kitMorphApplyRunning)
+        live_morphCaptured();
+#endif
+    menu_kitMorphApplyRunning = 0u;
     if (menu_requestAppliedInstrumentNameUpdate(menu_instrumentApplySlot))
         return 1u;
     menu_storageBusy = 0u;
@@ -12459,15 +12468,6 @@ void menu_repaint(void)
     if (live_plaitsActive() && editDisplayBuffer[1][15] == ' ')
         editDisplayBuffer[1][15] = 'P';
 #endif
-    /*
-     * Morph view (SHIFT + VOICE): an 'M' in the same corner while the VOICE
-     * pages show and edit the Morph endpoint, so the mode is visible on the
-     * screen and not only by the blinking VOICE LED. It wins over the 'P'.
-     */
-    if (voiceModeShowMorph && menu_activePage <= VOICE7_PAGE &&
-        !copyClear_menuVisible() &&
-        (editDisplayBuffer[1][15] == ' ' || editDisplayBuffer[1][15] == 'P'))
-        editDisplayBuffer[1][15] = 'M';
     if ((menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
         !menu_loadSaveCursorVisible()) {
         uint8_t row;
@@ -18673,7 +18673,9 @@ static void menu_switchPageTarget(uint8_t pageNr, menu_library_target_t library)
         menu_instrumentLoadActive = 0u;
         menu_saveOptions.what = (library == MENU_LIBRARY_KIT ||
                                  library == MENU_LIBRARY_SAVE_KIT)
-            ? SAVE_TYPE_KIT : SAVE_TYPE_BANK;
+            ? SAVE_TYPE_KIT
+            : (library == MENU_LIBRARY_KIT_MORPH) ? SAVE_TYPE_KIT_MORPH
+            : SAVE_TYPE_BANK;
 #endif
         menu_resetSaveParameters();
         menu_requestCurrentLoadSaveSelection(0);
@@ -18877,6 +18879,17 @@ void menu_liveKitSaveAutoSlot(void)
 }
 
 /* LIVE: the SD kit library (LOAD + KIT) is on screen. */
+uint8_t menu_liveMorphLibraryActive(void)
+{
+#if LIVE_MODE
+    return (uint8_t)(menu_activePage == LOAD_PAGE &&
+                     menu_saveOptions.what == SAVE_TYPE_KIT_MORPH &&
+                     !menu_instrumentLoadActive);
+#else
+    return 0u;
+#endif
+}
+
 uint8_t menu_liveKitLibraryActive(void)
 {
 #if LIVE_MODE
@@ -19589,7 +19602,10 @@ void menu_setVoiceModeShowMorph(uint8_t onOff)
      * include VOICE SHIFT and the Effect-page voice mix overlay (S075 F2-F/G).
      * buttonHandler also owns the MODE1 blink feedback for the latch.
     */
-    voiceModeShowMorph = (uint8_t)(onOff != 0u);
+    /* Normotone simple Morph: no Morph endpoint view (SHIFT + VOICE, SHIFT
+     * held); the target is chosen with LOAD + MORPH. */
+    (void)onOff;
+    voiceModeShowMorph = 0u;
     menu_endlessPotMappingChanged();
     /* Morph changes endpoint display only; target identity/search results and
      * held-step values remain valid. Repaint the current VOICE frame so a

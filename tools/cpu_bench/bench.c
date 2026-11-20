@@ -373,6 +373,29 @@ int main(int argc, char **argv)
         printf("map active %u\n", plaitsMode_mapActive);
         return 0;
     }
+    /* Simple Morph scenario: bench card bank blocks morphtest */
+    if (argc > 4 && !strcmp(argv[4], "morphtest")) {
+        int g, i, same, diff;
+        const kit_t *k0, *k4;
+
+        activate(0); for (g = 0; g < 60; g++) { live_service(); settle(); }
+#define MDIFF(sc) do { diff = 0; for (v = 0; v < 6; v++) for (i = 0; i < INSTRUMENT_PARAM_COUNT; i++) \
+            diff += scene_getConst(sc)->kit.instruments[v].parameter_images.morph_instrument_parameters[i] != \
+                    scene_getConst(sc)->kit.instruments[v].parameter_images.instrument_parameters[i]; } while (0)
+        MDIFF(0); printf("after load, scene 1 morph rows != normal: %d (want 0)\n", diff);
+        live_morphSelect(4); for (g = 0; g < 60; g++) { live_service(); settle(); }
+        k0 = &scene_getConst(0)->kit; k4 = &scene_getConst(4)->kit; same = 0;
+        for (v = 0; v < 6; v++) if (k0->instruments[v].type == k4->instruments[v].type)
+            same += !memcmp(k0->instruments[v].parameter_images.morph_instrument_parameters,
+                            k4->instruments[v].parameter_images.instrument_parameters, INSTRUMENT_PARAM_COUNT);
+        MDIFF(0); printf("target = pattern 5: rows != normal %d, slots whose morph = pattern-5 sound: %d\n", diff, same);
+        preset_morph(200); for (g = 0; g < 60; g++) { live_service(); settle(); }
+        ev_scene(2); for (g = 0; g < 60; g++) { live_service(); settle(); }
+        MDIFF(2); printf("pattern change to 3: scene 3 morph rows != normal %d, MRP %u (want 200)\n", diff, scene_getVoiceMorphAmount(2, 0));
+        live_morphSelect(4); for (g = 0; g < 60; g++) { live_service(); settle(); }
+        MDIFF(2); printf("step 5 again (target off): scene 3 rows != normal %d (want 0)\n", diff);
+        return 0;
+    }
     /* Loaded kits: Morph rows that differ from normal. bench card bank blocks morphload */
     if (argc > 4 && !strcmp(argv[4], "morphload")) {
         uint8_t sc;
@@ -595,6 +618,23 @@ int main(int argc, char **argv)
             printf("routing:");
             for (v = 0; v < 6; v++) printf(" %u", mixer_audioRouting[v]);
             printf("\n");
+        }
+        /* BENCH_MORPH="src,amount": simple Morph target = kit of pattern src. */
+        if (getenv("BENCH_MORPH")) {
+            int src = atoi(getenv("BENCH_MORPH"));
+            const char *c = strchr(getenv("BENCH_MORPH"), ',');
+            int g;
+
+            live_morphSelect((uint8_t)src);
+            preset_morph((uint8_t)(c ? atoi(c + 1) : 255));
+            for (g = 0; g < 60; g++) { live_service(); settle(); }
+        }
+        /* BENCH_LEND=src: the kit of pattern src plays (KIT page lend). */
+        if (getenv("BENCH_LEND")) {
+            int g;
+
+            live_kitSelect((uint8_t)atoi(getenv("BENCH_LEND")));
+            for (g = 0; g < 60; g++) { live_service(); settle(); }
         }
         /* BENCH_DVB=1: the factory dark rumble on every Scene. */
         if (getenv("BENCH_DVB")) {
