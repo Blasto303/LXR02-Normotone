@@ -162,7 +162,7 @@ static uint8_t menuEffects_screenCount(uint8_t sub_page)
         return sub_page == RUMBLE_REVERB;
     }
     if (sub_page == 0u)
-        return 2u;
+        return 1u;      /* Normotone: no FX sequencer screen (run len scl) */
     if (entry->select_layout) {
         screens = entry->select_layout->screen_count[sub_page];
         return (screens > MENU_FX_SCREENS_MAX) ? MENU_FX_SCREENS_MAX : screens;
@@ -290,10 +290,8 @@ void menuEffects_enter(uint8_t *sub_page, uint8_t *column)
 void menuEffects_toggleFirstScreen(uint8_t *sub_page, uint8_t *column)
 {
     menuEffects_typeEdit = 0u;
-    if (rumbleEditor)
-        menuEffects_screen[0] = 0u;
-    else
-        menuEffects_screen[0] = (uint8_t)(menuEffects_screen[0] ? 0u : 1u);
+    /* Normotone: one first screen only (the FX sequencer screen is gone). */
+    menuEffects_screen[0] = 0u;
     *sub_page = 0u;
     *column = 0u;
 }
@@ -1084,14 +1082,16 @@ void menuEffects_seqButtonPressed(uint8_t step)
 {
     const effect_record_t *record = menuEffects_record();
 
-    if (record && record->seq_run_mode == EFFECT_SEQ_RUN_SEL)
-        effects_seqSelect(step);
+    /* Normotone: no FX sequencer, no `sel` step. */
+    (void)record;
+    (void)step;
 }
 
 /* Open FX lock editing after the shared VOICE hold threshold (S074). */
 void menuEffects_seqHoldExpired(void)
 {
-    menuEffects_holdState = MENU_FX_HOLD_ACTIVE;
+    /* Normotone: the FX sequencer is gone; a held step locks nothing. */
+    menuEffects_holdState = 0u;
     menuEffects_holdMask = 0u;
 }
 

@@ -975,6 +975,10 @@ static uint8_t effects_seqStepFor(const effect_record_t *record)
 {
     uint8_t len = effects_seqLength(record);
 
+    /* Normotone: the FX sequencer is removed; stored locks never play. */
+    (void)len;
+    return EFFECT_SEQ_STEP_NONE;
+
     /* `sel` always applies; seq_step_valid belongs to the clock step only. */
     if (record->seq_run_mode == EFFECT_SEQ_RUN_SEL)
         return (uint8_t)(effects_state.seq_sel_step % len);

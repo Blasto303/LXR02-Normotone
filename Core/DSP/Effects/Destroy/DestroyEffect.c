@@ -8,9 +8,10 @@
  *   curve   high band x drive (0..+36 dB) through a curve that goes from a
  *           rational soft clip (fld 0) to a sine wavefolder (fld 127),
  *           evaluated at 2x (midpoint and sample, averaged) to tame aliasing
- *   sub     a square one octave down, from a flip-flop on the rising zero
+ *   sub     a square one octave down (flip-flop on the rising zero
  *           crossings of the 120 Hz low-passed mono sum, shaped by its
- *           envelope and smoothed at 200 Hz
+ *           envelope), injected into the curve; above 64 it also flips
+ *           the distorted band (octave-down ring modulation)
  *   tone    tilt around a 1.2 kHz one-pole: 0 dark, 64 flat, 127 thin
  *   mix     dry MAIN to destroyed MAIN, ramped per block
  *   plate   the DlyVerb plate at a quarter rate on the mono mix (pla send,
@@ -176,7 +177,7 @@ static void destroy_process(void *rt_void, effect_io_t *io)
     float *R;
     uint32_t n;
     uint32_t frames;
-    float fold, kf, split_a, use_split, sub_lvl, tone_t, tone_a;
+    float fold, kf, split_a, use_split, sub_lvl, sub_rm, tone_t, tone_a;
     float mix0, mix1, mix_inc, drv0, drv1, drv_inc;
     float pla, decay, dd2, damp2, sub_lp_a, sub_out_a, env_rel;
     uint32_t folding;
@@ -204,11 +205,12 @@ static void destroy_process(void *rt_void, effect_io_t *io)
         split_a = 1.0f - expf(-DS_TWO_PI * hz / DS_FS);
     }
     sub_lvl = (float)DS_ROW(rt, DESTROY_PARAM_SUB) * (1.0f / 127.0f);
+    sub_rm = (sub_lvl > 0.5f) ? 2.0f * (sub_lvl - 0.5f) : 0.0f;
     tone_t = ((float)DS_ROW(rt, DESTROY_PARAM_TONE) - 64.0f) * (1.0f / 63.0f);
     tone_t = (tone_t > 1.0f) ? 1.0f : ((tone_t < -1.0f) ? -1.0f : tone_t);
     tone_a = 1.0f - expf(-DS_TWO_PI * 1200.0f / DS_FS);
     sub_lp_a = 1.0f - expf(-DS_TWO_PI * 120.0f / DS_FS);
-    sub_out_a = 1.0f - expf(-DS_TWO_PI * 200.0f / DS_FS);
+    sub_out_a = 1.0f - expf(-DS_TWO_PI * 1000.0f / DS_FS);  /* keeps grit */
     env_rel = expf(-1.0f / (0.05f * DS_FS));
     mix1 = (float)DS_ROW(rt, DESTROY_PARAM_MIX) * (1.0f / 127.0f);
     drv1 = exp2f((float)DS_ROW(rt, DESTROY_PARAM_DRIVE) * (6.0f / 127.0f));
@@ -263,21 +265,29 @@ static void destroy_process(void *rt_void, effect_io_t *io)
             st->sub_out += sub_out_a * (st->sub_sq * st->sub_env - st->sub_out);
         }
 
-        /* Split, curve at 2x, recombine (per channel). */
+        /*
+         * Split, curve at 2x, recombine (per channel). sub, first half of its
+         * travel: the sub-octave goes INTO the curve (1.5x), so it is driven
+         * and saturated with everything (a roar, not an added bass). Second
+         * half: the distorted band is also flipped every other sub half-
+         * period (octave-down ring modulation, with hard edges): it tears.
+         */
         {
+            const float inj = 1.5f * sub_lvl * st->sub_out;
+            const float flip = 1.0f + sub_rm * (st->sub_sq - 1.0f);
             float lo;
 
             st->split[0] += split_a * (xl - st->split[0]);
             lo = use_split * st->split[0];
-            yl = lo + comp * ds_shape((xl - lo) * drv, &st->dprev[0],
-                                      folding, fold, kf);
+            yl = lo + comp * ds_shape(((xl - lo) * flip + inj) * drv,
+                                      &st->dprev[0], folding, fold, kf);
             st->split[1] += split_a * (xr - st->split[1]);
             lo = use_split * st->split[1];
-            yr = lo + comp * ds_shape((xr - lo) * drv, &st->dprev[1],
-                                      folding, fold, kf);
+            yr = lo + comp * ds_shape(((xr - lo) * flip + inj) * drv,
+                                      &st->dprev[1], folding, fold, kf);
         }
-        yl += sub_lvl * st->sub_out;
-        yr += sub_lvl * st->sub_out;
+        yl += 0.5f * sub_lvl * st->sub_out;
+        yr += 0.5f * sub_lvl * st->sub_out;
 
         /* Tone tilt. */
         st->tone[0] += tone_a * (yl - st->tone[0]);
