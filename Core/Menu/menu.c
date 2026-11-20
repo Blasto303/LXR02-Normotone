@@ -4689,6 +4689,9 @@ static menu_cell_t menu_resolveSceneSettingCell(uint8_t index)
     cell.descriptor_index = INSTRUMENT_MENU_EMPTY;
     if (index >= MENU_SCENE_SETTING_COUNT)
         return cell;
+    /* Normotone simple Morph: no per-voice Morph cell (Nvm); MRP only. */
+    if (index == MENU_SCENE_SETTING_VOICE_MORPH)
+        return cell;
     cell.kind = MENU_CELL_SCENE_SETTING;
     cell.scene_setting = index;
     cell.slot = menu_voicePageToSlot(menu_activePage);
@@ -19257,12 +19260,10 @@ void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
         uint8_t scene_index;
         uint8_t slot = (uint8_t)(paramNr - PAR_VOICE1_MORPH);
 
-        for (scene_index = 0u;
-             scene_index < SCENE_SLOT_TOTAL;
-             scene_index++) {
-            if ((edit_mask & (1ul << scene_index)) != 0u)
-                preset_morphVoiceScene(scene_index, slot, value);
-        }
+        /* Normotone simple Morph: no per-voice amounts (MRP only). */
+        (void)edit_mask;
+        (void)scene_index;
+        (void)slot;
         break;
     }
 

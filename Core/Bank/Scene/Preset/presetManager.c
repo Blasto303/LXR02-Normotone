@@ -4506,7 +4506,12 @@ void preset_morphVoice(uint8_t slot, uint8_t morph)
      * operation while MIDI CC1 on a voice channel and PERF 1vm..6vm edits must
      * preserve the other five slot amounts.
      */
-    preset_morphVoiceScene(scene_getActiveIndex(), slot, morph);
+    /*
+     * Normotone simple Morph: one MRP for the whole kit. Per-voice sources
+     * (CC1 on a voice channel, velocity -> voice Morph, Nvm) do nothing.
+     */
+    (void)slot;
+    (void)morph;
 }
 
 void preset_morphVoiceScene(uint8_t scene_index, uint8_t slot, uint8_t morph)
