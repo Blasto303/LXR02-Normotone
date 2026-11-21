@@ -11,7 +11,7 @@
 
 #include "EffectsManager.h"
 
-#define DESTROY_PARAM_COUNT 11u
+#define DESTROY_PARAM_COUNT 12u
 
 /* Append only; never renumber (FX lanes, automation ids, `.fx` keys). */
 typedef enum {
@@ -26,6 +26,12 @@ typedef enum {
     DESTROY_PARAM_MIX,             /* mix: dry/wet on MAIN                */
     DESTROY_PARAM_PLATE,           /* pla: plate on the whole mix         */
     DESTROY_PARAM_PLATE_DECAY,     /* pdc: plate length                   */
+    /*
+     * alg: 0 cls (the curve above), 1..8 feedback-network models. For a
+     * model, dri/fld/sub are its three knobs (names on the Effect page
+     * follow the model).
+     */
+    DESTROY_PARAM_ALG,
     DESTROY_PARAM_ENUM_COUNT
 } destroy_param_t;
 
@@ -33,5 +39,7 @@ extern const effect_param_descriptor_t destroy_descriptors[];
 extern const char destroy_token3[];
 extern const char destroy_abbrev5[];
 extern const char destroy_full8[];
+extern const effect_select_layout_t destroy_layout;
+extern const effect_ui_hooks_t destroy_ui;
 
 #endif /* DESTROY_PARAMETERS_H_ */

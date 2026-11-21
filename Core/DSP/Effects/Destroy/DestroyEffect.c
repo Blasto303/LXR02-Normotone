@@ -23,12 +23,15 @@
 #include "DestroyEffect.h"
 #include "DestroyParameters.h"
 #include "DlyVerbEffect.h"
+#include "DestroyModels.h"
 #include <math.h>
 #include <string.h>
 
 #define DS_FS          44108.07f
 #define DS_TWO_PI      6.28318531f
 #define DS_RVB_MASK    (DESTROY_RVB_SAMPLES - 1u)
+/* Model output level (they peak near full scale; the dry mix is lower). */
+#define DS_MODEL_GAIN  0.5f
 
 typedef struct {
     float split[2];        /* crossover low-pass                    */
@@ -48,6 +51,8 @@ typedef struct {
     float plate_mod;       /* plate modulation phase                */
     uint32_t ptr;
     uint32_t primed;
+    float env;             /* input dynamics follower (models)      */
+    DsModelState models;   /* alg 1..8 state (DestroyModels.c)      */
 } DestroyState;
 
 _Static_assert(sizeof(DestroyState) <= DESTROY_STATE_BYTES,
@@ -182,6 +187,8 @@ static void destroy_process(void *rt_void, effect_io_t *io)
     float pla, decay, dd2, damp2, sub_lp_a, sub_out_a, env_rel;
     uint32_t folding;
     float comp0, comp_inc;
+    uint8_t alg;
+    int16_t *pool;
 
     if (!rt || !io || !io->l || !io->r || io->frames == 0u)
         return;
@@ -189,6 +196,12 @@ static void destroy_process(void *rt_void, effect_io_t *io)
     if (!st)
         return;                         /* no share: MAIN stays dry */
     rv = (int16_t *)((uint8_t *)st + DESTROY_STATE_BYTES);
+    pool = rv + DESTROY_RVB_SAMPLES;
+    alg = DS_ROW(rt, DESTROY_PARAM_ALG);
+    alg = (alg < DSM_ALG_COUNT) ? alg : 0u;
+    if (alg)
+        dsm_block(&st->models, alg, DS_ROW(rt, DESTROY_PARAM_DRIVE),
+                  DS_ROW(rt, DESTROY_PARAM_FOLD), DS_ROW(rt, DESTROY_PARAM_SUB));
     L = io->l;
     R = io->r;
     frames = io->frames;
@@ -205,6 +218,8 @@ static void destroy_process(void *rt_void, effect_io_t *io)
         split_a = 1.0f - expf(-DS_TWO_PI * hz / DS_FS);
     }
     sub_lvl = (float)DS_ROW(rt, DESTROY_PARAM_SUB) * (1.0f / 127.0f);
+    if (alg)
+        sub_lvl = 0.0f;           /* sub-octave: cls only (sub = a knob) */
     sub_rm = (sub_lvl > 0.5f) ? 2.0f * (sub_lvl - 0.5f) : 0.0f;
     tone_t = ((float)DS_ROW(rt, DESTROY_PARAM_TONE) - 64.0f) * (1.0f / 63.0f);
     tone_t = (tone_t > 1.0f) ? 1.0f : ((tone_t < -1.0f) ? -1.0f : tone_t);
@@ -272,7 +287,25 @@ static void destroy_process(void *rt_void, effect_io_t *io)
          * half: the distorted band is also flipped every other sub half-
          * period (octave-down ring modulation, with hard edges): it tears.
          */
-        {
+        if (alg) {
+            /* Models 1..8: the band above crs goes through the network. */
+            const float a = (fabsf(xl) > fabsf(xr)) ? fabsf(xl) : fabsf(xr);
+            float env01;
+            float lo;
+
+            st->env = (a > st->env) ? st->env + 0.01f * (a - st->env)
+                                    : a + env_rel * (st->env - a);
+            env01 = 3.0f * st->env;
+            env01 = (env01 > 1.0f) ? 1.0f : env01;
+            st->split[0] += split_a * (xl - st->split[0]);
+            lo = use_split * st->split[0];
+            yl = lo + DS_MODEL_GAIN * dsm_sample(&st->models, pool, 0u,
+                                                 xl - lo, env01);
+            st->split[1] += split_a * (xr - st->split[1]);
+            lo = use_split * st->split[1];
+            yr = lo + DS_MODEL_GAIN * dsm_sample(&st->models, pool, 1u,
+                                                 xr - lo, env01);
+        } else {
             const float inj = 1.5f * sub_lvl * st->sub_out;
             const float flip = 1.0f + sub_rm * (st->sub_sq - 1.0f);
             float lo;

@@ -163,7 +163,7 @@ static const effect_registry_entry_t effects_registry[EFFECT_TYPE_COUNT] = {
           DESTROY_PARAM_PLATE, DESTROY_PARAM_PLATE_DECAY, DESTROY_PARAM_LEVEL,
           EFFECT_LANE_NONE, EFFECT_LANE_NONE, EFFECT_LANE_NONE,
           EFFECT_LANE_NONE, EFFECT_LANE_NONE, EFFECT_LANE_NONE },
-        NULL, &destroy_ops, NULL,
+        &destroy_layout, &destroy_ops, &destroy_ui,
         (uint16_t)sizeof(DestroyRuntime),
         DESTROY_BUFFER_MIN_BYTES, DESTROY_BUFFER_MIN_BYTES
     },

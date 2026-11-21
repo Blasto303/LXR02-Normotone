@@ -11,10 +11,13 @@
 
 #include "EffectsManager.h"
 
-#define DESTROY_TYPE_ROWS         8u
-#define DESTROY_STATE_BYTES       160u
+#define DESTROY_TYPE_ROWS         9u
+#define DESTROY_STATE_BYTES       512u
 #define DESTROY_RVB_SAMPLES       16384u
-#define DESTROY_BUFFER_MIN_BYTES  (DESTROY_STATE_BYTES + DESTROY_RVB_SAMPLES * 2u)
+/* + the model delay pool (DestroyModels.h, 8,192 int16) after the ring. */
+#define DESTROY_POOL_SAMPLES      8192u
+#define DESTROY_BUFFER_MIN_BYTES  (DESTROY_STATE_BYTES + DESTROY_RVB_SAMPLES * 2u + \
+                                   DESTROY_POOL_SAMPLES * 2u)
 
 typedef struct {
     uint8_t raw[DESTROY_TYPE_ROWS];

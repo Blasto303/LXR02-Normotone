@@ -170,6 +170,7 @@ DSP_SRCS = \
   Core/DSP/Effects/CrumpBit/CrumpBitEffect.c \
   Core/DSP/Effects/DlyVerb/DlyVerbEffect.c \
   Core/DSP/Effects/Destroy/DestroyEffect.c \
+  Core/DSP/Effects/Destroy/DestroyModels.c \
   Core/DSP/Instruments/PlaitsKick/PlaitsKickVoice.c \
   Core/DSP/Instruments/PlaitsSnare/PlaitsSnareVoice.c \
   Core/DSP/Instruments/PlaitsHat/PlaitsHatVoice.c \
@@ -272,6 +273,10 @@ $(BUILD)/Core/DSP/Effects/DlyVerb/DlyVerbEffect.o: Core/DSP/Effects/DlyVerb/DlyV
 	$(CC) -c $(CFLAGS_DSP) $< -o $@
 
 $(BUILD)/Core/DSP/Effects/Destroy/DestroyEffect.o: Core/DSP/Effects/Destroy/DestroyEffect.c | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(CC) -c $(CFLAGS_DSP) $< -o $@
+
+$(BUILD)/Core/DSP/Effects/Destroy/DestroyModels.o: Core/DSP/Effects/Destroy/DestroyModels.c | $(BUILD)
 	@mkdir -p $(dir $@)
 	$(CC) -c $(CFLAGS_DSP) $< -o $@
 
