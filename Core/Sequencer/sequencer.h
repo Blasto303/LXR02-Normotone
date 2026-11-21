@@ -35,6 +35,8 @@ enum Seq_QuantisationEnum
 };
 
 extern uint8_t seq_activePattern;
+/* LIVE random layer dose 0..127 (sequencer.c). */
+extern volatile uint8_t seq_liveRndDose;
 extern uint8_t seq_newPatternAvailable;
 extern uint8_t seq_resetBarOnPatternChange;
 

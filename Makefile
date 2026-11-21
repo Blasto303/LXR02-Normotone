@@ -40,6 +40,7 @@ CFLAGS  = $(MCU) -O2 -flto -Wall -Wextra -std=gnu11 \
           -ICore/DSP/Effects/StereoFilter \
           -ICore/DSP/Effects/CrumpBit \
           -ICore/DSP/Effects/DlyVerb \
+          -ICore/DSP/Effects/Destroy \
           -ICore/DSP/Instruments/PlaitsKick \
           -ICore/DSP/Instruments/PlaitsSnare \
           -ICore/DSP/Instruments/PlaitsHat \
@@ -96,6 +97,9 @@ SRCS = \
   Core/Hardware/USB/App/usbd_usr.c \
   Core/Menu/menu.c \
   Core/Menu/menuEffects.c \
+  Core/Menu/liveMode.c \
+  Core/Menu/plaitsMode.c \
+  Core/Hardware/cpuProfile.c \
   Core/Sequencer/StepScale.c \
   Core/Menu/Cc2Text.c \
   Core/Menu/CopyClear/copyClearSession.c \
@@ -123,6 +127,7 @@ SRCS = \
   Core/DSP/Effects/StereoFilter/StereoFilterParameters.c \
   Core/DSP/Effects/CrumpBit/CrumpBitParameters.c \
   Core/DSP/Effects/DlyVerb/DlyVerbParameters.c \
+  Core/DSP/Effects/Destroy/DestroyParameters.c \
   Core/DSP/Instruments/PlaitsKick/PlaitsKickParameters.c \
   Core/DSP/Instruments/PlaitsSnare/PlaitsSnareParameters.c \
   Core/DSP/Instruments/PlaitsHat/PlaitsHatParameters.c \
@@ -164,6 +169,8 @@ DSP_SRCS = \
   Core/DSP/Effects/StereoFilter/StereoFilterEffect.c \
   Core/DSP/Effects/CrumpBit/CrumpBitEffect.c \
   Core/DSP/Effects/DlyVerb/DlyVerbEffect.c \
+  Core/DSP/Effects/Destroy/DestroyEffect.c \
+  Core/DSP/Effects/Destroy/DestroyModels.c \
   Core/DSP/Instruments/PlaitsKick/PlaitsKickVoice.c \
   Core/DSP/Instruments/PlaitsSnare/PlaitsSnareVoice.c \
   Core/DSP/Instruments/PlaitsHat/PlaitsHatVoice.c \
@@ -262,6 +269,14 @@ $(BUILD)/Core/DSP/Instruments/PlaitsModal/PlaitsModalVoice.o: Core/DSP/Instrumen
 # DlyVerb DSP runs with the fast-math policy like CrumpBit; its descriptor
 # and label source stays an ordinary -O2 source in SRCS.
 $(BUILD)/Core/DSP/Effects/DlyVerb/DlyVerbEffect.o: Core/DSP/Effects/DlyVerb/DlyVerbEffect.c | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(CC) -c $(CFLAGS_DSP) $< -o $@
+
+$(BUILD)/Core/DSP/Effects/Destroy/DestroyEffect.o: Core/DSP/Effects/Destroy/DestroyEffect.c | $(BUILD)
+	@mkdir -p $(dir $@)
+	$(CC) -c $(CFLAGS_DSP) $< -o $@
+
+$(BUILD)/Core/DSP/Effects/Destroy/DestroyModels.o: Core/DSP/Effects/Destroy/DestroyModels.c | $(BUILD)
 	@mkdir -p $(dir $@)
 	$(CC) -c $(CFLAGS_DSP) $< -o $@
 

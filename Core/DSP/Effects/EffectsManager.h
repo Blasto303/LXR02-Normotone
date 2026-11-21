@@ -66,7 +66,9 @@
 #define EFFECT_TYPE_STEREO_FILTER        1u
 #define EFFECT_TYPE_CRUMPBIT             2u
 #define EFFECT_TYPE_DLYVERB              3u
-#define EFFECT_TYPE_COUNT                4u
+/* Normotone `dst`: multi-stage distortion inserted on MAIN (dry/wet). */
+#define EFFECT_TYPE_DESTROY              4u
+#define EFFECT_TYPE_COUNT                5u
 
 /* Extra descriptor capability flags used by Effect-specific owners. */
 #define EFFECT_PARAM_FLAG_WIDE8              0x01u
@@ -81,6 +83,8 @@
 #define EFFECT_IO_STEREO_IN              0x02u
 #define EFFECT_IO_MONO_OUT               0x04u
 #define EFFECT_IO_STEREO_OUT             0x08u
+/* Normotone: the type processes MAIN in place (no FX bus, no sends). */
+#define EFFECT_IO_MAIN_INSERT            0x10u
 
 /* Convert a Pattern's seven-bit value to an Effect's stored domain. */
 typedef uint8_t (*effect_expand7_fn)(uint8_t value7);
@@ -118,6 +122,7 @@ typedef struct {
     uint8_t frames;
     uint8_t channels;
     const fx_share_t *share;
+    const float *aux;   /* Normotone plate bus (mono, frames), or NULL */
 } effect_io_t;
 
 /*
@@ -502,6 +507,13 @@ uint8_t effects_changeType(uint8_t scene_index, effect_type_id_t type);
 void effects_service(void);
 void effects_process(effect_io_t *io);
 effect_type_id_t effects_activeType(void);
+/* Diagnostics: value last pushed to the runtime, and the runtime's Scene. */
+uint8_t effects_lastApplied(uint8_t index);
+/* Plate send 0..127 of mixer slot 1..5 (0 unless DlyVerb runs). */
+uint8_t effects_plateSend(uint8_t slot);
+/* Sidechain hit for the DlyVerb duck; returns 0 when DlyVerb is not running. */
+uint8_t effects_duckTrigger(float weight);
+uint8_t effects_runtimeScene(void);
 uint8_t effects_activeIoFlags(void);
 const effects_common_runtime_t *effects_commonRuntime(void);
 

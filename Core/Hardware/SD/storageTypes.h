@@ -351,6 +351,9 @@ storage_status_t storage_instrumentFinalize(const storage_instrument_state_t *st
  * corresponding morph image value. Client:
  * filesystem_loadKitDirectory_tick() calls this when seen_morph_count is zero.
  */
+/* Normotone: a darker, longer Morph endpoint when it equals the normal sound. */
+void storage_instrumentStartMorph(storage_instrument_type_t type,
+                                  kit_instrument_slot_t *instrument);
 void storage_instrumentCopyMainToMorphFallback(storage_instrument_type_t type,
                                                uint8_t slot,
                                                kit_instrument_slot_t *instrument);

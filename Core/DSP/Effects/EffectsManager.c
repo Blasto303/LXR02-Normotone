@@ -22,6 +22,8 @@
 /* S074: CrumpBit (`cbt`), the first buffer-using Effect type. */
 #include "CrumpBitParameters.h"
 #include "CrumpBitEffect.h"
+#include "DestroyParameters.h"
+#include "DestroyEffect.h"
 /* DlyVerb (`dvb`): tempo-synced character delay into a plate reverb. */
 #include "DlyVerbParameters.h"
 #include "DlyVerbEffect.h"
@@ -146,12 +148,33 @@ static const effect_registry_entry_t effects_registry[EFFECT_TYPE_COUNT] = {
         (uint16_t)sizeof(DlyVerbRuntime),
         DLYVERB_BUFFER_MIN_BYTES, DLYVERB_BUFFER_MIN_BYTES
     },
+    /*
+     * Destroy (`dst`, Normotone): MAIN insert, stereo in place. State and the
+     * plate ring use the Effect share. Lanes: drive, fold, sub, cross, tone,
+     * mix, plate, plate decay, vol.
+     */
+    {
+        destroy_token3, destroy_abbrev5, destroy_full8,
+        EFFECT_IO_STEREO_IN | EFFECT_IO_STEREO_OUT | EFFECT_IO_MAIN_INSERT,
+        destroy_descriptors, DESTROY_PARAM_COUNT,
+        { EFFECT_LANE_MORPH_SOURCE,
+          DESTROY_PARAM_DRIVE, DESTROY_PARAM_FOLD, DESTROY_PARAM_SUB,
+          DESTROY_PARAM_CROSS, DESTROY_PARAM_TONE, DESTROY_PARAM_MIX,
+          DESTROY_PARAM_PLATE, DESTROY_PARAM_PLATE_DECAY, DESTROY_PARAM_LEVEL,
+          EFFECT_LANE_NONE, EFFECT_LANE_NONE, EFFECT_LANE_NONE,
+          EFFECT_LANE_NONE, EFFECT_LANE_NONE, EFFECT_LANE_NONE },
+        &destroy_layout, &destroy_ops, &destroy_ui,
+        (uint16_t)sizeof(DestroyRuntime),
+        DESTROY_BUFFER_MIN_BYTES, DESTROY_BUFFER_MIN_BYTES
+    },
 };
 
 _Static_assert(sizeof(StereoFilterRuntime) <= sizeof(effects_runtime_t),
                "Effect runtime union must hold StereoFilter");
 _Static_assert(sizeof(CrumpBitRuntime) <= sizeof(effects_runtime_t),
                "Effect runtime union must hold CrumpBit");
+_Static_assert(sizeof(DestroyRuntime) <= sizeof(effects_runtime_t),
+               "DestroyRuntime must fit the Effect runtime union");
 _Static_assert(sizeof(DlyVerbRuntime) <= sizeof(effects_runtime_t),
                "Effect runtime union must hold DlyVerb");
 /*
@@ -676,8 +699,23 @@ uint8_t effects_setParameter(uint8_t scene_index, uint8_t index,
      * cell/card-clean state; the active runtime is rescanned by service.
      */
     for (s = 0u; s < SCENE_SLOT_TOTAL; s++) {
-        if ((mask & (1ul << s)) != 0u)
+        if ((mask & (1ul << s)) != 0u) {
+            /*
+             * Normotone: while a row's two endpoints are equal (no Morph
+             * designed for it), a normal edit moves both, so it is heard
+             * whatever the Effect Morph amount. Before, at fxm/mrp 255 the
+             * Morph endpoint played alone and normal edits were silent.
+             */
+            const effect_record_t *rec = scene_effectConst(s);
+            const uint8_t linked = (uint8_t)(image == EFFECT_IMAGE_NORMAL &&
+                rec && index < EFFECT_PARAM_COUNT &&
+                rec->normal[index] == rec->morph[index]);
+
             changed |= effects_setParameterScene(s, index, image, value);
+            if (linked)
+                changed |= effects_setParameterScene(s, index,
+                                                     EFFECT_IMAGE_MORPH, value);
+        }
     }
     /*
      * Menu edit of an Effect parameter clears its overlay and sets menuHold
@@ -936,6 +974,10 @@ static void effects_seqConsume(const effect_record_t *record)
 static uint8_t effects_seqStepFor(const effect_record_t *record)
 {
     uint8_t len = effects_seqLength(record);
+
+    /* Normotone: the FX sequencer is removed; stored locks never play. */
+    (void)len;
+    return EFFECT_SEQ_STEP_NONE;
 
     /* `sel` always applies; seq_step_valid belongs to the clock step only. */
     if (record->seq_run_mode == EFFECT_SEQ_RUN_SEL)
@@ -1945,6 +1987,8 @@ void effects_service(void)
         morph = scene_getEffectMorphAmount(effects_state.scene_index);
     }
     morph = effects_lfoResolve(EFFECT_LFO_TARGET_MORPH, morph, 0u, 255u);
+    /* Normotone simple Morph: Effects always play their normal settings. */
+    morph = 0u;
     lfo_mask = effects_lfoTargetMask();
     fxbuf_effectShare(&share);
     for (index = 0u; index < entry->descriptor_count; index++) {
@@ -2009,6 +2053,37 @@ void effects_process(effect_io_t *io)
      * no process hook and the mixer skips the bus entirely for it. */
     if (entry && entry->ops && entry->ops->process && io)
         entry->ops->process(effects_runtimeMember(), io);
+}
+
+/* Diagnostic: the value effects_service() last pushed to the runtime. */
+uint8_t effects_lastApplied(uint8_t index)
+{
+    return (index < EFFECT_PARAM_COUNT) ? effects_state.last_applied[index] : 0u;
+}
+
+uint8_t effects_plateSend(uint8_t slot)
+{
+    if (effects_state.runtime_type != EFFECT_TYPE_DLYVERB ||
+        slot == 0u || slot > 5u)
+        return 0u;
+    return effects_state.last_applied[DLYVERB_PARAM_PLATE_D2 + slot - 1u];
+}
+
+uint8_t effects_duckTrigger(float weight)
+{
+    DlyVerbRuntime *rt;
+
+    if (effects_state.runtime_type != EFFECT_TYPE_DLYVERB)
+        return 0u;
+    rt = (DlyVerbRuntime *)effects_runtimeMember();
+    if (weight > rt->duck_pending)
+        rt->duck_pending = weight;
+    return 1u;
+}
+
+uint8_t effects_runtimeScene(void)
+{
+    return effects_state.scene_index;
 }
 
 effect_type_id_t effects_activeType(void)

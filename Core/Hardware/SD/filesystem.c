@@ -59,6 +59,7 @@
  * from filesystem_tick(), including synchronous boot polling.
  */
 
+#include "liveMode.h"
 #include "filesystem.h"
 #include "config.h"
 #include "asyncfatfs.h"
@@ -2794,7 +2795,8 @@ static void filesystem_resetGlobalsToDefaults(void)
     parameter_values[PAR_PERF_VEL_LT] = 0u;
     parameter_values[PAR_PERF_VEL_RT] = 0u;
     parameter_values[PAR_SCENE_CHANGE_DIV] = 0u;
-    parameter_values[PAR_SCENE_QUEUE_DIV] = 0u;
+    /* LIVE: SHIFT+step patterns start at the end of the bar (qcd 1b). */
+    parameter_values[PAR_SCENE_QUEUE_DIV] = LIVE_MODE ? 4u : 0u;
     parameter_values[PAR_SCENE_QUEUE_ACTION] = 0u;
 }
 
@@ -2824,6 +2826,12 @@ static void filesystem_sanitizeLoadedGlobals(void)
      */
     if (parameter_values[PAR_SCENE_QUEUE_DIV] > 17u)
         parameter_values[PAR_SCENE_QUEUE_DIV] = 0u;
+    /* LIVE: the clock follows CLK IN, DIN or USB when one runs (aut). */
+    if (LIVE_MODE && parameter_values[PAR_EXT_SYNC] == SEQ_EXT_SYNC_OFF)
+        parameter_values[PAR_EXT_SYNC] = SEQ_EXT_SYNC_AUTO;
+    /* LIVE: an instant queue (older settings.cfg) becomes end of bar. */
+    if (LIVE_MODE && parameter_values[PAR_SCENE_QUEUE_DIV] == 0u)
+        parameter_values[PAR_SCENE_QUEUE_DIV] = 4u;
     if (parameter_values[PAR_SCENE_CHANGE_DIV] > 9u)
         parameter_values[PAR_SCENE_CHANGE_DIV] = 0u;
     /*
@@ -12579,6 +12587,7 @@ static void filesystem_loadKitDirectory_tick(void)
                         (uint8_t)(op_instrument_slot + 1u),
                         &op_staged_kit.instruments[op_instrument_slot]);
                 }
+                storage_instrumentStartMorph(op_kitset.instrument_type[op_instrument_slot], &op_staged_kit.instruments[op_instrument_slot]);
                 op_close_status = FS_STATUS_DONE;
             }
             op_phase = 20;
@@ -13404,6 +13413,7 @@ static void filesystem_loadSceneDirectory_tick(void)
                         (uint8_t)(op_instrument_slot + 1u),
                         &fs_stage_workspace.scene_stage.kit.instruments[op_instrument_slot]);
                 }
+                storage_instrumentStartMorph(op_kitset.instrument_type[op_instrument_slot], &fs_stage_workspace.scene_stage.kit.instruments[op_instrument_slot]);
                 op_close_status = FS_STATUS_DONE;
             }
             op_phase = 30;
@@ -17161,6 +17171,7 @@ static void filesystem_loadInstrument_tick(void)
                         (uint8_t)(op_instrument_load_destination_slot + 1u),
                         &op_staged_instrument);
                 }
+                storage_instrumentStartMorph(op_instrument_load_type, &op_staged_instrument);
                 /*
                  * Pair the validated Instrument with its one identity row.
                  *
@@ -30196,6 +30207,8 @@ static uint8_t filesystem_bootReaderParseInstrumentFile(
                 storage_instrumentCopyMainToMorphFallback(
                     type, one_based_voice, destination);
             }
+            if (ok)
+                storage_instrumentStartMorph(type, destination);
             break;
         }
     }

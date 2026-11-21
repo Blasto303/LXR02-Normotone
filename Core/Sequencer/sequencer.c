@@ -47,6 +47,7 @@
 #include "MidiVoiceControl.h"
 #include "CymbalVoice.h"
 #include "sequencer.h"
+#include "plaitsMode.h"
 #include <string.h>
 #include "usb_manager.h"
 #include "clockSync.h"
@@ -75,6 +76,52 @@
  */
 #include "random.h"
 
+
+/*
+ * LIVE random layer (liveMode.h, SHIFT + LAST STEP).
+ *
+ * What: at play time, with dose 0..127, an active step may be skipped (up to
+ * 25 %), an empty step may fire a ghost hit (up to 20 %) and every hit gets a
+ * velocity jitter (up to +-dose/2). Track 1 (DRUM1, the rumble kick) is left
+ * alone. Nothing is written to the Pattern: dose 0 plays the original.
+ * Context: TIM3 ISR (reads one byte written by the foreground).
+ */
+volatile uint8_t seq_liveRndDose;
+
+static uint8_t seq_liveRndRoll(void)
+{
+    return (uint8_t)(((uint16_t)GetRngValue() & 0x7FFFu) % 128u);
+}
+
+static uint8_t seq_liveRndSkip(uint8_t track)
+{
+    uint8_t d = seq_liveRndDose;
+
+    return (uint8_t)(d && track != 0u && seq_liveRndRoll() < (uint8_t)(d / 4u));
+}
+
+static uint8_t seq_liveRndGhost(uint8_t track)
+{
+    uint8_t d = seq_liveRndDose;
+
+    return (uint8_t)(d && track != 0u && seq_liveRndRoll() < (uint8_t)(d / 5u));
+}
+
+static uint8_t seq_liveRndVelocity(uint8_t track, uint8_t vel)
+{
+    uint8_t d = seq_liveRndDose;
+    int16_t v;
+
+    if (!d || track == 0u)
+        return vel;
+    v = (int16_t)vel + (int16_t)(seq_liveRndRoll() % (uint8_t)(d + 1u)) -
+        (int16_t)(d / 2u);
+    if (v < 1)
+        v = 1;
+    if (v > 127)
+        v = 127;
+    return (uint8_t)v;
+}
 
 #define SEQ_INTERNAL_PPQ	96u
 #define SEQ_MIDI_PPQ        24u
@@ -3104,6 +3151,9 @@ static void seq_advanceTrackStep(uint8_t track)
 		/* Set when this step's stored trigger is suppressed (C-9c). */
 		uint8_t trigger_suppressed = 0u;
 
+		/* LIVE random layer: velocity jitter (no-op at dose 0). */
+		sp.velocity = seq_liveRndVelocity(track, sp.velocity);
+
 		/*
 		 * Fired bit: bit 15 set and the condition passed, known at the step start
 		 * whether or not the trigger is deferred (S081 §9.1a, C-9a).
@@ -3190,7 +3240,8 @@ static void seq_advanceTrackStep(uint8_t track)
 				                  (uint8_t)seq_stepIndex[track], 0u);
 				patSvc_enqueueEraseSpecials(seq_perTrackPattern[track], track,
 				                            (uint8_t)seq_stepIndex[track]);
-			} else if (step_allowed && !trigger_suppressed) {
+			} else if (step_allowed && !trigger_suppressed &&
+			           !seq_liveRndSkip(track)) {
 				/*
 				 * Trigger emission: per-step roll or shuffle/micro-timing
 				 * deferral (S078 §3.2, S079 §4, §7).
@@ -3277,6 +3328,12 @@ static void seq_advanceTrackStep(uint8_t track)
 					}
 				}
 			}
+		} else if (step_allowed && !trigger_suppressed &&
+		           seq_liveRndGhost(track)) {
+			/* LIVE random layer: ghost hit on an empty step. */
+			seq_triggerVoice(track,
+			                 (uint8_t)(24u + seq_liveRndRoll() % 48u),
+			                 sp.note, 1);
 		}
 
 		/*
@@ -3563,6 +3620,22 @@ void seq_drainPendingAutomation(void)
              * automation records; Effect overlays are last-writer-wins.
              */
             if ((identity & SEQ_PENDING_TYPE_AUTOMATION_BIT) != 0u) {
+                /*
+                 * PLAITS mode (LIVE): the pattern's p-locks were written for
+                 * its own kit; redirect them to the matching Plaits row, or
+                 * drop them when there is none. Ramps are off while it runs.
+                 */
+                uint8_t plaitsMapped = 0u;
+
+                if (plaitsMode_mapActive &&
+                    instrumentParam_isVoiceParameter(target) &&
+                    owner_scene == scene_getActiveIndex()) {
+                    if (!plaitsMode_remap(&target, &value)) {
+                        i++;
+                        continue;
+                    }
+                    plaitsMapped = 1u;
+                }
                 if (instrumentParam_isVoiceParameter(target) &&
                     instrumentManager_targetValid(owner_scene, target,
                                                   INSTRUMENT_TARGET_AUTOMATION)) {
@@ -3598,7 +3671,7 @@ void seq_drainPendingAutomation(void)
                             seq_writeInstrumentAutomation(owner_scene, target,
                                                           value);
 
-                        if (descriptor)
+                        if (descriptor && !plaitsMapped)
                             seq_rampStartIfPaired(owner_track, owner_scene,
                                 (uint8_t)((identity & SEQ_PENDING_STEP_ID_MASK) %
                                           NUM_STEPS),
@@ -4268,6 +4341,10 @@ void seq_rampService(void)
 
         if (r->id == 0u)
             continue;
+        if (plaitsMode_mapActive) {
+            r->id = 0u;                 /* PLAITS mode: no ramps */
+            continue;
+        }
         key = (uint16_t)(r->id - 1u);
         track = (uint8_t)(key >> 9u);
         target = (uint16_t)(key & 0x01FFu);

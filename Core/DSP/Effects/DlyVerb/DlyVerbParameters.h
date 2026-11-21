@@ -30,8 +30,8 @@
  * Affiliates: DlyVerbEffect.c/.h, EffectParamRows.h, StepScale.h.
  */
 
-/* Descriptor rows: common rows 0..2 plus type rows 3..18. */
-#define DLYVERB_PARAM_COUNT 19u
+/* Descriptor rows: common rows 0..2 plus type rows 3..27. */
+#define DLYVERB_PARAM_COUNT 28u
 
 /*
  * Local descriptor indices.
@@ -62,6 +62,28 @@ typedef enum {
     DLYVERB_PARAM_RVB_DECAY,
     DLYVERB_PARAM_RVB_DAMP,
     DLYVERB_PARAM_RVB_ROUTE,
+    /*
+     * Normotone plate bus (19..25): per-track sends into a second plate
+     * (same decay as the rumble plate, own brightness and level) that skips
+     * the rumble's echo, tone and feedback. Sends follow the effect, so the
+     * dose stays with the rumble across pattern changes. Mixer slots 1..5:
+     * DRUM2, DRUM3, SNARE, CLP/CYM, HIHATS (closed and open share a slot).
+     */
+    DLYVERB_PARAM_PLATE_D2,
+    DLYVERB_PARAM_PLATE_D3,
+    DLYVERB_PARAM_PLATE_SN,
+    DLYVERB_PARAM_PLATE_CY,
+    DLYVERB_PARAM_PLATE_HH,
+    DLYVERB_PARAM_PLATE_LEVEL,
+    DLYVERB_PARAM_PLATE_TONE,
+    /*
+     * Normotone rumble duck (26..27): the sidechain cut (csc track) dips the
+     * DlyVerb's own return only, by up to 30 dB (dck) with a 3 ms attack
+     * and a dkr release. The bus compressor no longer ducks while DlyVerb
+     * runs, so the kick and the other tracks are never cut.
+     */
+    DLYVERB_PARAM_DUCK,
+    DLYVERB_PARAM_DUCK_REL,
     DLYVERB_PARAM_ENUM_COUNT
 } dlyverb_param_t;
 
@@ -75,7 +97,8 @@ typedef enum {
 #define DLYVERB_STEREO_STEREO   0u
 #define DLYVERB_STEREO_PINGPONG 1u
 #define DLYVERB_STEREO_WIDTH    2u
-#define DLYVERB_STEREO_MAX      2u
+#define DLYVERB_STEREO_MONO     3u  /* mono echo, stereo plate (CPU) */
+#define DLYVERB_STEREO_MAX      3u
 
 /* Reverb routing (row `rrt`). */
 #define DLYVERB_ROUTE_PARALLEL 0u

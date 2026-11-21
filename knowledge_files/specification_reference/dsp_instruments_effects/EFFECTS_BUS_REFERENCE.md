@@ -1024,19 +1024,39 @@ delay/reverb combination of a Eurorack character delay. Source:
   and mutes the delay rings through a fill counter (never adopts).
 - **Rows** (SELECT 2..5 in order): `div` (14 musical StepScale stops, 1/64..
   1/2, always synced), `fbk` (0..1.05), `dlv` delay level, `rvl` reverb
-  level; `mdl` (`dig` crossfades two taps on a time change, `bbd` glides fast
-  with clock-limited bandwidth and gentle saturation, `tap` glides slowly with
-  wow/flutter and full saturation), `stm` (`str`, `png` ping-pong, `wid`
-  right side up to a third longer), `wid`, `drv`; `lpf`, `hpf` (one-pole, in
+  level; `mdl` (see Models below), `stm` (`str`, `png` ping-pong, `wid`
+  right side up to a third longer), `wid`, `drv` (see Drive below); `lpf`,
+  `hpf` (one-pole, in
   the echo path), `mod` depth (up to 4 ms), `mrt` rate (0.05..8 Hz); `age`
   (hiss and crackle inside the loop), `rdc` decay, `rdp` damping, `rrt`
   (`par` plate on the driven input, `ser` plate on the echoes, `fbk` plate on
   the echoes and half its output back into the loop).
+- **Models** (reworked after the 2026-11-06 hardware test: the first
+  version only differed in glide and in details that a closed `lpf`, a small
+  `mod` and a high `drv` hid, so `dig`, `bbd` and `tap` sounded the same).
+  Each keeps its character at any setting; the model's modulation is added
+  to the user's `mod`.
+  | | `dig` | `bbd` | `tap` |
+  |---|---|---|---|
+  | Time change | crossfade of 2 taps | fast glide | slow glide |
+  | Echo band | 10.5 kHz | 1.5–3.5 kHz, falls as the delay lengthens | 6.5 kHz |
+  | Loop saturation | hard clamp | soft clip, pre-gain 1.6 (+1.0 × drive) | asymmetric soft clip, pre-gain 2.2 (+1.8 × drive) |
+  | Permanent modulation | none | 0.14 ms triangle at 0.9 Hz | 0.63 ms wow at 0.55 Hz + 0.07 ms flutter at 6.5 Hz |
+  | Echo output | flat | +20 % of a 90 Hz low-pass | +60 % of a 90 Hz low-pass (head bump) |
+  | Noise into the loop | none | clock noise 0.0015 | hiss 0.0008 |
+  The loop pre-gain keeps unity gain for small signals; the head bump is on
+  the echo output only, so the loop gain does not change.
+- **Drive.** Gain 1 + 8d² (d = `drv` / 127), bias 0.35 d for even
+  harmonics (static offset removed), light makeup 1 / (0.9 + 0.1 gain), then
+  a tone low-pass from 9 kHz (d = 0) to 2.5 kHz (d = 1). On the rumble patch
+  the wet level stays within 0.6 dB from 0 to 127: clean, warm (60),
+  lightly saturated (90), saturated (127).
 - **Safety.** The plate cross-feed is soft-clipped and the wet sum passes a
   gentle limiter (ceiling 1.33), so feedback 127 self-oscillates but stays
   bounded.
 - **Cost.** About 770 instructions per half-rate sample in the linked loop
-  (≈385 per output frame, est. 8–12 % of 4,897 cycles). Measure on the
+  before the model rework, which added about 25 operations per channel
+  (≈385 per output frame, est. 8–12 % of 4,897 cycles, +0.5 %). Measure on the
   worst-case Scene with the `cpu` widget.
 - **Dry/wet** is per voice: set the voice's fader mode to `d/w` (§3).
 

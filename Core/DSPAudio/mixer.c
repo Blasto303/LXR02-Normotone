@@ -98,6 +98,51 @@ typedef union {
 static INDTCMZ mixer_fx_bus_t mixer_fx_bus;
 
 /*
+ * Normotone plate bus: mono, normalized float (1.0 = int16 full scale), fed
+ * by the DlyVerb plate sends of slots 1..5 (pl2 pl3 pl4 pl5 plh) and handed
+ * to the Effect as io.aux. The send follows the track fader like the FX send
+ * (post mode: fader ignored) and the roll gate. 128 B DTCM + 24 B.
+ */
+static INDTCMZ float mixer_plate_bus[OUTPUT_DMA_SIZE];
+static float mixer_plate_last_gain[6];
+
+static uint8_t mixer_addVoiceToPlateBus(uint8_t slot, uint8_t scene_index,
+		const int16_t *data)
+{
+	const uint8_t send = effects_plateSend(slot);
+	float gain = 0.0f;
+	float last = mixer_plate_last_gain[slot];
+
+	if (send) {
+		/* The same fader laws as the FX send (mixer_faderGains). */
+		const float amount = (float)send * (1.0f / 127.0f);
+		const float fader = slider_vol[slot];
+		const uint8_t mode = scene_getVoiceFaderSetting(scene_index, slot);
+
+		if (mode == MIXER_FADER_POST)
+			gain = amount;
+		else if (mode == MIXER_FADER_XFD)
+			gain = amount * adc_sliderGainMirrored(fader);
+		else if (mode == MIXER_FADER_DW)
+			gain = instrumentManager_runtimeVolume(slot) * fader * sqrtf(amount);
+		else
+			gain = amount * fader;
+		gain *= instrumentManager_gateGain(slot);
+	}
+	mixer_plate_last_gain[slot] = gain;
+	if (gain <= 0.0f && last <= 0.0f)
+		return 0u;
+	{
+		const float k = 1.0f / 32767.0f;
+		const float delta = (gain - last) * (1.0f / (OUTPUT_DMA_SIZE - 1.f));
+
+		for (uint8_t i = 0u; i < OUTPUT_DMA_SIZE; i++)
+			mixer_plate_bus[i] += (float)data[i] * k * (last + (float)i * delta);
+	}
+	return 1u;
+}
+
+/*
  * Last effective per-slot FX send gain at the end of the previous block.
  *
  * What: send amount x send-side fader, one float per slot (24 B DTCM). Why:
@@ -147,9 +192,61 @@ void mixer_init()
 #endif
 }
 //-----------------------------------------------------------------------
+/*
+ * Silent-voice sleep (Normotone, CPU).
+ *
+ * What: a voice whose rendered block stayed within +-mixer_sleepLevel (-72 dBFS) for
+ * MIXER_SLEEP_BLOCKS consecutive blocks (about 12 ms) is put to sleep: the
+ * mixer skips its DSP and its bus adds until the next trigger wakes it
+ * (instrumentManager_triggerTrack() -> mixer_wakeVoice()). Why: the voice
+ * engines cost the same whether they sound or not (bench: 76 k host
+ * instructions per block with no trigger at all, 77 k with all six playing),
+ * so in a sparse pattern most of the render budget went to silence. The test
+ * is on the output, so a voice that still sounds (long decay, resonant
+ * filter, drone) never sleeps. Context: render loop (foreground) for the
+ * check, trigger path for the wake (single-byte stores).
+ */
+#define MIXER_SLEEP_BLOCKS 16u
+volatile uint8_t mixer_voiceAsleep[6];
+static uint8_t mixer_voiceQuiet[6];
+uint8_t mixer_sleepEnabled = 1u;
+int16_t mixer_sleepLevel = 8;      /* +-8 of 32767: -72 dBFS per voice */
+uint32_t mixer_sleepBlocks[6];     /* blocks skipped per slot (statistics) */   /* 0 only for the host bench comparison */
+
+void mixer_wakeVoice(uint8_t slot)
+{
+	if (slot < 6u) {
+		mixer_voiceQuiet[slot] = 0u;
+		mixer_voiceAsleep[slot] = 0u;
+	}
+}
+
+static void mixer_updateVoiceSleep(uint8_t slot, const int16_t *buf)
+{
+	uint8_t i;
+
+	for (i = 0u; i < OUTPUT_DMA_SIZE; i++) {
+		if (buf[i] > mixer_sleepLevel || buf[i] < -mixer_sleepLevel) {
+			mixer_voiceQuiet[slot] = 0u;
+			return;
+		}
+	}
+	if (++mixer_voiceQuiet[slot] >= MIXER_SLEEP_BLOCKS && mixer_sleepEnabled)
+		mixer_voiceAsleep[slot] = 1u;
+}
+
 void mixer_decimateBlock(const uint8_t voiceNr, int16_t* buffer)
 {
 	uint8_t i;
+	/*
+	 * Full rate (Normotone CPU): every sample would be taken, so the block is
+	 * already the output; only the held sample is kept current for a later
+	 * rate change. Output identical, 32 iterations saved per voice.
+	 */
+	if (mixer_decimation_rate[voiceNr] >= 1.0f) {
+		mixer_voice_samples[voiceNr] = buffer[OUTPUT_DMA_SIZE - 1u];
+		return;
+	}
 	for(i=0;i<OUTPUT_DMA_SIZE;i++)
 	{
 		/* S075: the retired global multiplier (former rate[6]) is gone. */
@@ -935,12 +1032,18 @@ void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2)
 	 */
 	const uint8_t fx_io = effects_activeIoFlags();
 	const uint8_t fx_stereo_in = (uint8_t)((fx_io & EFFECT_IO_STEREO_IN) != 0u);
-	const uint8_t fx_active = (uint8_t)(fx_io != 0u);
+	/* Normotone: a MAIN-insert type gets no FX bus and no sends. */
+	const uint8_t fx_insert = (uint8_t)((fx_io & EFFECT_IO_MAIN_INSERT) != 0u);
+	const uint8_t fx_active = (uint8_t)(fx_io != 0u && !fx_insert);
 	const uint8_t fx_scene = scene_getActiveIndex();
 	const effects_common_runtime_t *fx_common = effects_commonRuntime();
 	const uint8_t fx_route = mixer_checkOutJackAvailable(fx_common->route);
-	if (fx_active)
+	uint8_t plate_used = 0u;
+	if (fx_active) {
 		bufferTool_clearBuffer32(&mixer_fx_bus.mx[0][0], OUTPUT_DMA_SIZE * 2);
+		for (uint8_t i = 0u; i < OUTPUT_DMA_SIZE; i++)
+			mixer_plate_bus[i] = 0.0f;
+	}
 
 	// //---------------------------------------
 	// // TEST BLOCK - Calc and add test sine tone
@@ -974,8 +1077,14 @@ void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2)
 		uint8_t pan;
 		float voiceGain;
 		float sendGain;
+		/* Silent-voice sleep: a sleeping voice adds nothing to any bus. */
+		if (mixer_voiceAsleep[slot]) {
+			mixer_sleepBlocks[slot]++;
+			continue;
+		}
 		instrumentManager_calcSlotSyncBlock(slot, sampleData, OUTPUT_DMA_SIZE);
 		mixer_decimateBlock(slot,sampleData);
+		mixer_updateVoiceSleep(slot, sampleData);
 		/*
 		 * sampleData is the decimated, pre-volume voice block. The fader mode
 		 * creates parallel dry/send gains: PRE scales both, POST scales only the
@@ -1020,6 +1129,9 @@ void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2)
 					&output[pos],&output[pos+1],&output2[pos],&output2[pos+1]);
 		mixer_voice_last_gain[slot] = voiceGain;
 		mixer_send_last_gain[slot] = sendGain;
+		if (fx_active && slot != 0u)
+			plate_used |= mixer_addVoiceToPlateBus(slot,
+					preset_getSlotPlayedScene(slot), sampleData);
 	}
 
 	if (fx_active) {
@@ -1054,6 +1166,7 @@ void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2)
 		io.frames = OUTPUT_DMA_SIZE;
 		io.channels = fx_channels_in;
 		io.share = &share;
+		io.aux = plate_used ? mixer_plate_bus : 0;
 		effects_process(&io);
 
 		/*
@@ -1108,6 +1221,35 @@ void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2)
 	 * Output: only the selected buffer is compressed in place.
 	 * Affiliate: BusCompressor.h and voiceControl_triggerNow().
 	 */
+	/*
+	 * Normotone MAIN insert (`dst`): MAIN (St1 = output2) goes through the
+	 * Effect in place, after every voice, before the compressor. The
+	 * Effect's own mix row is the dry/wet; `vol` scales the result.
+	 */
+	if (fx_insert) {
+		const float inv_mx = 1.0f / 8388352.0f;
+		const float g = fx_common->level * 8388352.0f;
+		fx_share_t share;
+		effect_io_t io;
+
+		for (uint8_t i = 0u; i < OUTPUT_DMA_SIZE; i++) {
+			mixer_fx_bus.f[0][i] = (float)output2[pos + 2u * i] * inv_mx;
+			mixer_fx_bus.f[1][i] = (float)output2[pos + 2u * i + 1u] * inv_mx;
+		}
+		fxbuf_effectShare(&share);
+		io.l = mixer_fx_bus.f[0];
+		io.r = mixer_fx_bus.f[1];
+		io.frames = OUTPUT_DMA_SIZE;
+		io.channels = 2u;
+		io.share = &share;
+		io.aux = 0;
+		effects_process(&io);
+		for (uint8_t i = 0u; i < OUTPUT_DMA_SIZE; i++) {
+			output2[pos + 2u * i] = (sample_mx_t)(mixer_fx_bus.f[0][i] * g);
+			output2[pos + 2u * i + 1u] = (sample_mx_t)(mixer_fx_bus.f[1][i] * g);
+		}
+	}
+
 	busComp_processBlock(&output2[pos], &output[pos], fx_scene);
 
 }

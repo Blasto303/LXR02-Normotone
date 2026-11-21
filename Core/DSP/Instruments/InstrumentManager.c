@@ -1993,6 +1993,8 @@ void instrumentManager_triggerTrack(uint8_t trigger_track, uint8_t note,
     slot = (trigger_track >= INSTRUMENT_SLOT_COUNT)
         ? (INSTRUMENT_SLOT_COUNT - 1u)
         : trigger_track;
+    /* A sleeping silent voice renders again from this trigger on. */
+    mixer_wakeVoice(slot);
     alternate_slot6 =
         (uint8_t)(slot == 5u && trigger_track == INSTRUMENT_SLOT_COUNT);
     if (slot == 5u)

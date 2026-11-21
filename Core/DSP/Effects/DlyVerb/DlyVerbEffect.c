@@ -10,15 +10,27 @@
  *
  * Signal flow, per channel, at the 22,054 Hz half rate:
  *
- *   in -> 9 kHz LP -> /2 -> drive -> (+ feedback, + age noise) -> sat -> ring
+ *   in -> 9 kHz LP -> /2 -> drive -> drive tone LP
+ *      -> (+ feedback, + age and model noise) -> loop sat -> ring
  *   ring -> two read taps (crossfade) + modulation -> LP -> HP = echo
- *   echo, or the drive output (par) -> Dattorro plate -> reverb
- *   feedback = echo, or a mix of echo and reverb (fbk route)
- *   wet = dlv * echo + rvl * reverb -> x2 -> 9 kHz LP -> out (100 % wet)
+ *   echo + head bump = echo out; echo out, or the drive output (par)
+ *      -> Dattorro plate -> reverb
+ *   feedback = echo (no bump), or a mix of echo and reverb (fbk route)
+ *   wet = dlv * echo out + rvl * reverb -> x2 -> 9 kHz LP -> out (100 % wet)
  *
  * Every stage runs on every sample whatever its settings (constant CPU): the
- * models differ only in coefficients (glide, saturation, modulation shape,
- * clock-limited bandwidth), not in code paths.
+ * models differ only in coefficients, not in code paths. Each model keeps
+ * its character at any setting (FIELD_TEST_LXR02 2026-11-06: the first
+ * models only differed in glide and in details that a closed lpf, a small
+ * mod and a high drive hid):
+ *   dig  clean: hard clamp, no glide (crossfade), triangle mod, full band.
+ *   bbd  dark: 1.5-3.5 kHz band falling with the delay time, compander-like
+ *        symmetric saturation, permanent slow chorus, clock noise.
+ *   tap  warm: slow glide, permanent wow and flutter, asymmetric tape
+ *        saturation (even harmonics), head bump on the echo, 6.5 kHz band,
+ *        hiss.
+ * Drive is asymmetric, level-compensated and darkens as it rises; it also
+ * pushes the loop saturation of bbd and tap, so each repeat gets warmer.
  */
 
 #include "DlyVerbEffect.h"
@@ -35,8 +47,11 @@
  * DV_SAMPLES_PER_TICK  half-rate samples per 96-PPQ tick at 1 BPM.
  * DV_B0..DV_A2     9 kHz Butterworth low-pass at 44,108 Hz (decimator and
  *                  interpolator image filter).
- * DV_MOD_MAX       largest modulation excursion, 4 ms in half-rate samples.
- * DV_TAP_MIN       shortest delay a tap may read (guard + modulation).
+ * DV_MOD_MAX       largest user modulation excursion, 4 ms in half-rate
+ *                  samples.
+ * DV_MOD_BASE_MAX  largest permanent model modulation (tap: 14 wow + 1.5
+ *                  flutter), rounded up.
+ * DV_TAP_MIN       shortest delay a tap may read (guard + both modulations).
  * DV_FADE_INC      digital-model tap crossfade, 1,024 half-rate samples
  *                  (46 ms).
  * DV_FEEDBACK_MAX  feedback gain at 127: just over unity, so the loop can
@@ -56,9 +71,16 @@
 #define DV_A1                 (-0.339426408f)
 #define DV_A2                 0.192013228f
 #define DV_MOD_MAX            88.0f
-#define DV_TAP_MIN            (DV_MOD_MAX + 4.0f)
+#define DV_MOD_BASE_MAX       16.0f
+#define DV_TAP_MIN            (DV_MOD_MAX + DV_MOD_BASE_MAX + 4.0f)
 #define DV_FADE_INC           (1.0f / 1024.0f)
 #define DV_FEEDBACK_MAX       1.05f
+/*
+ * fbk route: share of the plate in the delay feedback (the rest is the echo).
+ * Fixed, so rvl only sets the reverb's output level (it used to set this mix
+ * too, which made rvl change the delay's sustain and silenced fbk at 127).
+ */
+#define DV_FBK_MIX            0.5f
 #define DV_INV16              (1.0f / 32768.0f)
 #define DV_RVB_SCALE          8192.0f
 #define DV_RVB_INV            (1.0f / 8192.0f)
@@ -76,6 +98,8 @@
  */
 #define DV_RVB_MASK   (DLYVERB_RVB_SAMPLES - 1u)
 #define DV_RVB_EXC    16
+/* Plate-bus sleep delay: 12 s of 32-frame blocks. */
+#define DV_P2_HOLD_BLOCKS ((uint32_t)(12.0f * DV_FS / 32.0f))
 #define DV_L_IN1      102
 #define DV_L_IN2      77
 #define DV_L_IN3      273
@@ -132,6 +156,7 @@ typedef struct {
     float hp_x[2];
     float hp_y[2];
     float ph_wow;
+    float ph_base_flutter;
     float ph_flutter;
     float ph_tri;
     float ph_rvb;
@@ -141,12 +166,40 @@ typedef struct {
     float rv_bw;
     float rv_damp[2];
     float rv_tank[2];
+    float drv_lp[2];
+    float bump[2];
     uint32_t dly_len;
     uint32_t wp;
     uint32_t valid;
     uint32_t rv_ptr;
     uint32_t noise;
     uint32_t primed;
+    /* mno (quarter rate): output smoothing, control-rate modulation. */
+    float hp_lp[2][2];
+    float q_mod;
+    float q_rmod;
+    uint32_t q_mode;        /* 1 while the rings hold quarter-rate content */
+    float s_mod;            /* str/png/wid: control-rate modulation */
+    float s_rmod;
+    /* mno: output tone (lpf / hpf on the whole rumble, echo and plate). */
+    float o_lp[2];
+    float o_hpx[2];
+    float o_hpy[2];
+    /* mno: the Normotone plate bus (second plate, see dv_plateHalf). */
+    float p2_bw;
+    float p2_damp[2];
+    float p2_tank[2];
+    float plv;              /* plate-bus return ramp end */
+    uint32_t p2_hold;       /* blocks left before the idle plate sleeps */
+    uint32_t p2_clean;      /* 1 while its lines hold only its own content */
+    /* mno, dig model: tap crossfade on a `div` change (quarter-rate taps). */
+    float q_tb;             /* destination tap */
+    float q_xf;             /* 0..1 progress, 0 = idle */
+    float dec_a[2];         /* str/png/wid: plate-bus image filter */
+    /* Rumble duck (dck/dkr): reduction in dB, its target, last linear gain. */
+    float dk_db;
+    float dk_target;
+    float dk_gain;
 } DlyVerbState;
 
 _Static_assert(sizeof(DlyVerbState) <= DLYVERB_STATE_BYTES,
@@ -318,6 +371,139 @@ static inline void dv_plate(DlyVerbState *st, int16_t *rv, uint32_t ptr,
 }
 
 /*
+ * The plate at a quarter of the codec rate (mno, Normotone CPU).
+ *
+ * What: the same Dattorro topology with every line, tap and modulation
+ * excursion halved and the two one-pole coefficients converted, run once per
+ * two half-rate samples. Loop times, decay per loop and therefore the tail
+ * length match dv_plate(); the reverb loses content above about 5 kHz, which
+ * the rumble (echo low-pass, heavy damping) does not feed it. The lines use
+ * the first half of dv_plate()'s regions, so the ring layout is shared.
+ * Inputs/outputs as dv_plate().
+ */
+#define DV_H(x) ((x) / 2)
+/*
+ * Second plate (Normotone plate bus). At the quarter rate each line uses
+ * only the first half of its region, so a second plate fits in the upper
+ * halves: base DV_H(L) + 1 (all-pass 1: + the doubled excursion), length
+ * DV_H(L) - 1 so it ends inside the region even when L is even. Same loop
+ * times within one sample, so the same decay; the 1-sample offset also
+ * decorrelates it from the rumble plate. sec is a compile-time constant.
+ */
+#define DV_PB(b, L)  ((b) + (sec ? DV_H(L) + 1 : 0))
+#define DV_PBA(b, L) ((b) + (sec ? DV_H(L) + 2 * DV_H(DV_RVB_EXC) + 1 : 0))
+#define DV_PL(L)     (DV_H(L) - (sec ? 1 : 0))
+__attribute__((always_inline))
+static inline void dv_plateHalf(float *bw, float *dz, float *tk,
+                                int16_t *rv, uint32_t ptr, const int sec,
+                                float x, float decay, float dd2, float damp2,
+                                float mod, float *out_l, float *out_r)
+{
+    const float tank_l = tk[0];
+    const float tank_r = tk[1];
+    float a;
+    float d;
+    float pos;
+    int i;
+    float f;
+    float w;
+
+    *bw += 0.9775f * (x - *bw);   /* 0.85 at twice the rate */
+    a = dv_allpass(rv, ptr, DV_PB(DV_B_IN1, DV_L_IN1), DV_PL(DV_L_IN1), 0.75f, *bw);
+    a = dv_allpass(rv, ptr, DV_PB(DV_B_IN2, DV_L_IN2), DV_PL(DV_L_IN2), 0.75f, a);
+    a = dv_allpass(rv, ptr, DV_PB(DV_B_IN3, DV_L_IN3), DV_PL(DV_L_IN3), 0.625f, a);
+    a = dv_allpass(rv, ptr, DV_PB(DV_B_IN4, DV_L_IN4), DV_PL(DV_L_IN4), 0.625f, a);
+
+    pos = (float)(DV_PL(DV_L_AP1L) + DV_H(DV_RVB_EXC)) +
+          (float)DV_H(DV_RVB_EXC) * 0.75f * mod;
+    i = (int)pos;
+    f = pos - (float)i;
+    d = DV_RD(DV_PBA(DV_B_AP1L, DV_L_AP1L), i) +
+        f * (DV_RD(DV_PBA(DV_B_AP1L, DV_L_AP1L), i + 1) -
+             DV_RD(DV_PBA(DV_B_AP1L, DV_L_AP1L), i));
+    w = a + decay * dv_soft(tank_r) + 0.7f * d;
+    DV_WR(DV_PBA(DV_B_AP1L, DV_L_AP1L), w);
+    DV_WR(DV_PB(DV_B_D1L, DV_L_D1L), d - 0.7f * w);
+    d = DV_RD(DV_PB(DV_B_D1L, DV_L_D1L), DV_PL(DV_L_D1L));
+    dz[0] = d + damp2 * (dz[0] - d);
+    d = dv_allpass(rv, ptr, DV_PB(DV_B_AP2L, DV_L_AP2L), DV_PL(DV_L_AP2L), dd2,
+                   dz[0] * decay);
+    DV_WR(DV_PB(DV_B_D2L, DV_L_D2L), d);
+
+    pos = (float)(DV_PL(DV_L_AP1R) + DV_H(DV_RVB_EXC)) -
+          (float)DV_H(DV_RVB_EXC) * 0.75f * mod;
+    i = (int)pos;
+    f = pos - (float)i;
+    d = DV_RD(DV_PBA(DV_B_AP1R, DV_L_AP1R), i) +
+        f * (DV_RD(DV_PBA(DV_B_AP1R, DV_L_AP1R), i + 1) -
+             DV_RD(DV_PBA(DV_B_AP1R, DV_L_AP1R), i));
+    w = a + decay * dv_soft(tank_l) + 0.7f * d;
+    DV_WR(DV_PBA(DV_B_AP1R, DV_L_AP1R), w);
+    DV_WR(DV_PB(DV_B_D1R, DV_L_D1R), d - 0.7f * w);
+    d = DV_RD(DV_PB(DV_B_D1R, DV_L_D1R), DV_PL(DV_L_D1R));
+    dz[1] = d + damp2 * (dz[1] - d);
+    d = dv_allpass(rv, ptr, DV_PB(DV_B_AP2R, DV_L_AP2R), DV_PL(DV_L_AP2R), dd2,
+                   dz[1] * decay);
+    DV_WR(DV_PB(DV_B_D2R, DV_L_D2R), d);
+
+    tk[0] = DV_RD(DV_PB(DV_B_D2L, DV_L_D2L), DV_PL(DV_L_D2L));
+    tk[1] = DV_RD(DV_PB(DV_B_D2R, DV_L_D2R), DV_PL(DV_L_D2R));
+
+#define DV_T(b, L, t) DV_RD(DV_PB(b, L), DV_H(t))
+    *out_l = 0.6f * (DV_T(DV_B_D1R, DV_L_D1R, 192) + DV_T(DV_B_D1R, DV_L_D1R, 2141)
+                     - DV_T(DV_B_AP2R, DV_L_AP2R, 1377) + DV_T(DV_B_D2R, DV_L_D2R, 1437)
+                     - DV_T(DV_B_D1L, DV_L_D1L, 1433) - DV_T(DV_B_AP2L, DV_L_AP2L, 135)
+                     - DV_T(DV_B_D2L, DV_L_D2L, 768));
+    *out_r = 0.6f * (DV_T(DV_B_D1L, DV_L_D1L, 254) + DV_T(DV_B_D1L, DV_L_D1L, 2611)
+                     - DV_T(DV_B_AP2L, DV_L_AP2L, 884) + DV_T(DV_B_D2L, DV_L_D2L, 1925)
+                     - DV_T(DV_B_D1R, DV_L_D1R, 1520) - DV_T(DV_B_AP2R, DV_L_AP2R, 241)
+                     - DV_T(DV_B_D2R, DV_L_D2R, 87));
+#undef DV_T
+}
+
+/*
+ * The quarter-rate plate for another Effect (Normotone `dst`): same lines and
+ * tank, its own 5-float state (bw, damp[2], tank[2]) and its own 16,384-
+ * sample ring; the caller decrements ptr (mask DLYVERB_RVB_SAMPLES - 1) once
+ * per call.
+ */
+void dlyVerb_plateQuarter(float *pst, int16_t *rv, uint32_t ptr, float x,
+                          float decay, float dd2, float damp2, float mod,
+                          float *out_l, float *out_r)
+{
+    dv_plateHalf(&pst[0], &pst[1], &pst[3], rv, ptr, 0, x, decay, dd2, damp2,
+                 mod, out_l, out_r);
+}
+
+/* Zero the second plate's lines (their place is relative to the pointer). */
+static void dv_plate2Clear(int16_t *rv, uint32_t ptr)
+{
+    static const uint16_t base[12] = {
+        DV_B_IN1 + DV_H(DV_L_IN1) + 1, DV_B_IN2 + DV_H(DV_L_IN2) + 1,
+        DV_B_IN3 + DV_H(DV_L_IN3) + 1, DV_B_IN4 + DV_H(DV_L_IN4) + 1,
+        DV_B_AP1L + DV_H(DV_L_AP1L) + 2 * DV_H(DV_RVB_EXC) + 1,
+        DV_B_D1L + DV_H(DV_L_D1L) + 1, DV_B_AP2L + DV_H(DV_L_AP2L) + 1,
+        DV_B_D2L + DV_H(DV_L_D2L) + 1,
+        DV_B_AP1R + DV_H(DV_L_AP1R) + 2 * DV_H(DV_RVB_EXC) + 1,
+        DV_B_D1R + DV_H(DV_L_D1R) + 1, DV_B_AP2R + DV_H(DV_L_AP2R) + 1,
+        DV_B_D2R + DV_H(DV_L_D2R) + 1
+    };
+    static const uint16_t span[12] = {
+        DV_H(DV_L_IN1), DV_H(DV_L_IN2), DV_H(DV_L_IN3), DV_H(DV_L_IN4),
+        DV_H(DV_L_AP1L) + 2 * DV_H(DV_RVB_EXC), DV_H(DV_L_D1L),
+        DV_H(DV_L_AP2L), DV_H(DV_L_D2L),
+        DV_H(DV_L_AP1R) + 2 * DV_H(DV_RVB_EXC), DV_H(DV_L_D1R),
+        DV_H(DV_L_AP2R), DV_H(DV_L_D2R)
+    };
+    uint32_t k;
+    uint32_t j;
+
+    for (k = 0u; k < 12u; k++)
+        for (j = 0u; j < span[k]; j++)
+            rv[(ptr + base[k] + j) & DV_RVB_MASK] = 0;
+}
+
+/*
  * Seat the DSP state in the current Effect share.
  *
  * What: when the share differs from the seated one (first block after init,
@@ -387,7 +573,7 @@ static void dlyVerb_exportHandoff(const void *rt_void, fxbuf_handoff_t *out)
         out->state_flags |= FXBUF_STATE_EFFECT_WRITTEN;
 }
 
-/* Store one resolved row value (rows 3..18); conversions happen per block. */
+/* Store one resolved row value (rows 3..25); conversions happen per block. */
 static void dlyVerb_writeParam(void *rt_void, uint8_t index, uint8_t value)
 {
     DlyVerbRuntime *rt = (DlyVerbRuntime *)rt_void;
@@ -415,7 +601,7 @@ static inline float dv_expHz(uint8_t v, float lo, float hi)
  * stereo io (frames <= 32, even). Output: io in place, rings in the share.
  * Caller: effects_process(). Affiliates: seq_getBpm(), stepScale_ticksQ8().
  */
-static void dlyVerb_process(void *rt_void, effect_io_t *io)
+static void dlyVerb_processCore(void *rt_void, effect_io_t *io)
 {
     DlyVerbRuntime *rt = (DlyVerbRuntime *)rt_void;
     DlyVerbState *st;
@@ -425,6 +611,7 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
     int16_t *ring_l;
     int16_t *ring_r;
     float xs_l[DV_HALF_FRAMES_MAX / 2u];
+    float xa[DV_HALF_FRAMES_MAX / 2u];
     float xs_r[DV_HALF_FRAMES_MAX / 2u];
     float ys_l[DV_HALF_FRAMES_MAX / 2u];
     float ys_r[DV_HALF_FRAMES_MAX / 2u];
@@ -475,6 +662,29 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
     float dlv_inc;
     float rvl_inc;
     float lp_hz;
+    float base_tri;
+    float base_wow;
+    float base_flutter;
+    float inc_wow;
+    float inc_base_flutter;
+    float loop_k;
+    float loop_inv;
+    float loop_bias;
+    float loop_bias_out;
+    float bump_g;
+    float bump_a;
+    float floor_nz;
+    float drive_bias;
+    float drive_bias_out;
+    float drive_makeup;
+    float drive_lp_a;
+    float model_lp_hz;
+    float user_lp_hz;
+    uint32_t aux_on;
+    uint8_t mno;
+    float pdamp;
+    float plv;
+    float plv_to;
 
     if (!rt || !io || !io->l || io->frames == 0u ||
         io->frames > DV_HALF_FRAMES_MAX)
@@ -530,38 +740,94 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
     }
 
     /*
-     * Model coefficients. dig: no glide (a time change crossfades two taps),
-     * no saturation beyond a hard clamp, triangle modulation. bbd: fast
-     * glide, gentle saturation, triangle modulation, bandwidth that falls as
-     * the delay gets longer (a real BBD clocks slower). tap: slow glide,
-     * full saturation, wow and flutter.
+     * Drive (all models). d = drv / 127. Gain 1..9, a bias that grows with
+     * d for even harmonics (its static offset is subtracted), a light makeup
+     * (the loop saturation and the limiter hold the level: the rumble patch
+     * stays within 0.6 dB from 0 to 127), and a tone
+     * low-pass that falls from 9 kHz to 2.5 kHz as d rises.
      */
+    {
+        const float d = (float)DV_ROW(rt, DLYVERB_PARAM_DRIVE) *
+                        (1.0f / 127.0f);
+
+        drive_mix = d;
+        drive_gain = 1.0f + 8.0f * d * d;
+        drive_bias = 0.35f * d;
+        drive_bias_out = dv_soft(drive_bias);
+        drive_makeup = 1.0f / (0.9f + 0.1f * drive_gain);
+        drive_lp_a = 1.0f - expf(-DV_TWO_PI *
+                                 (9000.0f - 6500.0f * d) / DV_FS);
+    }
+
+    /*
+     * Model coefficients (header comment). Base modulation, in half-rate
+     * samples, is added to the user's mod depth: bbd 3 (0.14 ms chorus at
+     * 0.9 Hz), tap 14 wow at 0.55 Hz + 1.5 flutter at 6.5 Hz (about 4 and
+     * 5 cents). loop_k is the saturation pre-gain (small signals keep unity
+     * gain), raised by drive; loop_bias makes tap asymmetric. bump_g is the
+     * gain of a 90 Hz low-pass added to the echo output only, so the loop
+     * gain is unchanged. floor_nz is the model noise entering the loop.
+     */
+    base_tri = 0.0f; base_wow = 0.0f; base_flutter = 0.0f;
+    loop_bias = 0.0f; bump_g = 0.0f; floor_nz = 0.0f;
     if (model == DLYVERB_MODEL_DIGITAL) {
-        glide_k = 0.0f; sat_k = 0.0f;
+        glide_k = 0.0f; sat_k = 0.0f; loop_k = 1.0f;
         w_tri = 1.0f; w_wow = 0.0f; w_flutter = 0.0f;
         lp_hz = 10500.0f;
     } else if (model == DLYVERB_MODEL_BBD) {
-        glide_k = 1.0f / (0.06f * DV_FS); sat_k = 0.5f;
+        glide_k = 1.0f / (0.06f * DV_FS); sat_k = 1.0f;
+        loop_k = 1.6f + 1.0f * drive_mix;
         w_tri = 1.0f; w_wow = 0.0f; w_flutter = 0.0f;
-        lp_hz = 4500.0f * (0.25f * DV_FS) / t_l;
-        lp_hz = (lp_hz > 9000.0f) ? 9000.0f : lp_hz;
-        lp_hz = (lp_hz < 1800.0f) ? 1800.0f : lp_hz;
+        base_tri = 3.0f;
+        floor_nz = 0.0015f;
+        bump_g = 0.2f;
+        lp_hz = 2800.0f * (0.25f * DV_FS) / t_l;
+        lp_hz = (lp_hz > 3500.0f) ? 3500.0f : lp_hz;
+        lp_hz = (lp_hz < 1500.0f) ? 1500.0f : lp_hz;
     } else {
         glide_k = 1.0f / (0.25f * DV_FS); sat_k = 1.0f;
+        loop_k = 2.2f + 1.8f * drive_mix;
+        loop_bias = 0.2f;
         w_tri = 0.0f; w_wow = 1.0f; w_flutter = 0.3f;
-        lp_hz = 10500.0f;
+        base_wow = 14.0f; base_flutter = 1.5f;
+        floor_nz = 0.0008f;
+        bump_g = 0.6f;
+        lp_hz = 6500.0f;
     }
+    loop_inv = 1.0f / loop_k;
+    loop_bias_out = dv_soft(loop_bias);
+    inc_wow = 0.55f / DV_FS;
+    inc_base_flutter = 6.5f / DV_FS;
+    bump_a = 1.0f - expf(-DV_TWO_PI * 90.0f / DV_FS);
+    model_lp_hz = lp_hz;
     {
         const float user_hz = dv_expHz(DV_ROW(rt, DLYVERB_PARAM_LOWPASS),
                                        400.0f, 10500.0f);
+        user_lp_hz = user_hz;
         lp_hz = (user_hz < lp_hz) ? user_hz : lp_hz;
     }
     lp_a = 1.0f - expf(-DV_TWO_PI * lp_hz / DV_FS);
     hp_r = expf(-DV_TWO_PI * dv_expHz(DV_ROW(rt, DLYVERB_PARAM_HIGHPASS),
                                       15.0f, 2000.0f) / DV_FS);
 
+    /*
+     * Leaving mno: the taps hold quarter-rate samples; the codec-rate path
+     * reads half-rate samples, so double them (and mute the rings, as
+     * before). In mno the trigger below is skipped: it would compare a
+     * quarter-rate tap with a half-rate target.
+     */
+    mno = (uint8_t)(stereo == DLYVERB_STEREO_MONO && (io->frames & 3u) == 0u);
+    if (!mno && st->q_mode) {
+        st->q_mode = 0u;
+        st->valid = 0u;
+        st->tap_a[0] = st->tap_a[1] = st->tap_b[0] = st->tap_b[1] =
+            2.0f * st->tap_a[0];
+        st->xfade = 0.0f;
+        st->xfade_inc = 0.0f;
+    }
+
     /* Digital model: a new target starts a crossfade to a second tap. */
-    if (st->xfade_inc == 0.0f) {
+    if (!mno && st->xfade_inc == 0.0f) {
         if (model == DLYVERB_MODEL_DIGITAL &&
             (fabsf(t_l - st->tap_a[0]) > 0.5f ||
              fabsf(t_r - st->tap_a[1]) > 0.5f)) {
@@ -584,13 +850,6 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         inc_mod = rate / DV_FS;
         inc_flutter = fl / DV_FS;
         inc_rvb = 0.7f / DV_FS;
-    }
-    {
-        const float d = (float)DV_ROW(rt, DLYVERB_PARAM_DRIVE) *
-                        (1.0f / 127.0f);
-
-        drive_mix = d;
-        drive_gain = 1.0f + 7.0f * d * d;
     }
     {
         const float a = (float)DV_ROW(rt, DLYVERB_PARAM_AGE) *
@@ -621,6 +880,33 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
                        (1.0f / 127.0f);
     }
 
+    /*
+     * Plate bus: ptn sets the second plate's damping (127 = brightest),
+     * plv its return level (ramped). The plate sleeps after about 12 s
+     * without input, which is longer than its tail at rdc 127.
+     */
+    {
+        const float* aux = io->aux;
+        uint32_t k;
+
+        aux_on = 0u;
+        if (aux)
+            for (k = 0u; k < io->frames; k++)
+                if (aux[k] != 0.0f) {
+                    aux_on = 1u;
+                    break;
+                }
+        if (aux_on)
+            st->p2_hold = DV_P2_HOLD_BLOCKS;
+        else if (st->p2_hold)
+            st->p2_hold--;
+        pdamp = 0.05f + 0.85f * (1.0f - (float)DV_ROW(rt, DLYVERB_PARAM_PLATE_TONE) *
+                                        (1.0f / 127.0f));
+        plv = st->plv;
+        plv_to = (float)DV_ROW(rt, DLYVERB_PARAM_PLATE_LEVEL) * (1.0f / 127.0f);
+        st->plv = plv_to;
+    }
+
     /* Gain ramps across the block's half-rate frames. */
     fb = st->fb;
     dlv = st->dlv;
@@ -642,6 +928,236 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         st->rvl = rvl_to;
     }
 
+    /*
+     * mno: the whole rumble path at a quarter of the codec rate (Normotone).
+     *
+     * What: one mono echo chain (drive, tap, tone, bump, loop saturation)
+     * and the stereo plate (dv_plateHalf) run at 11,027 Hz on the 4-sample
+     * mean of the L+R input; every one-pole is converted (pole squared), taps
+     * and modulation are in quarter-rate samples, the gain ramps step twice
+     * as far, and wow/flutter/plate modulation are computed once per block and
+     * ramped (all below 10 Hz). The output is interpolated back to the codec
+     * rate and smoothed by a one-pole near 5 kHz. Why: the rumble echo is
+     * low-passed near 600 Hz and its plate heavily damped, so nothing it
+     * produces lives above 5 kHz; running it at a quarter rate keeps that
+     * sound and halves the cost again. The dig crossfade is replaced by the
+     * glide in this mode.
+     */
+    if (mno) {
+        const uint32_t q = io->frames / 4u;
+        /*
+         * Tone in mno acts on the whole rumble at the output (echo and
+         * plate), so lpf / hpf are heard at once instead of pass by pass;
+         * inside the loop only the model's own low-pass and a 15 Hz DC
+         * guard remain. Coefficients are for the quarter rate (11 kHz).
+         */
+        const float mlp = 1.0f - expf(-DV_TWO_PI * model_lp_hz / DV_FS);
+        const float lp4 = 1.0f - (1.0f - mlp) * (1.0f - mlp);
+        const float hp_dc = expf(-DV_TWO_PI * 15.0f / DV_FS);
+        const float hp4 = hp_dc * hp_dc;
+        const float olp1 = 1.0f - expf(-DV_TWO_PI * user_lp_hz / DV_FS);
+        const float olp4 = 1.0f - (1.0f - olp1) * (1.0f - olp1);
+        const float ohp4 = hp_r * hp_r;
+        const float bump4 = 1.0f - (1.0f - bump_a) * (1.0f - bump_a);
+        const float dlp4 = 1.0f - (1.0f - drive_lp_a) * (1.0f - drive_lp_a);
+        const float glide4 = 1.0f - (1.0f - glide_k) * (1.0f - glide_k);
+        const float damp2 = damp * damp;
+        const float pdamp2 = pdamp * pdamp;
+        const uint32_t p2_run = (st->p2_hold != 0u);   /* tail runs on after the sends stop */
+        const float plv_inc = (plv_to - plv) / (float)(io->frames / 4u);
+        const float *aux = io->aux;
+        const float tq = 0.5f * t_l;
+        const uint32_t dig = (model == DLYVERB_MODEL_DIGITAL);
+        const float adv = (float)half;   /* half-rate samples per block */
+        float mod;
+        float mod_inc;
+        float rmod;
+        float rmod_inc;
+        uint32_t i;
+
+        if (!st->q_mode) {          /* rings held codec-rate content */
+            st->q_mode = 1u;
+            st->valid = 0u;
+            st->tap_a[0] = tq;
+            st->q_mod = 0.0f;
+            st->q_rmod = 0.0f;
+            st->p2_clean = 0u;      /* the full plate wrote over its lines */
+            st->q_xf = 0.0f;
+            st->q_tb = tq;
+        }
+        st->ph_tri += inc_mod * adv;          st->ph_tri -= floorf(st->ph_tri);
+        st->ph_flutter += inc_flutter * adv;  st->ph_flutter -= floorf(st->ph_flutter);
+        st->ph_wow += inc_wow * adv;          st->ph_wow -= floorf(st->ph_wow);
+        st->ph_base_flutter += inc_base_flutter * adv;
+        st->ph_base_flutter -= floorf(st->ph_base_flutter);
+        st->ph_rvb += inc_rvb * adv;          st->ph_rvb -= floorf(st->ph_rvb);
+        mod = 0.5f * (mod_depth * (w_tri * (1.0f - 4.0f * fabsf(st->ph_tri - 0.5f)) +
+                                   w_wow * dv_sine(st->ph_tri) +
+                                   w_flutter * dv_sine(st->ph_flutter)) +
+                      base_tri * (1.0f - 4.0f * fabsf(st->ph_wow - 0.5f)) +
+                      base_wow * dv_sine(st->ph_wow) +
+                      base_flutter * dv_sine(st->ph_base_flutter));
+        rmod = dv_sine(st->ph_rvb);
+        mod_inc = (mod - st->q_mod) / (float)q;
+        rmod_inc = (rmod - st->q_rmod) / (float)q;
+        mod = st->q_mod;
+        rmod = st->q_rmod;
+        st->q_mod += mod_inc * (float)q;
+        st->q_rmod += rmod_inc * (float)q;
+
+        wp = st->wp;
+        valid = st->valid;
+        ptr = st->rv_ptr;
+        /*
+         * dig has no glide: a new `div` crossfades from the playing tap to
+         * the new one over 1,024 half-rate samples (about 46 ms), as in the
+         * codec-rate modes. A change during a fade waits for its end.
+         */
+        if (!dig)
+            st->q_xf = 0.0f;
+        else if (st->q_xf == 0.0f && fabsf(tq - st->tap_a[0]) > 0.5f) {
+            st->q_tb = tq;
+            st->q_xf = 1e-6f;
+        }
+        if (p2_run && !st->p2_clean) {
+            dv_plate2Clear(rv, ptr);
+            st->p2_bw = 0.0f;
+            st->p2_damp[0] = st->p2_damp[1] = 0.0f;
+            st->p2_tank[0] = st->p2_tank[1] = 0.0f;
+            st->p2_clean = 1u;
+        }
+        for (i = 0u; i < q; i++) {
+            const float *li = &left[4u * i];
+            const float *ri = right ? &right[4u * i] : li;
+            const float x = 0.125f * (li[0] + li[1] + li[2] + li[3] +
+                                      ri[0] + ri[1] + ri[2] + ri[3]);
+            float in_m;
+            float e_m;
+            float eo_m;
+            float rv_l;
+            float rv_r;
+            float w_m;
+            float nz;
+            float y_l;
+            float y_r;
+            float p2_l;
+            float p2_r;
+            uint32_t j;
+
+            fb += 2.0f * fb_inc;
+            dlv += 2.0f * dlv_inc;
+            rvl += 2.0f * rvl_inc;
+            mod += mod_inc;
+            rmod += rmod_inc;
+
+            in_m = x + drive_mix *
+                   (drive_makeup * (dv_soft(drive_gain * x + drive_bias) -
+                                    drive_bias_out) - x);
+            st->drv_lp[0] += dlp4 * (in_m - st->drv_lp[0]);
+            in_m = st->drv_lp[0];
+
+            {
+                const float al = st->tap_a[0] + mod;
+                float va = dv_ringRead(ring_l, len, wp, al);
+
+                va = ((al + 2.0f) <= (float)valid) ? va : 0.0f;
+                if (st->q_xf != 0.0f) {
+                    const float bl = st->q_tb + mod;
+                    float vb = dv_ringRead(ring_l, len, wp, bl);
+
+                    vb = ((bl + 2.0f) <= (float)valid) ? vb : 0.0f;
+                    va += st->q_xf * (vb - va);
+                    st->q_xf += 2.0f * DV_FADE_INC;
+                    if (st->q_xf >= 1.0f) {
+                        st->tap_a[0] = st->q_tb;
+                        st->q_xf = 0.0f;
+                    }
+                }
+                st->lp[0] += lp4 * (va - st->lp[0]);
+            }
+            st->hp_y[0] = hp4 * (st->hp_y[0] + st->lp[0] - st->hp_x[0]);
+            st->hp_x[0] = st->lp[0];
+            e_m = st->hp_y[0];
+            st->bump[0] += bump4 * (e_m - st->bump[0]);
+            eo_m = e_m + bump_g * st->bump[0];
+
+            dv_plateHalf(&st->rv_bw, st->rv_damp, st->rv_tank, rv, ptr, 0,
+                         0.5f * (eo_m + r_par * (in_m - eo_m)),
+                         decay, dd2, damp2, rmod, &rv_l, &rv_r);
+            p2_l = 0.0f;
+            p2_r = 0.0f;
+            plv += plv_inc;
+            if (p2_run) {
+                const float *ai = aux ? &aux[4u * i] : 0;
+
+                dv_plateHalf(&st->p2_bw, st->p2_damp, st->p2_tank, rv, ptr, 1,
+                             ai ? 0.125f * (ai[0] + ai[1] + ai[2] + ai[3]) : 0.0f,
+                             decay, dd2, pdamp2, -rmod, &p2_l, &p2_r);
+                p2_l *= plv;
+                p2_r *= plv;
+            }
+            ptr = (ptr - 1u) & DV_RVB_MASK;
+
+            nz = dv_noise(&st->noise);
+            nz = (hiss + floor_nz) * nz +
+                 ((fabsf(nz) < crackle_p) ? crackle_amp : 0.0f);
+            w_m = in_m + fb * (e_m + r_fbk * DV_FBK_MIX * (0.25f * (rv_l + rv_r) - e_m)) + nz;
+            if (sat_k >= 1.0f)
+                w_m = loop_inv * (dv_soft(loop_k * w_m + loop_bias) - loop_bias_out);
+            else
+                w_m = dv_clamp(w_m, 1.0f) + sat_k *
+                      (loop_inv * (dv_soft(loop_k * w_m + loop_bias) - loop_bias_out) -
+                       dv_clamp(w_m, 1.0f));
+            ring_l[wp] = (int16_t)(w_m * 32767.0f);
+            wp++;
+            wp -= (wp >= len) ? len : 0u;
+            valid += (valid < len) ? 1u : 0u;
+            st->tap_a[0] += (tq - st->tap_a[0]) * glide4;
+
+            y_l = dlv * eo_m + rvl * rv_l;
+            y_r = dlv * eo_m + rvl * rv_r;
+            /* Output tone: one-pole low-pass (lpf), then high-pass (hpf). */
+            st->o_lp[0] += olp4 * (y_l - st->o_lp[0]);
+            st->o_lp[1] += olp4 * (y_r - st->o_lp[1]);
+            st->o_hpy[0] = ohp4 * (st->o_hpy[0] + st->o_lp[0] - st->o_hpx[0]);
+            st->o_hpx[0] = st->o_lp[0];
+            st->o_hpy[1] = ohp4 * (st->o_hpy[1] + st->o_lp[1] - st->o_hpx[1]);
+            st->o_hpx[1] = st->o_lp[1];
+            /* The plate bus joins after the rumble's tone stage. */
+            /* ...with its own soft clip, so a hot plate never ducks the rumble. */
+            y_l = DV_LIMIT_INV * dv_soft(DV_LIMIT * st->o_hpy[0]);
+            y_r = DV_LIMIT_INV * dv_soft(DV_LIMIT * st->o_hpy[1]);
+            if (p2_run) {
+                y_l += DV_LIMIT_INV * dv_soft(DV_LIMIT * p2_l);
+                y_r += DV_LIMIT_INV * dv_soft(DV_LIMIT * p2_r);
+            }
+            for (j = 0u; j < 4u; j++) {
+                const float k = 0.25f * (float)(j + 1u);
+                const float ol = st->prev_out[0] + k * (y_l - st->prev_out[0]);
+                const float orr = st->prev_out[1] + k * (y_r - st->prev_out[1]);
+
+                st->hp_lp[0][0] += 0.5f * (ol - st->hp_lp[0][0]);
+                st->hp_lp[1][0] += 0.5f * (orr - st->hp_lp[1][0]);
+                if (right) {
+                    left[4u * i + j] = st->hp_lp[0][0];
+                    right[4u * i + j] = st->hp_lp[1][0];
+                } else {
+                    left[4u * i + j] = 0.5f * (st->hp_lp[0][0] + st->hp_lp[1][0]);
+                }
+            }
+            st->prev_out[0] = y_l;
+            st->prev_out[1] = y_r;
+        }
+        st->tap_a[1] = st->tap_a[0];
+        st->tap_b[0] = st->tap_a[0];
+        st->tap_b[1] = st->tap_a[0];
+        st->xfade = 0.0f;
+        st->xfade_inc = 0.0f;
+        st->wp = wp;
+        st->valid = valid;
+        st->rv_ptr = ptr;
+        return;
+    }
     /* 2:1 decimation behind the 9 kHz image filter. */
     for (n = 0u; n < half; n++) {
         const float r0 = right ? right[2u * n] : left[2u * n];
@@ -651,13 +1167,47 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         (void)dv_biquad(r0, st->dec_z[1]);
         xs_l[n] = dv_biquad(left[2u * n + 1u], st->dec_z[0]);
         xs_r[n] = dv_biquad(r1, st->dec_z[1]);
+        if (io->aux) {
+            (void)dv_biquad(io->aux[2u * n], st->dec_a);
+            xa[n] = dv_biquad(io->aux[2u * n + 1u], st->dec_a);
+        }
     }
 
     wp = st->wp;
     valid = st->valid;
     ptr = st->rv_ptr;
+    {
+        float s_mod_inc = 0.0f;
+        float s_rmod_inc = 0.0f;
+
     for (n = 0u; n < half; n++) {
         float in_l;
+        /*
+         * Modulation at control rate (Normotone CPU): every 8 half-rate
+         * samples the shapes are evaluated 8 samples ahead and ramped. All
+         * of them are below 25 Hz; the delay-time error stays under a few
+         * hundredths of a sample at the extreme settings.
+         */
+        if ((n & 7u) == 0u) {
+            float target;
+
+            st->ph_tri += 8.0f * inc_mod;          st->ph_tri -= floorf(st->ph_tri);
+            st->ph_flutter += 8.0f * inc_flutter;  st->ph_flutter -= floorf(st->ph_flutter);
+            st->ph_wow += 8.0f * inc_wow;          st->ph_wow -= floorf(st->ph_wow);
+            st->ph_base_flutter += 8.0f * inc_base_flutter;
+            st->ph_base_flutter -= floorf(st->ph_base_flutter);
+            st->ph_rvb += 8.0f * inc_rvb;          st->ph_rvb -= floorf(st->ph_rvb);
+            target = mod_depth * (w_tri * (1.0f - 4.0f * fabsf(st->ph_tri - 0.5f)) +
+                                  w_wow * dv_sine(st->ph_tri) +
+                                  w_flutter * dv_sine(st->ph_flutter)) +
+                     base_tri * (1.0f - 4.0f * fabsf(st->ph_wow - 0.5f)) +
+                     base_wow * dv_sine(st->ph_wow) +
+                     base_flutter * dv_sine(st->ph_base_flutter);
+            s_mod_inc = 0.125f * (target - st->s_mod);
+            s_rmod_inc = 0.125f * (dv_sine(st->ph_rvb) - st->s_rmod);
+        }
+        st->s_mod += s_mod_inc;
+        st->s_rmod += s_rmod_inc;
         float in_r;
         float mod;
         float d_l;
@@ -672,19 +1222,29 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         float w_l;
         float w_r;
         float nz;
+        float eo_l;
+        float eo_r;
 
         fb += fb_inc;
         dlv += dlv_inc;
         rvl += rvl_inc;
 
-        /* Drive: crossfade from clean to the soft clipper. */
-        in_l = xs_l[n] + drive_mix * (dv_soft(drive_gain * xs_l[n]) - xs_l[n]);
-        in_r = xs_r[n] + drive_mix * (dv_soft(drive_gain * xs_r[n]) - xs_r[n]);
+        /*
+         * Drive: crossfade from clean to the biased, level-compensated soft
+         * clipper, then the drive tone low-pass.
+         */
+        in_l = xs_l[n] + drive_mix *
+               (drive_makeup * (dv_soft(drive_gain * xs_l[n] + drive_bias) -
+                                drive_bias_out) - xs_l[n]);
+        in_r = xs_r[n] + drive_mix *
+               (drive_makeup * (dv_soft(drive_gain * xs_r[n] + drive_bias) -
+                                drive_bias_out) - xs_r[n]);
+        st->drv_lp[0] += drive_lp_a * (in_l - st->drv_lp[0]);
+        st->drv_lp[1] += drive_lp_a * (in_r - st->drv_lp[1]);
+        in_l = st->drv_lp[0];
+        in_r = st->drv_lp[1];
 
-        /* Modulation (constant cost: all three shapes every sample). */
-        mod = mod_depth * (w_tri * (1.0f - 4.0f * fabsf(st->ph_tri - 0.5f)) +
-                           w_wow * dv_sine(st->ph_tri) +
-                           w_flutter * dv_sine(st->ph_flutter));
+        mod = st->s_mod;
 
         /* Two taps per side; reads beyond what was written are silent. */
         {
@@ -696,15 +1256,24 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
             float vb;
 
             va = dv_ringRead(ring_l, len, wp, al);
-            vb = dv_ringRead(ring_l, len, wp, bl);
             va = ((al + 2.0f) <= (float)valid) ? va : 0.0f;
-            vb = ((bl + 2.0f) <= (float)valid) ? vb : 0.0f;
-            d_l = va + st->xfade * (vb - va);
+            /* The second tap only matters during a dig crossfade (CPU). */
+            if (st->xfade != 0.0f) {
+                vb = dv_ringRead(ring_l, len, wp, bl);
+                vb = ((bl + 2.0f) <= (float)valid) ? vb : 0.0f;
+                d_l = va + st->xfade * (vb - va);
+            } else {
+                d_l = va;
+            }
             va = dv_ringRead(ring_r, len, wp, ar);
-            vb = dv_ringRead(ring_r, len, wp, br);
             va = ((ar + 2.0f) <= (float)valid) ? va : 0.0f;
-            vb = ((br + 2.0f) <= (float)valid) ? vb : 0.0f;
-            d_r = va + st->xfade * (vb - va);
+            if (st->xfade != 0.0f) {
+                vb = dv_ringRead(ring_r, len, wp, br);
+                vb = ((br + 2.0f) <= (float)valid) ? vb : 0.0f;
+                d_r = va + st->xfade * (vb - va);
+            } else {
+                d_r = va;
+            }
         }
 
         /* Echo tone: one-pole low-pass then one-pole high-pass. */
@@ -717,10 +1286,21 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         e_l = st->hp_y[0];
         e_r = st->hp_y[1];
 
+        /* Head bump: a 90 Hz low-pass added to the echo output only. */
+        st->bump[0] += bump_a * (e_l - st->bump[0]);
+        st->bump[1] += bump_a * (e_r - st->bump[1]);
+        eo_l = e_l + bump_g * st->bump[0];
+        eo_r = e_r + bump_g * st->bump[1];
+
         /* Plate: fed by the echoes, or by the driven input (par). */
-        rin = 0.5f * ((e_l + e_r) + r_par * ((in_l + in_r) - (e_l + e_r)));
+        rin = 0.5f * ((eo_l + eo_r) + r_par * ((in_l + in_r) - (eo_l + eo_r)));
+        /* str/png/wid: the full plate fills the ring, so the plate bus
+         * feeds the shared plate, filtered like the main input and at the
+         * mno input scale (0.5 x plv); its return then follows rvl. */
+        if (io->aux)
+            rin += plv_to * xa[n];
         dv_plate(st, rv, ptr, 0.5f * rin, decay, dd2, damp,
-                 dv_sine(st->ph_rvb), &rv_l, &rv_r);
+                 st->s_rmod, &rv_l, &rv_r);
         ptr = (ptr - 1u) & DV_RVB_MASK;
 
         /*
@@ -728,21 +1308,39 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
          * level, because the plate's resonant modes have more than unity
          * gain and would self-oscillate the loop at moderate feedback.
          */
-        s_l = e_l + r_fbk * rvl * (0.5f * rv_l - e_l);
-        s_r = e_r + r_fbk * rvl * (0.5f * rv_r - e_r);
+        s_l = e_l + r_fbk * DV_FBK_MIX * (0.5f * rv_l - e_l);
+        s_r = e_r + r_fbk * DV_FBK_MIX * (0.5f * rv_r - e_r);
 
-        /* Age: hiss and sparse crackle enter the loop and echo with it. */
+        /*
+         * Age (hiss, sparse crackle) and the model's noise floor enter the
+         * loop and echo with it.
+         */
         nz = dv_noise(&st->noise);
-        nz = hiss * nz + ((fabsf(nz) < crackle_p) ? crackle_amp : 0.0f);
+        nz = (hiss + floor_nz) * nz +
+             ((fabsf(nz) < crackle_p) ? crackle_amp : 0.0f);
 
         w_l = g_ll * in_l + g_lr * in_r +
               fb * (s_l + cross * (s_r - s_l)) + nz;
         w_r = g_rl * in_l + g_rr * in_r +
               fb * (s_r + cross * (s_l - s_r)) - nz;
-        w_l = dv_clamp(w_l, 1.0f) + sat_k * (dv_soft(w_l) -
-                                             dv_clamp(w_l, 1.0f));
-        w_r = dv_clamp(w_r, 1.0f) + sat_k * (dv_soft(w_r) -
-                                             dv_clamp(w_r, 1.0f));
+        /*
+         * Loop saturation: dig clamps; bbd and tap soft clip after a
+         * pre-gain (unity for small signals), tap with a bias.
+         */
+        if (sat_k >= 1.0f) {        /* bbd/tap: the clamp terms cancel */
+            w_l = loop_inv * (dv_soft(loop_k * w_l + loop_bias) - loop_bias_out);
+            w_r = loop_inv * (dv_soft(loop_k * w_r + loop_bias) - loop_bias_out);
+        } else if (sat_k <= 0.0f) { /* dig: clamp only */
+            w_l = dv_clamp(w_l, 1.0f);
+            w_r = dv_clamp(w_r, 1.0f);
+        } else {
+            w_l = dv_clamp(w_l, 1.0f) + sat_k *
+                  (loop_inv * (dv_soft(loop_k * w_l + loop_bias) - loop_bias_out) -
+                   dv_clamp(w_l, 1.0f));
+            w_r = dv_clamp(w_r, 1.0f) + sat_k *
+                  (loop_inv * (dv_soft(loop_k * w_r + loop_bias) - loop_bias_out) -
+                   dv_clamp(w_r, 1.0f));
+        }
         ring_l[wp] = (int16_t)(w_l * 32767.0f);
         ring_r[wp] = (int16_t)(w_r * 32767.0f);
         wp++;
@@ -750,8 +1348,8 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
         valid += (valid < len) ? 1u : 0u;
 
         /* Wet sum through a gentle limiter (2 % at 0.5, ceiling 1.33). */
-        ys_l[n] = DV_LIMIT_INV * dv_soft(DV_LIMIT * (dlv * e_l + rvl * rv_l));
-        ys_r[n] = DV_LIMIT_INV * dv_soft(DV_LIMIT * (dlv * e_r + rvl * rv_r));
+        ys_l[n] = DV_LIMIT_INV * dv_soft(DV_LIMIT * (dlv * eo_l + rvl * rv_l));
+        ys_r[n] = DV_LIMIT_INV * dv_soft(DV_LIMIT * (dlv * eo_r + rvl * rv_r));
 
         /* Taps: glide (bbd/tap) and crossfade (dig). */
         st->tap_a[0] += (t_l - st->tap_a[0]) * glide_k;
@@ -764,12 +1362,7 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
             st->xfade_inc = 0.0f;
         }
 
-        st->ph_tri += inc_mod;
-        st->ph_tri -= (st->ph_tri >= 1.0f) ? 1.0f : 0.0f;
-        st->ph_flutter += inc_flutter;
-        st->ph_flutter -= (st->ph_flutter >= 1.0f) ? 1.0f : 0.0f;
-        st->ph_rvb += inc_rvb;
-        st->ph_rvb -= (st->ph_rvb >= 1.0f) ? 1.0f : 0.0f;
+    }
     }
     /* A model change away from dig mid-fade lets the glide take over. */
     if (model != DLYVERB_MODEL_DIGITAL && st->xfade_inc == 0.0f) {
@@ -804,6 +1397,72 @@ static void dlyVerb_process(void *rt_void, effect_io_t *io)
 }
 
 /* Share change: re-seat (clears the reverb, mutes the delay rings). */
+/*
+ * Rumble duck (Normotone): the csc sidechain hit dips the DlyVerb return.
+ *
+ * What: a hit of weight w = (v/127)^3 sets the target to -dck x 30/127 x w
+ * dB; the reduction falls to it with a 3 ms one-pole, then the target goes
+ * back to 0 and it recovers with the dkr time (20 ms..1 s). The gain is
+ * ramped across the block. Why here: the bus compressor's cut dipped all of
+ * MAIN, so the kick (on MAIN when OUT 2 is free, as with headphones) and the
+ * tracks under it were cut too and clicked; now only the rumble moves.
+ */
+#define DV_DUCK_ATTACK_MS 3.0f
+
+static inline float dv_blockCoef(float tau_ms, uint32_t frames)
+{
+    const float t = 1000.0f * (float)frames / DV_FS;
+
+    return t / (tau_ms + 0.5f * t);
+}
+
+static void dlyVerb_process(void *rt_void, effect_io_t *io)
+{
+    DlyVerbRuntime *rt = (DlyVerbRuntime *)rt_void;
+    DlyVerbState *st;
+    float g0;
+    float g1;
+    float step;
+    uint32_t n;
+
+    dlyVerb_processCore(rt_void, io);
+    if (!rt || !io || !io->l || !rt->state)
+        return;
+    st = (DlyVerbState *)rt->state;
+    if (rt->duck_pending > 0.0f) {
+        const float t = -(float)DV_ROW(rt, DLYVERB_PARAM_DUCK) *
+                        (30.0f / 127.0f) * rt->duck_pending;
+
+        rt->duck_pending = 0.0f;
+        if (t < st->dk_target)
+            st->dk_target = t;
+    }
+    if (st->dk_target < 0.0f && st->dk_db <= st->dk_target + 0.5f)
+        st->dk_target = 0.0f;                  /* depth reached: release */
+    if (st->dk_target < st->dk_db)
+        st->dk_db += dv_blockCoef(DV_DUCK_ATTACK_MS, io->frames) *
+                     (st->dk_target - st->dk_db);
+    else
+        st->dk_db += dv_blockCoef(dv_expHz(DV_ROW(rt, DLYVERB_PARAM_DUCK_REL),
+                                           20.0f, 1000.0f), io->frames) *
+                     (st->dk_target - st->dk_db);
+    if (st->dk_db > -0.01f && st->dk_target == 0.0f)
+        st->dk_db = 0.0f;
+    g0 = (st->dk_gain > 0.0f) ? st->dk_gain : 1.0f;
+    g1 = exp2f(st->dk_db * 0.16609640f);
+    st->dk_gain = g1;
+    if (g0 == 1.0f && g1 == 1.0f)
+        return;
+    step = (g1 - g0) / (float)io->frames;
+    for (n = 0u; n < io->frames; n++) {
+        const float g = g0 + step * (float)(n + 1u);
+
+        io->l[n] *= g;
+        if (io->r)
+            io->r[n] *= g;
+    }
+}
+
 static void dlyVerb_bufferChanged(void *rt_void, const fx_share_t *share)
 {
     (void)dv_seat((DlyVerbRuntime *)rt_void, share);

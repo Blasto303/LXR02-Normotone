@@ -20,6 +20,7 @@ Treat everything as beta: Helicase is still at 0.00 upstream.
 - **DlyVerb effect** (`dvb`): tempo-synced character delay (dig/bbd/tape, stereo/ping-pong/width) into a Dattorro plate reverb, 100 % wet. Per-voice dry/wet with the `d/w` fader mode.
 - **Plaits instruments** (C translations of Plaits by Emilie Gillet, MIT): analog kick (`PlKick`), analog snare (`PlSnare`), hi-hat with open hat on track 7 (`PlHat`), and the Rings-derived modal resonator with Rings' strike position (`PlModal`). Presets in `SD_CARD/Instrument/`.
 - **One-shot LFOs**: waveforms `si1`..`xd1` play one cycle per retrigger and hold; the LFO offset becomes a delay, as in LXR Catalyst.
+- **LXR-02 project import**: `tools/convert_lxr02_project.py` turns stock Erica Synths LXR-02 projects (PROJ00..PROJ09) into Helicase Kits and Banks: one Scene per pattern with its own kit, triggers, velocity, note, probability and step automation. `tools/build_lxr02_card.py` builds a full card that keeps the stock projects next to Helicase.
 
 ### How to use - Quickstart
 The Helicase firmware uses the LXR UX as a starting point, but is almost entirely new code now. A full manual will be written when things are reasonably complete, but here are some pointers to get you started:

@@ -59,6 +59,7 @@
  *            blocking delays, before TIM7 is running.
  */
 
+#include "cpuProfile.h"
 #include "timebase.h"
 #include "lcd.h"
 #include "config.h"
@@ -130,7 +131,7 @@ volatile uint32_t systick_ticks = 0;
 ** heavier front-panel scan for foreground service at 500Hz. This leaves more
 ** uninterrupted foreground time for DSP render while preserving 1ms UI timers.
 ** ----------------------------------------------------------------------- */
-void TIM6_DAC_IRQHandler(void)
+void TIM6_DAC_IRQHandler_body(void)
 {
     TIM6_SR = 0;  /* clear update flag */
 
@@ -231,7 +232,7 @@ void timebase_serviceFrontPanel(void)
 ** ----------------------------------------------------------------------- */
 #define TIM7_SR (*((volatile uint32_t *)0x40001410UL))  /* TIM7_BASE+0x10 */
 
-void TIM7_IRQHandler(void)
+void TIM7_IRQHandler_body(void)
 {
     TIM7_SR = 0;  /* clear update interrupt flag */
     lcd_tim7_tick();
@@ -310,3 +311,9 @@ uint32_t timebase_tim2Delta(uint32_t newer, uint32_t older)
 {
     return (uint32_t)(newer - older);
 }
+
+/* Normotone CPU profile: timed wrapper (cpuProfile.h). */
+PROF_ISR_WRAP(TIM6_DAC_IRQHandler, PROF_T6)
+
+/* Normotone CPU profile: timed wrapper (cpuProfile.h). */
+PROF_ISR_WRAP(TIM7_IRQHandler, PROF_LCD)

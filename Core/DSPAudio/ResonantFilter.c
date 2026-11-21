@@ -192,7 +192,7 @@ static inline float svf_padeDen(const float a)
 #error "Batched ZDF solver (S073 Step 1) requires nonlinear integrators and no shaper"
 #endif
 //------------------------------------------------------------------------------------
-INITCM_EFFECT_NOINLINE void SVF_calcBlockZDF(ResonantFilter* filter, const uint8_t type, int16_t* buf, const uint8_t size)
+static inline __attribute__((always_inline)) void svf_zdfBlockT(ResonantFilter* filter, const uint8_t type, int16_t* buf, const uint8_t size)
 {
 	uint8_t i;
 	const float f 	= filter->g;
@@ -334,6 +334,29 @@ INITCM_EFFECT_NOINLINE void SVF_calcBlockZDF(ResonantFilter* filter, const uint8
 		filter->s1 = s1;
 		filter->s2 = s2;
 		filter->zi = zi;
+	}
+}
+
+/*
+ * Constant-type dispatch (Normotone CPU).
+ *
+ * What: svf_zdfBlockT() is the original block body; each call below passes a
+ * compile-time filter type, so the compiler drops the per-sample output
+ * switch and the unused branches. Same arithmetic in the same order: the
+ * output is bit-identical (host bench). Unknown types keep the original
+ * generic path.
+ */
+INITCM_EFFECT_NOINLINE void SVF_calcBlockZDF(ResonantFilter* filter, const uint8_t type, int16_t* buf, const uint8_t size)
+{
+	switch (type) {
+	case FILTER_LP:          svf_zdfBlockT(filter, FILTER_LP, buf, size); break;
+	case FILTER_HP:          svf_zdfBlockT(filter, FILTER_HP, buf, size); break;
+	case FILTER_BP:          svf_zdfBlockT(filter, FILTER_BP, buf, size); break;
+	case FILTER_UNITY_BP:    svf_zdfBlockT(filter, FILTER_UNITY_BP, buf, size); break;
+	case FILTER_NOTCH:       svf_zdfBlockT(filter, FILTER_NOTCH, buf, size); break;
+	case FILTER_PEAK:        svf_zdfBlockT(filter, FILTER_PEAK, buf, size); break;
+	case FILTER_NAIVE_2_POLE: svf_zdfBlockT(filter, FILTER_NAIVE_2_POLE, buf, size); break;
+	default:                 svf_zdfBlockT(filter, type, buf, size); break;
 	}
 }
 //------------------------------------------------------------------------------------

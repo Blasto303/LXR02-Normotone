@@ -62,6 +62,7 @@
  * read1/read2 removed permanently.
  */
 
+#include "cpuProfile.h"
 #include "encoder.h"
 
 /* -----------------------------------------------------------------------
@@ -193,7 +194,7 @@ void encoder_tim14_tick(void) {}
 ** Runs Dannegger. On accepted transition: accumulates enc_delta and
 ** stores current timestamp in circular buffer. No velocity computation.
 ** ----------------------------------------------------------------------- */
-void TIM1_CC_IRQHandler(void)
+void TIM1_CC_IRQHandler_body(void)
 {
     TIM1_SR = ~((1UL<<3)|(1UL<<4));
 
@@ -367,3 +368,6 @@ uint8_t encode_readButton(void)
 {
     return button_val;
 }
+
+/* Normotone CPU profile: timed wrapper (cpuProfile.h). */
+PROF_ISR_WRAP(TIM1_CC_IRQHandler, PROF_ENI)

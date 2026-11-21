@@ -230,8 +230,8 @@ void Snare_calcSyncBlockVoice(SnareVoice *voice, int16_t* buf,
 	SVF_calcBlockZDF(&voice->filter,voice->filterType,buf,size);
 
 	//calc transient sample
-	transient_calcBlock(&voice->transGen,transBuf,size);
-	bufferTool_addBuffersSaturating(buf,transBuf,size);
+	if (!transient_calcBlock(&voice->transGen,transBuf,size))
+		bufferTool_addBuffersSaturating(buf,transBuf,size);
 
 	//calc next osc sample
 	calcNextOscSampleBlock(&voice->osc,transBuf,size,(1.f-voice->mix));

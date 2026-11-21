@@ -78,6 +78,7 @@ typedef enum {
     PS_PARAM_LFO_TARGET_PARAM,
     PS_PARAM_LFO_TARGET_VOICE_2,
     PS_PARAM_LFO_TARGET_PARAM_2,
+    PS_PARAM_SYNTH,
     PS_PARAM_COUNT
 } plaits_snare_param_index_t;
 
@@ -112,6 +113,8 @@ const ParamDescriptor plaits_snare_param_descriptors[] = {
     ROW_NOBIND("lfo_target_param", "LFO", "DstParam", "ds1", DTYPE_TARGET_SELECTION_LFO, INSTRUMENT_BIND_LFO_TARGET_PARAM),
     ROW_NOBIND("lfo_target_voice_2", "LFO", "DstVoice2", "vo2", DTYPE_VOICE_LFO, INSTRUMENT_BIND_LFO_TARGET_VOICE_2),
     ROW_NOBIND("lfo_target_param_2", "LFO", "DstParam2", "ds2", DTYPE_TARGET_SELECTION_LFO, INSTRUMENT_BIND_LFO_TARGET_PARAM_2),
+    /* Model: off = AnalogSnareDrum (Plaits OUT), on = SyntheticSnareDrum (AUX). */
+    { "snare_synth", "syn", "Synth", "Plaits", DTYPE_ON_OFF, INSTRUMENT_PARAM_FLAG_MORPHABLE | INSTRUMENT_PARAM_FLAG_AUTOMATABLE, MOD_NONE, BIND(model, TYPE_UINT8) },
 };
 
 const uint8_t plaits_snare_param_descriptor_count =
@@ -134,7 +137,7 @@ const instrument_menu_page_t plaits_snare_menu_pages[] = {
     {{ PS_PARAM_NOTE, PS_PARAM_FINE, PS_PARAM_TONE, PS_PARAM_DECAY, E, E, E, E, E, E, E, E, E, E, E, E }},
     {{ PS_PARAM_AMP_ENVELOPE_ATTACK, PS_PARAM_AMP_ENVELOPE_DECAY, PS_PARAM_AMP_ENVELOPE_SLOPE, E, E, E, E, E, E, E, E, E, E, E, E, E }},
     {{ PS_PARAM_SNAPPY, PS_PARAM_TONE, PS_PARAM_DECAY, INSTRUMENT_MENU_SKIP, PS_PARAM_VELO_MOD_DEST, PS_PARAM_VELO_MOD_AMOUNT, PS_PARAM_VELO_VOL_ON_OFF, E, E, E, E, E, E, E, E, E }},
-    {{ PS_PARAM_SNAPPY, PS_PARAM_TONE, PS_PARAM_DECAY, E, E, E, E, E, E, E, E, E, E, E, E, E }},
+    {{ PS_PARAM_SYNTH, PS_PARAM_SNAPPY, PS_PARAM_TONE, PS_PARAM_DECAY, E, E, E, E, E, E, E, E, E, E, E, E }},
     {{ PS_PARAM_NOTE, PS_PARAM_FINE, E, E, E, E, E, E, E, E, E, E, E, E, E, E }},
     {{ PS_PARAM_TONE, PS_PARAM_DECAY, PS_PARAM_SNAPPY, E, E, E, E, E, E, E, E, E, E, E, E, E }},
     {{ PS_PARAM_LFO_RATE, PS_PARAM_LFO_SYNC, PS_PARAM_LFO_WAVE, PS_PARAM_LFO_OFFSET, PS_PARAM_LFO_RETRIGGER_VOICE, PS_PARAM_LFO_POLARITY, PS_PARAM_LFO_AMOUNT, PS_PARAM_LFO_AMOUNT_2, PS_PARAM_LFO_TARGET_VOICE, PS_PARAM_LFO_TARGET_PARAM, PS_PARAM_LFO_TARGET_VOICE_2, PS_PARAM_LFO_TARGET_PARAM_2, E, E, E, E }},
