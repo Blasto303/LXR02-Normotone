@@ -29,15 +29,17 @@ typedef struct {
     uint16_t ap_w[2][DSM_AP_COUNT];
     uint16_t rv_w[2];
     float dc_x[2], dc_y[2];             /* DC blocker */
-    float lp_a[2], lp_b[2], lp_c[2];    /* model filters */
+    float lp_a[2], lp_b[2], lp_c[2], lp_d[2];   /* model filters */
+    float sq[2];                        /* riot logic state (+-1) */
     float fbs[2];                       /* held feedback (bit-crushed) */
     float hold_in[2], hold_out[2];      /* sample-and-hold values */
     float ph[2];                        /* pitch shifter phase 0..1 */
     float last[2];                      /* previous output */
     uint16_t cnt[2];                    /* sample-and-hold counter */
     /* per block (from the three knobs) */
-    float k_fb, k_g, k_tap, k_x, k_q, k_tune_frac;
+    float k_fb, k_g, k_tap, k_x, k_q, k_f;
     uint16_t k_hold;
+    uint16_t k_tap2, k_tap3;            /* assault fifth / octave taps */
     uint8_t alg;
 } DsModelState;
 
