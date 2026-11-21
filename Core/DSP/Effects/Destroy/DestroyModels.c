@@ -36,7 +36,7 @@ static const uint16_t dsm_ap_len[DSM_AP_COUNT] = { 142u, 107u, 379u, 277u };
 
 /* Output trims so the models sit near the dry level (bench, mix 127). */
 static const float dsm_trim[DSM_ALG_COUNT] = {
-    1.0f, 1.6f, 1.0f, 0.8f, 1.15f, 0.55f, 0.6f, 1.0f, 0.9f
+    1.0f, 1.6f, 1.0f, 0.8f, 1.15f, 0.95f, 1.0f, 1.5f, 1.8f
 };
 
 /* Pool layout, per channel. */
@@ -188,7 +188,8 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
     case 7u: case 8u: {                           /* bloodbath mudslide */
         const float bits = 15.0f - 13.0f * b;     /* dirt: 15 .. 2 bits */
 
-        m->k_fb = (alg == 7u) ? 0.9f * a : a;
+        m->k_fb = (alg == 7u) ? 0.9f * a : 0.95f * a;
+        m->k_x = 2.0f + 6.0f * a;                 /* mudslide fold depth */
         m->k_q = exp2f(bits - 1.0f);
         m->k_hold = (uint16_t)(1.0f + 47.0f * c * c);   /* dirtrate */
         tune = -1.0f;
@@ -238,7 +239,7 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
     switch (m->alg) {
     case 1u: {                                    /* hustle */
         const float z = dsm_read(md, DSM_MD_LEN, mw, m->k_tap);
-        float u = 3.0f * x + fb * z;
+        float u = 3.0f * x + 0.4f * fb * z;   /* x2.5 below: loop gain ~fb */
 
         u += m->k_x * (2.0f * fabsf(u) - 0.6f - u);    /* rectifier blend */
         y = dsm_dc(m, c, dsm_soft(2.5f * u));
@@ -247,7 +248,7 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
     }
     case 2u: {                                    /* turmoil */
         const float z = dsm_read(md, DSM_MD_LEN, mw, m->k_tap);
-        float s = dsm_soft(m->k_g * (x + fb * z));
+        float s = dsm_soft(m->k_g * x + (fb * (1.0f / 10.8f)) * z);
 
         m->lp_a[c] += 0.35f * (s - m->lp_a[c]);        /* ~2.9 kHz */
         m->lp_b[c] += 0.043f * (s - m->lp_b[c]);       /* ~300 Hz  */
@@ -260,7 +261,7 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
     case 3u: {                                    /* mutiny */
         const float z = dsm_read(md, DSM_MD_LEN, mw, m->k_tap);
 
-        y = dsm_dc(m, c, dsm_soft(m->k_g * (x + fb * z)));
+        y = dsm_dc(m, c, dsm_soft(m->k_g * x + fb * z));   /* loop gain fb */
         dsm_write(md, mw, y);
         break;
     }
@@ -275,7 +276,8 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
 
             if (fabsf(s) < 0.15f * m->k_x)
                 i = 0;                                   /* gate */
-            i ^= mask;                                   /* bit flipping */
+            else
+                i ^= mask;                               /* bit flipping */
         }
         y = (float)i * (1.0f / 32767.0f);
         /* Allpass (first line of the pool's chain) inside the loop. */
@@ -291,23 +293,25 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
             g = d - 0.6f * v;
         }
         dsm_write(md, mw, dsm_dc(m, c, g));
+        m->lp_b[c] += 0.002f * (y - m->lp_b[c]);         /* DC-free output */
+        y -= m->lp_b[c];
         break;
     }
     case 5u: {                                    /* assault */
         const float z = dsm_read(md, DSM_MD_LEN, mw, m->k_tap);
-        const float u = x + fb * z;
+        const float v = m->k_g * x + (fb * (1.0f / 2.2f)) * z;
         float s;
 
-        m->lp_a[c] += 0.043f * (u - m->lp_a[c]);
-        s = dsm_soft(m->k_g * u) +
-            dsm_clamp(1.7f * m->k_g * u, 0.7f) * (1.0f / 0.7f) +
-            dsm_soft(3.0f * m->k_g * (u - m->lp_a[c]));
+        m->lp_a[c] += 0.043f * (v - m->lp_a[c]);
+        s = dsm_soft(v) +
+            dsm_clamp(1.7f * v, 0.7f) * (1.0f / 0.7f) +
+            dsm_soft(3.0f * (v - m->lp_a[c]));
         y = dsm_dc(m, c, s * (1.0f / 3.0f));
         dsm_write(md, mw, y);
         break;
     }
     case 6u: {                                    /* bloodshed */
-        const float in = x + fb * dsm_soft(m->k_x * m->last[c]);
+        const float in = x + (fb / m->k_x) * dsm_soft(m->k_x * m->last[c]);
         float p = m->ph[c];
         float p2;
         float w1;
@@ -347,10 +351,10 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
                 m->hold_out[c] = dsm_crush(m, z);
                 m->fbs[c] = (m->alg == 7u)
                     ? m->hold_out[c]
-                    : dsm_psin(z * (2.0f + 6.0f * m->k_fb));   /* folded */
+                    : dsm_psin(0.25f * m->k_x * z) / (1.5708f * m->k_x);
             }
             if (m->alg == 7u)
-                in = dsm_soft(4.0f * (x + fb * m->fbs[c]));
+                in = dsm_soft(4.0f * x + fb * m->fbs[c]);
             else
                 in = m->hold_in[c] + fb * m->fbs[c];
             ap = dsm_apChain(m, pool, c, in);

@@ -151,6 +151,11 @@ static void run_pattern(uint8_t sc, int blocks)
         }
     }
     for (b = 0; b < blocks; b++) {
+        /* BENCH_MUTE_AT=block: every fader to 0 from that block (tails). */
+        if (getenv("BENCH_MUTE_AT") && b == atoi(getenv("BENCH_MUTE_AT"))) {
+            int v2;
+            for (v2 = 0; v2 < 6; v2++) slider_vol[v2] = 0.0f;
+        }
         for (ci = 0; ci < nchg; ci++)
             if (b == change_at[ci])
                 scene_setEffectNormalParameter(sc, change_idx[ci], change_val[ci]);
