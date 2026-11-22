@@ -94,10 +94,32 @@ static void destroy_uiPaintRow0(uint8_t sub_page, uint8_t screen, char *row0)
 
 static uint8_t destroy_uiFormatValue3(uint8_t index, uint8_t value, char *out)
 {
-    if (index != DESTROY_PARAM_ALG)
-        return 0u;
-    memcpy(out, dsm_algName(value), 3);
-    return 1u;
+    if (index == DESTROY_PARAM_ALG) {
+        memcpy(out, dsm_algName(value), 3);
+        return 1u;
+    }
+    /* itv (alg 15) shows semitones, tmp (alg 16) its tempo division. */
+    if (index == DESTROY_PARAM_DRIVE) {
+        const uint8_t alg = menuEffects_shownParam(DESTROY_PARAM_ALG);
+        const float a = (float)value * (1.0f / 127.0f);
+
+        if (alg == 15u) {
+            const int8_t n = (int8_t)((int16_t)(a * 24.0f + 0.5f) - 12);
+            const uint8_t m = (uint8_t)((n < 0) ? -n : n);
+
+            out[0] = (n < 0) ? '-' : ((n > 0) ? '+' : ' ');
+            out[1] = (m >= 10u) ? (char)('0' + m / 10u) : (char)('0' + m);
+            out[2] = (m >= 10u) ? (char)('0' + m % 10u) : ' ';
+            return 1u;
+        }
+        if (alg == 16u) {
+            static const char div[4][4] = { "/32", "/16", "/8 ", "/4 " };
+
+            memcpy(out, div[(uint8_t)(a * 3.99f)], 3);
+            return 1u;
+        }
+    }
+    return 0u;
 }
 
 const effect_ui_hooks_t destroy_ui = {

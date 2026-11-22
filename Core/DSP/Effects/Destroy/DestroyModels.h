@@ -15,7 +15,7 @@
 
 #include <stdint.h>
 
-#define DSM_ALG_COUNT      10u         /* cls + 8 feedback models + saw */
+#define DSM_ALG_COUNT      17u         /* cls, 8 feedback, saw, 7 shifters */
 #define DSM_POOL_SAMPLES   8192u
 
 /* Line lengths (samples, per channel). */
@@ -34,12 +34,17 @@ typedef struct {
     float fbs[2];                       /* held feedback (bit-crushed) */
     float hold_in[2], hold_out[2];      /* sample-and-hold values */
     float ph[2];                        /* pitch shifter phase 0..1 */
+    float ph2[2];                       /* second shifter phase (spl) */
+    float acc[2];                       /* riot decimator phase */
     float last[2];                      /* previous output */
     uint16_t cnt[2];                    /* sample-and-hold counter */
     /* per block (from the three knobs) */
     float k_fb, k_g, k_tap, k_x, k_q, k_f;
     uint16_t k_hold;
     uint16_t k_tap2, k_tap3;            /* assault fifth / octave taps */
+    float k_step, k_step2, k_win, k_rate; /* shifters / riot */
+    float k_inc[2], k_inc2[2], k_winc[2]; /* per-channel tap speed, window */
+    uint16_t k_tlen, k_mask, k_xmask;   /* tmp division, riot masks */
     uint8_t alg;
 } DsModelState;
 

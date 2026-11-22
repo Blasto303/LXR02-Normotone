@@ -5,24 +5,33 @@
  * small nonlinear feedback network; all loops pass a saturator, so they stay
  * bounded at any setting (some choke on purpose at high feedback).
  *
- *   1 hustle    feedback / fb_shift / disorder: a rectifier (octave up) on
- *               the mids, fed back through a micro delay (flanged metal);
+ *   1 hustle    feedback / fb_shift / disorder: the mids through a shaper
+ *               that morphs from overdrive to full-wave (octave up) to a
+ *               double rectifier (two octaves up), fed back through a micro
+ *               delay (2..1000 samples) that the dynamics stretch (flange);
  *               the loop starves the input at high feedback (it chokes)
  *   2 turmoil   gain / feedback / fb_tune: dark input, three overdrive
  *               stages with a resonant band-pass (a vowel) between them
  *   3 mutiny    gain / feedback / fb_tune: overdrive into a near-linear
  *               tuned comb that rings at the fb_tune pitch (shrill)
- *   4 riot      feedback / fb_tune / demur: 1-bit logic (a Schmitt square
- *               XORed with the loop), bit flipping and a gate, allpass loop
- *   5 assault   gain / feedback / fb_tune: soft lows, hard-clipped full band
- *               and asymmetric highs in parallel, each with its own comb
- *               (root, fifth, octave), spread across the stereo field
+ *   4 riot      feedback / fb_tune / demur: a decimator tuned 100 Hz..11 kHz
+ *               (pitched aliasing, slower when loud), bit reduction 12..2
+ *               bits (demur, plus a fixed bit-flip at the top), and the word
+ *               XORed with its own past (feedback = how many top bits)
+ *   5 assault   gain / feedback / fb_tune: three bands distorted apart,
+ *               tube-like asymmetric lows, hard-clipped mids ringing in a
+ *               comb tuned by fb_tune, wavefolded highs
  *   6 bloodshed gain / pitchback / grit: a granular +1 semitone shifter whose
  *               overdriven output is fed back into it (rising spiral)
  *   7 bloodbath feedback / dirt / dirtrate: short metallic pseudo-reverb,
  *               driven hard, with a bit-crushed held feedback
  *   8 mudslide  feedback / dirt / dirtrate: dark, heavily crushed and
  *               decimated pseudo-reverb with a wavefolded feedback
+ *  10..16      the bloodshed loop with other intervals: shm +7 (fifth),
+ *               dwn -12 (octave down), fal -1, spl +1 and -1 together,
+ *               qtr +0.5, itv any interval -12..+12 (pot 1), tmp +1 with
+ *               the cascade restarted every tempo division (pot 1: 1/32,
+ *               1/16, 1/8, 1/4; free-running at the sequencer tempo)
  *   9 saw       dist / low / high: no feedback. High-passed input, high
  *               gain into a hard diode-style clip, then two resonant
  *               band boosts after the clip (about 100 Hz and 1 kHz) with
@@ -36,6 +45,7 @@
  * The input dynamics (env) scale the feedback between 0.55x and 1x.
  */
 #include "DestroyModels.h"
+#include "sequencer.h"
 #include <math.h>
 
 #define DSM_FS        44108.07f
@@ -46,7 +56,8 @@ static const uint16_t dsm_ap_len[DSM_AP_COUNT] = { 142u, 107u, 379u, 277u };
 
 /* Output trims so the models sit near the dry level (bench, mix 127). */
 static const float dsm_trim[DSM_ALG_COUNT] = {
-    1.0f, 1.6f, 1.1f, 3.2f, 1.4f, 0.95f, 0.9f, 1.5f, 1.2f, 1.0f
+    1.0f, 3.2f, 1.1f, 3.2f, 1.0f, 1.8f, 0.9f, 1.5f, 1.2f, 1.0f,
+    0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f
 };
 
 /* Pool layout, per channel. */
@@ -60,7 +71,8 @@ _Static_assert(DSM_RV_BASE + 2u * DSM_RV_LEN <= DSM_POOL_SAMPLES,
                "Destroy model lines must fit the pool");
 
 static const char dsm_names[DSM_ALG_COUNT][4] = {
-    "cls", "hus", "tur", "mut", "rio", "ass", "bls", "blb", "mud", "saw"
+    "cls", "hus", "tur", "mut", "rio", "ass", "bls", "blb", "mud", "saw",
+    "shm", "dwn", "fal", "spl", "qtr", "itv", "tmp"
 };
 static const char dsm_knobs[DSM_ALG_COUNT][10] = {
     "drifldsub",   /* cls: drive fold sub     */
@@ -73,6 +85,13 @@ static const char dsm_knobs[DSM_ALG_COUNT][10] = {
     "fbkdrtdrr",   /* bloodbath               */
     "fbkdrtdrr",   /* mudslide                */
     "dislowhig",   /* saw: dist, low, high    */
+    "gaipbkgrt",   /* shm +7                  */
+    "gaipbkgrt",   /* dwn -12                 */
+    "gaipbkgrt",   /* fal -1                  */
+    "gaipbkgrt",   /* spl +1 / -1             */
+    "gaipbkgrt",   /* qtr +0.5                */
+    "itvpbkgrt",   /* itv: interval           */
+    "divpbkgrt",   /* tmp: tempo division     */
 };
 
 const char *dsm_algName(uint8_t alg)
@@ -177,7 +196,7 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
     switch (alg) {
     case 1u:                                      /* hustle */
         m->k_fb = a;
-        m->k_tap = 2.0f * expf(b * 5.3f);         /* 2..400 samples */
+        m->k_tap = 2.0f * expf(b * 6.2f);         /* 2..985 samples */
         m->k_x = c;                               /* disorder */
         tune = -1.0f;
         break;
@@ -194,14 +213,27 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
         m->k_fb = 0.985f * b;
         break;
     case 5u:                                      /* assault */
-        m->k_g = 1.0f + 39.0f * a * a;
-        m->k_fb = 0.97f * b;
+        m->k_g = 1.0f + 24.0f * a * a;
+        m->k_fb = 0.96f * b;
         break;
-    case 4u:                                      /* riot */
-        m->k_fb = 0.97f * a;
-        tune = b;
-        m->k_x = c;                               /* demur */
+    case 4u: {                                    /* riot (block) */
+        const float hz = 100.0f * exp2f(b * 6.8f);        /* 100 Hz..11 kHz */
+        const uint8_t nb = (uint8_t)(a * 9.0f + 0.5f);    /* XOR top bits */
+        const float bits = 12.0f - 10.0f * c;             /* 12..2 bits */
+
+        m->k_rate = hz / DSM_FS;
+        m->k_tap = DSM_FS / hz;
+        if (m->k_tap > (float)(DSM_MD_LEN - 2u))
+            m->k_tap = (float)(DSM_MD_LEN - 2u);
+        if (m->k_tap < 1.0f)
+            m->k_tap = 1.0f;
+        m->k_xmask = (uint16_t)(((1u << nb) - 1u) << (15u - nb));
+        m->k_q = exp2f(bits - 1.0f);
+        m->k_mask = (c > 0.6f)
+            ? (uint16_t)((uint32_t)((c - 0.6f) * 2.5f * 1023.0f) << 4) : 0u;
+        tune = -1.0f;
         break;
+    }
     case 6u:                                      /* bloodshed */
         m->k_g = 1.0f + 15.0f * a;
         m->k_fb = 0.98f * b;                      /* pitchback */
@@ -218,6 +250,53 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
         m->k_q = exp2f(bits - 1.0f);
         m->k_hold = (uint16_t)((alg == 7u) ? 1.0f + 23.0f * c * c
                                            : 2.0f + 46.0f * c);
+        tune = -1.0f;
+        break;
+    }
+    case 10u: case 11u: case 12u: case 13u: case 14u: case 15u: case 16u:
+    {                                             /* shifter family (block) */
+        static const float steps[5] = {
+            0.4983071f,     /* shm +7  */
+            -0.5f,          /* dwn -12 */
+            -0.0561257f,    /* fal -1  */
+            0.0594631f,     /* spl +1 (and -1 below) */
+            0.0293022f      /* qtr +0.5 */
+        };
+
+        m->k_g = (alg >= 15u) ? 7.0f : 1.0f + 15.0f * a;
+        m->k_fb = 0.98f * b;                      /* pitchback */
+        m->k_x = 1.0f + 15.0f * c;                /* grit */
+        m->k_q = (1.0f + m->k_x) / m->k_x;
+        m->k_win = 600.0f;
+        m->k_step2 = -0.0561257f;
+        if (alg <= 14u) {
+            m->k_step = steps[alg - 10u];
+            if (alg == 11u)
+                m->k_win = 860.0f;                /* octave down: long grain */
+        } else if (alg == 15u) {                  /* itv: -12..+12 */
+            const int8_t n = (int8_t)((int16_t)(a * 24.0f + 0.5f) - 12);
+
+            m->k_step = exp2f((float)n * (1.0f / 12.0f)) - 1.0f;
+            if (n < -6)
+                m->k_win = 860.0f;
+        } else {                                  /* tmp: +1, per division */
+            static const float beats[4] = { 0.125f, 0.25f, 0.5f, 1.0f };
+            const uint16_t bpm = seq_getBpm();
+            float len = DSM_FS * 60.0f / (float)((bpm < 30u) ? 30u : bpm) *
+                        beats[(uint8_t)(a * 3.99f)];
+
+            m->k_step = 0.0594631f;
+            m->k_tlen = (uint16_t)((len > 65000.0f) ? 65000.0f : len);
+        }
+        /* Per-channel windows (L, R a bit longer) and tap speeds, once
+         * per block: no division per sample. */
+        m->k_winc[0] = m->k_win;
+        m->k_winc[1] = (m->k_win * 1.1667f > 1000.0f) ? 1000.0f
+                                                      : m->k_win * 1.1667f;
+        m->k_inc[0] = m->k_step / m->k_winc[0];
+        m->k_inc[1] = m->k_step / m->k_winc[1];
+        m->k_inc2[0] = m->k_step2 / (m->k_winc[0] * 0.93f);
+        m->k_inc2[1] = m->k_step2 / (m->k_winc[1] * 0.93f);
         tune = -1.0f;
         break;
     }
@@ -263,6 +342,52 @@ static float dsm_apChain(DsModelState *m, int16_t *pool, uint32_t c, float x,
     return x;
 }
 
+/*
+ * Two-tap pitch shifter on the micro-delay line (as bloodshed): the taps
+ * move by step = ratio - 1 per sample (inc = step / win, precomputed)
+ * across a window of `win` samples,
+ * half a window apart, crossfaded by a triangle. step < 0 shifts down.
+ */
+static float dsm_shift(const int16_t *md, uint16_t mw, float *ph, float inc,
+                       float win)
+{
+    float p = *ph;
+    float p2 = p + 0.5f;
+    float w1;
+    float y;
+
+    p2 -= (p2 >= 1.0f) ? 1.0f : 0.0f;
+    w1 = 1.0f - fabsf(2.0f * p - 1.0f);
+    y = w1 * dsm_read(md, DSM_MD_LEN, mw, 8.0f + p * win) +
+        (1.0f - w1) * dsm_read(md, DSM_MD_LEN, mw, 8.0f + p2 * win);
+    p -= inc;                                   /* inc = step / win */
+    p += (p < 0.0f) ? 1.0f : 0.0f;
+    p -= (p >= 1.0f) ? 1.0f : 0.0f;
+    *ph = p;
+    return y;
+}
+
+/* Same shifter with integer reads (spl's second voice: cheaper). */
+static float dsm_shiftI(const int16_t *md, uint16_t mw, float *ph, float inc,
+                        float win)
+{
+    float p = *ph;
+    float p2 = p + 0.5f;
+    float w1;
+    float y;
+
+    p2 -= (p2 >= 1.0f) ? 1.0f : 0.0f;
+    w1 = 1.0f - fabsf(2.0f * p - 1.0f);
+    y = w1 * dsm_readI(md, DSM_MD_LEN, mw, (uint32_t)(8.0f + p * win)) +
+        (1.0f - w1) * dsm_readI(md, DSM_MD_LEN, mw,
+                                (uint32_t)(8.0f + p2 * win));
+    p -= inc;
+    p += (p < 0.0f) ? 1.0f : 0.0f;
+    p -= (p >= 1.0f) ? 1.0f : 0.0f;
+    *ph = p;
+    return y;
+}
+
 float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
                  float env)
 {
@@ -273,17 +398,27 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
 
     switch (m->alg) {
     case 1u: {                                    /* hustle */
-        const float z = dsm_read(md, DSM_MD_LEN, mw,
-                                 c ? 1.013f * m->k_tap : m->k_tap);
+        /* The dynamics stretch the micro delay: a flange that breathes. */
+        float d = (c ? 1.013f : 1.0f) * m->k_tap * (1.0f + 0.5f * env);
+        float z;
         float h;
-        float u;
+        float v;
+        float s1;
+        float s2;
+        float t;
 
-        m->lp_d[c] += 0.03f * (x - m->lp_d[c]);          /* ~210 Hz */
-        h = x - m->lp_d[c];                              /* the mids */
+        d = (d > 1000.0f) ? 1000.0f : d;
+        z = dsm_read(md, DSM_MD_LEN, mw, d);
+        m->lp_d[c] += 0.03f * (x - m->lp_d[c]);          /* ~210 Hz HP */
+        h = x - m->lp_d[c];
         /* Choke: a loud loop starves the input (input-only term). */
-        u = 4.0f * h * (1.0f - 0.85f * fb * fabsf(z)) + 0.2f * fb * z;
-        u += m->k_x * (2.0f * fabsf(u) - 0.6f - u);      /* rectifier */
-        y = dsm_dc(m, c, dsm_soft(2.5f * u));
+        v = dsm_soft(4.0f * h * (1.0f - 0.85f * fb * fabsf(z)) +
+                     0.25f * fb * z);
+        s1 = 2.0f * fabsf(v) - 0.64f;                    /* octave up */
+        s2 = 2.0f * fabsf(s1) - 0.64f;                   /* two octaves */
+        t = 2.0f * m->k_x;                               /* disorder 0..2 */
+        y = (t < 1.0f) ? v + t * (s1 - v) : s1 + (t - 1.0f) * (s2 - s1);
+        y = dsm_dc(m, c, 0.8f * y);                      /* loop gain <= fb */
         dsm_write(md, mw, y);
         break;
     }
@@ -317,77 +452,65 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
         break;
     }
     case 4u: {                                    /* riot */
-        const float z = dsm_read(md, DSM_MD_LEN, mw, m->k_tap);
-        float h;
-        float s;
-        int32_t i;
-        float g;
+        /*
+         * Decimator (sample and hold) tuned by fb_tune: pitched aliasing.
+         * Loud passages slow it down (dirtier), quiet ones stay finer. On
+         * each held sample: bit reduction (demur), the word XORed with its
+         * own past one decimation period earlier (feedback = number of top
+         * bits), and a fixed bit flip at the top of demur. A gate closes
+         * the XOR on silence so nothing sustains on its own.
+         */
+        m->acc[c] += m->k_rate * (c ? 1.01f : 1.0f) * (1.15f - 0.6f * env);
+        if (m->acc[c] >= 1.0f) {
+            const float z = dsm_read(md, DSM_MD_LEN, mw, m->k_tap);
+            const float h = dsm_soft(3.0f * x);
+            int32_t i;
 
-        m->lp_d[c] += 0.03f * (x - m->lp_d[c]);
-        h = x - m->lp_d[c];
-        /* Schmitt trigger: a 1-bit square of the input. */
-        if (h > 0.08f * env + 0.002f)
-            m->sq[c] = 1.0f;
-        else if (h < -0.08f * env - 0.002f)
-            m->sq[c] = -1.0f;
-        else if (m->sq[c] == 0.0f)
-            m->sq[c] = 1.0f;
-        /* XOR with the loop's sign, scaled by the dynamics. */
-        m->lp_c[c] += 0.15f * (z - m->lp_c[c]);
-        s = 0.6f * dsm_soft(3.0f * h + fb * z) +
-            0.4f * env * m->sq[c] * ((m->lp_c[c] >= 0.0f) ? 1.0f : -1.0f);
-        i = (int32_t)(s * 32767.0f);
-        if (m->k_x > 0.0f) {
-            const int32_t mask = (int32_t)(m->k_x * m->k_x * 16383.0f) & 0x3FF0;
-
-            if (fabsf(s) < m->k_x * (0.05f + 0.1f * env))
-                i = 0;                                   /* gate */
-            else
-                i ^= mask;                               /* bit flipping */
+            m->acc[c] -= 1.0f;
+            m->acc[c] = (m->acc[c] >= 1.0f) ? 0.0f : m->acc[c];
+            i = (int32_t)(dsm_crush(m, h) * 32767.0f);
+            if (fabsf(h) > 0.004f) {
+                i ^= ((int32_t)(z * 32767.0f) & (int32_t)m->k_xmask);
+                i ^= (int32_t)m->k_mask;
+            } else {
+                i = 0;
+            }
+            i = (i > 32767) ? 32767 : ((i < -32768) ? -32768 : i);
+            m->hold_out[c] = (float)i * (1.0f / 32767.0f);
         }
-        y = (float)i * (1.0f / 32767.0f);
-        {
-            int16_t *line = &pool[DSM_AP_BASE + c * DSM_AP_SPAN];
-            const uint16_t w = m->ap_w[c][0];
-            const float d = dsm_readI(line, dsm_ap_len[0], w,
-                                      dsm_ap_len[0] - 1u);
-            /* The flipped word can be louder than s: the loop only gets
-             * its sign at |s|, so the flipping never adds energy. */
-            const float lv = (fabsf(y) > fabsf(s))
-                ? ((y >= 0.0f) ? fabsf(s) : -fabsf(s)) : y;
-            const float v = lv + 0.6f * d;
-
-            dsm_write(line, w, v);
-            m->ap_w[c][0] = dsm_next(w, dsm_ap_len[0]);
-            g = d - 0.6f * v;
-        }
-        dsm_write(md, mw, dsm_dc(m, c, g));
-        m->lp_b[c] += 0.002f * (y - m->lp_b[c]);         /* DC-free output */
+        y = m->hold_out[c];
+        dsm_write(md, mw, y);
+        m->lp_b[c] += 0.004f * (y - m->lp_b[c]);         /* DC-free */
         y -= m->lp_b[c];
         break;
     }
     case 5u: {                                    /* assault */
-        const float z1 = dsm_read(md, DSM_MD_LEN, mw, m->k_tap);
-        /* Fifth and octave taps: integer reads (cheap, close enough). */
-        const float z2 = dsm_readI(md, DSM_MD_LEN, mw, m->k_tap2);
-        const float z3 = dsm_readI(md, DSM_MD_LEN, mw, m->k_tap3);
-        const float v = m->k_g * x;
-        float b1;
-        float b2;
-        float b3;
+        /*
+         * Three bands distorted apart: tube-like asymmetric lows (even
+         * harmonics), hard-clipped mids ringing in a comb tuned by
+         * fb_tune (loop gain = fb), wavefolded highs.
+         */
+        const float z = dsm_read(md, DSM_MD_LEN, mw,
+                                 c ? 1.007f * m->k_tap : m->k_tap);
+        float lo;
+        float mid;
+        float hi;
+        float bl;
+        float bm;
+        float cm;
+        float bh;
 
-        m->lp_a[c] += 0.043f * (v - m->lp_a[c]);         /* ~300 Hz */
-        m->lp_b[c] += 0.25f * (v - m->lp_b[c]);          /* ~2 kHz  */
-        b1 = dsm_soft(m->lp_a[c] + fb * z1);                   /* lows  */
-        b2 = dsm_clamp(1.7f * v + fb * 0.41f * z2, 0.7f) * 1.4286f; /* all */
-        b3 = dsm_soft(3.0f * (v - m->lp_b[c]) + 0.33f * fb * z3 + 0.4f);
-        b3 -= 0.2857f;                                   /* asymmetric highs */
-        y = dsm_dc(m, c, (b1 + b2 + b3) * (1.0f / 3.0f));
-        dsm_write(md, mw, y);
-        /* Spread: lows left, highs right. */
-        y = c ? (0.5f * b1 + b2 + 1.8f * b3) : (0.9f * b1 + b2 + 1.2f * b3);
-        m->lp_c[c] += 0.002f * (y - m->lp_c[c]);
-        y = (y - m->lp_c[c]) * (1.0f / 3.0f);
+        m->lp_a[c] += 0.035f * (x - m->lp_a[c]);         /* ~250 Hz */
+        m->lp_b[c] += 0.30f * (x - m->lp_b[c]);          /* ~2.5 kHz */
+        lo = m->lp_a[c];
+        mid = m->lp_b[c] - lo;
+        hi = x - m->lp_b[c];
+        bl = dsm_soft(m->k_g * lo + 0.35f) - 0.2592593f;
+        bm = dsm_clamp(2.0f * m->k_g * mid, 0.6f) * 1.6666667f;
+        cm = dsm_soft(bm + m->k_fb * z);
+        dsm_write(md, mw, cm);
+        bh = dsm_psin((0.5f + 0.08f * m->k_g) * hi);
+        y = dsm_dc(m, c, 0.6f * (0.9f * bl + cm + 0.5f * bh));
         break;
     }
     case 6u: {                                    /* bloodshed */
@@ -450,6 +573,34 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
             m->last[c] = dsm_dc(m, c, y);
         }
         y = m->last[c];
+        break;
+    }
+    case 10u: case 11u: case 12u: case 13u: case 14u: case 15u: case 16u: {
+        /* The bloodshed loop with another interval (see dsm_block). */
+        const float win = m->k_winc[c];
+        float fbm = 1.0f;
+        float in;
+
+        if (m->alg == 16u) {
+            /* tmp: the loop is cut for ~18 ms at each division, then
+             * ramps back: the cascade climbs, restarts, climbs. */
+            uint16_t k = m->cnt[c];
+
+            k = (uint16_t)((k + 1u >= m->k_tlen) ? 0u : k + 1u);
+            m->cnt[c] = k;
+            fbm = (k < 800u) ? 0.0f
+                : ((k < 1020u) ? (float)(k - 800u) * (1.0f / 220.0f) : 1.0f);
+        }
+        in = dsm_soft(m->k_x * x) * m->k_q +
+             fb * fbm * dsm_soft(m->last[c]);
+        dsm_write(md, mw, in);
+        y = dsm_shift(md, mw, &m->ph[c], m->k_inc[c], win);
+        if (m->alg == 13u)
+            y = 0.5f * (y + dsm_shiftI(md, mw, &m->ph2[c], m->k_inc2[c],
+                                       win * 0.93f));
+        m->lp_a[c] += 0.002f * (y - m->lp_a[c]);
+        m->last[c] = y - m->lp_a[c];
+        y = dsm_dc(m, c, dsm_soft(m->k_g * y));
         break;
     }
     case 9u: {                                    /* saw */
