@@ -3029,9 +3029,46 @@ uint8_t preset_loadKitForScenes(uint16_t presetNr, uint16_t scene_mask)
     return 0u;
 }
 
+/*
+ * Never save an object without a name.
+ *
+ * What: control or non-ASCII cells in the eight-cell save name become
+ * spaces; an all-space name becomes "<tag><slot>" (Proj103, Scn012,
+ * Kit100, Pat050). Why: every loader treats an all-space name as an
+ * unresolved row and refuses it (Menu LSR-03, filesystem requests), so an
+ * unnamed Project could be written but never loaded again; at boot an
+ * unnamed active Project left every Scene empty. Inputs: tag (3-4 chars)
+ * and slot. Output: preset_currentName, which every save request copies.
+ */
+static void preset_ensureSaveName(const char *tag, uint16_t slot)
+{
+    uint8_t i;
+    uint8_t blank = 1u;
+    uint8_t n = 0u;
+
+    for (i = 0u; i < 8u; i++) {
+        const unsigned char c = (unsigned char)preset_currentName[i];
+
+        if (c < 0x20u || c > 0x7Eu)
+            preset_currentName[i] = ' ';
+        if (preset_currentName[i] != ' ')
+            blank = 0u;
+    }
+    if (!blank)
+        return;
+    while (tag[n] != '\0' && n < 5u) {
+        preset_currentName[n] = tag[n];
+        n++;
+    }
+    preset_currentName[n++] = (char)('0' + (slot / 100u) % 10u);
+    preset_currentName[n++] = (char)('0' + (slot / 10u) % 10u);
+    preset_currentName[n++] = (char)('0' + slot % 10u);
+}
+
 uint8_t preset_saveDrumset(uint16_t presetNr, uint8_t isMorph,
                            uint8_t source_scene)
 {
+    preset_ensureSaveName("Kit", presetNr);
     /*
      * Post normal Kit Save or KitMrp Save to the shared directory writer.
      *
@@ -3118,6 +3155,7 @@ uint8_t preset_loadSceneForScenes(uint16_t presetNr, uint16_t scene_mask)
 
 uint8_t preset_saveScene(uint16_t presetNr, uint8_t source_scene)
 {
+    preset_ensureSaveName("Scn", presetNr);
     /*
      * Post a root Scene Save request.
      *
@@ -3178,6 +3216,7 @@ uint8_t preset_loadBank(uint16_t presetNr, uint16_t act_mask,
 uint8_t preset_saveBank(uint16_t presetNr, uint16_t act_mask,
                         uint16_t empty_mask)
 {
+    preset_ensureSaveName("Proj", presetNr);
     uint8_t source_scene = scene_backgroundHomeIndex();
 
     /*
@@ -4381,6 +4420,7 @@ uint8_t preset_loadPatternForScenes(uint16_t presetNr, uint16_t scene_mask)
 
 uint8_t preset_savePattern(uint16_t presetNr)
 {
+    preset_ensureSaveName("Pat", presetNr);
     filesystem_ack();
     pm_status = PRESET_LOAD_IN_PROGRESS;
     pm_completed_op = PRESET_OP_NONE;

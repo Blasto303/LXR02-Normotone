@@ -14,6 +14,7 @@
  *   Z    DATA click while a background card scan holds the filesystem
  *   O    set the active Scene's Effect to off      L  open the Load page
  *   Y    SHIFT+SAVE (config) while a Preset Kit save is in flight
+ *   N    blank the save name (preset_currentName)   W  write the card to SAVE_IMG
  * Each action is followed by main-loop passes until storage is idle; the
  * line shows SD reads and simulated foreground time for that gesture.
  */
@@ -203,6 +204,7 @@ int main(int argc, char **argv)
         case 'd': press((uint8_t)atoi(s + 2)); break;
         case 'u': release((uint8_t)atoi(s + 2)); break;
         case 'R': h_running = !h_running; break;
+        case 'N': memset(preset_currentName, ' ', 8); break;  /* blank save name */
         case 'W': ram_save(getenv("SAVE_IMG") ? getenv("SAVE_IMG") : "out.img"); break;
         case 'L': menu_switchPage(LOAD_PAGE); break;
         case 'y':
