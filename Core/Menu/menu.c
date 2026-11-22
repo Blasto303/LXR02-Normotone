@@ -2055,6 +2055,8 @@ static void menu_finishLoadSaveCommand(void);
 static void menu_paintLoadSaveConfirmation(uint8_t overwrite,
                                            uint8_t selected);
 static void menu_repaintGeneric(void);
+static void menu_saveRetryArm(uint8_t what, uint16_t slot,
+                              uint8_t source_scene);
 void sendDisplayBuffer(void);
 static void menu_moveToMenuItem(int8_t inc);
 static void menu_encoderChangeParameter(int8_t inc);
@@ -15253,18 +15255,30 @@ static void menu_handleLoadSaveMenu(int8_t inc, uint8_t btnClicked)
                             menu_currentPresetNr[SAVE_TYPE_KIT], 0u,
                             menu_loadSaveSourceScene))
                         commandAccepted = 1u;
+                    else
+                        menu_saveRetryArm(SAVE_TYPE_KIT,
+                                          menu_currentPresetNr[SAVE_TYPE_KIT],
+                                          menu_loadSaveSourceScene);
                     break;
                 case SAVE_TYPE_KIT_MORPH:
                     if (preset_saveDrumset(
                             menu_currentPresetNr[SAVE_TYPE_KIT_MORPH], 1u,
                             menu_loadSaveSourceScene))
                         commandAccepted = 1u;
+                    else
+                        menu_saveRetryArm(SAVE_TYPE_KIT_MORPH,
+                                          menu_currentPresetNr[SAVE_TYPE_KIT_MORPH],
+                                          menu_loadSaveSourceScene);
                     break;
                 case SAVE_TYPE_SCENE:
                     if (preset_saveScene(
                             menu_currentPresetNr[SAVE_TYPE_SCENE],
                             menu_loadSaveSourceScene))
                         commandAccepted = 1u;
+                    else
+                        menu_saveRetryArm(SAVE_TYPE_SCENE,
+                                          menu_currentPresetNr[SAVE_TYPE_SCENE],
+                                          menu_loadSaveSourceScene);
                     break;
                 /*
                  * Bank OK: compute the outcome masks and post the operation
@@ -15316,6 +15330,10 @@ static void menu_handleLoadSaveMenu(int8_t inc, uint8_t btnClicked)
                     if (preset_savePattern(
                             menu_currentPresetNr[SAVE_TYPE_PATTERN]))
                         commandAccepted = 1u;
+                    else
+                        menu_saveRetryArm(SAVE_TYPE_PATTERN,
+                                          menu_currentPresetNr[SAVE_TYPE_PATTERN],
+                                          0u);
                     break;
                 case SAVE_TYPE_GLO:     commandAccepted = preset_saveGlobals(); break;
                 default: break;
@@ -17176,6 +17194,76 @@ void menu_serviceRuntimeWidgets(void)
 ** provided: parameters arrive after the SD transfer completes, not
 ** before the function returns.
 ** ----------------------------------------------------------------------- */
+/*
+ * Save OK during playback: retry instead of dropping the press.
+ *
+ * What: a top-level Kit/KitMrp/Scene/Pattern Save whose request is refused
+ * because the card is busy (AutoSave drains and other background work run
+ * often while the sequencer plays) is remembered and posted again from the
+ * Menu poll as soon as the facade is free, for up to MENU_SAVE_RETRY_MS.
+ * AutoSave is asked to yield meanwhile so it does not take the card back
+ * between two polls. Why: the press used to vanish with no message, so Save
+ * seemed to work only with the transport stopped. Inputs: the Save page
+ * type/slot/source Scene at press time. Outputs: one accepted command (the
+ * ordinary menu_beginLoadSaveCommand() path) or a silent expiry.
+ */
+#define MENU_SAVE_RETRY_MS 8000u
+static uint8_t menu_saveRetryWhat = 0xFFu;
+static uint16_t menu_saveRetrySlot;
+static uint8_t menu_saveRetryScene;
+static uint16_t menu_saveRetryT0;
+
+static uint8_t menu_postSaveRequest(uint8_t what, uint16_t slot,
+                                    uint8_t source_scene)
+{
+    switch (what) {
+    case SAVE_TYPE_KIT:       return preset_saveDrumset(slot, 0u, source_scene);
+    case SAVE_TYPE_KIT_MORPH: return preset_saveDrumset(slot, 1u, source_scene);
+    case SAVE_TYPE_SCENE:     return preset_saveScene(slot, source_scene);
+    case SAVE_TYPE_PATTERN:   return preset_savePattern(slot);
+    default:                  return 1u;
+    }
+}
+
+static void menu_saveRetryStop(void)
+{
+    if (menu_saveRetryWhat == 0xFFu)
+        return;
+    menu_saveRetryWhat = 0xFFu;
+    filesystem_setAutosaveYield(0u);
+}
+
+static void menu_saveRetryArm(uint8_t what, uint16_t slot,
+                              uint8_t source_scene)
+{
+    menu_saveRetryWhat = what;
+    menu_saveRetrySlot = slot;
+    menu_saveRetryScene = source_scene;
+    menu_saveRetryT0 = time_sysTick;
+    filesystem_setAutosaveYield(1u);
+}
+
+static void menu_serviceSaveRetry(void)
+{
+    if (menu_saveRetryWhat == 0xFFu)
+        return;
+    if (menu_activePage != SAVE_PAGE ||
+        menu_saveOptions.what != menu_saveRetryWhat ||
+        (uint16_t)(time_sysTick - menu_saveRetryT0) > MENU_SAVE_RETRY_MS) {
+        menu_saveRetryStop();
+        return;
+    }
+    if (menu_storageBusy || preset_getStatus() != PRESET_IDLE)
+        return;
+    if (!menu_postSaveRequest(menu_saveRetryWhat, menu_saveRetrySlot,
+                              menu_saveRetryScene))
+        return;
+    menu_saveRetryStop();
+    menu_selectionGeneration++;
+    menu_selectionGenerationSnapshot = menu_selectionGeneration;
+    menu_beginLoadSaveCommand();
+}
+
 void menu_pollPresetStatus(void)
 {
     uint8_t retrySelectionAfterAck = 0;
@@ -17204,6 +17292,7 @@ void menu_pollPresetStatus(void)
      * Affiliates: transport owners and menu_updateNoPlaybackStorage().
     */
     menu_updateNoPlaybackStorage();
+    menu_serviceSaveRetry();
 
     /*
      * Publish Bank child progress before any worker below can return early.

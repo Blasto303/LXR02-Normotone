@@ -11,6 +11,7 @@
  *   k:I:D  knob I (1..4) delta D           S+ / S-  SHIFT down / up
  *   C+ / C-  COPY/CLR down / up            w:MS  idle MS milliseconds
  *   d:B / u:B  raw button B down / up      K  print kit/effect identity
+ *   Z    DATA click while a background card scan holds the filesystem
  * Each action is followed by main-loop passes until storage is idle; the
  * line shows SD reads and simulated foreground time for that gesture.
  */
@@ -174,6 +175,12 @@ int main(int argc, char **argv)
         case 'd': press((uint8_t)atoi(s + 2)); break;
         case 'u': release((uint8_t)atoi(s + 2)); break;
         case 'R': h_running = !h_running; break;
+        case 'Z':
+            /* DATA click while the card is busy (a background scan runs). */
+            filesystem_ack(); filesystem_requestScanKits(NULL);
+            enc_btn = 1u; menu_parseEncoder(0, enc_btn);
+            enc_btn = 0u; menu_parseEncoder(0, enc_btn);
+            break;
         case 'B': if (h_queue) h_fire = 1; break;
         case 'K': {
             /* Which resident Scene's kit / effect equals the active one. */
