@@ -13,6 +13,7 @@
  *   d:B / u:B  raw button B down / up      K  print kit/effect identity
  *   Z    DATA click while a background card scan holds the filesystem
  *   O    set the active Scene's Effect to off      L  open the Load page
+ *   Y    SHIFT+SAVE (config) while a Preset Kit save is in flight
  * Each action is followed by main-loop passes until storage is idle; the
  * line shows SD reads and simulated foreground time for that gesture.
  */
@@ -177,6 +178,17 @@ int main(int argc, char **argv)
         case 'u': release((uint8_t)atoi(s + 2)); break;
         case 'R': h_running = !h_running; break;
         case 'L': menu_switchPage(LOAD_PAGE); break;
+        case 'y':
+            press(BUT_SHIFT); tap(BUT_MODE4); release(BUT_SHIFT);
+            break;
+        case 'Y':
+            /* SHIFT+SAVE (config) while a Preset Kit save is in flight. */
+            filesystem_ack(); if (getenv("Y_PAT")) preset_savePattern(50u); else preset_saveDrumset(100u, 0u, scene_getActiveIndex());
+            printf("  preset status before %u\n", preset_getStatus());
+            if (getenv("Y_PERF")) tap(BUT_MODE2);
+            else { press(BUT_SHIFT); tap(BUT_MODE4); release(BUT_SHIFT); }
+            printf("  preset status after %u page %u\n", preset_getStatus(), menu_activePage);
+            break;
         case 'O': {
             /* Set the active Scene's Effect to off (record + runtime). */
             scene_t *sc = scene_get(scene_getActiveIndex());

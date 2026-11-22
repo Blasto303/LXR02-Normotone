@@ -18467,6 +18467,21 @@ static void menu_switchPageTarget(uint8_t pageNr, menu_library_target_t library)
     if (preset_backgroundBankLoadUnlocked() && pageNr == LOAD_PAGE &&
         menu_activePage == LOAD_PAGE)
         return;
+    /*
+     * Config (SHIFT+SAVE: BPM, sync...) opens at once, even while a Preset
+     * or card operation runs, unless Load/Save owns that operation.
+     *
+     * What: the busy gate below dropped every page request outside
+     * Load/Save, so during playback (background Preset/card work is
+     * frequent) SHIFT+SAVE often did nothing. The Config page only edits
+     * global settings and owns no storage state. Other pages requested
+     * outside Load/Save are now queued (served when the work ends) instead
+     * of dropped. Inputs: pageNr, menu_activePage, library.
+     */
+    if (pageNr == MENU_MIDI_PAGE && library == MENU_LIBRARY_DEFAULT &&
+        menu_activePage != LOAD_PAGE && menu_activePage != SAVE_PAGE) {
+        /* fall through to the ordinary switch */
+    } else
     if ((menu_storageBusy || preset_getStatus() != PRESET_IDLE) &&
         !preset_backgroundBankLoadUnlocked()) {
         /*
@@ -18483,7 +18498,9 @@ static void menu_switchPageTarget(uint8_t pageNr, menu_library_target_t library)
          */
         if (((menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
              pageNr != LOAD_PAGE) ||
-            (library != MENU_LIBRARY_DEFAULT && !menu_loadSaveCommandActive)) {
+            (library != MENU_LIBRARY_DEFAULT && !menu_loadSaveCommandActive) ||
+            (library == MENU_LIBRARY_DEFAULT && pageNr != LOAD_PAGE &&
+             pageNr != SAVE_PAGE && pageNr != menu_activePage)) {
             /* Invalidate any live browser completion before the queued exit. */
             if (menu_pendingPageSwitch == MENU_PENDING_PAGE_NONE)
                 menu_selectionGeneration++;
@@ -19057,7 +19074,11 @@ static void menu_resetSaveParametersEx(uint8_t after_command)
     menu_instrumentLoadActive = 0u;
     menu_instrumentSaveMode = 0u;
     menu_loadSaveClearInstrumentVoiceBlinks();
-    editModeActive = 1;
+    /* Edit mode belongs to Load/Save: a completion that lands after the
+     * user left for another page (Config opens during busy work) must not
+     * switch that page into its full-screen editor. */
+    if (menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE)
+        editModeActive = 1;
     menu_saveOptions.state = menu_loadSaveHomeState(menu_saveOptions.what);
     menu_saveDraftValid = 0u;
     menu_loadSaveClickPending = 0u;
