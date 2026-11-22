@@ -40,6 +40,7 @@ __asm__(".pushsection .bss\n.balign 32\n.globl _sfxbuf\n_sfxbuf:\n"
         ".space 0x1e000\n.globl _efxbuf\n_efxbuf:\n.popsection");
 
 extern int ram_load(const char *);
+extern int ram_save(const char *);
 extern unsigned long sd_reads, sd_writes;
 extern unsigned long long sim_us;
 extern void sim_advance(unsigned int us);
@@ -137,8 +138,33 @@ int main(int argc, char **argv)
     (void)filesystem_createLibraryIndexBlocking(FS_LIBRARY_INDEX_PATTERN);
     (void)filesystem_createBootIndexBlocking();
     filesystem_requestLoadBankIndex(NULL); settle(); filesystem_ack();
+    if (getenv("BOOT")) {
+        /* main.c boot order: AutoSave winner, reader, HCNAMES, Bank fallback. */
+        uint8_t restored = 0u;
+        filesystem_setAutosaveEnabled(1u);
+        (void)filesystem_validateAutosaveWinnerBlocking();
+        if (filesystem_hasBootWinner())
+            restored = filesystem_autosaveBootReaderBlocking();
+        printf("boot: winner %u restored %u\n", filesystem_hasBootWinner(), restored);
+        if (!restored) {
+            restored = filesystem_bootHcnamesAuthoritativeLoad();
+            printf("boot: hcnames restored %u\n", restored);
+        }
+        if (!restored) {
+            filesystem_requestLoadBank((uint16_t)atoi(argv[2]), 0xFFFFu, 0u, 0x03u, NULL);
+            settle(); filesystem_ack();
+            printf("boot: bank fallback\n");
+        }
+        if (bank_hasResidentBank())
+            filesystem_patternAutosaveBootReaderBlocking();
+        printf("boot: notice scene mask %04x bank_fallback %u present %04x\n",
+               filesystem_bootReaderNoticeSceneMask(),
+               filesystem_bootReaderNoticeBankFallback(), bank_scenePresentMask());
+    } else {
     filesystem_requestLoadBank((uint16_t)atoi(argv[2]), 0xFFFFu, 0u, 0x03u, NULL);
     settle(); filesystem_ack();
+    if (getenv("AUTOSAVE_ON")) filesystem_setAutosaveEnabled(1u);
+    }
     if (argc > 3 && !strcmp(argv[3], "--rumble"))
         live_initFactoryRumble();
     effects_activateScene(scene_getActiveIndex());
@@ -177,6 +203,7 @@ int main(int argc, char **argv)
         case 'd': press((uint8_t)atoi(s + 2)); break;
         case 'u': release((uint8_t)atoi(s + 2)); break;
         case 'R': h_running = !h_running; break;
+        case 'W': ram_save(getenv("SAVE_IMG") ? getenv("SAVE_IMG") : "out.img"); break;
         case 'L': menu_switchPage(LOAD_PAGE); break;
         case 'y':
             press(BUT_SHIFT); tap(BUT_MODE4); release(BUT_SHIFT);
