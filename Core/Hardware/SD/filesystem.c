@@ -1324,6 +1324,19 @@ static uint16_t op_pattern_source = FS_RESIDENT_SOURCE_UNKNOWN;
 static storage_sceneset_t op_sceneset_state;
 static storage_effect_state_t op_effect_state;
 /*
+ * Root Kit Effect (`effect.fx` in the Kit directory).
+ *
+ * What: Kit Save writes the source Scene's Effect next to kitset.kcg; Kit
+ * Load stages it here and commits it with the Kit to every target Scene.
+ * A Kit without the file (saved before) leaves the target Effects as they
+ * are; an unreadable file is ignored the same way, the Kit still loads.
+ * KitMrp neither writes nor reads it. Inputs/outputs: the flags below and
+ * filesystem_kitLoadHadEffect() for Preset's completion.
+ */
+static effect_record_t op_kit_effect;
+static uint8_t op_kit_effect_checked = 0u;
+static uint8_t op_kit_effect_valid = 0u;
+/*
  * Bank load/save scratch.
  *
  * Root Bank identity uses the scan cache above. While one Bank is selected,
@@ -12309,6 +12322,8 @@ static void filesystem_loadKitDirectory_tick(void)
         return;
 
     case 11: /* OPEN kitset.kcg */
+        op_kit_effect_checked = 0u;
+        op_kit_effect_valid = 0u;
         storage_kitsetInit(&op_kitset);
         op_line_len = 0u;
         op_file_ready = false;
@@ -12401,6 +12416,12 @@ static void filesystem_loadKitDirectory_tick(void)
              * filesystem_loadedKit(), because Preset must preserve destination
              * slot identity and copy only same-type morphable endpoint values.
              */
+            if (current_op == FS_INTERNAL_OP_LOAD_KIT &&
+                !op_kit_effect_checked) {
+                op_kit_effect_checked = 1u;
+                op_phase = 40;          /* optional effect.fx first */
+                return;
+            }
             if (current_op == FS_INTERNAL_OP_LOAD_KIT) {
                 uint8_t identity_slot;
 
@@ -12455,6 +12476,8 @@ static void filesystem_loadKitDirectory_tick(void)
                         scene_t *target_scene = scene_get(scene_index);
                         if (target_scene) {
                             target_scene->kit = op_staged_kit;
+                            if (op_kit_effect_valid)
+                                target_scene->effect = op_kit_effect;
                             /*
                              * The validated normal Kit now owns the resident
                              * Kit payload. Mark only that Kit and its six
@@ -12592,6 +12615,58 @@ static void filesystem_loadKitDirectory_tick(void)
             }
             op_phase = 20;
         }
+        return;
+
+    case 40: /* OPEN optional effect.fx */
+        storage_effectStateInit(&op_effect_state, &op_kit_effect);
+        op_line_len = 0u;
+        op_file_ready = false;
+        op_file = NULL;
+        if (!afatfs_fopen_lfn(STORAGE_KIT_EFFECT_FILENAME, "r",
+                              AFATFS_MATCH_CASE_INSENSITIVE, NULL,
+                              on_file_opened))
+            return;
+        op_phase = 41;
+        return;
+
+    case 41: /* WAIT effect.fx: absent keeps the current Effects */
+        if (!op_file_ready) return;
+        op_phase = op_file ? 42 : 16;
+        return;
+
+    case 42: /* READ effect.fx (a bad file is ignored, the Kit loads) */
+        st = filesystem_readTextLine(op_file, op_line_buf, &op_line_len,
+                                     sizeof(op_line_buf), &line_ready, &eof);
+        if (st == STORAGE_STATUS_WAIT)
+            return;
+        if (st != STORAGE_STATUS_OK) {
+            op_phase = 43;
+            return;
+        }
+        if (line_ready) {
+            if (storage_effectParseLine(&op_effect_state, op_line_buf,
+                                        &op_kit_effect) != STORAGE_STATUS_OK)
+                op_phase = 43;
+            return;
+        }
+        if (eof) {
+            op_kit_effect_valid = (uint8_t)(
+                storage_effectFinalize(&op_effect_state, &op_kit_effect) ==
+                STORAGE_STATUS_OK);
+            op_phase = 43;
+        }
+        return;
+
+    case 43: /* CLOSE effect.fx */
+        op_close_done = false;
+        if (afatfs_fclose(op_file, on_file_closed))
+            op_phase = 44;
+        return;
+
+    case 44: /* WAIT CLOSE effect.fx, then commit the Kit (phase 16) */
+        if (!op_close_done) return;
+        op_file = NULL;
+        op_phase = 16;
         return;
 
     case 20: /* CLOSE INSTRUMENT */
@@ -19506,7 +19581,9 @@ static void filesystem_saveKitDirectory_tick(void)
 
     case 16:
         if (op_instrument_slot >= STORAGE_KIT_SLOT_COUNT) {
-            op_phase = 21u;
+            /* Normal Kit Save also writes the Scene's Effect (effect.fx). */
+            op_phase = (op_kit_save_mode == STORAGE_INSTRUMENT_SAVE_NORMAL)
+                ? 40u : 21u;
             return;
         }
         op_file_ready = false;
@@ -19563,6 +19640,49 @@ static void filesystem_saveKitDirectory_tick(void)
         op_file = NULL;
         op_instrument_slot++;
         op_phase = 16u;
+        return;
+
+    case 40: /* OPEN effect.fx */
+        op_file_ready = false;
+        op_file = NULL;
+        memset(op_root_open_name, 0, sizeof(op_root_open_name));
+        if (!afatfs_fopen_lfn(STORAGE_KIT_EFFECT_FILENAME, "w",
+                              AFATFS_MATCH_CASE_INSENSITIVE,
+                              op_root_open_name, on_file_opened))
+            return;
+        op_phase = 41u;
+        return;
+
+    case 41:
+        if (!op_file_ready)
+            return;
+        if (!op_file) {
+            filesystem_finish(FS_STATUS_ERROR);
+            return;
+        }
+        op_write_line_index = 0u;
+        op_write_line_len = 0u;
+        op_write_line_offset = 0u;
+        op_phase = 42u;
+        return;
+
+    case 42:
+        if (filesystem_writeTextLine(filesystem_nextEffectLine, (void *)scene))
+            return;
+        op_phase = 43u;
+        return;
+
+    case 43:
+        op_close_done = false;
+        if (afatfs_fclose(op_file, on_file_closed))
+            op_phase = 44u;
+        return;
+
+    case 44:
+        if (!op_close_done)
+            return;
+        op_file = NULL;
+        op_phase = 21u;
         return;
 
     case 21:
@@ -31949,6 +32069,11 @@ bool filesystem_requestLoadKitForScenes(uint16_t slot, uint16_t scene_mask,
     op_kit_load_scene_mask = valid_mask;
     memset(&op_staged_kit, 0, sizeof(op_staged_kit));
     return true;
+}
+
+uint8_t filesystem_kitLoadHadEffect(void)
+{
+    return op_kit_effect_valid;
 }
 
 bool filesystem_requestSaveKitDirectory(uint16_t slot,

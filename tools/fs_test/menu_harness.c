@@ -12,6 +12,7 @@
  *   C+ / C-  COPY/CLR down / up            w:MS  idle MS milliseconds
  *   d:B / u:B  raw button B down / up      K  print kit/effect identity
  *   Z    DATA click while a background card scan holds the filesystem
+ *   O    set the active Scene's Effect to off      L  open the Load page
  * Each action is followed by main-loop passes until storage is idle; the
  * line shows SD reads and simulated foreground time for that gesture.
  */
@@ -175,6 +176,13 @@ int main(int argc, char **argv)
         case 'd': press((uint8_t)atoi(s + 2)); break;
         case 'u': release((uint8_t)atoi(s + 2)); break;
         case 'R': h_running = !h_running; break;
+        case 'L': menu_switchPage(LOAD_PAGE); break;
+        case 'O': {
+            /* Set the active Scene's Effect to off (record + runtime). */
+            scene_t *sc = scene_get(scene_getActiveIndex());
+            if (sc) effects_recordDefaultsForType(&sc->effect, EFFECT_TYPE_OFF);
+            effects_activateScene(scene_getActiveIndex());
+            break; }
         case 'Z':
             /* DATA click while the card is busy (a background scan runs). */
             filesystem_ack(); filesystem_requestScanKits(NULL);

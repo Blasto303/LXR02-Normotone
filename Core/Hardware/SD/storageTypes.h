@@ -47,6 +47,8 @@
 #define STORAGE_ROOT_PATTERN          "Pattern"
 #define STORAGE_ROOT_INSTRUMENT       "Instrument"
 #define STORAGE_KITSET_FILENAME       "kitset.kcg"
+/* Optional Effect of a root Kit (`.fx` v2 content); absent = keep current. */
+#define STORAGE_KIT_EFFECT_FILENAME   "effect.fx"
 #define STORAGE_SCENESET_FILENAME     "sceneset.scg"
 #define STORAGE_BANKSET_FILENAME      "bankset.bcg"
 #define STORAGE_SETTINGS_FILENAME     "settings.cfg"

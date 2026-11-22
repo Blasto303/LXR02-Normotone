@@ -420,8 +420,16 @@ static void on_kit_load_complete(void)
             if ((pm_kit_request_scene_mask &
                  (uint16_t)(1u << scene_index)) != 0u) {
                 autosave_markKitDirty(scene_index);
+                if (filesystem_kitLoadHadEffect())
+                    autosave_markEffectDirty(scene_index);
             }
         }
+        /* A Kit saved with its Effect brings it back: rebuild the runtime. */
+        if (filesystem_kitLoadHadEffect() &&
+            scene_getActiveIndex() < 16u &&
+            (pm_kit_request_scene_mask &
+             (uint16_t)(1u << scene_getActiveIndex())) != 0u)
+            effects_activateScene(scene_getActiveIndex());
     }
     preset_completeFilesystemOp(PRESET_OP_KIT_LOAD);
 }
