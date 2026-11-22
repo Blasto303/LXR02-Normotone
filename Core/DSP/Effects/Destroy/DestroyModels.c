@@ -23,6 +23,12 @@
  *               driven hard, with a bit-crushed held feedback
  *   8 mudslide  feedback / dirt / dirtrate: dark, heavily crushed and
  *               decimated pseudo-reverb with a wavefolded feedback
+ *   9 saw       dist / low / high: no feedback. High-passed input, high
+ *               gain into a hard diode-style clip, then two resonant
+ *               band boosts after the clip (about 100 Hz and 1 kHz) with
+ *               the mids between them left out: the "chainsaw" pedal sound
+ *               when both are up. Written from the general principle of
+ *               such pedals, not from any schematic.
  *
  * Every loop gain stays at or below the feedback knob, so nothing
  * oscillates on its own once the input stops.
@@ -40,7 +46,7 @@ static const uint16_t dsm_ap_len[DSM_AP_COUNT] = { 142u, 107u, 379u, 277u };
 
 /* Output trims so the models sit near the dry level (bench, mix 127). */
 static const float dsm_trim[DSM_ALG_COUNT] = {
-    1.0f, 1.6f, 1.1f, 3.2f, 1.4f, 0.95f, 0.9f, 1.5f, 1.2f
+    1.0f, 1.6f, 1.1f, 3.2f, 1.4f, 0.95f, 0.9f, 1.5f, 1.2f, 1.0f
 };
 
 /* Pool layout, per channel. */
@@ -54,7 +60,7 @@ _Static_assert(DSM_RV_BASE + 2u * DSM_RV_LEN <= DSM_POOL_SAMPLES,
                "Destroy model lines must fit the pool");
 
 static const char dsm_names[DSM_ALG_COUNT][4] = {
-    "cls", "hus", "tur", "mut", "rio", "ass", "bls", "blb", "mud"
+    "cls", "hus", "tur", "mut", "rio", "ass", "bls", "blb", "mud", "saw"
 };
 static const char dsm_knobs[DSM_ALG_COUNT][10] = {
     "drifldsub",   /* cls: drive fold sub     */
@@ -66,6 +72,7 @@ static const char dsm_knobs[DSM_ALG_COUNT][10] = {
     "gaipbkgrt",   /* bloodshed               */
     "fbkdrtdrr",   /* bloodbath               */
     "fbkdrtdrr",   /* mudslide                */
+    "dislowhig",   /* saw: dist, low, high    */
 };
 
 const char *dsm_algName(uint8_t alg)
@@ -214,6 +221,12 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
         tune = -1.0f;
         break;
     }
+    case 9u:                                      /* saw */
+        m->k_g = 2.0f + 250.0f * a * a;           /* dist: up to ~+48 dB */
+        m->k_x = 4.0f * b;                        /* low boost, 0..x4    */
+        m->k_q = 4.0f * c;                        /* high boost, 0..x4   */
+        tune = -1.0f;
+        break;
     default:
         break;
     }
@@ -437,6 +450,43 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
             m->last[c] = dsm_dc(m, c, y);
         }
         y = m->last[c];
+        break;
+    }
+    case 9u: {                                    /* saw */
+        /*
+         * High-pass (~150 Hz) so the clip bites the mids, then a hard
+         * clip with a soft knee. Two Chamberlin band-passes on the clipped
+         * signal, unity peak, centres ~100 Hz (Q 1.4) and ~1 kHz (Q 1.8),
+         * scaled by low/high and added to a thin direct part. A ~6 kHz
+         * low-pass takes the fizz off. No loop: nothing can drone.
+         */
+        float h;
+        float k;
+        float hp;
+        float bl;
+        float bh;
+
+        m->lp_a[c] += 0.021f * (x - m->lp_a[c]);         /* ~150 Hz */
+        h = m->k_g * (x - m->lp_a[c]);
+        k = dsm_clamp(h, 1.2f);
+        k = k - 0.13f * k * k * k;                       /* knee, |k| <= 1 */
+        /* Low band: lp = lp_b, bp = lp_c, f = 2 sin(pi 100 / fs). */
+        m->lp_b[c] += 0.01425f * m->lp_c[c];
+        hp = k - m->lp_b[c] - 0.71f * m->lp_c[c];
+        m->lp_c[c] += 0.01425f * hp;
+        bl = 0.71f * m->lp_c[c];
+        /* High band: lp = hold_in, bp = hold_out, f = 2 sin(pi 1000 / fs). */
+        m->hold_in[c] += 0.1424f * m->hold_out[c];
+        hp = k - m->hold_in[c] - 0.55f * m->hold_out[c];
+        m->hold_out[c] += 0.1424f * hp;
+        bh = 0.55f * m->hold_out[c];
+        /* Direct part thins out as the boosts come up (0.85 -> 0.35). */
+        y = (0.85f - 0.0625f * (m->k_x + m->k_q)) * k +
+            m->k_x * bl + m->k_q * bh;
+        m->lp_d[c] += 0.58f * (y - m->lp_d[c]);          /* ~6 kHz */
+        /* Level follows the boosts so low/high do not just add volume. */
+        y = dsm_dc(m, c, 0.45f * m->lp_d[c] /
+                         (1.0f + 0.08f * (m->k_x + m->k_q)));
         break;
     }
     default:

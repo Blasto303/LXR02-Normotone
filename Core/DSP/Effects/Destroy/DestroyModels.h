@@ -15,7 +15,7 @@
 
 #include <stdint.h>
 
-#define DSM_ALG_COUNT      9u          /* cls + 8 models */
+#define DSM_ALG_COUNT      10u         /* cls + 8 feedback models + saw */
 #define DSM_POOL_SAMPLES   8192u
 
 /* Line lengths (samples, per channel). */
