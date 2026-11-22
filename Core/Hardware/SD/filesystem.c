@@ -3370,7 +3370,27 @@ static void filesystem_patternBuildHeader(uint8_t *header,
         /* S081 P2: byte 5 stores the automation ramp mode (1 = on). */
         header[base + 5u] =
             (uint8_t)((region->track_auto_smooth >> track) & 1u);
+        /* Bytes 6..13: track generators (pat_track_gen_t, zero = standard). */
+        memcpy(&header[base + 6u], region->track_gen[track].v,
+               PAT_TRACK_GEN_BYTES);
     }
+}
+
+/*
+ * Read one track's generator record from PAT4 track header bytes 6..13.
+ * Older files hold zeros there (standard sequencer); an unknown mode byte
+ * also falls back to standard so a newer file never plays garbage.
+ */
+static void filesystem_patternReadTrackGen(pat_scene_region_t *region,
+                                           uint8_t track, const uint8_t *src)
+{
+    pat_track_gen_t *g = &region->track_gen[track];
+
+    memcpy(g->v, src, PAT_TRACK_GEN_BYTES);
+    if (g->v[PAT_GEN_F_MODE] >= PAT_GEN_MODES)
+        g->v[PAT_GEN_F_MODE] = PAT_GEN_STD;
+    if (g->v[PAT_GEN_F_EUC_STEPS] > 64u)
+        g->v[PAT_GEN_F_EUC_STEPS] = 64u;
 }
 
 /* Validate v4 geometry and return the file header/pool/checksum fields. */
@@ -13779,6 +13799,8 @@ static void filesystem_loadSceneDirectory_tick(void)
                 /* S081 P2: byte 5 = automation ramp mode (files read 0). */
                 if (staging_buf[base + 5u] != 0u)
                     region->track_auto_smooth |= (uint8_t)(1u << track);
+                filesystem_patternReadTrackGen(region, track,
+                                           &staging_buf[base + 6u]);
             }
             op_stream_index = 0u;
             op_phase = 48u;
@@ -16016,6 +16038,8 @@ static void filesystem_loadPattern_tick(void)
                 /* S081 P2: byte 5 = automation ramp mode (files read 0). */
                 if (staging_buf[base + 5u] != 0u)
                     region->track_auto_smooth |= (uint8_t)(1u << track);
+                filesystem_patternReadTrackGen(region, track,
+                                           &staging_buf[base + 6u]);
             }
             op_stream_index = 0u; op_phase = 9u; return;
         }
@@ -30702,6 +30726,8 @@ static uint8_t filesystem_bootReaderReadPatternFile(const char *file_name,
         /* S081 P2: byte 5 = automation ramp mode (files read 0). */
         if (staging_buf[base + 5u] != 0u)
             region->track_auto_smooth |= (uint8_t)(1u << track);
+        filesystem_patternReadTrackGen(region, track,
+                                   &staging_buf[base + 6u]);
     }
     if (filesystem_blockRead(file, (uint8_t *)region->address,
                              PATTERN_FILE_ADDRESS_BYTES) !=

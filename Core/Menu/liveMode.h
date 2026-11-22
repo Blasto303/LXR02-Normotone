@@ -78,10 +78,14 @@ void live_cpuPageOpen(void);
  * rotation of the selected track (track buttons), DATA = hits. The first
  * turn rewrites the track's triggers; the track loop length follows len.
  */
-void live_euclidPageOpen(void);
-uint8_t live_euclidPageActive(void);
-void live_euclidTrack(uint8_t track);
-void live_euclidKnob(uint8_t knob, int8_t delta);
+/* GEN page (LOAD + LAST STEP): per-track generators, see TrackGen.h. */
+void live_genPageOpen(void);
+uint8_t live_genPageActive(void);
+void live_genTrack(uint8_t track);
+void live_genStep(uint8_t step);
+void live_genKnob(uint8_t knob, int8_t delta);
+/* PERF pot 2: hits (Euclid) or prb (Turing/standard) of the active track. */
+void live_genMacro(int8_t delta);
 uint8_t live_cpuPageActive(void);
 uint8_t live_rndPageActive(void);
 void live_rndStep(uint8_t step);

@@ -145,9 +145,7 @@ SRCS = \
   Core/MIDI/MidiVoiceControl.c \
   Core/Bank/Scene/Pattern/PatternData.c \
   Core/Bank/Scene/Pattern/PatternStackService.c \
-  Core/Bank/Scene/Pattern/EuklidGenerator.c \
-  Core/Bank/Scene/Pattern/SomGenerator.c \
-  Core/Bank/Scene/Pattern/SomData.c \
+  Core/Sequencer/TrackGen.c \
 	  Core/Sequencer/sequencer.c \
 	  Core/Sequencer/sequencerTimer.c \
 	  Core/Sequencer/clockSync.c \

@@ -43,7 +43,7 @@ _Static_assert(PAT_STACK_SIZE > 0u && PAT_STACK_SIZE <= 512u,
                "PAT_STACK_SIZE must fit the 14-bit pool bitmap");
 _Static_assert(sizeof(pat_scene_region_t) ==
                (PAT_STEPS_PER_SCENE * 2u) + (PAT_STACK_SIZE * 32u) +
-               512u + 32u,
+               512u + 32u + (NUM_TRACKS * PAT_TRACK_GEN_BYTES),
                "pat_scene_region_t size must match the Pattern budget (S081 P2: +1 B auto smooth)");
 
 /*
@@ -1032,6 +1032,8 @@ static void pat_initRegion(pat_scene_region_t *region)
     region->track_loop_exclude = 0u;
     /* S081 P2: every track starts with automation ramps off. */
     region->track_auto_smooth = 0u;
+    /* Every track starts on the standard sequencer (generators off). */
+    memset(region->track_gen, 0, sizeof(region->track_gen));
 }
 
 void pat_initScene(uint8_t scene_index)
@@ -1373,6 +1375,94 @@ void pat_applyTrackSettingsToMenu(uint8_t scene_index, uint8_t track)
     /* S081 P2: rmp mirror (1 = automation ramps on). */
     parameter_values[PAR_TRACK_AUTO_SMOOTH] =
         (uint8_t)((region->track_auto_smooth >> track) & 1u);
+}
+
+/*
+ * Generator settings of one track (GEN page, PERF pot 2, copy/clear).
+ *
+ * What: stores one pat_gen_field_t value, clamped to its domain; a Euclid
+ * step change also re-clamps hits and rotation. Entering Euclid with an
+ * untouched record seeds 16 steps / 4 hits so the mode is audible at once.
+ * Outputs: the region field and the Scene's Pattern dirty mark (AutoSave).
+ * Read by TrackGen.c in TIM3 (byte reads, no lock needed).
+ */
+static uint8_t pat_genEucSteps(const pat_track_gen_t *g)
+{
+    return g->v[PAT_GEN_F_EUC_STEPS] ? g->v[PAT_GEN_F_EUC_STEPS] : 16u;
+}
+
+void pat_setTrackGen(uint8_t scene_index, uint8_t track, uint8_t field,
+                     uint8_t value)
+{
+    pat_scene_region_t *region = pat_sceneRegionMut(scene_index);
+    pat_track_gen_t *g;
+    uint8_t steps;
+
+    if (!region || !pat_trackValid(track) || field >= PAT_TRACK_GEN_BYTES)
+        return;
+    g = &region->track_gen[track];
+    switch (field) {
+    case PAT_GEN_F_MODE:
+        if (value >= PAT_GEN_MODES)
+            value = PAT_GEN_STD;
+        if (value == PAT_GEN_EUC && g->v[PAT_GEN_F_EUC_STEPS] == 0u &&
+            g->v[PAT_GEN_F_EUC_HITS] == 0u) {
+            g->v[PAT_GEN_F_EUC_STEPS] = 16u;
+            g->v[PAT_GEN_F_EUC_HITS] = 4u;
+        }
+        break;
+    case PAT_GEN_F_EUC_STEPS:
+        value = (value < 1u) ? 1u : ((value > 64u) ? 64u : value);
+        break;
+    case PAT_GEN_F_EUC_HITS:
+        steps = pat_genEucSteps(g);
+        if (value > steps)
+            value = steps;
+        break;
+    case PAT_GEN_F_EUC_ROT:
+        steps = pat_genEucSteps(g);
+        if (value >= steps)
+            value = (uint8_t)(steps - 1u);
+        break;
+    case PAT_GEN_F_TM_LEN:
+        if (value < 2u || value > 16u)
+            value = 8u;
+        break;
+    default:
+        if (value > 127u)
+            value = 127u;
+        break;
+    }
+    g->v[field] = value;
+    if (field == PAT_GEN_F_EUC_STEPS) {
+        if (g->v[PAT_GEN_F_EUC_HITS] > value)
+            g->v[PAT_GEN_F_EUC_HITS] = value;
+        if (g->v[PAT_GEN_F_EUC_ROT] >= value)
+            g->v[PAT_GEN_F_EUC_ROT] = (uint8_t)(value - 1u);
+    }
+    pat_markSceneDirty(scene_index);
+}
+
+void pat_copyTrackGen(uint8_t dst_scene, uint8_t dst_track,
+                      uint8_t src_scene, uint8_t src_track)
+{
+    const pat_scene_region_t *src = pat_sceneRegion(src_scene);
+    pat_scene_region_t *dst = pat_sceneRegionMut(dst_scene);
+
+    if (!src || !dst || !pat_trackValid(src_track) ||
+        !pat_trackValid(dst_track))
+        return;
+    dst->track_gen[dst_track] = src->track_gen[src_track];
+    pat_markSceneDirty(dst_scene);
+}
+
+uint8_t pat_trackGen(uint8_t scene_index, uint8_t track, uint8_t field)
+{
+    const pat_scene_region_t *region = pat_sceneRegion(scene_index);
+
+    if (!region || !pat_trackValid(track) || field >= PAT_TRACK_GEN_BYTES)
+        return 0u;
+    return region->track_gen[track].v[field];
 }
 
 /* Persist one track-length menu edit in the resident Scene region. */
@@ -2354,6 +2444,7 @@ void pat_rawRegionCopyBody(uint8_t src_scene, uint8_t dst_scene)
     dst->track_loop_exclude = src->track_loop_exclude;
     /* S081 P2: the automation ramp mode travels with a Scene copy. */
     dst->track_auto_smooth = src->track_auto_smooth;
+    memcpy(dst->track_gen, src->track_gen, sizeof(dst->track_gen));
     dst->pattern_change_bar = src->pattern_change_bar;
     dst->pattern_next = src->pattern_next;
 }

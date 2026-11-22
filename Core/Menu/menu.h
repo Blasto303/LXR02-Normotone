@@ -84,10 +84,10 @@ enum PageNames {
     SAVE_PAGE,
     PERFORMANCE_PAGE,
     SEQ_PAGE,
-    EUKLID_PAGE,
+    RESERVED_PAGE_12,      /* was EUKLID_PAGE: id kept, page removed */
     PATTERN_SETTINGS_PAGE,
     RECORDING_PAGE,
-    SOM_PAGE,
+    RESERVED_PAGE_15,      /* was SOM_PAGE: id kept, page removed */
     /*
      * Effect page (SHIFT+PERF, Session 072 step 7). Cells are resolved by
      * menuEffects.c, not by menuPages[][]; the table row exists only so the

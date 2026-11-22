@@ -184,6 +184,26 @@ static void map_peripherals(void)
     }
 }
 
+/*
+ * Trigger log (FG_GEN): every voice note-on through the real sequencer,
+ * with its time, so a generator's rhythm can be checked step by step.
+ * Linked with -Wl,--wrap=voiceControl_noteOn (build_fg.sh).
+ */
+#include "TrackGen.h"
+extern void __real_voiceControl_noteOn(uint8_t voice, uint8_t note, uint8_t vel);
+static long fg_now_ms;
+static long fg_hit_ms[7][256];
+static uint8_t fg_hit_vel[7][256];
+static int fg_hit_n[7];
+void __wrap_voiceControl_noteOn(uint8_t voice, uint8_t note, uint8_t vel)
+{
+    if (voice < 7 && fg_hit_n[voice] < 256) {
+        fg_hit_vel[voice][fg_hit_n[voice]] = vel;
+        fg_hit_ms[voice][fg_hit_n[voice]++] = fg_now_ms;
+    }
+    __real_voiceControl_noteOn(voice, note, vel);
+}
+
 static void settle(void)
 {
     int quiet = 0;
@@ -230,6 +250,20 @@ int main(int argc, char **argv)
     for (v = 0; v < 50 && bank_scenePresentMask() != 0xFFFFu; v++) settle();
     preset_startDrumsetApply(); settle();
     seq_setBpm(130);
+    /*
+     * FG_GEN="t:f=v,f=v,...": generator fields of track t (pat_gen_field_t
+     * indices) on the active Scene before the run; the log of track t is
+     * printed as one character per 16th step at the end.
+     */
+    if (getenv("FG_GEN")) {
+        const char *e = getenv("FG_GEN");
+        int t = atoi(e), f, val;
+        const char *c = strchr(e, ':');
+        while (c && sscanf(c + 1, "%d=%d", &f, &val) == 2) {
+            pat_setTrackGen(scene_getActiveIndex(), (uint8_t)t, (uint8_t)f, (uint8_t)val);
+            c = strchr(c + 1, ',');
+        }
+    }
     /* PERF page, transport running. */
     ev_press(BUT_MODE2); ev_release(BUT_MODE2);
     seq_setRunning(1);
@@ -239,6 +273,7 @@ int main(int argc, char **argv)
         long us = st * 50L;
         long ms = us / 1000L;
 
+        fg_now_ms = ms;
         if (st % 5 == 0) { systick_ticks++; isr_seq(); }
         if (st % 4 == 0) isr_lcd();
         if (st % 20 == 0) {
@@ -268,13 +303,29 @@ int main(int argc, char **argv)
         }
         if (st % 14 == 0 || st % 15 == 0) {     /* ~725 us: one 32-frame block */
             static long last_block = -1000;
-            if (us - last_block >= 725) {
+            if (us - last_block >= 725 && !getenv("FG_NORENDER")) {
                 last_block = us;
                 ctl_render();
                 rnd_block();   /* render, timed per block */
             }
         }
         sim_advance(50);
+    }
+    if (getenv("FG_GEN")) {
+        int t = atoi(getenv("FG_GEN")), i, k;
+        const double step_ms = 60000.0 / 130.0 / 4.0;
+        long t0 = fg_hit_n[t] ? fg_hit_ms[t][0] : 0;
+        char line[129];
+        memset(line, '.', 128); line[128] = 0;
+        for (i = 0; i < fg_hit_n[t]; i++) {
+            k = (int)((fg_hit_ms[t][i] - t0) / step_ms + 0.5);
+            if (k >= 0 && k < 128) line[k] = 'x';
+        }
+        printf("track %d hits %d first at %ld ms\n", t, fg_hit_n[t], t0);
+        for (i = 0; i < 128; i += 32) printf("  %.32s\n", line + i);
+        printf("  vel:");
+        for (i = 0; i < fg_hit_n[t] && i < 24; i++) printf(" %u", fg_hit_vel[t][i]);
+        printf("\n");
     }
     printf("final screen |%.16s|%.16s|\n", editDisplayBuffer[0], editDisplayBuffer[1]);
     printf("done: %s s, gestures %d, scene %u, bank %u, blocks %u\n", argv[3], gestures,

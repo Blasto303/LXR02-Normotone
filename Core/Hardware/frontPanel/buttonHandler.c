@@ -29,9 +29,6 @@
 #include "SceneData.h"
 #include "menuEffects.h"
 #include "EffectsManager.h"
-#if ENABLE_EUKLID_PAGE
-#include "EuklidGenerator.h"
-#endif
 #include "sequencer.h"
 #include "LiveRecord.h"
 #include "presetManager.h"
@@ -718,22 +715,6 @@ static void buttonHandler_updateSubSteps(void)
     }
 }
 
-#if ENABLE_EUKLID_PAGE
-/* Euklid UI compiled out (Session 072 step 7; plan §13.1). */
-static void buttonHandler_applyEuklidParamsToMenu(uint8_t track)
-{
-    /*
-     * Why: entering PATGEN needs the current generator values in menu params,
-     * but there is no parser request path anymore. Input: track index. Output:
-     * PAR_EUKLID_* values updated for repaint. Risk: invalid tracks are ignored.
-     */
-    if (!pat_trackValid(track))
-        return;
-    parameter_values[PAR_EUKLID_LENGTH] = euklid_getLength(track);
-    parameter_values[PAR_EUKLID_STEPS] = euklid_getSteps(track);
-    parameter_values[PAR_EUKLID_ROTATION] = euklid_getRotation(track);
-}
-#endif
 
 static void buttonHandler_enterSeqModeStepMode(void)
 {
@@ -1980,6 +1961,8 @@ static void buttonHandler_closeLatchedSurfaces(uint8_t restore_page,
 
 static void handleModeButtonsForLibrary(uint8_t mode, menu_library_target_t library)
 {
+    uint8_t open_gen = 0u;
+
     if (menu_loadInstrumentTransactionBusy()) {
         /*
          * Freeze mode ownership through the complete Instrument transaction.
@@ -2013,6 +1996,8 @@ static void handleModeButtonsForLibrary(uint8_t mode, menu_library_target_t libr
 
         if (buttonHandler_getShift() && mode == SELECT_MODE_VOICE)
             next = SELECT_MODE_VOICE;
+        else if (buttonHandler_getShift() && mode == SELECT_MODE_STEP)
+            next = SELECT_MODE_PERF;            /* SHIFT+LOAD: GEN page */
         else if (buttonHandler_getShift())
             next = (uint8_t)((mode + 4u) & 0x07u);
         else
@@ -2069,6 +2054,14 @@ static void handleModeButtonsForLibrary(uint8_t mode, menu_library_target_t libr
         bh_state.selectButtonMode = (uint8_t)((mode + 4u) & 0x07u);
     else
         bh_state.selectButtonMode = (uint8_t)(mode & 0x07u);
+    /*
+     * SHIFT+LOAD (was the inert SOM generator) opens the GEN page: PERF
+     * mode plus the same overlay as LOAD + LAST STEP.
+     */
+    if (bh_state.selectButtonMode == SELECT_MODE_SOM_GEN) {
+        bh_state.selectButtonMode = SELECT_MODE_PERF;
+        open_gen = 1u;
+    }
 
     led_clearAllBlinkLeds();
     led_setMode2(bh_state.selectButtonMode);
@@ -2129,13 +2122,14 @@ static void handleModeButtonsForLibrary(uint8_t mode, menu_library_target_t libr
         menu_switchPage(EFFECT_PAGE);
         break;
 
-    case SELECT_MODE_SOM_GEN:
-        menu_switchPage(SOM_PAGE);
-        break;
 
     default:
         break;
     }
+#if LIVE_MODE
+    if (open_gen)
+        live_genPageOpen();
+#endif
     /*
      * BAR overlay LEDs shown only in PERF mode (S081 §5.7, R19).
      *
@@ -2769,14 +2763,6 @@ static void handleVoiceButton(uint8_t voiceNr)
             }
         }
 
-        /*
-         * Active voice is UI/menu context, so Menu owns the selected value.
-         * Euklid params are then pulled directly from the Pattern generator
-         * module so the generator page is correct if the user switches there.
-         */
-#if ENABLE_EUKLID_PAGE
-        buttonHandler_applyEuklidParamsToMenu(voiceNr);
-#endif
 
         if (bh_state.selectButtonMode == SELECT_MODE_STEP ||
             menu_activePage == SEQ_PAGE) {
@@ -2817,11 +2803,6 @@ static void handleVoiceButton(uint8_t voiceNr)
             buttonHandler_updateSubSteps();
             led_setBlinkLed(selectedStepLed, 1);
         }
-#if ENABLE_EUKLID_PAGE
-        if (menu_activePage == EUKLID_PAGE) {
-            menu_repaintAll();
-        }
-#endif
 
         if (shouldPreviewVoice)
             seq_previewVoice(voiceNr);
@@ -2931,18 +2912,19 @@ static uint8_t buttonHandler_livePress(uint8_t b)
         buttonHandler_liveConsume(b);
         if (bh_state.selectButtonMode != SELECT_MODE_PERF)
             handleModeButtons(SELECT_MODE_PERF);
-        live_euclidPageOpen();
+        live_genPageOpen();
         return 1u;
     }
-    if (btn_to_voice(b) >= 0 && live_euclidPageActive() && !shift &&
+    if (btn_to_voice(b) >= 0 && live_genPageActive() && !shift &&
         bh_state.selectButtonMode == SELECT_MODE_PERF) {
         buttonHandler_liveConsume(b);
-        live_euclidTrack((uint8_t)btn_to_voice(b));
+        live_genTrack((uint8_t)btn_to_voice(b));
         return 1u;
     }
-    if (seq >= 0 && live_euclidPageActive() && !shift &&
+    if (seq >= 0 && live_genPageActive() && !shift &&
         bh_state.selectButtonMode == SELECT_MODE_PERF) {
-        buttonHandler_liveConsume(b);   /* steps show the rhythm only */
+        buttonHandler_liveConsume(b);   /* rotation (Euclid) / Write (Turing) */
+        live_genStep((uint8_t)seq);
         return 1u;
     }
     if (seq == 12 && bh_liveLoadHeld && !shift) {        /* LOAD + RELOAD */
@@ -3465,6 +3447,10 @@ static void processPress(uint8_t buttonNr)
         if (bh_clearHeld && liveRec_armed())
             buttonHandler_liveEraseBegin();
         led_setValue(1, LED_SHIFT);
+#if LIVE_MODE
+        if (live_genPageActive())
+            menu_repaintAll();          /* GEN page: SHIFT shows vdp len prb */
+#endif
         switch (bh_state.selectButtonMode) {
         case SELECT_MODE_VOICE:
             /*
@@ -3492,31 +3478,6 @@ static void processPress(uint8_t buttonNr)
             break;
 
         case SELECT_MODE_PERF:
-#if ENABLE_EUKLID_PAGE
-        {
-            uint8_t trackNr;
-            uint8_t patternNr;
-
-            /* Legacy pattern-settings layer retained only for diagnostics. */
-            menu_switchPage(PATTERN_SETTINGS_PAGE);
-            led_clearSelectLeds();
-            led_clearAllBlinkLeds();
-            led_setBlinkLed((uint8_t)(LED_STEP1 +
-                                       parameter_values[PAR_TRACK_ROTATION]), 1);
-            if (parameter_values[PAR_FOLLOW]) {
-                menu_setShownPattern(menu_shownPattern);
-                led_clearSequencerLeds();
-                trackNr = menu_getActiveVoice();
-                patternNr = menu_getViewedPattern();
-                led_updatePatternTrack(trackNr, patternNr,
-                                       buttonHandler_selectedStep);
-            }
-            led_setBlinkLed((uint8_t)(LED_PART_SELECT1 +
-                                      menu_getViewedPattern()), 1);
-            break;
-        }
-#endif
-            /* PERF remains visible when the retired SHIFT layer is disabled. */
             break;
 
         case SELECT_MODE_STEP:
@@ -3876,6 +3837,10 @@ static void processRelease(uint8_t buttonNr)
             led_setValue(1u, LED_SHIFT);              /* CLEAR still held */
         else
             led_setValue(0, LED_SHIFT);
+#if LIVE_MODE
+        if (live_genPageActive())
+            menu_repaintAll();
+#endif
 
         switch (bh_state.selectButtonMode) {
         case SELECT_MODE_VOICE:

@@ -52,7 +52,7 @@
 #include "usb_manager.h"
 #include "clockSync.h"
 #include "MidiPitch.h"
-#include "SomGenerator.h"
+#include "TrackGen.h"
 #include "triggerJacks.h"
 #include "timebase.h"
 #include "ledHandler.h"
@@ -747,7 +747,6 @@ static uint32_t seq_autoSyncLastUs = 0;
 uint8_t seq_lastMasterStep[NUM_TRACKS];		//keeps track of the last triggered master sync step of each track
 
 
-static uint8_t seq_SomModeActive = 0;
 
 static uint8_t seq_mutedTracks=0;			/**< indicate which tracks are muted */
 uint8_t seq_running = 0;					/**< 1 if running, 0 if stopped*/
@@ -1715,6 +1714,7 @@ void seq_refreshTrackEffectiveParams(void)
 //------------------------------------------------------------------------------
 void seq_init()
 {
+	tgen_init();
 	memset(seq_stepIndex,0,sizeof(seq_stepIndex));
 	memset(seq_lastMasterStep,0,NUM_TRACKS);
 	/* S078: clear every per-track DDA, shuffle, and play-mode byte at boot. */
@@ -3050,13 +3050,23 @@ static void seq_advanceTrackStep(uint8_t track)
 		break;
 	}
 
-	if (seq_SomModeActive) {
-		if (track == 0u)
-			som_tick(seq_stepIndex[0], seq_mutedTracks);
-		return;
-	}
-
 	{
+		/*
+		 * Track generators (GEN page): the Pattern keeps the step position,
+		 * specials and automation; gen_on decides whether the step fires
+		 * (the Pattern trigger in standard mode, else Euclid or Turing).
+		 * tgen_step() runs on every step, muted or not, so the Turing
+		 * register and the Euclid counter keep time.
+		 */
+		const pat_scene_region_t *gen_region =
+		    pat_sceneRegion(seq_perTrackPattern[track]);
+		const pat_track_gen_t *gen_g =
+		    gen_region ? &gen_region->track_gen[track] : NULL;
+		const uint8_t pat_on = pat_isStepActive(track,
+		    (uint8_t)seq_stepIndex[track], seq_perTrackPattern[track]);
+		const uint8_t gen_on = gen_g
+		    ? tgen_step(track, gen_g, pat_on, (uint16_t)GetRngValue())
+		    : pat_on;
 		uint8_t track_muted = (uint8_t)((seq_mutedTracks >> track) & 1u);
 		uint8_t process_step = (uint8_t)(!track_muted);
 		/* Fired bit reported to the boundary ring (S081 §9.1a, C-9a). */
@@ -3153,6 +3163,8 @@ static void seq_advanceTrackStep(uint8_t track)
 
 		/* LIVE random layer: velocity jitter (no-op at dose 0). */
 		sp.velocity = seq_liveRndVelocity(track, sp.velocity);
+		/* Turing -> velocity (any mode), then the voice's velocity target. */
+		sp.velocity = tgen_velocity(track, gen_g, sp.velocity);
 
 		/*
 		 * Fired bit: bit 15 set and the condition passed, known at the step start
@@ -3177,9 +3189,7 @@ static void seq_advanceTrackStep(uint8_t track)
 		 * condition result. Outputs: seq_rollActive may be cleared. Affiliates:
 		 * seq_rollBegin carry path, seq_rollRemaining, seq_processRollTicks.
 		 */
-		if (seq_rollActive[track] && sp.roll == 0u &&
-		    pat_isStepActive(track, (uint8_t)seq_stepIndex[track],
-		                     seq_perTrackPattern[track]) &&
+		if (seq_rollActive[track] && sp.roll == 0u && gen_on &&
 		    step_allowed) {
 			seq_rollActive[track] = 0u;
 			seq_rollDuckActive[track] = 0u;
@@ -3215,8 +3225,8 @@ static void seq_advanceTrackStep(uint8_t track)
 			     (seq_liveHoldMask & (uint8_t)(1u << track)) != 0u));
 		}
 
-		if (pat_isStepActive(track, (uint8_t)seq_stepIndex[track], seq_perTrackPattern[track])) {
-			if ((seq_eraseFullMask & (uint8_t)(1u << track)) != 0u) {
+		if (gen_on) {
+			if (pat_on && (seq_eraseFullMask & (uint8_t)(1u << track)) != 0u) {
 				/*
 				 * Live erase (full) clears the trigger and queues reclamation.
 				 *
@@ -3234,7 +3244,8 @@ static void seq_advanceTrackStep(uint8_t track)
 				                  (uint8_t)seq_stepIndex[track], 0u);
 				patSvc_enqueueErase(seq_perTrackPattern[track], track,
 				                    (uint8_t)seq_stepIndex[track]);
-			} else if ((seq_eraseSpecialsMask & (uint8_t)(1u << track)) != 0u) {
+			} else if (pat_on &&
+			           (seq_eraseSpecialsMask & (uint8_t)(1u << track)) != 0u) {
 				/* S081 G-5: specials erase keeps automation; TIM3 clears bit 15. */
 				pat_setStepActive(seq_perTrackPattern[track], track,
 				                  (uint8_t)seq_stepIndex[track], 0u);
@@ -5571,8 +5582,7 @@ static void seq_loopProcessTick(void)
 		 * Context: TIM3, before the DDA. Affiliates: seq_recRingPush(),
 		 * liveRec_drainRing(), liveRec_stepEnd() (jump rule).
 		 */
-		if (!seq_SomModeActive &&
-		    (uint32_t)seq_trackAccumulator[track] + 256u <
+		if ((uint32_t)seq_trackAccumulator[track] + 256u <
 		        (uint32_t)stepScale_ticksQ8(seq_effectiveTrackScale[track]))
 			seq_recRingPush(track, seq_stepIndex[track], 0u, 1u);
 	}
@@ -6632,6 +6642,7 @@ static void seq_setStepIndexToStart()
 
 		seq_lastMasterStep[i] = 0u;
 		seq_stepIndex[i] = -1;
+		tgen_resetTrack(i);
 		/*
 		 * Seed the DDA so the first scheduler tick fires step zero (S078).
 		 *

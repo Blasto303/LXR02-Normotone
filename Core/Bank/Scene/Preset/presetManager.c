@@ -3330,6 +3330,7 @@ static uint8_t preset_copyBackgroundTrack(uint8_t track, uint8_t src_scene)
                                         (src->track_loop_exclude & bit));
     dst->track_auto_smooth = (uint8_t)((dst->track_auto_smooth & ~bit) |
                                        (src->track_auto_smooth & bit));
+    dst->track_gen[track] = src->track_gen[track];
     dst_scene->settings.midi_channel[track] =
         src_scene_data->settings.midi_channel[track];
     dst_scene->settings.midi_note[track] =

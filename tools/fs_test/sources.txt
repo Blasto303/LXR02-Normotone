@@ -5,12 +5,9 @@ Core/Hardware/SD/asyncfatfs/fat_standard.c
 Core/Bank/BankData.c
 Core/Bank/Scene/Autosave.c
 Core/Bank/Scene/AutosaveTrace.c
-Core/Bank/Scene/Pattern/EuklidGenerator.c
 Core/Bank/Scene/Pattern/PatternData.c
 Core/Bank/Scene/Pattern/PatternStackService.c
 Core/Bank/Scene/Pattern/PatternTrace.c
-Core/Bank/Scene/Pattern/SomData.c
-Core/Bank/Scene/Pattern/SomGenerator.c
 Core/Bank/Scene/Preset/ParameterArray.c
 Core/Bank/Scene/Preset/presetManager.c
 Core/Bank/Scene/Preset/presetMorphEngine.c
@@ -37,3 +34,4 @@ Core/DSP/Effects/Destroy/DestroyEffect.c
 Core/DSP/Effects/Destroy/DestroyModels.c
 Core/DSP/Effects/StereoFilter/StereoFilterEffect.c
 Core/Sequencer/StepScale.c
+Core/Sequencer/TrackGen.c

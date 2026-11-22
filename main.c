@@ -62,8 +62,6 @@
 #include "sequencerTimer.h"
 #include "PatternStackService.h"
 #include "copyClearSession.h"
-#include "EuklidGenerator.h"
-#include "SomGenerator.h"
 
 #include "MidiDin.h"
 #include "MidiIn.h"
@@ -618,8 +616,6 @@ int main(void)
     boot_showFxBufDiagnostic();
 #endif
     seq_init();
-    euklid_init();
-    som_init();
 
     midiDin_init();
     usb_init();

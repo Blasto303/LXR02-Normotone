@@ -46,7 +46,7 @@ gcc -m32 -fshort-enums -w -g $INC -c -o $OUT/obj/zz_ramsd.o tools/fs_test/ramsd.
 gcc -m32 -fshort-enums -w -g $INC -c -o $OUT/obj/zz_harness.o $MAIN
 # Stub every remaining undefined symbol (variables get zeroed storage).
 rm -f $OUT/obj/zz_stubs.o $OUT/harness
-gcc -m32 -o $OUT/harness $OUT/obj/*.o -lm 2>&1 | grep "undefined reference to" | grep -v "more undefined" \
+gcc -m32 -Wl,--wrap=voiceControl_noteOn -o $OUT/harness $OUT/obj/*.o -lm 2>&1 | grep "undefined reference to" | grep -v "more undefined" \
   | sed "s/.*undefined reference to .//; s/'$//" | sort -u > $OUT/undef.txt || true
 python3 -I - $OUT <<'PY'
 import re, sys
@@ -79,5 +79,5 @@ for s in sorted(set(open(out + '/undef.txt').read().split())):
 open(out + '/stubs.c', 'w').write('\n'.join(lines) + '\n')
 PY
 gcc -m32 -w -c -o $OUT/obj/zz_stubs.o $OUT/stubs.c
-gcc -m32 -g -o $OUT/harness $OUT/obj/*.o -lm
+gcc -m32 -Wl,--wrap=voiceControl_noteOn -g -o $OUT/harness $OUT/obj/*.o -lm
 echo "built $OUT/harness"

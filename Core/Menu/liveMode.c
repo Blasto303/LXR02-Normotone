@@ -48,7 +48,7 @@
 #include "plaitsMode.h"
 #include "adcPots.h"
 #include "timebase.h"
-#include "EuklidGenerator.h"
+#include "TrackGen.h"
 #include "PatternData.h"
 #include "DlyVerbParameters.h"
 
@@ -58,12 +58,10 @@ static uint16_t live_backupBank = 0xFFFFu;  /* Bank slot of that Scene    */
 static uint8_t  live_kitSource = 0xFFu;     /* kit shown on the KIT page  */
 static uint8_t  live_pendingKit = 0xFFu;    /* kit waiting for the bar    */
 static uint8_t  live_carrier;               /* queue only carries the kit */
-static uint8_t  live_page;                  /* 0 none, 1 KIT, 2 PATTERN, 3 RND, 4 CPU, 5 EUCLID */
-/* EUCLID page (LOAD + LAST STEP): track and the three generator values. */
-static uint8_t  live_eucTrack;
-static uint8_t  live_eucLen = 16u;
-static uint8_t  live_eucHit = 4u;
-static uint8_t  live_eucRot;
+static uint8_t  live_page;                  /* 0 none, 1 KIT, 2 PATTERN, 3 RND, 4 CPU, 5 GEN */
+/* GEN page (LOAD + LAST STEP): the track whose generator is edited. */
+static uint8_t  live_genTrk;
+static uint32_t live_genShown;              /* LED signature on the GEN page */
 static uint8_t  live_cpuEntry;              /* first entry on the CPU page */
 static uint8_t  live_cpuSerial;
 static uint8_t  live_shownQueue = 0xFFu;    /* queued pattern on the LCD  */
@@ -568,110 +566,216 @@ void live_reloadKit(void)
     live_kitSelect(scene_getActiveIndex());
 }
 
-/* EUCLID: step LEDs show bar 1 of the track being generated. */
-static void live_eucLeds(void)
+/*
+ * GEN page (LOAD + LAST STEP, in PERF): the per-track generators.
+ *
+ * What: pot 1 picks the track mode (std, euc, tm); pots 2-4 set the mode's
+ * three values; with SHIFT held, pots 2-4 set the Turing velocity
+ * modulation (vdp, len, prb), active in every mode. DATA = pot 2. VOICE
+ * buttons pick the track. Step LEDs show the Euclid rhythm (playhead
+ * blinking) or the Turing register (bit n on step n+1, Length blinking);
+ * a step press sets the Euclid rotation or flips that register bit (Write).
+ * Non-destructive: values go to pat_scene_region_t.track_gen[] of the
+ * active Scene (AutoSave), the Pattern steps are never rewritten.
+ */
+static const uint8_t live_tmLens[8] = { 2u, 3u, 4u, 5u, 6u, 8u, 12u, 16u };
+
+static const pat_track_gen_t *live_genRec(void)
 {
-    uint8_t scene = scene_getActiveIndex();
+    const pat_scene_region_t *r = pat_sceneRegion(scene_getActiveIndex());
+
+    return (r && live_genTrk < NUM_TRACKS) ? &r->track_gen[live_genTrk] : NULL;
+}
+
+static uint8_t live_genGet(uint8_t field)
+{
+    return pat_trackGen(scene_getActiveIndex(), live_genTrk, field);
+}
+
+static void live_genSet(uint8_t field, int16_t v)
+{
+    pat_setTrackGen(scene_getActiveIndex(), live_genTrk, field,
+                    (uint8_t)((v < 0) ? 0 : ((v > 255) ? 255 : v)));
+}
+
+/* Turing Length steps through 2,3,4,5,6,8,12,16. */
+static void live_genStepLen(int8_t delta)
+{
+    uint8_t cur = live_genGet(PAT_GEN_F_TM_LEN);
+    int8_t i = 5;                               /* 8 = default */
+    uint8_t k;
+
+    for (k = 0u; k < 8u; k++)
+        if (live_tmLens[k] == cur)
+            i = (int8_t)k;
+    i = (int8_t)(i + ((delta > 0) ? 1 : -1));
+    i = (int8_t)((i < 0) ? 0 : ((i > 7) ? 7 : i));
+    live_genSet(PAT_GEN_F_TM_LEN, live_tmLens[i]);
+}
+
+static void live_genLeds(uint8_t force)
+{
+    const pat_track_gen_t *g = live_genRec();
+    uint32_t sig;
     uint8_t s;
 
-    if (live_page != 5u)
+    if (live_page != 5u || !g)
         return;
-    for (s = 0u; s < 16u; s++) {
-        led_setBlinkLed((uint8_t)(LED_SEQ1 + s), 0u);
-        led_setValue(pat_isStepActive(live_eucTrack, s, scene),
-                     (uint8_t)(LED_SEQ1 + s));
+    if (g->v[PAT_GEN_F_MODE] == PAT_GEN_EUC)
+        sig = 0x80000000u | ((uint32_t)tgen_eucPos(live_genTrk) << 24) |
+              ((uint32_t)g->v[PAT_GEN_F_EUC_STEPS] << 16) |
+              ((uint32_t)g->v[PAT_GEN_F_EUC_HITS] << 8) |
+              g->v[PAT_GEN_F_EUC_ROT];
+    else
+        sig = ((uint32_t)tgen_tmLen(g) << 16) | tgen_register(live_genTrk);
+    sig ^= (uint32_t)live_genTrk << 28;
+    if (!force && sig == live_genShown)
+        return;
+    live_genShown = sig;
+    if (g->v[PAT_GEN_F_MODE] == PAT_GEN_EUC) {
+        /* Hit k plays at step k+1 of its own cycle; the playhead blinks. */
+        const uint8_t n = tgen_eucSteps(g);
+        const uint8_t pos = tgen_eucPos(live_genTrk);
+        const uint8_t now = (uint8_t)((pos == 0u ? n : pos) - 1u);
+
+        for (s = 0u; s < 16u; s++) {
+            led_setBlinkLed((uint8_t)(LED_SEQ1 + s),
+                            (uint8_t)(s == now && seq_isRunning()));
+            led_setValue((uint8_t)(s < n && tgen_eucHit(g, s)),
+                         (uint8_t)(LED_SEQ1 + s));
+        }
+    } else {
+        const uint16_t r = tgen_register(live_genTrk);
+        const uint8_t len = tgen_tmLen(g);
+
+        for (s = 0u; s < 16u; s++) {
+            led_setBlinkLed((uint8_t)(LED_SEQ1 + s),
+                            (uint8_t)(s == (uint8_t)(len - 1u)));
+            led_setValue((uint8_t)((r >> s) & 1u), (uint8_t)(LED_SEQ1 + s));
+        }
     }
 }
 
-/* Read the track's present length and hit count; nothing is rewritten. */
-static void live_eucRead(void)
-{
-    uint8_t scene = scene_getActiveIndex();
-    const pat_scene_region_t *r = pat_sceneRegion(scene);
-    uint8_t len = (r && live_eucTrack < NUM_TRACKS && r->track_length[live_eucTrack])
-        ? r->track_length[live_eucTrack] : 16u;
-    uint8_t hits = 0u;
-    uint8_t s;
-
-    if (len > NUM_STEPS)
-        len = NUM_STEPS;
-    for (s = 0u; s < len; s++)
-        hits = (uint8_t)(hits + (pat_isStepActive(live_eucTrack, s, scene) ? 1u : 0u));
-    live_eucLen = len;
-    /* An empty or full track gives no hint: start from 4 hits. */
-    live_eucHit = (hits == 0u || hits >= len) ? (len < 4u ? len : 4u) : hits;
-    live_eucRot = 0u;
-}
-
-/* Write the Euclidean rhythm: track loop length = len, then the triggers. */
-static void live_eucApply(void)
-{
-    uint8_t scene = scene_getActiveIndex();
-
-    if (scene >= SCENE_COUNT || live_eucTrack >= NUM_TRACKS)
-        return;
-    if (live_eucHit > live_eucLen)
-        live_eucHit = live_eucLen;
-    if (live_eucRot >= live_eucLen)
-        live_eucRot = (uint8_t)(live_eucRot % live_eucLen);
-    pat_setTrackLength(scene, live_eucTrack, live_eucLen);
-    euklid_setLength(live_eucTrack, live_eucLen);
-    euklid_setSteps(live_eucTrack, live_eucHit, scene);
-    euklid_setRotation(live_eucTrack, live_eucRot, scene);
-    live_eucLeds();
-    menu_repaintAll();
-}
-
-void live_euclidPageOpen(void)
+void live_genPageOpen(void)
 {
     if (live_page == 1u)
         live_kitPageClose();
     live_page = 5u;
-    live_eucTrack = menu_getActiveVoice();
-    if (live_eucTrack >= NUM_TRACKS)
-        live_eucTrack = 0u;
-    live_eucRead();
-    live_eucLeds();
+    live_genTrk = menu_getActiveVoice();
+    if (live_genTrk >= NUM_TRACKS)
+        live_genTrk = 0u;
+    live_genLeds(1u);
     menu_repaintAll();
 }
 
-uint8_t live_euclidPageActive(void)
+uint8_t live_genPageActive(void)
 {
     return (uint8_t)(live_page == 5u);
 }
 
-void live_euclidTrack(uint8_t track)
+void live_genTrack(uint8_t track)
 {
     if (track >= NUM_TRACKS)
         return;
-    live_eucTrack = track;
-    live_eucRead();
-    live_eucLeds();
+    live_genTrk = track;
+    menu_setActiveVoice(track);     /* PERF pot 2 follows this track */
+    live_genLeds(1u);
     menu_repaintAll();
 }
 
-/* Pot 1 len, pot 2 hits, pot 3 rotation (endless deltas). */
-void live_euclidKnob(uint8_t knob, int8_t delta)
+/* A step press: Euclid rotation, or Turing Write (flip that bit). */
+void live_genStep(uint8_t step)
 {
-    int16_t v;
+    const pat_track_gen_t *g = live_genRec();
 
-    if (delta == 0)
+    if (!g || step >= 16u)
         return;
+    if (g->v[PAT_GEN_F_MODE] == PAT_GEN_EUC)
+        live_genSet(PAT_GEN_F_EUC_ROT, (int16_t)(step % tgen_eucSteps(g)));
+    else
+        tgen_flipBit(live_genTrk, step);
+    live_genLeds(1u);
+    menu_repaintAll();
+}
+
+/* Pot 1 mode; pots 2-4 by mode (SHIFT: vdp len prb). Endless deltas. */
+void live_genKnob(uint8_t knob, int8_t delta)
+{
+    const pat_track_gen_t *g = live_genRec();
+    uint8_t mode;
+
+    if (delta == 0 || !g)
+        return;
+    mode = g->v[PAT_GEN_F_MODE];
     if (knob == 0u) {
-        v = (int16_t)live_eucLen + delta;
-        live_eucLen = (uint8_t)(v < 1 ? 1 : (v > NUM_STEPS ? NUM_STEPS : v));
-    } else if (knob == 1u) {
-        v = (int16_t)live_eucHit + delta;
-        live_eucHit = (uint8_t)(v < 1 ? 1 : (v > live_eucLen ? live_eucLen : v));
-    } else if (knob == 2u) {
-        v = (int16_t)live_eucRot + delta;
-        while (v < 0)
-            v += live_eucLen;
-        live_eucRot = (uint8_t)(v % live_eucLen);
+        int16_t m = (int16_t)mode + ((delta > 0) ? 1 : -1);
+
+        live_genSet(PAT_GEN_F_MODE,
+                    (m < 0) ? 0 : ((m >= (int16_t)PAT_GEN_MODES)
+                                   ? (int16_t)(PAT_GEN_MODES - 1u) : m));
+    } else if (buttonHandler_getShift() || mode == PAT_GEN_STD) {
+        if (knob == 1u)
+            live_genSet(PAT_GEN_F_VDP, (int16_t)live_genGet(PAT_GEN_F_VDP) + delta);
+        else if (knob == 2u)
+            live_genStepLen(delta);
+        else if (knob == 3u)
+            live_genSet(PAT_GEN_F_TM_PRB,
+                        (int16_t)live_genGet(PAT_GEN_F_TM_PRB) + delta);
+    } else if (mode == PAT_GEN_EUC) {
+        if (knob == 1u)
+            live_genSet(PAT_GEN_F_EUC_STEPS,
+                        (int16_t)tgen_eucSteps(g) + delta);
+        else if (knob == 2u)
+            live_genSet(PAT_GEN_F_EUC_HITS,
+                        (int16_t)live_genGet(PAT_GEN_F_EUC_HITS) + delta);
+        else if (knob == 3u) {
+            int16_t n = (int16_t)tgen_eucSteps(g);
+            int16_t v = (int16_t)live_genGet(PAT_GEN_F_EUC_ROT) + delta;
+
+            while (v < 0)
+                v += n;
+            live_genSet(PAT_GEN_F_EUC_ROT, (int16_t)(v % n));
+        }
     } else {
-        return;
+        if (knob == 1u)
+            live_genStepLen(delta);
+        else if (knob == 2u)
+            live_genSet(PAT_GEN_F_TM_PRB,
+                        (int16_t)live_genGet(PAT_GEN_F_TM_PRB) + delta);
+        else if (knob == 3u)
+            live_genSet(PAT_GEN_F_TM_GAT,
+                        (int16_t)live_genGet(PAT_GEN_F_TM_GAT) + delta);
     }
-    live_eucApply();
+    live_genLeds(1u);
+    menu_repaintAll();
+}
+
+/*
+ * PERF pot 2: the main generator value of the active track (hits in
+ * Euclid, prb in Turing or standard). Shown in PERF cell 2.
+ */
+void live_genMacro(int8_t delta)
+{
+    uint8_t keep = live_genTrk;
+
+    live_genTrk = menu_getActiveVoice();
+    if (live_genTrk < NUM_TRACKS && delta != 0) {
+        if (live_genGet(PAT_GEN_F_MODE) == PAT_GEN_EUC)
+            live_genSet(PAT_GEN_F_EUC_HITS,
+                        (int16_t)live_genGet(PAT_GEN_F_EUC_HITS) + delta);
+        else
+            live_genSet(PAT_GEN_F_TM_PRB,
+                        (int16_t)live_genGet(PAT_GEN_F_TM_PRB) + delta);
+        menu_repaintAll();
+    }
+    live_genTrk = keep;
+}
+
+static void live_put3(char *dst, uint8_t v)
+{
+    dst[0] = (char)(v >= 100u ? '0' + v / 100u : ' ');
+    dst[1] = (char)(v >= 10u ? '0' + (v / 10u) % 10u : ' ');
+    dst[2] = (char)('0' + v % 10u);
 }
 
 void live_cpuPageOpen(void)
@@ -886,7 +990,7 @@ void live_encoder(int8_t inc, uint8_t clicked)
         return;
     }
     if (live_page == 5u) {
-        live_euclidKnob(1u, inc);       /* DATA = hits */
+        live_genKnob(1u, inc);          /* DATA = pot 2 */
         return;
     }
     if (live_page == 3u) {
@@ -1059,6 +1163,8 @@ void live_service(void)
         live_kitSelect(live_currentKit());
     /* CPU page: a new snapshot every second. */
     /* CPU page fader line: repaint as soon as a fader moves one step. */
+    if (live_page == 5u)
+        live_genLeds(0u);               /* register / playhead move */
     if (live_page == 4u && live_cpuEntry == 0u) {
         static uint32_t shown;
         uint32_t sig = 0u;
@@ -1117,27 +1223,48 @@ uint8_t live_formatOverlay(char *row0, char *row1)
     if (live_page == 5u) {
         static const char trk[NUM_TRACKS][4] = {
             "DR1", "DR2", "DR3", "SNR", "CYM", "CHH", "OHH" };
-        uint8_t v;
+        const pat_track_gen_t *g = live_genRec();
+        uint8_t mode;
 
-        if (buttonHandler_getMode() != SELECT_MODE_PERF)
+        if (buttonHandler_getMode() != SELECT_MODE_PERF || !g)
             return 0u;
+        mode = g->v[PAT_GEN_F_MODE];
         memset(row0, ' ', 16);
         memset(row1, ' ', 16);
-        memcpy(row0, "LEN HIT ROT EUC", 15);
-        v = live_eucLen;
-        row1[0] = (char)(v >= 100u ? '0' + v / 100u : ' ');
-        row1[1] = (char)(v >= 10u ? '0' + (v / 10u) % 10u : ' ');
-        row1[2] = (char)('0' + v % 10u);
-        v = live_eucHit;
-        row1[4] = (char)(v >= 100u ? '0' + v / 100u : ' ');
-        row1[5] = (char)(v >= 10u ? '0' + (v / 10u) % 10u : ' ');
-        row1[6] = (char)('0' + v % 10u);
-        v = live_eucRot;
-        row1[8] = (char)(v >= 100u ? '0' + v / 100u : ' ');
-        row1[9] = (char)(v >= 10u ? '0' + (v / 10u) % 10u : ' ');
-        row1[10] = (char)('0' + v % 10u);
-        memcpy(&row1[12], trk[live_eucTrack < NUM_TRACKS ? live_eucTrack : 0], 3);
+        memcpy(row1, trk[live_genTrk < NUM_TRACKS ? live_genTrk : 0], 3);
+        if (buttonHandler_getShift() || mode == PAT_GEN_STD) {
+            memcpy(row0, buttonHandler_getShift() ? "MOD vdp len prb"
+                                                  : "STD vdp len prb", 15);
+            live_put3(&row1[4], g->v[PAT_GEN_F_VDP]);
+            live_put3(&row1[8], tgen_tmLen(g));
+            live_put3(&row1[12], g->v[PAT_GEN_F_TM_PRB]);
+        } else if (mode == PAT_GEN_EUC) {
+            memcpy(row0, "EUC stp hit rot", 15);
+            live_put3(&row1[4], tgen_eucSteps(g));
+            live_put3(&row1[8], g->v[PAT_GEN_F_EUC_HITS]);
+            live_put3(&row1[12], g->v[PAT_GEN_F_EUC_ROT]);
+        } else {
+            memcpy(row0, "TM  len prb gat", 15);
+            live_put3(&row1[4], tgen_tmLen(g));
+            live_put3(&row1[8], g->v[PAT_GEN_F_TM_PRB]);
+            live_put3(&row1[12], g->v[PAT_GEN_F_TM_GAT]);
+        }
         return 1u;
+    }
+    /* PERF page: pot 2 = the active track's generator (hit or prb). */
+    if (live_page == 0u && buttonHandler_getMode() == SELECT_MODE_PERF &&
+        menu_activePage == PERFORMANCE_PAGE && menu_getSubPage() == 0u) {
+        const pat_scene_region_t *r = pat_sceneRegion(scene_getActiveIndex());
+        const uint8_t t = menu_getActiveVoice();
+
+        if (r && t < NUM_TRACKS) {
+            const pat_track_gen_t *g = &r->track_gen[t];
+            const uint8_t euc = (uint8_t)(g->v[PAT_GEN_F_MODE] == PAT_GEN_EUC);
+
+            memcpy(&row0[4], euc ? "hit" : "prb", 3);
+            live_put3(&row1[4], euc ? g->v[PAT_GEN_F_EUC_HITS]
+                                    : g->v[PAT_GEN_F_TM_PRB]);
+        }
     }
     if (live_page == 4u) {
         if (buttonHandler_getMode() != SELECT_MODE_PERF)

@@ -1376,12 +1376,11 @@ void led_updateCurrentStep(uint8_t step)
     if ((shownPattern == playedPattern) &&
         (step >= (uint8_t)(menu_currentBar * NUM_STEPS_PER_BAR)) &&
         (step < (uint8_t)((menu_currentBar + 1u) * NUM_STEPS_PER_BAR))) {
-        /* Show chase on voice, sequencer, and Euklid pages. PERF owns the SEQ
+        /* Show chase on voice and sequencer pages. PERF owns the SEQ
          * row as a Scene selector/status surface, and EFFECT owns it for the
          * future FX-step view, so current-step feedback is suppressed there. */
         if ((menu_activePage < MENU_MIDI_PAGE) ||
-            (menu_activePage == SEQ_PAGE) ||
-            (menu_activePage == EUKLID_PAGE)) {
+            (menu_activePage == SEQ_PAGE)) {
             led_setActive_step(step);
         } else {
             led_clearActive_step();

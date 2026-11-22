@@ -88,6 +88,30 @@
  * legacy trigger-only bridge. Inputs/outputs: PatternData owns the object
  * and the filesystem streams its fields in the documented v4 order.
  */
+/*
+ * One track's generator settings (8 bytes, PAT4 track header bytes 6..13).
+ * A zero-filled record is the standard sequencer; engine defaults apply to
+ * zero fields (steps 16, Turing length 8). Affiliates: TrackGen.c.
+ */
+#define PAT_GEN_STD   0u
+#define PAT_GEN_EUC   1u
+#define PAT_GEN_TM    2u
+#define PAT_GEN_MODES 3u
+typedef enum {
+    PAT_GEN_F_MODE = 0,     /* 0 std, 1 euc, 2 tm */
+    PAT_GEN_F_EUC_STEPS,    /* 1..64 (0 = 16) */
+    PAT_GEN_F_EUC_HITS,     /* 0..steps */
+    PAT_GEN_F_EUC_ROT,      /* 0..steps-1 */
+    PAT_GEN_F_TM_LEN,       /* 2,3,4,5,6,8,12,16 (0 = 8) */
+    PAT_GEN_F_TM_PRB,       /* 0 locked, 64 random, 127 inverted loop */
+    PAT_GEN_F_TM_GAT,       /* 0 = bit 0, else density threshold 1..127 */
+    PAT_GEN_F_VDP,          /* Turing -> velocity depth 0..127 */
+    PAT_TRACK_GEN_BYTES
+} pat_gen_field_t;
+typedef struct __attribute__((packed)) {
+    uint8_t v[PAT_TRACK_GEN_BYTES];
+} pat_track_gen_t;
+
 typedef struct __attribute__((packed)) {
     uint16_t address[NUM_TRACKS][NUM_STEPS];
     uint8_t pool[PAT_STACK_SIZE * 32u];
@@ -142,11 +166,24 @@ typedef struct __attribute__((packed)) {
     uint8_t track_auto_smooth;
     uint8_t pattern_change_bar;
     uint8_t pattern_next;
+    /*
+     * Per-track generators (GEN page: LOAD + LAST STEP).
+     *
+     * What: the track's gate source (standard Pattern, Euclidean or Turing
+     * Machine) and the parameters of both engines, plus the depth of the
+     * Turing velocity modulation (active in every mode). Non-destructive:
+     * the Pattern steps are never rewritten. Storage: bytes 6..13 of each
+     * track's 16-byte PAT4 track header (reserved zeros before), so every
+     * older file reads as "standard" and the file version is unchanged.
+     * RAM: 8 B per track, 56 B per region. Affiliates: TrackGen.c (engine,
+     * TIM3), pat_setTrackGen(), filesystem.c PAT4 writer/readers.
+     */
+    pat_track_gen_t track_gen[NUM_TRACKS];
 } pat_scene_region_t;
 
 _Static_assert(sizeof(pat_scene_region_t) ==
                (PAT_STEPS_PER_SCENE * 2u) + (PAT_STACK_SIZE * 32u) +
-               512u + 32u,
+               512u + 32u + (NUM_TRACKS * PAT_TRACK_GEN_BYTES),
                "pat_scene_region_t size must match the Pattern budget (S081 P2: +1 B auto smooth)");
 
 /*
@@ -507,6 +544,12 @@ void pat_setTrackShuffle(uint8_t scene_index, uint8_t track, uint8_t value);
  * Output: region updated, Pattern AutoSave marked dirty. Affiliates: menu.c
  * PAR_TRACK_PLAY_MODE edit handler, pat_applyTrackSettingsToMenu().
  */
+/* Generator field of one track (pat_gen_field_t), clamped; marks dirty. */
+void pat_setTrackGen(uint8_t scene_index, uint8_t track, uint8_t field,
+                     uint8_t value);
+uint8_t pat_trackGen(uint8_t scene_index, uint8_t track, uint8_t field);
+void pat_copyTrackGen(uint8_t dst_scene, uint8_t dst_track,
+                      uint8_t src_scene, uint8_t src_track);
 void pat_setTrackPlayMode(uint8_t scene_index, uint8_t track, uint8_t value);
 
 /*
