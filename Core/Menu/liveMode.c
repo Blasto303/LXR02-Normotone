@@ -587,6 +587,18 @@ static const pat_track_gen_t *live_genRec(void)
     return (r && live_genTrk < NUM_TRACKS) ? &r->track_gen[live_genTrk] : NULL;
 }
 
+/* NUM mode global prime of the active Scene's Pattern (0..31). */
+static uint8_t live_genPrime(void)
+{
+    return pat_genPrime(scene_getActiveIndex());
+}
+
+static void live_genSetPrime(int16_t v)
+{
+    pat_setGenPrime(scene_getActiveIndex(),
+                    (uint8_t)((v < 0) ? 0 : ((v > 31) ? 31 : v)));
+}
+
 static uint8_t live_genGet(uint8_t field)
 {
     return pat_trackGen(scene_getActiveIndex(), live_genTrk, field);
@@ -621,7 +633,10 @@ static void live_genLeds(uint8_t force)
 
     if (live_page != 5u || !g)
         return;
-    if (g->v[PAT_GEN_F_MODE] == PAT_GEN_EUC)
+    if (g->v[PAT_GEN_F_MODE] == PAT_GEN_NUM)
+        sig = 0x40000000u | ((uint32_t)tgen_eucPos(live_genTrk) << 24) |
+              tgen_numPattern(g, live_genPrime());
+    else if (g->v[PAT_GEN_F_MODE] == PAT_GEN_EUC)
         sig = 0x80000000u | ((uint32_t)tgen_eucPos(live_genTrk) << 24) |
               ((uint32_t)g->v[PAT_GEN_F_EUC_STEPS] << 16) |
               ((uint32_t)g->v[PAT_GEN_F_EUC_HITS] << 8) |
@@ -632,7 +647,19 @@ static void live_genLeds(uint8_t force)
     if (!force && sig == live_genShown)
         return;
     live_genShown = sig;
-    if (g->v[PAT_GEN_F_MODE] == PAT_GEN_EUC) {
+    if (g->v[PAT_GEN_F_MODE] == PAT_GEN_NUM) {
+        /* The track's 16-step product; the playhead blinks. */
+        const uint16_t w = tgen_numPattern(g, live_genPrime());
+        const uint8_t pos = tgen_eucPos(live_genTrk);
+        const uint8_t now = (uint8_t)((pos + 15u) & 15u);
+
+        for (s = 0u; s < 16u; s++) {
+            led_setBlinkLed((uint8_t)(LED_SEQ1 + s),
+                            (uint8_t)(s == now && seq_isRunning()));
+            led_setValue((uint8_t)((w >> (15u - s)) & 1u),
+                         (uint8_t)(LED_SEQ1 + s));
+        }
+    } else if (g->v[PAT_GEN_F_MODE] == PAT_GEN_EUC) {
         /* Hit k plays at step k+1 of its own cycle; the playhead blinks. */
         const uint8_t n = tgen_eucSteps(g);
         const uint8_t pos = tgen_eucPos(live_genTrk);
@@ -692,7 +719,7 @@ void live_genStep(uint8_t step)
         return;
     if (g->v[PAT_GEN_F_MODE] == PAT_GEN_EUC)
         live_genSet(PAT_GEN_F_EUC_ROT, (int16_t)(step % tgen_eucSteps(g)));
-    else
+    else if (g->v[PAT_GEN_F_MODE] != PAT_GEN_NUM)
         tgen_flipBit(live_genTrk, step);
     live_genLeds(1u);
     menu_repaintAll();
@@ -710,9 +737,29 @@ void live_genKnob(uint8_t knob, int8_t delta)
     if (knob == 0u) {
         int16_t m = (int16_t)mode + ((delta > 0) ? 1 : -1);
 
-        live_genSet(PAT_GEN_F_MODE,
-                    (m < 0) ? 0 : ((m >= (int16_t)PAT_GEN_MODES)
-                                   ? (int16_t)(PAT_GEN_MODES - 1u) : m));
+        m = (m < 0) ? 0 : ((m >= (int16_t)PAT_GEN_MODES)
+                           ? (int16_t)(PAT_GEN_MODES - 1u) : m);
+        if (buttonHandler_getShift()) {
+            /* SHIFT + pot 1: the same mode on all 7 tracks at once. */
+            const uint8_t keep = live_genTrk;
+
+            for (live_genTrk = 0u; live_genTrk < NUM_TRACKS; live_genTrk++)
+                live_genSet(PAT_GEN_F_MODE, m);
+            live_genTrk = keep;
+        } else {
+            live_genSet(PAT_GEN_F_MODE, m);
+        }
+    } else if (mode == PAT_GEN_NUM && !buttonHandler_getShift()) {
+        if (knob == 1u)
+            live_genSetPrime((int16_t)live_genPrime() + delta);
+        else if (knob == 2u)
+            live_genSet(PAT_GEN_F_NUM_FCT,
+                        (int16_t)live_genGet(PAT_GEN_F_NUM_FCT) +
+                        ((delta > 0) ? 1 : -1));
+        else if (knob == 3u)
+            live_genSet(PAT_GEN_F_NUM_MSK,
+                        (int16_t)live_genGet(PAT_GEN_F_NUM_MSK) +
+                        ((delta > 0) ? 1 : -1));
     } else if (buttonHandler_getShift() || mode == PAT_GEN_STD) {
         if (knob == 1u)
             live_genSet(PAT_GEN_F_VDP, (int16_t)live_genGet(PAT_GEN_F_VDP) + delta);
@@ -763,12 +810,35 @@ void live_genMacro(int8_t delta)
         if (live_genGet(PAT_GEN_F_MODE) == PAT_GEN_EUC)
             live_genSet(PAT_GEN_F_EUC_HITS,
                         (int16_t)live_genGet(PAT_GEN_F_EUC_HITS) + delta);
+        else if (live_genGet(PAT_GEN_F_MODE) == PAT_GEN_NUM)
+            live_genSet(PAT_GEN_F_NUM_FCT,
+                        (int16_t)live_genGet(PAT_GEN_F_NUM_FCT) +
+                        ((delta > 0) ? 1 : -1));
         else
             live_genSet(PAT_GEN_F_TM_PRB,
                         (int16_t)live_genGet(PAT_GEN_F_TM_PRB) + delta);
         menu_repaintAll();
     }
     live_genTrk = keep;
+}
+
+/* PERF pot 3: the NUM mode global prime (all NUM tracks follow). */
+void live_genPrimeMacro(int8_t delta)
+{
+    if (delta == 0)
+        return;
+    live_genSetPrime((int16_t)live_genPrime() + ((delta > 0) ? 1 : -1));
+    menu_repaintAll();
+}
+
+/* Prime shown as bank and pattern: X01..X16, Y01..Y16. */
+static void live_putPrime(char *dst, uint8_t p)
+{
+    const uint8_t n = (uint8_t)((p & 15u) + 1u);
+
+    dst[0] = (p >= 16u) ? 'Y' : 'X';
+    dst[1] = (char)('0' + n / 10u);
+    dst[2] = (char)('0' + n % 10u);
 }
 
 static void live_put3(char *dst, uint8_t v)
@@ -1238,6 +1308,14 @@ uint8_t live_formatOverlay(char *row0, char *row1)
             live_put3(&row1[4], g->v[PAT_GEN_F_VDP]);
             live_put3(&row1[8], tgen_tmLen(g));
             live_put3(&row1[12], g->v[PAT_GEN_F_TM_PRB]);
+        } else if (mode == PAT_GEN_NUM) {
+            static const char msk[3][4] = { "  -", "0F0", "F03" };
+
+            memcpy(row0, "NUM prm fct msk", 15);
+            live_putPrime(&row1[4], live_genPrime());
+            live_put3(&row1[8], tgen_numFactor(g->v[PAT_GEN_F_NUM_FCT]));
+            memcpy(&row1[12], msk[(g->v[PAT_GEN_F_NUM_MSK] > 2u)
+                                  ? 0u : g->v[PAT_GEN_F_NUM_MSK]], 3);
         } else if (mode == PAT_GEN_EUC) {
             memcpy(row0, "EUC stp hit rot", 15);
             live_put3(&row1[4], tgen_eucSteps(g));
@@ -1259,11 +1337,21 @@ uint8_t live_formatOverlay(char *row0, char *row1)
 
         if (r && t < NUM_TRACKS) {
             const pat_track_gen_t *g = &r->track_gen[t];
-            const uint8_t euc = (uint8_t)(g->v[PAT_GEN_F_MODE] == PAT_GEN_EUC);
+            const uint8_t mode = g->v[PAT_GEN_F_MODE];
 
-            memcpy(&row0[4], euc ? "hit" : "prb", 3);
-            live_put3(&row1[4], euc ? g->v[PAT_GEN_F_EUC_HITS]
-                                    : g->v[PAT_GEN_F_TM_PRB]);
+            if (mode == PAT_GEN_EUC) {
+                memcpy(&row0[4], "hit", 3);
+                live_put3(&row1[4], g->v[PAT_GEN_F_EUC_HITS]);
+            } else if (mode == PAT_GEN_NUM) {
+                memcpy(&row0[4], "fct", 3);
+                live_put3(&row1[4], tgen_numFactor(g->v[PAT_GEN_F_NUM_FCT]));
+            } else {
+                memcpy(&row0[4], "prb", 3);
+                live_put3(&row1[4], g->v[PAT_GEN_F_TM_PRB]);
+            }
+            /* Pot 3: the NUM prime shared by the Pattern's NUM tracks. */
+            memcpy(&row0[8], "prm", 3);
+            live_putPrime(&row1[8], r->gen_prime);
         }
     }
     if (live_page == 4u) {

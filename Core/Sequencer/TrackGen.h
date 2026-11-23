@@ -28,7 +28,7 @@ void tgen_resetTrack(uint8_t track);
  * Returns the gate: pat_on in standard mode, else the generator's.
  */
 uint8_t tgen_step(uint8_t track, const pat_track_gen_t *g, uint8_t pat_on,
-                  uint16_t rnd);
+                  uint16_t rnd, uint8_t prime);
 /* Velocity after Turing modulation: vel + (volt - 128) * vdp / 127. */
 uint8_t tgen_velocity(uint8_t track, const pat_track_gen_t *g, uint8_t vel);
 
@@ -37,6 +37,16 @@ uint8_t tgen_eucHit(const pat_track_gen_t *g, uint8_t pos);
 uint8_t tgen_eucSteps(const pat_track_gen_t *g);
 uint8_t tgen_tmLen(const pat_track_gen_t *g);
 uint8_t tgen_eucPos(uint8_t track);
+
+/*
+ * NUM mode (after Noise Engineering's Numeric Repetitor, from its public
+ * manual): 32 prime rhythms of 16 steps; a track plays the prime, ANDed
+ * with its mask (0x0F0F or 0xF003), multiplied by its factor as binary
+ * numbers on a circle (bit 15 = step 1, overflow folded back in: a
+ * multiplication modulo 2^16 - 1). Returns the 16-step word.
+ */
+uint16_t tgen_numPattern(const pat_track_gen_t *g, uint8_t prime);
+uint8_t tgen_numFactor(uint8_t index);          /* 1 2 4 8 16 3 6 ... */
 
 /* Turing register of a track; Write: flip bit n (0 = newest). */
 uint16_t tgen_register(uint8_t track);

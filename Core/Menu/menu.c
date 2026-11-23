@@ -16643,11 +16643,15 @@ void menu_parseKnobDelta(uint8_t knobNr, int8_t delta)
         return;
     }
     /* PERF pot 2: the active track's generator (hit or prb). */
-    if (knobNr == 1u && menu_activePage == PERFORMANCE_PAGE &&
+    if ((knobNr == 1u || knobNr == 2u) &&
+        menu_activePage == PERFORMANCE_PAGE &&
         menu_getSubPage() == 0u && live_cpuPageActive() == 0u &&
         live_rndPageActive() == 0u && live_patternPageActive() == 0u &&
         live_kitPageActive() == 0u) {
-        live_genMacro(delta);
+        if (knobNr == 1u)
+            live_genMacro(delta);
+        else
+            live_genPrimeMacro(delta);      /* pot 3: NUM prime */
         return;
     }
 #endif

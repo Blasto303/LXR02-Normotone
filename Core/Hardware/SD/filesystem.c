@@ -3351,6 +3351,7 @@ static void filesystem_patternBuildHeader(uint8_t *header,
     header[9] = (uint8_t)(PATTERN_FILE_HEADER_BYTES >> 8u);
     header[32] = region->pattern_change_bar;
     header[33] = region->pattern_next;
+    header[34] = region->gen_prime;          /* NUM mode prime (0 before) */
     for (track = 0u; track < NUM_TRACKS; track++) {
         uint16_t base = (uint16_t)(48u +
                                    track * PATTERN_FILE_TRACK_HEADER_BYTES);
@@ -13783,6 +13784,8 @@ static void filesystem_loadSceneDirectory_tick(void)
             uint8_t track;
             region->pattern_change_bar = staging_buf[32];
             region->pattern_next = staging_buf[33];
+            region->gen_prime = (staging_buf[34u] < PAT_GEN_NUM_PRIMES)
+                ? staging_buf[34u] : 0u;
             region->track_loop_exclude = 0u;
             region->track_auto_smooth = 0u;
             for (track = 0u; track < NUM_TRACKS; track++) {
@@ -16022,6 +16025,8 @@ static void filesystem_loadPattern_tick(void)
             if (!region) { op_close_status = FS_STATUS_ERROR; op_phase = 13u; return; }
             region->pattern_change_bar = staging_buf[32u];
             region->pattern_next = staging_buf[33u];
+            region->gen_prime = (staging_buf[34u] < PAT_GEN_NUM_PRIMES)
+                ? staging_buf[34u] : 0u;
             region->track_loop_exclude = 0u;
             region->track_auto_smooth = 0u;
             for (track = 0u; track < NUM_TRACKS; track++) {
@@ -30710,6 +30715,8 @@ static uint8_t filesystem_bootReaderReadPatternFile(const char *file_name,
     }
     region->pattern_change_bar = staging_buf[32u];
     region->pattern_next = staging_buf[33u];
+    region->gen_prime = (staging_buf[34u] < PAT_GEN_NUM_PRIMES)
+        ? staging_buf[34u] : 0u;
     region->track_loop_exclude = 0u;
     region->track_auto_smooth = 0u;
     for (track = 0u; track < NUM_TRACKS; track++) {

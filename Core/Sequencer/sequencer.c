@@ -3065,7 +3065,8 @@ static void seq_advanceTrackStep(uint8_t track)
 		const uint8_t pat_on = pat_isStepActive(track,
 		    (uint8_t)seq_stepIndex[track], seq_perTrackPattern[track]);
 		const uint8_t gen_on = gen_g
-		    ? tgen_step(track, gen_g, pat_on, (uint16_t)GetRngValue())
+		    ? tgen_step(track, gen_g, pat_on, (uint16_t)GetRngValue(),
+		                gen_region->gen_prime)
 		    : pat_on;
 		uint8_t track_muted = (uint8_t)((seq_mutedTracks >> track) & 1u);
 		uint8_t process_step = (uint8_t)(!track_muted);

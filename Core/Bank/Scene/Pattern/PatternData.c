@@ -43,7 +43,7 @@ _Static_assert(PAT_STACK_SIZE > 0u && PAT_STACK_SIZE <= 512u,
                "PAT_STACK_SIZE must fit the 14-bit pool bitmap");
 _Static_assert(sizeof(pat_scene_region_t) ==
                (PAT_STEPS_PER_SCENE * 2u) + (PAT_STACK_SIZE * 32u) +
-               512u + 32u + (NUM_TRACKS * PAT_TRACK_GEN_BYTES),
+               512u + 32u + (NUM_TRACKS * PAT_TRACK_GEN_BYTES) + 1u,
                "pat_scene_region_t size must match the Pattern budget (S081 P2: +1 B auto smooth)");
 
 /*
@@ -1034,6 +1034,7 @@ static void pat_initRegion(pat_scene_region_t *region)
     region->track_auto_smooth = 0u;
     /* Every track starts on the standard sequencer (generators off). */
     memset(region->track_gen, 0, sizeof(region->track_gen));
+    region->gen_prime = 0u;
 }
 
 void pat_initScene(uint8_t scene_index)
@@ -1405,16 +1406,37 @@ void pat_setTrackGen(uint8_t scene_index, uint8_t track, uint8_t field,
     case PAT_GEN_F_MODE:
         if (value >= PAT_GEN_MODES)
             value = PAT_GEN_STD;
-        if (value == PAT_GEN_EUC && g->v[PAT_GEN_F_EUC_STEPS] == 0u &&
-            g->v[PAT_GEN_F_EUC_HITS] == 0u) {
+        if (value == PAT_GEN_NUM && g->v[PAT_GEN_F_MODE] != PAT_GEN_NUM) {
+            /*
+             * Entering NUM: the module's four outputs spread over the
+             * tracks (prime, product 1, product 2 = 0x0F0F, product 3 =
+             * 0xF003, then again), factor x1 everywhere.
+             */
+            static const uint8_t msk[4] = { 0u, 0u, 1u, 2u };
+
+            g->v[PAT_GEN_F_NUM_FCT] = 0u;
+            g->v[PAT_GEN_F_NUM_MSK] = msk[track & 3u];
+            g->v[PAT_GEN_F_EUC_ROT] = 0u;
+        } else if (value == PAT_GEN_EUC &&
+                   (g->v[PAT_GEN_F_MODE] == PAT_GEN_NUM ||
+                    (g->v[PAT_GEN_F_EUC_STEPS] == 0u &&
+                     g->v[PAT_GEN_F_EUC_HITS] == 0u))) {
             g->v[PAT_GEN_F_EUC_STEPS] = 16u;
             g->v[PAT_GEN_F_EUC_HITS] = 4u;
+            g->v[PAT_GEN_F_EUC_ROT] = 0u;
         }
         break;
-    case PAT_GEN_F_EUC_STEPS:
-        value = (value < 1u) ? 1u : ((value > 64u) ? 64u : value);
+    case PAT_GEN_F_EUC_STEPS:                     /* NUM: factor index */
+        if (g->v[PAT_GEN_F_MODE] == PAT_GEN_NUM)
+            value = (value > 15u) ? 15u : value;
+        else
+            value = (value < 1u) ? 1u : ((value > 64u) ? 64u : value);
         break;
-    case PAT_GEN_F_EUC_HITS:
+    case PAT_GEN_F_EUC_HITS:                      /* NUM: mask 0..2 */
+        if (g->v[PAT_GEN_F_MODE] == PAT_GEN_NUM) {
+            value = (value > 2u) ? 2u : value;
+            break;
+        }
         steps = pat_genEucSteps(g);
         if (value > steps)
             value = steps;
@@ -1434,13 +1456,31 @@ void pat_setTrackGen(uint8_t scene_index, uint8_t track, uint8_t field,
         break;
     }
     g->v[field] = value;
-    if (field == PAT_GEN_F_EUC_STEPS) {
+    if (field == PAT_GEN_F_EUC_STEPS && g->v[PAT_GEN_F_MODE] != PAT_GEN_NUM) {
         if (g->v[PAT_GEN_F_EUC_HITS] > value)
             g->v[PAT_GEN_F_EUC_HITS] = value;
         if (g->v[PAT_GEN_F_EUC_ROT] >= value)
             g->v[PAT_GEN_F_EUC_ROT] = (uint8_t)(value - 1u);
     }
     pat_markSceneDirty(scene_index);
+}
+
+void pat_setGenPrime(uint8_t scene_index, uint8_t prime)
+{
+    pat_scene_region_t *region = pat_sceneRegionMut(scene_index);
+
+    if (!region)
+        return;
+    region->gen_prime = (prime >= PAT_GEN_NUM_PRIMES)
+        ? (uint8_t)(PAT_GEN_NUM_PRIMES - 1u) : prime;
+    pat_markSceneDirty(scene_index);
+}
+
+uint8_t pat_genPrime(uint8_t scene_index)
+{
+    const pat_scene_region_t *region = pat_sceneRegion(scene_index);
+
+    return region ? region->gen_prime : 0u;
 }
 
 void pat_copyTrackGen(uint8_t dst_scene, uint8_t dst_track,
@@ -2445,6 +2485,7 @@ void pat_rawRegionCopyBody(uint8_t src_scene, uint8_t dst_scene)
     /* S081 P2: the automation ramp mode travels with a Scene copy. */
     dst->track_auto_smooth = src->track_auto_smooth;
     memcpy(dst->track_gen, src->track_gen, sizeof(dst->track_gen));
+    dst->gen_prime = src->gen_prime;
     dst->pattern_change_bar = src->pattern_change_bar;
     dst->pattern_next = src->pattern_next;
 }

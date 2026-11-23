@@ -86,6 +86,8 @@ void live_genStep(uint8_t step);
 void live_genKnob(uint8_t knob, int8_t delta);
 /* PERF pot 2: hits (Euclid) or prb (Turing/standard) of the active track. */
 void live_genMacro(int8_t delta);
+/* PERF pot 3: NUM mode global prime (0..31) of the active Pattern. */
+void live_genPrimeMacro(int8_t delta);
 uint8_t live_cpuPageActive(void);
 uint8_t live_rndPageActive(void);
 void live_rndStep(uint8_t step);

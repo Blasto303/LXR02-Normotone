@@ -264,6 +264,8 @@ int main(int argc, char **argv)
             c = strchr(c + 1, ',');
         }
     }
+    if (getenv("FG_PRIME"))      /* NUM mode global prime 0..31 */
+        pat_setGenPrime(scene_getActiveIndex(), (uint8_t)atoi(getenv("FG_PRIME")));
     /* PERF page, transport running. */
     ev_press(BUT_MODE2); ev_release(BUT_MODE2);
     seq_setRunning(1);

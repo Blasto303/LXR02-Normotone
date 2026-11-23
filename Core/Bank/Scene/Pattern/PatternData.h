@@ -96,7 +96,16 @@
 #define PAT_GEN_STD   0u
 #define PAT_GEN_EUC   1u
 #define PAT_GEN_TM    2u
-#define PAT_GEN_MODES 3u
+#define PAT_GEN_NUM   3u      /* numeric: global prime x track factor */
+#define PAT_GEN_MODES 4u
+/*
+ * NUM mode reuses the three Euclid bytes (never active together):
+ * EUC_STEPS = factor index 0..15 (x1 2 4 8 16 3 6 9 12 5 10 15 7 14 11 13),
+ * EUC_HITS = mask 0 none / 1 0x0F0F / 2 0xF003, EUC_ROT unused (0).
+ */
+#define PAT_GEN_F_NUM_FCT  PAT_GEN_F_EUC_STEPS
+#define PAT_GEN_F_NUM_MSK  PAT_GEN_F_EUC_HITS
+#define PAT_GEN_NUM_PRIMES 32u
 typedef enum {
     PAT_GEN_F_MODE = 0,     /* 0 std, 1 euc, 2 tm */
     PAT_GEN_F_EUC_STEPS,    /* 1..64 (0 = 16) */
@@ -179,11 +188,18 @@ typedef struct __attribute__((packed)) {
      * TIM3), pat_setTrackGen(), filesystem.c PAT4 writer/readers.
      */
     pat_track_gen_t track_gen[NUM_TRACKS];
+    /*
+     * NUM mode global prime 0..31 (two banks of 16), shared by every track
+     * of this Pattern in NUM mode. Storage: PAT4 fixed header byte 34
+     * (zero before, i.e. prime 0 "four on the floor"). Affiliates:
+     * pat_setGenPrime(), TrackGen.c, PERF pot 3 / GEN page.
+     */
+    uint8_t gen_prime;
 } pat_scene_region_t;
 
 _Static_assert(sizeof(pat_scene_region_t) ==
                (PAT_STEPS_PER_SCENE * 2u) + (PAT_STACK_SIZE * 32u) +
-               512u + 32u + (NUM_TRACKS * PAT_TRACK_GEN_BYTES),
+               512u + 32u + (NUM_TRACKS * PAT_TRACK_GEN_BYTES) + 1u,
                "pat_scene_region_t size must match the Pattern budget (S081 P2: +1 B auto smooth)");
 
 /*
@@ -548,6 +564,9 @@ void pat_setTrackShuffle(uint8_t scene_index, uint8_t track, uint8_t value);
 void pat_setTrackGen(uint8_t scene_index, uint8_t track, uint8_t field,
                      uint8_t value);
 uint8_t pat_trackGen(uint8_t scene_index, uint8_t track, uint8_t field);
+/* NUM mode global prime of a Pattern (0..31), marks dirty. */
+void pat_setGenPrime(uint8_t scene_index, uint8_t prime);
+uint8_t pat_genPrime(uint8_t scene_index);
 void pat_copyTrackGen(uint8_t dst_scene, uint8_t dst_track,
                       uint8_t src_scene, uint8_t src_track);
 void pat_setTrackPlayMode(uint8_t scene_index, uint8_t track, uint8_t value);
