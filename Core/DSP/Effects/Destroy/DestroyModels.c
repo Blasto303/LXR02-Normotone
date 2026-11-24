@@ -17,8 +17,10 @@
  *               distortion module, written from its public manual)
  *   3 mutiny    gain / feedback / fb_tune: overdrive into a near-linear
  *               tuned comb that rings at the fb_tune pitch (shrill)
- *   4 fld       fold / 8vize / drive: the chain fold -> full-wave rectify
- *               -> saturate, the sine wavefolder run at 2x
+ *   4 fld       fold / 8vize / drive, plus chn and dom on the FM screen:
+ *               fold, DOOM, rectify, saturate in the order UND (fold doom
+ *               rectify saturate), X (fold saturate rectify doom) or OVR
+ *               (UND then a second fold); the folders run at 2x
  *   5 assault   gain / feedback / fb_tune: three bands distorted apart,
  *               tube-like asymmetric lows, hard-clipped mids ringing in a
  *               comb tuned by fb_tune, wavefolded highs
@@ -372,6 +374,12 @@ static float dsm_apChain(DsModelState *m, int16_t *pool, uint32_t c, float x,
     return x;
 }
 
+void dsm_chain(DsModelState *m, uint8_t chain, uint8_t doom)
+{
+    m->k_chain = (chain > 2u) ? 0u : chain;
+    m->k_doom = (float)doom * (1.0f / 127.0f);
+}
+
 /*
  * Two-tap pitch shifter on the micro-delay line (as bloodshed): the taps
  * move by step = ratio - 1 per sample (inc = step / win, precomputed)
@@ -474,7 +482,13 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
                                 (0.5f * (1.0f + det) - 1.0f) / w1, w1) +
                       dsm_shiftI(md, mw, &m->ph2[c],
                                  (0.5f * (1.0f - det) - 1.0f) / w2, w2));
-        y = 0.8f * s + lvl * sub + bz * 0.6f * dsm_clamp(12.0f * sub, 0.8f);
+        {
+            float g = (env - 0.01f) * 20.0f;      /* gate (noise between hits) */
+
+            g = (g < 0.0f) ? 0.0f : ((g > 1.0f) ? 1.0f : g);
+            y = 0.8f * s + g * (lvl * sub +
+                                bz * 0.6f * dsm_clamp(12.0f * sub, 0.8f));
+        }
         y = dsm_dc(m, c, dsm_soft(1.2f * y));
         break;
     }
@@ -491,18 +505,78 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
         break;
     }
     case 4u: {                                    /* fld */
-        /* fold -> 8vize -> saturate, at 2x (midpoint, then the sample). */
+        /*
+         * Folders at 2x (midpoint, then the sample, averaged). With UND and
+         * no DOOM: fold -> 8vize -> saturate entirely at 2x (the original
+         * fld). Otherwise the folded signal runs the chain at the base
+         * rate, the DOOM stage being the dom model's suboctave chorus.
+         */
         const float mid = 0.5f * (x + m->last[c]);
         float o = 0.0f;
         uint8_t k;
 
         m->last[c] = x;
-        for (k = 0u; k < 2u; k++) {
-            float f = dsm_psin(0.35f * m->k_g * (k ? x : mid));
-            f += m->k_x * (2.0f * fabsf(f) - 0.64f - f);     /* octave up */
-            o += dsm_soft(m->k_q * f);
+        if (m->k_chain == 0u && m->k_doom == 0.0f) {
+            for (k = 0u; k < 2u; k++) {
+                float f = dsm_psin(0.35f * m->k_g * (k ? x : mid));
+
+                f += m->k_x * (2.0f * fabsf(f) - 0.64f - f); /* octave up */
+                o += dsm_soft(m->k_q * f);
+            }
+            y = dsm_dc(m, c, 0.6f * o);
+            break;
         }
-        y = dsm_dc(m, c, 0.6f * o);
+        for (k = 0u; k < 2u; k++)
+            o += dsm_psin(0.35f * m->k_g * (k ? x : mid));
+        y = 0.5f * o;                                    /* folded */
+        if (m->k_chain == 1u) {                          /* X */
+            y = 1.2f * dsm_soft(m->k_q * y);
+            y += m->k_x * (2.0f * fabsf(y) - 0.64f - y);
+        }
+        if (m->k_doom > 0.0f) {
+            /* DOOM: suboctave chorus, louder and more out of tune. */
+            const float dm = m->k_doom;
+            const float det = (0.002f + 0.035f * dm) *
+                              (1.0f + 0.5f * dsm_psin(m->acc[c]));
+            const float lvl = ((dm < 0.75f) ? dm * 1.3333f : 1.0f) * 1.6f;
+            const float bz = (dm > 0.75f) ? (dm - 0.75f) * 4.0f : 0.0f;
+            const float w1 = c ? 900.0f : 860.0f;
+            const float w2 = w1 * 0.93f;
+            float sub;
+
+            m->acc[c] += c ? 0.0000771f : 0.0000680f;
+            m->acc[c] -= (m->acc[c] >= 1.0f) ? 1.0f : 0.0f;
+            dsm_write(md, mw, y);
+            sub = 0.5f * (dsm_shiftI(md, mw, &m->ph[c],
+                                     (0.5f * (1.0f + det) - 1.0f) / w1, w1) +
+                          dsm_shiftI(md, mw, &m->ph2[c],
+                                     (0.5f * (1.0f - det) - 1.0f) / w2, w2));
+            {
+                /* Gate: the buzz must not lift the noise between hits. */
+                float g = (env - 0.01f) * 20.0f;
+
+                g = (g < 0.0f) ? 0.0f : ((g > 1.0f) ? 1.0f : g);
+                y = 0.8f * y + g * (lvl * sub +
+                                    bz * 0.6f * dsm_clamp(12.0f * sub, 0.8f));
+            }
+        }
+        if (m->k_chain != 1u) {                          /* UND, OVR */
+            y += m->k_x * (2.0f * fabsf(y) - 0.64f - y);
+            y = 1.2f * dsm_soft(m->k_q * y);
+        }
+        if (m->k_chain == 2u) {                          /* OVR: fold again */
+            const float m2 = 0.5f * (y + m->hold_in[c]);
+
+            m->hold_in[c] = y;
+            y = 0.5f * (dsm_psin(0.35f * m->k_g * m2) +
+                        dsm_psin(0.35f * m->k_g * y));
+        }
+        {
+            /* Level matched across the orders (bench, mid settings). */
+            static const float lv[3] = { 0.84f, 1.08f, 0.78f };
+
+            y = dsm_dc(m, c, lv[m->k_chain] * y);
+        }
         break;
     }
     case 5u: {                                    /* assault */

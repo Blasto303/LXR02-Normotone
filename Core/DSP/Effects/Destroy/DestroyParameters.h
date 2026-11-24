@@ -11,7 +11,7 @@
 
 #include "EffectsManager.h"
 
-#define DESTROY_PARAM_COUNT 12u
+#define DESTROY_PARAM_COUNT 14u
 
 /* Append only; never renumber (FX lanes, automation ids, `.fx` keys). */
 typedef enum {
@@ -32,6 +32,14 @@ typedef enum {
      * follow the model).
      */
     DESTROY_PARAM_ALG,
+    /*
+     * fld (alg 4) only, on the FM screen beside crs: chn = chain order
+     * (0 UND fold-doom-rectify-saturate, 1 X fold-saturate-rectify-doom,
+     * 2 OVR UND plus a second fold), dom = its DOOM stage (0 = none).
+     * Appended rows: older projects read 0 (UND, no DOOM = the old fld).
+     */
+    DESTROY_PARAM_CHAIN,
+    DESTROY_PARAM_DOOM,
     DESTROY_PARAM_ENUM_COUNT
 } destroy_param_t;
 

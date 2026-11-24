@@ -11,7 +11,7 @@
 
 #include "EffectsManager.h"
 
-#define DESTROY_TYPE_ROWS         9u
+#define DESTROY_TYPE_ROWS         11u
 #define DESTROY_STATE_BYTES       512u
 #define DESTROY_RVB_SAMPLES       16384u
 /* + the model delay pool (DestroyModels.h, 8,192 int16) after the ring. */

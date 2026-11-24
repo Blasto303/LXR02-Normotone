@@ -47,6 +47,8 @@ typedef struct {
     uint16_t k_tlen, k_mask, k_xmask;   /* (unused since dom/fld/mbs/smo) */
     float k_w[3], k_n[3];               /* mbs band weights, notch coefs */
     uint8_t k_notch;                    /* mbs notch on */
+    uint8_t k_chain;                    /* fld chain order 0..2 */
+    float k_doom;                       /* fld DOOM stage 0..1 */
     float ap_s[2][4];                   /* smo phase allpass states */
     uint8_t alg;
 } DsModelState;
@@ -61,6 +63,9 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
  */
 float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
                  float env);
+
+/* fld's chain order (0 UND, 1 X, 2 OVR) and DOOM stage (0..127), per block. */
+void dsm_chain(DsModelState *m, uint8_t chain, uint8_t doom);
 
 /* A voice was triggered (track 0..6): smo's trigger source. Any thread. */
 void dsm_noteTrigger(uint8_t track, uint8_t velocity);

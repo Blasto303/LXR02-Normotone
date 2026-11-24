@@ -200,8 +200,12 @@ static void destroy_process(void *rt_void, effect_io_t *io)
     alg = DS_ROW(rt, DESTROY_PARAM_ALG);
     alg = (alg < DSM_ALG_COUNT) ? alg : 0u;
     if (alg)
+    {
         dsm_block(&st->models, alg, DS_ROW(rt, DESTROY_PARAM_DRIVE),
                   DS_ROW(rt, DESTROY_PARAM_FOLD), DS_ROW(rt, DESTROY_PARAM_SUB));
+        dsm_chain(&st->models, DS_ROW(rt, DESTROY_PARAM_CHAIN),
+                  DS_ROW(rt, DESTROY_PARAM_DOOM));
+    }
     L = io->l;
     R = io->r;
     frames = io->frames;

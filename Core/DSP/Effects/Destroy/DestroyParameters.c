@@ -40,6 +40,10 @@ const effect_param_descriptor_t destroy_descriptors[] = {
     EFFECT_ROW("dst_alg", "Destroy", "Model", "alg", DTYPE_0B127,
                INSTRUMENT_PARAM_FLAG_MORPHABLE | INSTRUMENT_PARAM_FLAG_AUTOMATABLE,
                EFFECT_MOD_NONE, 0u, DSM_ALG_COUNT - 1u),
+    EFFECT_ROW("dst_chain", "Destroy", "Chain", "chn", DTYPE_0B127,
+               EFFECT_FLAGS_IMAGE, EFFECT_MOD_NONE, 0u, 2u),
+    EFFECT_ROW("dst_doom", "Destroy", "Doom", "dom", DTYPE_0B127,
+               EFFECT_FLAGS_IMAGE, EFFECT_MOD_0_127, 0u, 127u),
 };
 
 _Static_assert(sizeof(destroy_descriptors) / sizeof(destroy_descriptors[0]) ==
@@ -59,8 +63,8 @@ const effect_select_layout_t destroy_layout = {
                   DESTROY_PARAM_FOLD, DESTROY_PARAM_SUB } },
         [2] = { { DESTROY_PARAM_TONE, DESTROY_PARAM_MIX,
                   DESTROY_PARAM_PLATE, DESTROY_PARAM_PLATE_DECAY } },
-        [3] = { { DESTROY_PARAM_CROSS, EFFECT_LANE_NONE,
-                  EFFECT_LANE_NONE, EFFECT_LANE_NONE } },
+        [3] = { { DESTROY_PARAM_CROSS, DESTROY_PARAM_CHAIN,
+                  DESTROY_PARAM_DOOM, EFFECT_LANE_NONE } },
     },
     .custom_row0 = { 0u, 0x01u, 0u, 0u, 0u, 0u, 0u, 0u },
     .home_sub_page = 1u,
@@ -96,6 +100,12 @@ static uint8_t destroy_uiFormatValue3(uint8_t index, uint8_t value, char *out)
 {
     if (index == DESTROY_PARAM_ALG) {
         memcpy(out, dsm_algName(value), 3);
+        return 1u;
+    }
+    if (index == DESTROY_PARAM_CHAIN) {
+        static const char chn[3][4] = { "UND", "X  ", "OVR" };
+
+        memcpy(out, chn[(value > 2u) ? 0u : value], 3);
         return 1u;
     }
     /* itv (alg 15) shows semitones, smo (alg 16) its trigger voice. */
