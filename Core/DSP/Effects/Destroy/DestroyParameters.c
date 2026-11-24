@@ -98,7 +98,7 @@ static uint8_t destroy_uiFormatValue3(uint8_t index, uint8_t value, char *out)
         memcpy(out, dsm_algName(value), 3);
         return 1u;
     }
-    /* itv (alg 15) shows semitones, tmp (alg 16) its tempo division. */
+    /* itv (alg 15) shows semitones, smo (alg 16) its trigger voice. */
     if (index == DESTROY_PARAM_DRIVE) {
         const uint8_t alg = menuEffects_shownParam(DESTROY_PARAM_ALG);
         const float a = (float)value * (1.0f / 127.0f);
@@ -113,9 +113,10 @@ static uint8_t destroy_uiFormatValue3(uint8_t index, uint8_t value, char *out)
             return 1u;
         }
         if (alg == 16u) {
-            static const char div[4][4] = { "/32", "/16", "/8 ", "/4 " };
+            static const char trg[8][4] = {
+                "fix", "DR1", "DR2", "DR3", "SNR", "CYM", "CHH", "OHH" };
 
-            memcpy(out, div[(uint8_t)(a * 3.99f)], 3);
+            memcpy(out, trg[(uint8_t)(a * 7.99f)], 3);
             return 1u;
         }
     }

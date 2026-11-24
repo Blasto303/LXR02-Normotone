@@ -44,7 +44,10 @@ typedef struct {
     uint16_t k_tap2, k_tap3;            /* assault fifth / octave taps */
     float k_step, k_step2, k_win, k_rate; /* shifters / riot */
     float k_inc[2], k_inc2[2], k_winc[2]; /* per-channel tap speed, window */
-    uint16_t k_tlen, k_mask, k_xmask;   /* tmp division, riot masks */
+    uint16_t k_tlen, k_mask, k_xmask;   /* (unused since dom/fld/mbs/smo) */
+    float k_w[3], k_n[3];               /* mbs band weights, notch coefs */
+    uint8_t k_notch;                    /* mbs notch on */
+    float ap_s[2][4];                   /* smo phase allpass states */
     uint8_t alg;
 } DsModelState;
 
@@ -58,6 +61,9 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
  */
 float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
                  float env);
+
+/* A voice was triggered (track 0..6): smo's trigger source. Any thread. */
+void dsm_noteTrigger(uint8_t track, uint8_t velocity);
 
 /* Three-letter knob names of alg (3 x 3 chars), for the Effect page. */
 const char *dsm_knobNames(uint8_t alg);

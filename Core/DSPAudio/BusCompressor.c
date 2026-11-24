@@ -17,6 +17,7 @@
 #include "config.h"
 #include "SceneData.h"
 #include "EffectsManager.h"
+#include "DestroyModels.h"
 #include <math.h>
 
 /*
@@ -187,6 +188,9 @@ void busComp_sidechainTrigger(uint8_t track, uint8_t velocity)
     const uint8_t voice = (track >= 5u) ? 6u : (uint8_t)(track + 1u);
     float v;
     float weight;
+
+    /* dst smo: every voice trigger, whatever the sidechain setting. */
+    dsm_noteTrigger(track, velocity);
 
     /*
      * Record only the largest matching trigger until the next block.

@@ -10,14 +10,15 @@
  *               double rectifier (two octaves up), fed back through a micro
  *               delay (2..1000 samples) that the dynamics stretch (flange);
  *               the loop starves the input at high feedback (it chokes)
- *   2 turmoil   gain / feedback / fb_tune: dark input, three overdrive
- *               stages with a resonant band-pass (a vowel) between them
+ *   2 dom       drive / doom / detune: saturation, then a suboctave chorus
+ *               (two octave-down shifters detuned by a slow LFO) that gets
+ *               louder and more out of tune with doom; overtone buzz in its
+ *               top quarter (after the "DOOM" block of a known stereo
+ *               distortion module, written from its public manual)
  *   3 mutiny    gain / feedback / fb_tune: overdrive into a near-linear
  *               tuned comb that rings at the fb_tune pitch (shrill)
- *   4 riot      feedback / fb_tune / demur: a decimator tuned 100 Hz..11 kHz
- *               (pitched aliasing, slower when loud), bit reduction 12..2
- *               bits (demur, plus a fixed bit-flip at the top), and the word
- *               XORed with its own past (feedback = how many top bits)
+ *   4 fld       fold / 8vize / drive: the chain fold -> full-wave rectify
+ *               -> saturate, the sine wavefolder run at 2x
  *   5 assault   gain / feedback / fb_tune: three bands distorted apart,
  *               tube-like asymmetric lows, hard-clipped mids ringing in a
  *               comb tuned by fb_tune, wavefolded highs
@@ -25,13 +26,17 @@
  *               overdriven output is fed back into it (rising spiral)
  *   7 bloodbath feedback / dirt / dirtrate: short metallic pseudo-reverb,
  *               driven hard, with a bit-crushed held feedback
- *   8 mudslide  feedback / dirt / dirtrate: dark, heavily crushed and
- *               decimated pseudo-reverb with a wavefolded feedback
+ *   8 mbs       drive / center / notch: three bands saturated apart, drive
+ *               moving the emphasis from the low band to the high band,
+ *               center placing the middle band (200 Hz..4 kHz); notch off,
+ *               fixed at 1 kHz, or tracking the center
  *  10..16      the bloodshed loop with other intervals: shm +7 (fifth),
  *               dwn -12 (octave down), fal -1, spl +1 and -1 together,
- *               qtr +0.5, itv any interval -12..+12 (pot 1), tmp +1 with
- *               the cascade restarted every tempo division (pot 1: 1/32,
- *               1/16, 1/8, 1/4; free-running at the sequencer tempo)
+ *               qtr +0.5, itv any interval -12..+12 (pot 1)
+ *  16 smo       trigger / smoosh / phase: up to ~126 dB of gain into a hard
+ *               clip, opened by a voice's triggers (pot 1: fixed, DR1..OHH)
+ *               and decaying 20 ms..1 s, or fixed; phase = allpass stereo
+ *               width / phasing
  *   9 saw       dist / low / high: no feedback. High-passed input, high
  *               gain into a hard diode-style clip, then two resonant
  *               band boosts after the clip (about 100 Hz and 1 kHz) with
@@ -45,7 +50,6 @@
  * The input dynamics (env) scale the feedback between 0.55x and 1x.
  */
 #include "DestroyModels.h"
-#include "sequencer.h"
 #include <math.h>
 
 #define DSM_FS        44108.07f
@@ -55,9 +59,18 @@
 static const uint16_t dsm_ap_len[DSM_AP_COUNT] = { 142u, 107u, 379u, 277u };
 
 /* Output trims so the models sit near the dry level (bench, mix 127). */
+/* Voices triggered since the last block (bit = track), for smo. */
+static volatile uint8_t dsm_trig_mask;
+
+void dsm_noteTrigger(uint8_t track, uint8_t velocity)
+{
+    if (track < 7u && velocity != 0u)
+        dsm_trig_mask = (uint8_t)(dsm_trig_mask | (1u << track));
+}
+
 static const float dsm_trim[DSM_ALG_COUNT] = {
-    1.0f, 3.2f, 1.1f, 3.2f, 1.0f, 1.8f, 0.9f, 1.5f, 1.2f, 1.0f,
-    0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f
+    1.0f, 3.2f, 2.0f, 3.2f, 1.0f, 1.8f, 0.9f, 1.5f, 1.8f, 1.0f,
+    0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 1.45f
 };
 
 /* Pool layout, per channel. */
@@ -71,19 +84,19 @@ _Static_assert(DSM_RV_BASE + 2u * DSM_RV_LEN <= DSM_POOL_SAMPLES,
                "Destroy model lines must fit the pool");
 
 static const char dsm_names[DSM_ALG_COUNT][4] = {
-    "cls", "hus", "tur", "mut", "rio", "ass", "bls", "blb", "mud", "saw",
-    "shm", "dwn", "fal", "spl", "qtr", "itv", "tmp"
+    "cls", "hus", "dom", "mut", "fld", "ass", "bls", "blb", "mbs", "saw",
+    "shm", "dwn", "fal", "spl", "qtr", "itv", "smo"
 };
 static const char dsm_knobs[DSM_ALG_COUNT][10] = {
     "drifldsub",   /* cls: drive fold sub     */
     "fbkfshdis",   /* hustle                  */
-    "gaifbkftn",   /* turmoil                 */
+    "drvdomdtn",   /* dom: drive doom detune    */
     "gaifbkftn",   /* mutiny                  */
-    "fbkftndmr",   /* riot                    */
+    "fld8vzdrv",   /* fld: fold 8vize drive     */
     "gaifbkftn",   /* assault                 */
     "gaipbkgrt",   /* bloodshed               */
     "fbkdrtdrr",   /* bloodbath               */
-    "fbkdrtdrr",   /* mudslide                */
+    "drvctrntc",   /* mbs: drive center notch */
     "dislowhig",   /* saw: dist, low, high    */
     "gaipbkgrt",   /* shm +7                  */
     "gaipbkgrt",   /* dwn -12                 */
@@ -91,7 +104,7 @@ static const char dsm_knobs[DSM_ALG_COUNT][10] = {
     "gaipbkgrt",   /* spl +1 / -1             */
     "gaipbkgrt",   /* qtr +0.5                */
     "itvpbkgrt",   /* itv: interval           */
-    "divpbkgrt",   /* tmp: tempo division     */
+    "trgsmophs",   /* smo: trigger smoosh phase */
 };
 
 const char *dsm_algName(uint8_t alg)
@@ -200,14 +213,12 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
         m->k_x = c;                               /* disorder */
         tune = -1.0f;
         break;
-    case 2u: {                                    /* turmoil */
-        const float hz = 80.0f * exp2f(c * 5.0f);         /* 80 Hz..2.5 kHz */
-
-        m->k_g = 1.0f + 15.0f * a * a;
-        m->k_fb = 0.97f * b;
-        m->k_f = 2.0f * sinf(3.14159265f * hz / DSM_FS);
+    case 2u:                                      /* dom (block) */
+        m->k_g = 1.0f + 20.0f * a * a;            /* drive */
+        m->k_x = b;                               /* doom */
+        m->k_q = 0.002f + 0.035f * c + 0.03f * b; /* detune grows with doom */
+        tune = -1.0f;
         break;
-    }
     case 3u:                                      /* mutiny */
         m->k_g = 1.0f + 30.0f * a * a;
         m->k_fb = 0.985f * b;
@@ -216,24 +227,12 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
         m->k_g = 1.0f + 24.0f * a * a;
         m->k_fb = 0.96f * b;
         break;
-    case 4u: {                                    /* riot (block) */
-        const float hz = 100.0f * exp2f(b * 6.8f);        /* 100 Hz..11 kHz */
-        const uint8_t nb = (uint8_t)(a * 9.0f + 0.5f);    /* XOR top bits */
-        const float bits = 12.0f - 10.0f * c;             /* 12..2 bits */
-
-        m->k_rate = hz / DSM_FS;
-        m->k_tap = DSM_FS / hz;
-        if (m->k_tap > (float)(DSM_MD_LEN - 2u))
-            m->k_tap = (float)(DSM_MD_LEN - 2u);
-        if (m->k_tap < 1.0f)
-            m->k_tap = 1.0f;
-        m->k_xmask = (uint16_t)(((1u << nb) - 1u) << (15u - nb));
-        m->k_q = exp2f(bits - 1.0f);
-        m->k_mask = (c > 0.6f)
-            ? (uint16_t)((uint32_t)((c - 0.6f) * 2.5f * 1023.0f) << 4) : 0u;
+    case 4u:                                      /* fld (block) */
+        m->k_g = 1.0f + 15.0f * a;                /* fold gain */
+        m->k_x = b;                               /* 8vize */
+        m->k_q = 1.0f + 12.0f * c * c;            /* saturate */
         tune = -1.0f;
         break;
-    }
     case 6u:                                      /* bloodshed */
         m->k_g = 1.0f + 15.0f * a;
         m->k_fb = 0.98f * b;                      /* pitchback */
@@ -241,7 +240,46 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
         m->k_q = (1.0f + m->k_x) / m->k_x;        /* 1 / soft(grit) */
         tune = -1.0f;
         break;
-    case 7u: case 8u: {                           /* bloodbath mudslide */
+    case 8u: {                                    /* mbs (block) */
+        const float fcen = 200.0f * exp2f(b * 4.32f);      /* 200 Hz..4 kHz */
+        const float e = 2.0f * a;                          /* emphasis 0..2 */
+        uint8_t i;
+
+        for (i = 0u; i < 3u; i++) {
+            const float d = 1.0f - fabsf(e - (float)i);
+            m->k_w[i] = 1.0f + 5.0f * ((d > 0.0f) ? d : 0.0f);
+        }
+        m->k_g = 2.0f + 6.0f * a;
+        m->k_f = 1.0f - expf(-3.14159265f * fcen / DSM_FS);        /* fcen/2 */
+        m->k_rate = 1.0f - expf(-12.5663706f * fcen / DSM_FS);     /* 2 fcen */
+        m->k_notch = (uint8_t)(c >= 0.333f);
+        if (m->k_notch) {
+            const float fn = (c < 0.666f) ? 1000.0f : fcen;
+            const float g = tanf(3.14159265f * fn / DSM_FS);
+
+            m->k_n[0] = 1.0f / (1.0f + g * (g + 0.5f));
+            m->k_n[1] = g * m->k_n[0];
+            m->k_n[2] = g * m->k_n[1];
+        }
+        tune = -1.0f;
+        break;
+    }
+    case 16u: {                                   /* smo (block) */
+        const uint8_t sel = (uint8_t)(a * 7.99f);  /* 0 fixed, 1..7 track */
+        const uint8_t tm = dsm_trig_mask;
+
+        dsm_trig_mask = (uint8_t)(dsm_trig_mask & (uint8_t)~tm);
+        m->k_x = (float)sel;
+        m->k_q = b;                                 /* fixed smoosh amount */
+        m->k_rate = expf(-1.0f / (DSM_FS * (0.02f + 0.98f * b * b)));
+        m->k_hold = (uint16_t)((sel != 0u &&
+                                (tm & (1u << (sel - 1u))) != 0u) ? 1u : 0u);
+        m->k_f = c;                                 /* phase amount */
+        m->k_step = 0.9f * c;                       /* allpass coefficient */
+        tune = -1.0f;
+        break;
+    }
+    case 7u: {                                    /* bloodbath */
         const float bits = (alg == 7u) ? 15.0f - 11.0f * b    /* 15..4 */
                                        : 12.0f - 10.0f * b;   /* 12..2 */
 
@@ -253,7 +291,7 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
         tune = -1.0f;
         break;
     }
-    case 10u: case 11u: case 12u: case 13u: case 14u: case 15u: case 16u:
+    case 10u: case 11u: case 12u: case 13u: case 14u: case 15u:
     {                                             /* shifter family (block) */
         static const float steps[5] = {
             0.4983071f,     /* shm +7  */
@@ -273,20 +311,12 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
             m->k_step = steps[alg - 10u];
             if (alg == 11u)
                 m->k_win = 860.0f;                /* octave down: long grain */
-        } else if (alg == 15u) {                  /* itv: -12..+12 */
+        } else {                                  /* itv: -12..+12 */
             const int8_t n = (int8_t)((int16_t)(a * 24.0f + 0.5f) - 12);
 
             m->k_step = exp2f((float)n * (1.0f / 12.0f)) - 1.0f;
             if (n < -6)
                 m->k_win = 860.0f;
-        } else {                                  /* tmp: +1, per division */
-            static const float beats[4] = { 0.125f, 0.25f, 0.5f, 1.0f };
-            const uint16_t bpm = seq_getBpm();
-            float len = DSM_FS * 60.0f / (float)((bpm < 30u) ? 30u : bpm) *
-                        beats[(uint8_t)(a * 3.99f)];
-
-            m->k_step = 0.0594631f;
-            m->k_tlen = (uint16_t)((len > 65000.0f) ? 65000.0f : len);
         }
         /* Per-channel windows (L, R a bit longer) and tap speeds, once
          * per block: no division per sample. */
@@ -422,21 +452,30 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
         dsm_write(md, mw, y);
         break;
     }
-    case 2u: {                                    /* turmoil */
-        const float z = dsm_read(md, DSM_MD_LEN, mw, m->k_tap);
-        float s;
-        float hp;
+    case 2u: {                                    /* dom */
+        /*
+         * Saturation, then a suboctave chorus: two octave-down shifters on
+         * the saturated signal, detuned up and down by a slow LFO (doom
+         * raises both the level and the detune); in the top quarter of
+         * doom the clipped suboctave adds an overtone buzz. No loop.
+         */
+        const float s = dsm_soft(m->k_g * x);
+        const float det = m->k_q * (1.0f + 0.5f * dsm_psin(m->acc[c]));
+        const float lvl = ((m->k_x < 0.75f) ? m->k_x * 1.3333f : 1.0f) * 1.6f;
+        const float bz = (m->k_x > 0.75f) ? (m->k_x - 0.75f) * 4.0f : 0.0f;
+        const float w1 = c ? 900.0f : 860.0f;
+        const float w2 = w1 * 0.93f;
+        float sub;
 
-        m->lp_a[c] += 0.17f * (x - m->lp_a[c]);          /* ~1.3 kHz */
-        s = dsm_soft(m->k_g * m->lp_a[c] + fb * (1.0f / 16.0f) * z);
-        /* Band-pass at fb_tune (Q ~3.3), gain 3 at its centre. */
-        m->lp_b[c] += m->k_f * m->lp_c[c];
-        hp = s - m->lp_b[c] - 0.3f * m->lp_c[c];
-        m->lp_c[c] += m->k_f * hp;
-        s = dsm_soft(2.0f * (s + 0.9f * m->lp_c[c]));
-        m->lp_d[c] += 0.25f * (s - m->lp_d[c]);          /* ~2 kHz */
-        y = dsm_dc(m, c, dsm_soft(2.0f * m->lp_d[c]));
-        dsm_write(md, mw, y);
+        m->acc[c] += c ? 0.0000771f : 0.0000680f;        /* ~3 Hz LFO */
+        m->acc[c] -= (m->acc[c] >= 1.0f) ? 1.0f : 0.0f;
+        dsm_write(md, mw, s);
+        sub = 0.5f * (dsm_shift(md, mw, &m->ph[c],
+                                (0.5f * (1.0f + det) - 1.0f) / w1, w1) +
+                      dsm_shiftI(md, mw, &m->ph2[c],
+                                 (0.5f * (1.0f - det) - 1.0f) / w2, w2));
+        y = 0.8f * s + lvl * sub + bz * 0.6f * dsm_clamp(12.0f * sub, 0.8f);
+        y = dsm_dc(m, c, dsm_soft(1.2f * y));
         break;
     }
     case 3u: {                                    /* mutiny */
@@ -451,37 +490,19 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
         y = dsm_dc(m, c, y);
         break;
     }
-    case 4u: {                                    /* riot */
-        /*
-         * Decimator (sample and hold) tuned by fb_tune: pitched aliasing.
-         * Loud passages slow it down (dirtier), quiet ones stay finer. On
-         * each held sample: bit reduction (demur), the word XORed with its
-         * own past one decimation period earlier (feedback = number of top
-         * bits), and a fixed bit flip at the top of demur. A gate closes
-         * the XOR on silence so nothing sustains on its own.
-         */
-        m->acc[c] += m->k_rate * (c ? 1.01f : 1.0f) * (1.15f - 0.6f * env);
-        if (m->acc[c] >= 1.0f) {
-            const float z = dsm_read(md, DSM_MD_LEN, mw, m->k_tap);
-            const float h = dsm_soft(3.0f * x);
-            int32_t i;
+    case 4u: {                                    /* fld */
+        /* fold -> 8vize -> saturate, at 2x (midpoint, then the sample). */
+        const float mid = 0.5f * (x + m->last[c]);
+        float o = 0.0f;
+        uint8_t k;
 
-            m->acc[c] -= 1.0f;
-            m->acc[c] = (m->acc[c] >= 1.0f) ? 0.0f : m->acc[c];
-            i = (int32_t)(dsm_crush(m, h) * 32767.0f);
-            if (fabsf(h) > 0.004f) {
-                i ^= ((int32_t)(z * 32767.0f) & (int32_t)m->k_xmask);
-                i ^= (int32_t)m->k_mask;
-            } else {
-                i = 0;
-            }
-            i = (i > 32767) ? 32767 : ((i < -32768) ? -32768 : i);
-            m->hold_out[c] = (float)i * (1.0f / 32767.0f);
+        m->last[c] = x;
+        for (k = 0u; k < 2u; k++) {
+            float f = dsm_psin(0.35f * m->k_g * (k ? x : mid));
+            f += m->k_x * (2.0f * fabsf(f) - 0.64f - f);     /* octave up */
+            o += dsm_soft(m->k_q * f);
         }
-        y = m->hold_out[c];
-        dsm_write(md, mw, y);
-        m->lp_b[c] += 0.004f * (y - m->lp_b[c]);         /* DC-free */
-        y -= m->lp_b[c];
+        y = dsm_dc(m, c, 0.6f * o);
         break;
     }
     case 5u: {                                    /* assault */
@@ -537,7 +558,79 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
         y = dsm_dc(m, c, dsm_soft(m->k_g * y));
         break;
     }
-    case 7u: case 8u: {                           /* bloodbath mudslide */
+    case 8u: {                                    /* mbs */
+        float lo;
+        float mid;
+        float hi;
+
+        m->lp_a[c] += m->k_f * (x - m->lp_a[c]);
+        m->lp_b[c] += m->k_rate * (x - m->lp_b[c]);
+        lo = m->lp_a[c];
+        mid = m->lp_b[c] - lo;
+        hi = x - m->lp_b[c];
+        y = 0.8f * dsm_soft(m->k_g * m->k_w[0] * lo) +
+            dsm_soft(m->k_g * m->k_w[1] * mid) +
+            0.8f * dsm_soft(m->k_g * m->k_w[2] * hi);
+        if (m->k_notch) {
+            /* ZDF state-variable notch, Q 2: notch = input - k * band. */
+            const float v3 = y - m->hold_out[c];
+            const float v1 = m->k_n[0] * m->hold_in[c] + m->k_n[1] * v3;
+            const float v2 = m->hold_out[c] + m->k_n[1] * m->hold_in[c] +
+                             m->k_n[2] * v3;
+
+            m->hold_in[c] = 2.0f * v1 - m->hold_in[c];
+            m->hold_out[c] = 2.0f * v2 - m->hold_out[c];
+            y -= 0.5f * v1;
+        }
+        y = dsm_dc(m, c, 0.6f * y);
+        break;
+    }
+    case 16u: {                                   /* smo */
+        /*
+         * Smoosh: up to ~126 dB of gain into a hard clip. With a trigger
+         * track, each hit of that voice opens it fully and it decays; on
+         * "fixed" the smoosh knob sets a constant amount. Between hits the
+         * signal keeps a light saturation. Phase: four first-order
+         * allpasses with opposite coefficients on L and R, mixed with the
+         * direct signal (stereo width, phasing).
+         */
+        const float gate_in = env;               /* input dynamics 0..1 */
+        float base;
+        float s;
+
+        env = m->fbs[c];
+        if (m->k_x == 0.0f)
+            env = m->k_q;
+        else
+            env = m->k_hold ? 1.0f : env * m->k_rate;
+        m->fbs[c] = env;
+        base = 1.2f * dsm_soft(1.5f * x);
+        s = dsm_clamp(exp2f(21.0f * env) * x, 0.7f) * 1.4286f;
+        {
+            /* Gate on the input dynamics: ~100 dB of gain must not turn
+             * the noise floor between hits into full-scale hiss. */
+            float gate = (gate_in - 0.02f) * 10.0f;
+
+            gate = (gate < 0.0f) ? 0.0f : ((gate > 1.0f) ? 1.0f : gate);
+            y = base + env * gate * (s - base);
+        }
+        if (m->k_f > 0.0f) {
+            const float ac = c ? -m->k_step : m->k_step;
+            float z = y;
+            uint8_t k;
+
+            for (k = 0u; k < 4u; k++) {
+                const float o = -ac * z + m->ap_s[c][k];
+
+                m->ap_s[c][k] = z + ac * o;
+                z = o;
+            }
+            y += m->k_f * (z - y);
+        }
+        y = dsm_dc(m, c, 0.8f * y);
+        break;
+    }
+    case 7u: {                                    /* bloodbath */
         const uint32_t mud = (m->alg == 8u);
 
         if (mud)
@@ -575,24 +668,13 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
         y = m->last[c];
         break;
     }
-    case 10u: case 11u: case 12u: case 13u: case 14u: case 15u: case 16u: {
+    case 10u: case 11u: case 12u: case 13u: case 14u: case 15u: {
         /* The bloodshed loop with another interval (see dsm_block). */
         const float win = m->k_winc[c];
-        float fbm = 1.0f;
         float in;
 
-        if (m->alg == 16u) {
-            /* tmp: the loop is cut for ~18 ms at each division, then
-             * ramps back: the cascade climbs, restarts, climbs. */
-            uint16_t k = m->cnt[c];
-
-            k = (uint16_t)((k + 1u >= m->k_tlen) ? 0u : k + 1u);
-            m->cnt[c] = k;
-            fbm = (k < 800u) ? 0.0f
-                : ((k < 1020u) ? (float)(k - 800u) * (1.0f / 220.0f) : 1.0f);
-        }
         in = dsm_soft(m->k_x * x) * m->k_q +
-             fb * fbm * dsm_soft(m->last[c]);
+             fb * dsm_soft(m->last[c]);
         dsm_write(md, mw, in);
         y = dsm_shift(md, mw, &m->ph[c], m->k_inc[c], win);
         if (m->alg == 13u)
