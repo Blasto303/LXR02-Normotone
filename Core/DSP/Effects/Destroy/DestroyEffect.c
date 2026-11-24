@@ -24,6 +24,7 @@
 #include "DestroyParameters.h"
 #include "DlyVerbEffect.h"
 #include "DestroyModels.h"
+#include "cpuProfile.h"
 #include <math.h>
 #include <string.h>
 
@@ -173,7 +174,7 @@ static void destroy_writeParam(void *rt_void, uint8_t index, uint8_t value)
         rt->raw[index - DESTROY_PARAM_DRIVE] = value;
 }
 
-static void destroy_process(void *rt_void, effect_io_t *io)
+static void destroy_processBody(void *rt_void, effect_io_t *io)
 {
     DestroyRuntime *rt = (DestroyRuntime *)rt_void;
     DestroyState *st;
@@ -369,6 +370,20 @@ static void destroy_process(void *rt_void, effect_io_t *io)
         L[n] = ds_ceiling(yl);
         R[n] = ds_ceiling(yr);
     }
+}
+
+/* Timed for the CPU page (DST line): the effect alone, inside RND. */
+static void destroy_process(void *rt_void, effect_io_t *io)
+{
+#ifdef PROF_DWT_CYCCNT
+    const uint32_t t0 = PROF_DWT_CYCCNT;
+    const uint32_t i0 = prof_isrCycles;
+
+    destroy_processBody(rt_void, io);
+    prof_addSub(PROF_DST, PROF_DWT_CYCCNT - t0 - (prof_isrCycles - i0));
+#else
+    destroy_processBody(rt_void, io);
+#endif
 }
 
 static void destroy_bufferChanged(void *rt_void, const fx_share_t *share)

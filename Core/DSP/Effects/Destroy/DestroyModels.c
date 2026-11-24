@@ -52,6 +52,7 @@
  * The input dynamics (env) scale the feedback between 0.55x and 1x.
  */
 #include "DestroyModels.h"
+#include "config.h"
 #include <math.h>
 
 #define DSM_FS        44108.07f
@@ -426,8 +427,9 @@ static float dsm_shiftI(const int16_t *md, uint16_t mw, float *ph, float inc,
     return y;
 }
 
-float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
-                 float env)
+/* In ITCM: runs twice per frame, out of the flash I-cache churn. */
+INITCM float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c,
+                        float x, float env)
 {
     int16_t *md = &pool[DSM_MD_OFF(c)];
     const uint16_t mw = m->md_w[c];
@@ -517,12 +519,21 @@ float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
 
         m->last[c] = x;
         if (m->k_chain == 0u && m->k_doom == 0.0f) {
-            for (k = 0u; k < 2u; k++) {
-                float f = dsm_psin(0.35f * m->k_g * (k ? x : mid));
+            /* Both saturations share one division (CPU): a/(1+|a|) +
+             * b/(1+|b|) = (a(1+|b|) + b(1+|a|)) / ((1+|a|)(1+|b|)). */
+            float fa = dsm_psin(0.35f * m->k_g * mid);
+            float fb2 = dsm_psin(0.35f * m->k_g * x);
+            float da;
+            float db;
 
-                f += m->k_x * (2.0f * fabsf(f) - 0.64f - f); /* octave up */
-                o += dsm_soft(m->k_q * f);
-            }
+            fa += m->k_x * (2.0f * fabsf(fa) - 0.64f - fa); /* octave up */
+            fb2 += m->k_x * (2.0f * fabsf(fb2) - 0.64f - fb2);
+            fa *= m->k_q;
+            fb2 *= m->k_q;
+            da = 1.0f + fabsf(fa);
+            db = 1.0f + fabsf(fb2);
+            o = (fa * db + fb2 * da) / (da * db);
+            (void)k;
             y = dsm_dc(m, c, 0.6f * o);
             break;
         }

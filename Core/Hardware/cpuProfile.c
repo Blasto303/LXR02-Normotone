@@ -18,7 +18,8 @@ static uint8_t prof_serial;
 static const char prof_names[PROF_COUNT][4] = {
     "RND", "LED", "FPN", "MID", "ENC", "POT", "KNB", "MNU", "ADC", "SCR",
     "BTN", "PRS", "MRP", "SD ", "BGL",
-    "SEQ", "LCD", "T6 ", "MDI", "ENI", "CLK", "RST", "DMA", "USB"
+    "SEQ", "LCD", "T6 ", "MDI", "ENI", "CLK", "RST", "DMA", "USB",
+    "DST"
 };
 
 void prof_addFg(uint8_t id, uint32_t cycles)
@@ -32,7 +33,16 @@ void prof_addFg(uint8_t id, uint32_t cycles)
 
 void prof_addIsr(uint8_t id, uint32_t cycles)
 {
-    if (id < PROF_FG_COUNT || id >= PROF_COUNT)
+    if (id < PROF_FG_COUNT || id >= PROF_IRQ_END)
+        return;
+    prof_sum[id] += cycles;
+    if (cycles > prof_max[id])
+        prof_max[id] = cycles;
+}
+
+void prof_addSub(uint8_t id, uint32_t cycles)
+{
+    if (id < PROF_IRQ_END || id >= PROF_COUNT || (int32_t)cycles < 0)
         return;
     prof_sum[id] += cycles;
     if (cycles > prof_max[id])
@@ -78,7 +88,7 @@ void prof_formatEntry(uint8_t entry, char row[16])
     memset(row, ' ', 16);
     if (entry == 0u) {
         name = "IRQ";
-        for (i = PROF_FG_COUNT; i < PROF_COUNT; i++) {
+        for (i = PROF_FG_COUNT; i < PROF_IRQ_END; i++) {
             sum += prof_shownSum[i];
             if (prof_shownMax[i] > max) max = prof_shownMax[i];
         }

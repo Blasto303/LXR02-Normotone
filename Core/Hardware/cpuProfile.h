@@ -39,6 +39,8 @@ enum {
     PROF_RST,       /* EXTI9_5: RST IN                                */
     PROF_DMA,       /* DMA1 streams 4/7: audio                        */
     PROF_USB,       /* OTG_FS: USB                                    */
+    PROF_IRQ_END,
+    PROF_DST = PROF_IRQ_END, /* dst effect alone, already inside RND  */
     PROF_COUNT
 };
 
@@ -47,6 +49,8 @@ enum {
 extern volatile uint32_t prof_isrCycles;
 void prof_addFg(uint8_t id, uint32_t cycles);
 void prof_addIsr(uint8_t id, uint32_t cycles);
+/* A slice of the render (PROF_DST), shown apart and summed nowhere. */
+void prof_addSub(uint8_t id, uint32_t cycles);
 /* Main loop, once per pass: closes a 1 s window into the snapshot. */
 void prof_service(void);
 
