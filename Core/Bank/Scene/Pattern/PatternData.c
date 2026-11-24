@@ -1483,6 +1483,17 @@ uint8_t pat_genPrime(uint8_t scene_index)
     return region ? region->gen_prime : 0u;
 }
 
+void pat_putTrackGen(uint8_t scene_index, uint8_t track,
+                     const pat_track_gen_t *rec)
+{
+    pat_scene_region_t *region = pat_sceneRegionMut(scene_index);
+
+    if (!region || !rec || !pat_trackValid(track))
+        return;
+    region->track_gen[track] = *rec;
+    pat_markSceneDirty(scene_index);
+}
+
 void pat_copyTrackGen(uint8_t dst_scene, uint8_t dst_track,
                       uint8_t src_scene, uint8_t src_track)
 {

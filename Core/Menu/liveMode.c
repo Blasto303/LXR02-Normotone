@@ -581,34 +581,59 @@ void live_reloadKit(void)
  */
 static const uint8_t live_tmLens[8] = { 2u, 3u, 4u, 5u, 6u, 8u, 12u, 16u };
 
+/*
+ * Generator records shown and edited: the live global layer when it is
+ * latched (SHIFT + pot 1 to a mode other than STD), else the active
+ * Pattern's. An edit under the global layer goes through the Pattern's
+ * clamped setter (the Pattern adopts the global record first, so saving
+ * keeps what you hear), then back into the global layer.
+ */
 static const pat_track_gen_t *live_genRec(void)
 {
     const pat_scene_region_t *r = pat_sceneRegion(scene_getActiveIndex());
 
-    return (r && live_genTrk < NUM_TRACKS) ? &r->track_gen[live_genTrk] : NULL;
+    if (live_genTrk >= NUM_TRACKS)
+        return NULL;
+    if (tgen_globalOn())
+        return tgen_globalRec(live_genTrk);
+    return r ? &r->track_gen[live_genTrk] : NULL;
 }
 
-/* NUM mode global prime of the active Scene's Pattern (0..31). */
+/* NUM mode prime (0..31): global layer, else the active Pattern's. */
 static uint8_t live_genPrime(void)
 {
-    return pat_genPrime(scene_getActiveIndex());
+    return tgen_globalOn() ? tgen_globalPrime()
+                           : pat_genPrime(scene_getActiveIndex());
 }
 
 static void live_genSetPrime(int16_t v)
 {
-    pat_setGenPrime(scene_getActiveIndex(),
-                    (uint8_t)((v < 0) ? 0 : ((v > 31) ? 31 : v)));
+    const uint8_t p = (uint8_t)((v < 0) ? 0 : ((v > 31) ? 31 : v));
+
+    pat_setGenPrime(scene_getActiveIndex(), p);
+    if (tgen_globalOn())
+        tgen_setGlobalPrime(p);
 }
 
 static uint8_t live_genGet(uint8_t field)
 {
-    return pat_trackGen(scene_getActiveIndex(), live_genTrk, field);
+    const pat_track_gen_t *g = live_genRec();
+
+    return (g && field < PAT_TRACK_GEN_BYTES) ? g->v[field] : 0u;
 }
 
 static void live_genSet(uint8_t field, int16_t v)
 {
-    pat_setTrackGen(scene_getActiveIndex(), live_genTrk, field,
+    const uint8_t scene = scene_getActiveIndex();
+    const pat_scene_region_t *r;
+
+    if (tgen_globalOn())
+        pat_putTrackGen(scene, live_genTrk, tgen_globalRec(live_genTrk));
+    pat_setTrackGen(scene, live_genTrk, field,
                     (uint8_t)((v < 0) ? 0 : ((v > 255) ? 255 : v)));
+    r = pat_sceneRegion(scene);
+    if (tgen_globalOn() && r && live_genTrk < NUM_TRACKS)
+        *tgen_globalRec(live_genTrk) = r->track_gen[live_genTrk];
 }
 
 /* Turing Length steps through 2,3,4,5,6,8,12,16. */
@@ -744,9 +769,16 @@ void live_genKnob(uint8_t knob, int8_t delta)
             /* SHIFT + pot 1: the same mode on all 7 tracks at once. */
             const uint8_t keep = live_genTrk;
 
+            const pat_scene_region_t *r;
+
+            tgen_globalLatch(0u, NULL, 0u);       /* edit the Pattern itself */
             for (live_genTrk = 0u; live_genTrk < NUM_TRACKS; live_genTrk++)
                 live_genSet(PAT_GEN_F_MODE, m);
             live_genTrk = keep;
+            /* Any mode but STD now holds across Pattern changes. */
+            r = pat_sceneRegion(scene_getActiveIndex());
+            if (r && m != (int16_t)PAT_GEN_STD)
+                tgen_globalLatch(1u, r->track_gen, r->gen_prime);
         } else {
             live_genSet(PAT_GEN_F_MODE, m);
         }
@@ -1346,7 +1378,8 @@ uint8_t live_formatOverlay(char *row0, char *row1)
         const uint8_t t = menu_getActiveVoice();
 
         if (r && t < NUM_TRACKS) {
-            const pat_track_gen_t *g = &r->track_gen[t];
+            const pat_track_gen_t *g = tgen_globalOn() ? tgen_globalRec(t)
+                                                       : &r->track_gen[t];
             const uint8_t mode = g->v[PAT_GEN_F_MODE];
 
             if (mode == PAT_GEN_EUC) {
@@ -1361,7 +1394,8 @@ uint8_t live_formatOverlay(char *row0, char *row1)
             }
             /* Pot 3: the NUM prime shared by the Pattern's NUM tracks. */
             memcpy(&row0[8], "prm", 3);
-            live_putPrime(&row1[8], r->gen_prime);
+            live_putPrime(&row1[8], tgen_globalOn() ? tgen_globalPrime()
+                                                    : r->gen_prime);
             /* Pot 4: DJ filter, "off", L01..L64 (low-pass), H01..H64. */
             {
                 const int8_t f = djFilter_value();

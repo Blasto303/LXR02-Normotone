@@ -264,6 +264,15 @@ int main(int argc, char **argv)
             c = strchr(c + 1, ',');
         }
     }
+    if (getenv("FG_GLOBAL")) {   /* latch the 7 records, then reset the Pattern */
+        const pat_scene_region_t *r = pat_sceneRegion(scene_getActiveIndex());
+        uint8_t t;
+        if (getenv("FG_PRIME"))
+            pat_setGenPrime(scene_getActiveIndex(), (uint8_t)atoi(getenv("FG_PRIME")));
+        tgen_globalLatch(1u, r->track_gen, r->gen_prime);
+        for (t = 0; t < 7; t++)
+            pat_setTrackGen(scene_getActiveIndex(), t, PAT_GEN_F_MODE, PAT_GEN_STD);
+    }
     if (getenv("FG_PRIME"))      /* NUM mode global prime 0..31 */
         pat_setGenPrime(scene_getActiveIndex(), (uint8_t)atoi(getenv("FG_PRIME")));
     /* PERF page, transport running. */

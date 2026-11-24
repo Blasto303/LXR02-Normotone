@@ -567,6 +567,9 @@ uint8_t pat_trackGen(uint8_t scene_index, uint8_t track, uint8_t field);
 /* NUM mode global prime of a Pattern (0..31), marks dirty. */
 void pat_setGenPrime(uint8_t scene_index, uint8_t prime);
 uint8_t pat_genPrime(uint8_t scene_index);
+/* Overwrite one track's generator record (the live global layer). */
+void pat_putTrackGen(uint8_t scene_index, uint8_t track,
+                     const pat_track_gen_t *rec);
 void pat_copyTrackGen(uint8_t dst_scene, uint8_t dst_track,
                       uint8_t src_scene, uint8_t src_track);
 void pat_setTrackPlayMode(uint8_t scene_index, uint8_t track, uint8_t value);

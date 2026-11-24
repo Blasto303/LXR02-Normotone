@@ -48,6 +48,19 @@ uint8_t tgen_eucPos(uint8_t track);
 uint16_t tgen_numPattern(const pat_track_gen_t *g, uint8_t prime);
 uint8_t tgen_numFactor(uint8_t index);          /* 1 2 4 8 16 3 6 ... */
 
+/*
+ * Global generator layer (live): SHIFT + pot 1 on the GEN page sets the
+ * same mode on the 7 tracks; any mode but STD also latches these 7 records
+ * and the prime here, and the sequencer then uses them for every Pattern
+ * (pattern changes keep NUM, EUC or TM). Back to STD releases it. Runtime
+ * only: at boot each Pattern plays its own settings again.
+ */
+uint8_t tgen_globalOn(void);
+void tgen_globalLatch(uint8_t on, const pat_track_gen_t *recs, uint8_t prime);
+pat_track_gen_t *tgen_globalRec(uint8_t track);
+uint8_t tgen_globalPrime(void);
+void tgen_setGlobalPrime(uint8_t prime);
+
 /* Turing register of a track; Write: flip bit n (0 = newest). */
 uint16_t tgen_register(uint8_t track);
 void tgen_flipBit(uint8_t track, uint8_t bit);

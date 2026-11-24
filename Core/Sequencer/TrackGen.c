@@ -8,6 +8,42 @@
 #include "TrackGen.h"
 
 static uint8_t tgen_euc_pos[NUM_TRACKS];
+static pat_track_gen_t tgen_glob[NUM_TRACKS];
+static uint8_t tgen_globPrime;
+static volatile uint8_t tgen_globOn;
+
+uint8_t tgen_globalOn(void)
+{
+    return tgen_globOn;
+}
+
+void tgen_globalLatch(uint8_t on, const pat_track_gen_t *recs, uint8_t prime)
+{
+    uint8_t t;
+
+    if (on && recs) {
+        tgen_globOn = 0u;                 /* the ISR keeps the Pattern's */
+        for (t = 0u; t < NUM_TRACKS; t++)
+            tgen_glob[t] = recs[t];
+        tgen_globPrime = (prime < PAT_GEN_NUM_PRIMES) ? prime : 0u;
+    }
+    tgen_globOn = (uint8_t)(on && recs);
+}
+
+pat_track_gen_t *tgen_globalRec(uint8_t track)
+{
+    return &tgen_glob[(track < NUM_TRACKS) ? track : 0u];
+}
+
+uint8_t tgen_globalPrime(void)
+{
+    return tgen_globPrime;
+}
+
+void tgen_setGlobalPrime(uint8_t prime)
+{
+    tgen_globPrime = (prime < PAT_GEN_NUM_PRIMES) ? prime : 0u;
+}
 
 /*
  * The 32 prime rhythms, read cell by cell from the manual's table (bit 15

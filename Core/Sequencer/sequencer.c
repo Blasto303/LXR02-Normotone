@@ -3060,13 +3060,16 @@ static void seq_advanceTrackStep(uint8_t track)
 		 */
 		const pat_scene_region_t *gen_region =
 		    pat_sceneRegion(seq_perTrackPattern[track]);
-		const pat_track_gen_t *gen_g =
-		    gen_region ? &gen_region->track_gen[track] : NULL;
+		/* The live global layer, when latched, overrides the Pattern's. */
+		const pat_track_gen_t *gen_g = tgen_globalOn()
+		    ? tgen_globalRec(track)
+		    : (gen_region ? &gen_region->track_gen[track] : NULL);
 		const uint8_t pat_on = pat_isStepActive(track,
 		    (uint8_t)seq_stepIndex[track], seq_perTrackPattern[track]);
 		const uint8_t gen_on = gen_g
 		    ? tgen_step(track, gen_g, pat_on, (uint16_t)GetRngValue(),
-		                gen_region->gen_prime)
+		                tgen_globalOn() ? tgen_globalPrime()
+		                                : (gen_region ? gen_region->gen_prime : 0u))
 		    : pat_on;
 		uint8_t track_muted = (uint8_t)((seq_mutedTracks >> track) & 1u);
 		uint8_t process_step = (uint8_t)(!track_muted);
