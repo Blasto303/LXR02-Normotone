@@ -62,6 +62,7 @@
 #include "presetManager.h"
 /* S074 master bus compressor: final stage of mixer_calcNextSampleBlock(). */
 #include "BusCompressor.h"
+#include "DjFilter.h"
 // TODO DSP_PORT
 // #include "../Hardware/TriggerOut.h"
 //-----------------------------------------------------------------------
@@ -1251,5 +1252,7 @@ void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2)
 	}
 
 	busComp_processBlock(&output2[pos], &output[pos], fx_scene);
+	/* PERF pot 4: DJ filter on the whole machine, last in the chain. */
+	djFilter_processBlock(&output2[pos], &output[pos]);
 
 }

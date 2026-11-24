@@ -35,3 +35,4 @@ Core/DSP/Effects/Destroy/DestroyModels.c
 Core/DSP/Effects/StereoFilter/StereoFilterEffect.c
 Core/Sequencer/StepScale.c
 Core/Sequencer/TrackGen.c
+Core/DSPAudio/DjFilter.c

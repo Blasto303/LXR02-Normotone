@@ -49,6 +49,7 @@
 #include "adcPots.h"
 #include "timebase.h"
 #include "TrackGen.h"
+#include "DjFilter.h"
 #include "PatternData.h"
 #include "DlyVerbParameters.h"
 
@@ -822,6 +823,15 @@ void live_genMacro(int8_t delta)
     live_genTrk = keep;
 }
 
+/* PERF pot 4: the DJ filter (runtime only, off at boot). */
+void live_djFilter(int8_t delta)
+{
+    if (delta == 0)
+        return;
+    djFilter_adjust(delta);
+    menu_repaintAll();
+}
+
 /* PERF pot 3: the NUM mode global prime (all NUM tracks follow). */
 void live_genPrimeMacro(int8_t delta)
 {
@@ -1352,6 +1362,20 @@ uint8_t live_formatOverlay(char *row0, char *row1)
             /* Pot 3: the NUM prime shared by the Pattern's NUM tracks. */
             memcpy(&row0[8], "prm", 3);
             live_putPrime(&row1[8], r->gen_prime);
+            /* Pot 4: DJ filter, "off", L01..L64 (low-pass), H01..H64. */
+            {
+                const int8_t f = djFilter_value();
+                const uint8_t n = (uint8_t)((f < 0) ? -f : f);
+
+                memcpy(&row0[12], "flt", 3);
+                if (f == 0) {
+                    memcpy(&row1[12], "off", 3);
+                } else {
+                    row1[12] = (f < 0) ? 'L' : 'H';
+                    row1[13] = (char)('0' + n / 10u);
+                    row1[14] = (char)('0' + n % 10u);
+                }
+            }
         }
     }
     if (live_page == 4u) {

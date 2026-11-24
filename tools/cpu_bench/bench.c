@@ -150,6 +150,10 @@ static void run_pattern(uint8_t sc, int blocks)
             nchg++;
         }
     }
+    if (getenv("BENCH_DJ")) {               /* DJ filter -64..64 */
+        extern void djFilter_adjust(int8_t delta);
+        djFilter_adjust((int8_t)atoi(getenv("BENCH_DJ")));
+    }
     for (b = 0; b < blocks; b++) {
         /* BENCH_MUTE_AT=block: every fader to 0 from that block (tails). */
         if (getenv("BENCH_MUTE_AT") && b == atoi(getenv("BENCH_MUTE_AT"))) {

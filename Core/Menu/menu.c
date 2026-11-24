@@ -16643,15 +16643,17 @@ void menu_parseKnobDelta(uint8_t knobNr, int8_t delta)
         return;
     }
     /* PERF pot 2: the active track's generator (hit or prb). */
-    if ((knobNr == 1u || knobNr == 2u) &&
+    if (knobNr >= 1u && knobNr <= 3u &&
         menu_activePage == PERFORMANCE_PAGE &&
         menu_getSubPage() == 0u && live_cpuPageActive() == 0u &&
         live_rndPageActive() == 0u && live_patternPageActive() == 0u &&
         live_kitPageActive() == 0u) {
         if (knobNr == 1u)
             live_genMacro(delta);
-        else
+        else if (knobNr == 2u)
             live_genPrimeMacro(delta);      /* pot 3: NUM prime */
+        else
+            live_djFilter(delta);           /* pot 4: DJ filter */
         return;
     }
 #endif
@@ -16923,8 +16925,9 @@ void menu_serviceKnobRepaint(void)
             menu_repaint();
             return;
         }
-        menu_repaintGeneric();
-        sendDisplayBuffer();
+        /* Full repaint: the live overlays (PERF fct/prm/flt cells, GEN
+         * page, Plaits 'P') must survive a knob turn too. */
+        menu_repaint();
     }
 }
 
