@@ -36,8 +36,8 @@
  *               between hits so the noise floor stays down.
  *  10..15      the bloodshed loop with other intervals: shm +7 (fifth),
  *               dwn -12 (octave down), fal (each hit dives as it decays,
- *               dive depth 0..-12 on pot 1), spl (L an octave up, R an
- *               octave down), wob (pitch wobble +-2 semitones, rate
+ *               dive depth 0..-12 on pot 1), spl (L an octave up, R a
+ *               fifth up), wob (pitch wobble +-2 semitones, rate
  *               0.3..10 Hz on pot 1, L and R a quarter apart), itv any
  *               interval -12..+12 (pot 1)
  *  16 smo       trigger / smoosh / phase: up to ~126 dB of gain into a hard
@@ -109,7 +109,7 @@ static const char dsm_knobs[DSM_ALG_COUNT][10] = {
     "gaipbkgrt",   /* shm +7                  */
     "gaipbkgrt",   /* dwn -12                 */
     "dvepbkgrt",   /* fal: dive per hit        */
-    "gaipbkgrt",   /* spl: L +12, R -12        */
+    "gaipbkgrt",   /* spl: L +12, R +7         */
     "ratpbkgrt",   /* wob: wobble rate         */
     "itvpbkgrt",   /* itv: interval           */
     "trgsmophs",   /* smo: trigger smoosh phase */
@@ -308,7 +308,7 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
         m->k_step2 = -0.0561257f;
         if (alg <= 14u) {
             m->k_step = steps[alg - 10u];
-            if (alg == 11u || alg == 12u || alg == 13u)
+            if (alg == 11u || alg == 12u)
                 m->k_win = 860.0f;                /* down shifts: long grain */
             if (alg == 12u) {                     /* fal: dive depth */
                 m->k_step2 = 0.5f * a;            /* ratio 1 -> 0.5..1 */
@@ -335,9 +335,9 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
         /* k_inc2 = 1 / window: fal and wob move their step per sample. */
         m->k_inc2[0] = 1.0f / m->k_winc[0];
         m->k_inc2[1] = 1.0f / m->k_winc[1];
-        if (alg == 13u) {                         /* spl: L +12, R -12 */
+        if (alg == 13u) {                         /* spl: L +12, R +7 */
             m->k_inc[0] = 1.0f / m->k_winc[0];
-            m->k_inc[1] = -0.5f / m->k_winc[1];
+            m->k_inc[1] = 0.4983071f / m->k_winc[1];
         }
         tune = -1.0f;
         break;
