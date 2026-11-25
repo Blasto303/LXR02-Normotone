@@ -65,6 +65,9 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
  * dsm_sample calls (same output, one call per frame). */
 int dsm_fldFast(const DsModelState *m);
 void dsm_fldStereo(DsModelState *m, float xl, float xr, float *yl, float *yr);
+/* fld with any chain order and DOOM, both channels (same output). */
+void dsm_fldStereoChain(DsModelState *m, int16_t *pool, float xl, float xr,
+                        float env, float *yl, float *yr);
 float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
                  float env);
 

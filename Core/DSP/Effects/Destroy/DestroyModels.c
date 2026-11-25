@@ -387,7 +387,8 @@ void dsm_chain(DsModelState *m, uint8_t chain, uint8_t doom)
  * across a window of `win` samples,
  * half a window apart, crossfaded by a triangle. step < 0 shifts down.
  */
-static float dsm_shift(const int16_t *md, uint16_t mw, float *ph, float inc,
+static inline __attribute__((always_inline)) float
+dsm_shift(const int16_t *md, uint16_t mw, float *ph, float inc,
                        float win)
 {
     float p = *ph;
@@ -407,7 +408,8 @@ static float dsm_shift(const int16_t *md, uint16_t mw, float *ph, float inc,
 }
 
 /* Same shifter with integer reads (spl's second voice: cheaper). */
-static float dsm_shiftI(const int16_t *md, uint16_t mw, float *ph, float inc,
+static inline __attribute__((always_inline)) float
+dsm_shiftI(const int16_t *md, uint16_t mw, float *ph, float inc,
                         float win)
 {
     float p = *ph;
@@ -864,4 +866,81 @@ INITCM void dsm_fldStereo(DsModelState *m, float xl, float xr, float *yl,
     m->md_w[1] = dsm_next(m->md_w[1], DSM_MD_LEN);
     *yl = dsm_dc(m, 0u, 0.6f * ol) * dsm_trim[4];
     *yr = dsm_dc(m, 1u, 0.6f * orr) * dsm_trim[4];
+}
+
+/*
+ * fld, any chain order and DOOM, both channels in one call (CPU): the same
+ * stages as the fld case of dsm_sample, each run for L then R so the two
+ * independent chains interleave in the FPU.
+ */
+INITCM void dsm_fldStereoChain(DsModelState *m, int16_t *pool, float xl,
+                               float xr, float env, float *yl, float *yr)
+{
+    static const float lv[3] = { 0.84f, 1.08f, 0.78f };
+    const float g = 0.35f * m->k_g;
+    const uint8_t chain = m->k_chain;
+    const float dm = m->k_doom;
+    float x[2];
+    float y[2];
+    uint32_t c;
+
+    x[0] = xl;
+    x[1] = xr;
+    for (c = 0u; c < 2u; c++) {                      /* folded, at 2x */
+        const float mid = 0.5f * (x[c] + m->last[c]);
+
+        m->last[c] = x[c];
+        y[c] = 0.5f * (dsm_psin(g * mid) + dsm_psin(g * x[c]));
+    }
+    if (chain == 1u) {                               /* X */
+        for (c = 0u; c < 2u; c++) {
+            y[c] = 1.2f * dsm_soft(m->k_q * y[c]);
+            y[c] += m->k_x * (2.0f * fabsf(y[c]) - 0.64f - y[c]);
+        }
+    }
+    if (dm > 0.0f) {
+        /* DOOM: suboctave chorus, louder and more out of tune. */
+        const float lvl = ((dm < 0.75f) ? dm * 1.3333f : 1.0f) * 1.6f;
+        const float bz = (dm > 0.75f) ? (dm - 0.75f) * 4.0f : 0.0f;
+        float gt = (env - 0.01f) * 20.0f;        /* gate between hits */
+
+        gt = (gt < 0.0f) ? 0.0f : ((gt > 1.0f) ? 1.0f : gt);
+        for (c = 0u; c < 2u; c++) {
+            int16_t *md = &pool[DSM_MD_OFF(c)];
+            const uint16_t mw = m->md_w[c];
+            const float det = (0.002f + 0.035f * dm) *
+                              (1.0f + 0.5f * dsm_psin(m->acc[c]));
+            const float w1 = c ? 900.0f : 860.0f;
+            const float w2 = w1 * 0.93f;
+            float sub;
+
+            m->acc[c] += c ? 0.0000771f : 0.0000680f;
+            m->acc[c] -= (m->acc[c] >= 1.0f) ? 1.0f : 0.0f;
+            dsm_write(md, mw, y[c]);
+            sub = 0.5f * (dsm_shiftI(md, mw, &m->ph[c],
+                                     (0.5f * (1.0f + det) - 1.0f) / w1, w1) +
+                          dsm_shiftI(md, mw, &m->ph2[c],
+                                     (0.5f * (1.0f - det) - 1.0f) / w2, w2));
+            y[c] = 0.8f * y[c] + gt * (lvl * sub +
+                                       bz * 0.6f * dsm_clamp(12.0f * sub, 0.8f));
+        }
+    }
+    if (chain != 1u) {                               /* UND, OVR */
+        for (c = 0u; c < 2u; c++) {
+            y[c] += m->k_x * (2.0f * fabsf(y[c]) - 0.64f - y[c]);
+            y[c] = 1.2f * dsm_soft(m->k_q * y[c]);
+        }
+    }
+    if (chain == 2u) {                               /* OVR: fold again */
+        for (c = 0u; c < 2u; c++) {
+            const float m2 = 0.5f * (y[c] + m->hold_in[c]);
+
+            m->hold_in[c] = y[c];
+            y[c] = 0.5f * (dsm_psin(g * m2) + dsm_psin(g * y[c]));
+        }
+    }
+    for (c = 0u; c < 2u; c++)
+        m->md_w[c] = dsm_next(m->md_w[c], DSM_MD_LEN);
+    *yl = dsm_dc(m, 0u, lv[chain] * y[0]) * dsm_trim[4];
+    *yr = dsm_dc(m, 1u, lv[chain] * y[1]) * dsm_trim[4];
 }

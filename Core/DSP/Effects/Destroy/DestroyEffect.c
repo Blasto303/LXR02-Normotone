@@ -212,6 +212,7 @@ static void destroy_processBody(void *rt_void, effect_io_t *io)
     frames = io->frames;
     /* fld, UND, no DOOM: both channels in one call (same output). */
     const int fld_fast = (alg != 0u) && dsm_fldFast(&st->models);
+    const int fld_chain = (alg == 4u) && !fld_fast;
 
     /* Controls, once per block. */
     fold = (float)DS_ROW(rt, DESTROY_PARAM_FOLD) * (1.0f / 127.0f);
@@ -313,6 +314,16 @@ static void destroy_processBody(void *rt_void, effect_io_t *io)
                 float mr;
 
                 dsm_fldStereo(&st->models, xl - lol, xr - lor, &ml, &mr);
+                yl = lol + DS_MODEL_GAIN * ml;
+                yr = lor + DS_MODEL_GAIN * mr;
+            } else if (fld_chain) {
+                const float lol = use_split * st->split[0];
+                const float lor = use_split * st->split[1];
+                float ml;
+                float mr;
+
+                dsm_fldStereoChain(&st->models, pool, xl - lol, xr - lor,
+                                   env01, &ml, &mr);
                 yl = lol + DS_MODEL_GAIN * ml;
                 yr = lor + DS_MODEL_GAIN * mr;
             } else {
