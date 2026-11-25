@@ -133,11 +133,11 @@ static inline float dsm_clamp(float x, float l)
 /* Bipolar parabolic sine, period 1 (as ds_psin). */
 static inline float dsm_psin(float ph)
 {
-    const int32_t i = (int32_t)ph;
     float x;
 
-    ph -= (float)i;
-    ph += (ph < 0.0f) ? 1.0f : 0.0f;
+    /* floorf is one VRINTM on the M7: the same fraction as truncating and
+     * adding 1 below zero, without the compare that stalls the pipeline. */
+    ph -= floorf(ph);
     x = 2.0f * ph - 1.0f;
     return -4.0f * x * (1.0f - fabsf(x));
 }
@@ -813,4 +813,55 @@ INITCM float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c,
     }
     m->md_w[c] = dsm_next(mw, DSM_MD_LEN);
     return y * dsm_trim[m->alg];
+}
+
+int dsm_fldFast(const DsModelState *m)
+{
+    return m->alg == 4u && m->k_chain == 0u && m->k_doom == 0.0f;
+}
+
+/*
+ * fld, UND without DOOM, both channels in one call (CPU): the same maths as
+ * the fld case of dsm_sample, L and R interleaved so the FPU never waits on
+ * one channel's chain, and the call overhead paid once per frame.
+ */
+INITCM void dsm_fldStereo(DsModelState *m, float xl, float xr, float *yl,
+                          float *yr)
+{
+    const float g = 0.35f * m->k_g;
+    const float kx = m->k_x;
+    const float kq = m->k_q;
+    const float ml = 0.5f * (xl + m->last[0]);
+    const float mr = 0.5f * (xr + m->last[1]);
+    float al = dsm_psin(g * ml);
+    float ar = dsm_psin(g * mr);
+    float bl = dsm_psin(g * xl);
+    float br = dsm_psin(g * xr);
+    float dal;
+    float dar;
+    float dbl;
+    float dbr;
+    float ol;
+    float orr;
+
+    m->last[0] = xl;
+    m->last[1] = xr;
+    al += kx * (2.0f * fabsf(al) - 0.64f - al);       /* octave up */
+    ar += kx * (2.0f * fabsf(ar) - 0.64f - ar);
+    bl += kx * (2.0f * fabsf(bl) - 0.64f - bl);
+    br += kx * (2.0f * fabsf(br) - 0.64f - br);
+    al *= kq;
+    ar *= kq;
+    bl *= kq;
+    br *= kq;
+    dal = 1.0f + fabsf(al);
+    dar = 1.0f + fabsf(ar);
+    dbl = 1.0f + fabsf(bl);
+    dbr = 1.0f + fabsf(br);
+    ol = (al * dbl + bl * dal) / (dal * dbl);
+    orr = (ar * dbr + br * dar) / (dar * dbr);
+    m->md_w[0] = dsm_next(m->md_w[0], DSM_MD_LEN);
+    m->md_w[1] = dsm_next(m->md_w[1], DSM_MD_LEN);
+    *yl = dsm_dc(m, 0u, 0.6f * ol) * dsm_trim[4];
+    *yr = dsm_dc(m, 1u, 0.6f * orr) * dsm_trim[4];
 }

@@ -61,6 +61,10 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
  * One sample of channel c (0/1). x is the band to destroy, env 0..1 the
  * input dynamics (raises the feedback on loud passages).
  */
+/* fld with UND and no DOOM: true when dsm_fldStereo replaces two
+ * dsm_sample calls (same output, one call per frame). */
+int dsm_fldFast(const DsModelState *m);
+void dsm_fldStereo(DsModelState *m, float xl, float xr, float *yl, float *yr);
 float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c, float x,
                  float env);
 

@@ -210,6 +210,8 @@ static void destroy_processBody(void *rt_void, effect_io_t *io)
     L = io->l;
     R = io->r;
     frames = io->frames;
+    /* fld, UND, no DOOM: both channels in one call (same output). */
+    const int fld_fast = (alg != 0u) && dsm_fldFast(&st->models);
 
     /* Controls, once per block. */
     fold = (float)DS_ROW(rt, DESTROY_PARAM_FOLD) * (1.0f / 127.0f);
@@ -271,8 +273,8 @@ static void destroy_processBody(void *rt_void, effect_io_t *io)
         float yl;
         float yr;
 
-        /* Sub-octave from the mono sum. */
-        {
+        /* Sub-octave from the mono sum (skipped while sub is 0: unheard). */
+        if (sub_lvl > 0.0f) {
             const float m = 0.5f * (xl + xr);
             float a;
 
@@ -303,13 +305,24 @@ static void destroy_processBody(void *rt_void, effect_io_t *io)
             env01 = 3.0f * st->env;
             env01 = (env01 > 1.0f) ? 1.0f : env01;
             st->split[0] += split_a * (xl - st->split[0]);
-            lo = use_split * st->split[0];
-            yl = lo + DS_MODEL_GAIN * dsm_sample(&st->models, pool, 0u,
-                                                 xl - lo, env01);
             st->split[1] += split_a * (xr - st->split[1]);
-            lo = use_split * st->split[1];
-            yr = lo + DS_MODEL_GAIN * dsm_sample(&st->models, pool, 1u,
-                                                 xr - lo, env01);
+            if (fld_fast) {
+                const float lol = use_split * st->split[0];
+                const float lor = use_split * st->split[1];
+                float ml;
+                float mr;
+
+                dsm_fldStereo(&st->models, xl - lol, xr - lor, &ml, &mr);
+                yl = lol + DS_MODEL_GAIN * ml;
+                yr = lor + DS_MODEL_GAIN * mr;
+            } else {
+                lo = use_split * st->split[0];
+                yl = lo + DS_MODEL_GAIN * dsm_sample(&st->models, pool, 0u,
+                                                     xl - lo, env01);
+                lo = use_split * st->split[1];
+                yr = lo + DS_MODEL_GAIN * dsm_sample(&st->models, pool, 1u,
+                                                     xr - lo, env01);
+            }
         } else {
             const float inj = 1.5f * sub_lvl * st->sub_out;
             const float flip = 1.0f + sub_rm * (st->sub_sq - 1.0f);
@@ -327,13 +340,18 @@ static void destroy_processBody(void *rt_void, effect_io_t *io)
         yl += 0.5f * sub_lvl * st->sub_out;
         yr += 0.5f * sub_lvl * st->sub_out;
 
-        /* Tone tilt. */
-        st->tone[0] += tone_a * (yl - st->tone[0]);
-        st->tone[1] += tone_a * (yr - st->tone[1]);
-        if (tone_t < 0.0f) {
+        /* Tone tilt (skipped at the centre, where it changes nothing). */
+        if (tone_t == 0.0f) {
+            st->tone[0] = yl;                     /* ready if tone moves */
+            st->tone[1] = yr;
+        } else if (tone_t < 0.0f) {
+            st->tone[0] += tone_a * (yl - st->tone[0]);
+            st->tone[1] += tone_a * (yr - st->tone[1]);
             yl += -tone_t * (st->tone[0] - yl);
             yr += -tone_t * (st->tone[1] - yr);
         } else {
+            st->tone[0] += tone_a * (yl - st->tone[0]);
+            st->tone[1] += tone_a * (yr - st->tone[1]);
             yl -= tone_t * st->tone[0];
             yr -= tone_t * st->tone[1];
         }
@@ -375,7 +393,7 @@ static void destroy_processBody(void *rt_void, effect_io_t *io)
 /* Timed for the CPU page (DST line): the effect alone, inside RND. */
 static void destroy_process(void *rt_void, effect_io_t *io)
 {
-#ifdef PROF_DWT_CYCCNT
+#if defined(__arm__)
     const uint32_t t0 = PROF_DWT_CYCCNT;
     const uint32_t i0 = prof_isrCycles;
 
