@@ -236,6 +236,22 @@ static void destroy_processBody(void *rt_void, effect_io_t *io)
     sub_out_a = 1.0f - expf(-DS_TWO_PI * 1000.0f / DS_FS);  /* keeps grit */
     env_rel = expf(-1.0f / (0.05f * DS_FS));
     mix1 = (float)DS_ROW(rt, DESTROY_PARAM_MIX) * (1.0f / 127.0f);
+    {
+        /*
+         * mix curve per model (mix^k): mix 50 brings the same presence on
+         * every model, that of fld at 30 before (bench: A-weighted level of
+         * what the wet path adds, same pots). k > 1 tames the dominant ones
+         * (fld), k < 1 brings the discreet ones forward; 0 and 127 stay dry
+         * and full wet. cls stays linear (its saved scenes keep their sound).
+         */
+        static const float k_mix[DSM_ALG_COUNT] = {
+            1.00f, 1.39f, 0.60f, 0.89f, 1.55f, 1.04f, 0.70f, 0.89f, 0.94f,
+            0.97f, 0.83f, 0.60f, 0.81f, 0.91f, 0.63f, 0.67f, 0.60f
+        };
+
+        if (alg && mix1 > 0.0f && mix1 < 1.0f)
+            mix1 = powf(mix1, k_mix[alg]);
+    }
     drv1 = exp2f((float)DS_ROW(rt, DESTROY_PARAM_DRIVE) * (6.0f / 127.0f));
     if (!st->primed) {
         st->mix = mix1;
