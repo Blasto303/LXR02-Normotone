@@ -12671,9 +12671,11 @@ static void filesystem_loadKitDirectory_tick(void)
             return;
         }
         if (eof) {
+            /* During playback the running Effect stays (a Kit changed in
+             * performance keeps the sound); stopped, the Kit brings its own. */
             op_kit_effect_valid = (uint8_t)(
                 storage_effectFinalize(&op_effect_state, &op_kit_effect) ==
-                STORAGE_STATUS_OK);
+                STORAGE_STATUS_OK && !seq_isRunning());
             op_phase = 43;
         }
         return;
