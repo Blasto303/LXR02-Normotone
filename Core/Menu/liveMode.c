@@ -1016,8 +1016,22 @@ void live_beforeSceneChange(uint8_t target)
     uint8_t carry;
 
     /*
-     * From Scene 17 (the old project still playing after a project load):
-     * no mix to carry, but PLAITS must already sound on the first pattern.
+     * From Scene 17 (the old project still playing after a project load),
+     * during playback: the running Effect carries onto the new project's
+     * first pattern (Scene 17 is a copy of the Scene that was playing), as
+     * for a Kit loaded in performance; stopped, the project keeps its own.
+     * The next pattern changes carry it on as usual.
+     */
+    if (active >= SCENE_COUNT && live_sceneValid(target) && seq_isRunning()) {
+        const effect_record_t *fx = scene_effectConst(active);
+        const effect_record_t *dst = scene_effectConst(target);
+
+        if (fx && dst && memcmp(fx, dst, sizeof(*fx)) != 0)
+            (void)scene_commitEffectRecord(target, fx);
+    }
+    /*
+     * From Scene 17: no mix to carry, but PLAITS must already sound on the
+     * first pattern.
      */
     if (active >= SCENE_COUNT && live_plaits && live_sceneValid(target)) {
         live_checkBackup();
