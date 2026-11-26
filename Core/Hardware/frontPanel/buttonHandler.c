@@ -414,6 +414,19 @@ static uint8_t bh_overlayVoiceMask = 0u;
  */
 static uint8_t bh_overlayHeldType = 0xFFu;
 
+/*
+ * BAR LEDs for the NUM progression (BAR alone in PERF): BAR > lit while a
+ * phrase length is set, BAR < lit while held. A trigger overlay (SHIFT +
+ * BAR) keeps the LEDs for itself while it is on.
+ */
+static void buttonHandler_progLeds(void)
+{
+    if (bh_overlayActive != 0u)
+        return;
+    led_setValue((uint8_t)(tgen_progLength() != 0u), LED_BAR2);
+    led_setValue((uint8_t)(tgen_progHeld() != 0u), LED_BAR1);
+}
+
 #define DBLCLICK_FIRST  0u
 #define DBLCLICK_DOUBLE 1u
 
@@ -1661,6 +1674,7 @@ static void buttonHandler_loopCheckDisengage(void)
         menu_syncPerfSelectLed();
         led_setValue((uint8_t)(bh_overlayActive == 1u), LED_BAR1);
         led_setValue((uint8_t)(bh_overlayActive == 2u), LED_BAR2);
+        buttonHandler_progLeds();
     }
 }
 
@@ -2143,6 +2157,7 @@ static void handleModeButtonsForLibrary(uint8_t mode, menu_library_target_t libr
     if (bh_state.selectButtonMode == SELECT_MODE_PERF) {
         led_setValue((uint8_t)(bh_overlayActive == 1u), LED_BAR1);
         led_setValue((uint8_t)(bh_overlayActive == 2u), LED_BAR2);
+        buttonHandler_progLeds();
     } else {
         led_setValue(0u, LED_BAR1);
         led_setValue(0u, LED_BAR2);
@@ -3356,9 +3371,11 @@ static void processPress(uint8_t buttonNr)
              * momentary triplet modifier (x2/3). Loop starts never move.
              */
             bh_loopBarHeld |= 0x01u;
-            /* SHIFT + BAR <: hold / release the NUM progression. */
-            if (buttonHandler_getShift() && !seq_loopActive) {
+            /* BAR < alone: hold / release the NUM progression (SHIFT + BAR
+             * toggles the trigger overlay instead). */
+            if (!buttonHandler_getShift() && !seq_loopActive) {
                 tgen_progToggleHold();
+                buttonHandler_progLeds();
                 menu_repaintAll();
                 break;
             }
@@ -3373,6 +3390,7 @@ static void processPress(uint8_t buttonNr)
             led_setValue((uint8_t)(bh_overlayActive == 2u), LED_BAR2);
             /* Switch/toggle the held overlay trigger while a VOICE is held. */
             buttonHandler_overlaySwitchHeld();
+            buttonHandler_progLeds();      /* overlay off: progression LEDs */
             break;
         }
         if (menu_currentBar > 0u)
@@ -3400,9 +3418,11 @@ static void processPress(uint8_t buttonNr)
              * dot modifier during a loop, else the right trigger-overlay
              * toggle (see BAR1 above). */
             bh_loopBarHeld |= 0x02u;
-            /* SHIFT + BAR >: NUM progression phrase off / 4 / 8 / 16. */
-            if (buttonHandler_getShift() && !seq_loopActive) {
+            /* BAR > alone: NUM progression phrase off / 4 / 8 / 16 (SHIFT +
+             * BAR toggles the trigger overlay instead). */
+            if (!buttonHandler_getShift() && !seq_loopActive) {
                 tgen_progCycleLen();
+                buttonHandler_progLeds();
                 menu_repaintAll();
                 break;
             }
@@ -3417,6 +3437,7 @@ static void processPress(uint8_t buttonNr)
             led_setValue((uint8_t)(bh_overlayActive == 2u), LED_BAR2);
             /* Switch/toggle the held overlay trigger while a VOICE is held. */
             buttonHandler_overlaySwitchHeld();
+            buttonHandler_progLeds();      /* overlay off: progression LEDs */
             break;
         }
         if (menu_currentBar < (NUM_BARS - 1u))
