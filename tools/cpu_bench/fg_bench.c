@@ -319,6 +319,14 @@ int main(int argc, char **argv)
                 { ev_release(BUT_BAR2); ev_release(BUT_SHIFT); }
             if (getenv("FG_HOLD") && ms == atoi(getenv("FG_HOLD"))) { ev_press(BUT_SHIFT); ev_press(BUT_BAR1); }
             if (getenv("FG_HOLD") && ms == atoi(getenv("FG_HOLD")) + 5) { ev_release(BUT_BAR1); ev_release(BUT_SHIFT); }
+            /* FG_OVL: BAR < at 1 s, then VOICE 1..3 tapped (overlay hits). */
+            if (getenv("FG_OVL")) {
+                if (ms == 1000) { ev_press(BUT_BAR1); }
+                if (ms == 1005) { ev_release(BUT_BAR1); }
+                if (ms == 1500 || ms == 2000 || ms == 2500) ev_press(BUT_VOICE_1);
+                if (ms == 1510 || ms == 2010 || ms == 2510) ev_release(BUT_VOICE_1);
+                if (ms == 1600) printf("ovl screen |%.16s|%.16s| muted %02x\n", editDisplayBuffer[0], editDisplayBuffer[1], (unsigned)seq_mutedTracks);
+            }
             if (getenv("FG_SCREEN") && ms % 1846 == 900)
                 printf("t=%5ld |%.16s|%.16s|\n", ms, editDisplayBuffer[0], editDisplayBuffer[1]);
             svc_led(); svc_mnu(); svc_scr(); svc_btn();
