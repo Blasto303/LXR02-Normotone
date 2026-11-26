@@ -309,6 +309,18 @@ int main(int argc, char **argv)
                 if (ms == 8001) { ev_release(BUT_SEQ8); ev_release(BUT_MODE3); }
                 if (ms == 8100) { ev_press(BUT_SEQ3); ev_release(BUT_SEQ3); }
             }
+            /* FG_PROG=n: n presses of SHIFT + BAR > (NUM progression length),
+             * FG_HOLD=ms: SHIFT + BAR < at that time; FG_SCREEN: PERF screen
+             * printed at every bar line. */
+            if (getenv("FG_PROG") && ms >= 200 && ms < 200 + 10 * atoi(getenv("FG_PROG")) && ms % 10 == 0) {
+                if (ms % 20 == 0) { ev_press(BUT_SHIFT); ev_press(BUT_BAR2); }
+            }
+            if (getenv("FG_PROG") && ms >= 200 && ms % 20 == 10 && ms < 200 + 20 * atoi(getenv("FG_PROG")))
+                { ev_release(BUT_BAR2); ev_release(BUT_SHIFT); }
+            if (getenv("FG_HOLD") && ms == atoi(getenv("FG_HOLD"))) { ev_press(BUT_SHIFT); ev_press(BUT_BAR1); }
+            if (getenv("FG_HOLD") && ms == atoi(getenv("FG_HOLD")) + 5) { ev_release(BUT_BAR1); ev_release(BUT_SHIFT); }
+            if (getenv("FG_SCREEN") && ms % 1846 == 900)
+                printf("t=%5ld |%.16s|%.16s|\n", ms, editDisplayBuffer[0], editDisplayBuffer[1]);
             svc_led(); svc_mnu(); svc_scr(); svc_btn();
             svc_prs(); svc_mrp(); svc_sd(); svc_bgl();
         }

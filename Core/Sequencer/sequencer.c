@@ -4441,6 +4441,13 @@ static uint8_t seq_handleMasterBoundary(void)
 	 * scaled track. They own pattern-boundary commit, trigger clock output, beat
 	 * LED pulse, and 128-step drift correction checkpoints.
 	 */
+	/* NUM progression: phrases counted from the start, bar by bar. */
+	if (masterStepPos == 0u) {
+		if (seq_masterStepClock == 0u)
+			tgen_progStart();
+		else
+			tgen_progBar();
+	}
 	if (masterStepPos == 0u && seq_masterStepClock != 0u) {
 		seq_barCounter++;
 		if ((seq_activePattern != seq_pendingPattern) || seq_loadPendigFlag) {

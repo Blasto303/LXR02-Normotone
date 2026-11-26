@@ -48,6 +48,23 @@ uint8_t tgen_eucPos(uint8_t track);
 uint16_t tgen_numPattern(const pat_track_gen_t *g, uint8_t prime);
 uint8_t tgen_numFactor(uint8_t index);          /* 1 2 4 8 16 3 6 ... */
 
+/* NUM progression (PERF, SHIFT + BAR): AAAB phrases of 4 / 8 / 16 bars; B
+ * moves tracks 2..7 one factor position for that bar; the prime steps every
+ * 16 bars and swaps bank every 32. Runtime only. */
+void tgen_progStart(void);                      /* sequencer start (ISR) */
+void tgen_progBar(void);                        /* every bar line (ISR) */
+void tgen_progCycleLen(void);                   /* off -> 4 -> 8 -> 16 -> off */
+void tgen_progToggleHold(void);
+void tgen_progRebase(void);                     /* the prime pot moved */
+uint8_t tgen_progLength(void);
+uint8_t tgen_progHeld(void);
+uint8_t tgen_progSerial(void);
+uint8_t tgen_progLenShown(void);
+void tgen_progHideLen(void);
+uint8_t tgen_progPos(void);                     /* 1..len, 0 when off */
+uint8_t tgen_progInB(void);
+uint8_t tgen_progPrime(uint8_t prime);          /* prime after the walk */
+
 /*
  * Global generator layer (live): SHIFT + pot 1 on the GEN page sets the
  * same mode on the 7 tracks; any mode but STD also latches these 7 records

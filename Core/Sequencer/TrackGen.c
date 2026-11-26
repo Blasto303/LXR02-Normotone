@@ -68,6 +68,119 @@ uint8_t tgen_numFactor(uint8_t index)
     return tgen_factors[index & 15u];
 }
 
+/*
+ * NUM progression (PERF, SHIFT + BAR): phrases of 4, 8 or 16 bars counted
+ * from the sequencer start. The last bar of each phrase (B) moves tracks
+ * 2..7 to the next factor position; every 16 bars the prime moves to the
+ * next one in its bank, every 32 bars it changes bank (X <-> Y). Runtime
+ * only. Written by the master-boundary ISR (bar) and the foreground (PERF
+ * buttons, prime pot); single bytes, so no lock.
+ */
+static volatile uint8_t tgen_progLen;      /* 0 off, 4, 8, 16 */
+static volatile uint8_t tgen_progHold;
+static volatile uint8_t tgen_progCnt;      /* bars since start, wraps */
+static volatile uint8_t tgen_progAdv;      /* prime steps within the bank */
+static volatile uint8_t tgen_progFlip;     /* 0 or 16: bank swapped */
+static volatile uint8_t tgen_progSer;      /* bumps at every bar */
+static volatile uint8_t tgen_progShowLen;  /* length shown until next bar */
+
+void tgen_progStart(void)
+{
+    tgen_progCnt = 0u;
+    tgen_progAdv = 0u;                /* a new start begins at the base */
+    tgen_progFlip = 0u;
+    tgen_progSer++;
+}
+
+void tgen_progBar(void)
+{
+    const uint8_t c = (uint8_t)(tgen_progCnt + 1u);
+
+    tgen_progCnt = c;
+    tgen_progShowLen = 0u;
+    if (tgen_progLen && !tgen_progHold) {
+        if ((c & 31u) == 0u)
+            tgen_progFlip ^= 16u;                     /* every 32 bars */
+        else if ((c & 15u) == 0u)
+            tgen_progAdv = (uint8_t)((tgen_progAdv + 1u) & 15u);
+    }
+    tgen_progSer++;
+}
+
+void tgen_progCycleLen(void)
+{
+    const uint8_t l = tgen_progLen;
+
+    tgen_progLen = (l == 0u) ? 4u : (l == 4u) ? 8u : (l == 8u) ? 16u : 0u;
+    if (tgen_progLen == 0u) {                 /* off: back to the base */
+        tgen_progAdv = 0u;
+        tgen_progFlip = 0u;
+        tgen_progHold = 0u;
+    }
+    tgen_progShowLen = 1u;
+    tgen_progSer++;
+}
+
+void tgen_progToggleHold(void)
+{
+    if (tgen_progLen)
+        tgen_progHold = (uint8_t)!tgen_progHold;
+    tgen_progSer++;
+}
+
+void tgen_progRebase(void)
+{
+    tgen_progAdv = 0u;
+    tgen_progFlip = 0u;
+    tgen_progSer++;
+}
+
+uint8_t tgen_progLength(void) { return tgen_progLen; }
+uint8_t tgen_progHeld(void) { return tgen_progHold; }
+uint8_t tgen_progSerial(void) { return tgen_progSer; }
+uint8_t tgen_progLenShown(void) { return tgen_progShowLen; }
+
+void tgen_progHideLen(void)
+{
+    tgen_progShowLen = 0u;
+    tgen_progSer++;
+}
+
+uint8_t tgen_progPos(void)
+{
+    return tgen_progLen ? (uint8_t)(tgen_progCnt % tgen_progLen) + 1u : 0u;
+}
+
+uint8_t tgen_progInB(void)
+{
+    return (uint8_t)(tgen_progLen && !tgen_progHold &&
+                     tgen_progPos() == tgen_progLen);
+}
+
+uint8_t tgen_progPrime(uint8_t prime)
+{
+    prime = (uint8_t)(prime % PAT_GEN_NUM_PRIMES);
+    if (!tgen_progLen)
+        return prime;
+    return (uint8_t)((((prime & 15u) + tgen_progAdv) & 15u) |
+                     ((prime & 16u) ^ tgen_progFlip));
+}
+
+static uint16_t tgen_numPatternF(const pat_track_gen_t *g, uint8_t prime,
+                                 uint8_t fct)
+{
+    uint32_t r;
+    uint8_t msk;
+
+    msk = g->v[PAT_GEN_F_NUM_MSK];
+    r = (uint32_t)(tgen_primes[prime % PAT_GEN_NUM_PRIMES] &
+                   tgen_masks[(msk > 2u) ? 0u : msk]) *
+        tgen_factors[fct & 15u];
+    while (r >> 16)
+        r = (r & 0xFFFFu) + (r >> 16);
+    return (uint16_t)r;
+}
+
 uint16_t tgen_numPattern(const pat_track_gen_t *g, uint8_t prime)
 {
     uint32_t r;
@@ -176,8 +289,14 @@ uint8_t tgen_step(uint8_t track, const pat_track_gen_t *g, uint8_t pat_on,
         /* 16-step measure counted from the track's start (as a reset). */
         uint8_t p = tgen_euc_pos[track];
 
+        /* Progression: prime walk, and in the B bar the next factor on
+         * every track but the first (the kick keeps the floor). */
+        const uint8_t fct = (uint8_t)(g->v[PAT_GEN_F_NUM_FCT] +
+                                      ((track != 0u && tgen_progInB()) ? 1u : 0u));
+
         p = (uint8_t)(p & 15u);
-        gate = (uint8_t)((tgen_numPattern(g, prime) >> (15u - p)) & 1u);
+        gate = (uint8_t)((tgen_numPatternF(g, tgen_progPrime(prime), fct) >>
+                          (15u - p)) & 1u);
         tgen_euc_pos[track] = (uint8_t)((p + 1u) & 15u);
     } else if (mode == PAT_GEN_TM) {
         const uint8_t gat = g->v[PAT_GEN_F_TM_GAT];

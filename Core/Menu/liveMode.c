@@ -869,7 +869,11 @@ void live_genPrimeMacro(int8_t delta)
 {
     if (delta == 0)
         return;
-    live_genSetPrime((int16_t)live_genPrime() + ((delta > 0) ? 1 : -1));
+    /* From the prime heard (after the progression's walk), which becomes
+     * the new base: the progression goes on from there. */
+    live_genSetPrime((int16_t)tgen_progPrime(live_genPrime()) +
+                     ((delta > 0) ? 1 : -1));
+    tgen_progRebase();
     menu_repaintAll();
 }
 
@@ -1243,6 +1247,32 @@ void live_service(void)
             live_morphLeds();
         }
     }
+    /* NUM progression: the PERF screen follows each bar line. */
+    {
+        static uint8_t ser;
+        const uint8_t now = tgen_progSerial();
+
+        static uint16_t shown_at;
+        static uint8_t shown;
+
+        /* The L04 / off label lasts about 1.5 s even when stopped. */
+        if (tgen_progLenShown()) {
+            if (!shown) {
+                shown = 1u;
+                shown_at = time_sysTick;
+            } else if ((uint16_t)(time_sysTick - shown_at) > 1500u) {
+                tgen_progHideLen();
+            }
+        } else {
+            shown = 0u;
+        }
+        if (now != ser) {
+            ser = now;
+            if (live_page == 0u && buttonHandler_getMode() == SELECT_MODE_PERF &&
+                menu_activePage == PERFORMANCE_PAGE && menu_getSubPage() == 0u)
+                menu_repaintAll();
+        }
+    }
     /* PLAITS on/off message: about one second. */
     if (live_flash && (uint16_t)(time_sysTick - live_flashStart) > 1200u) {
         live_flash = 0u;
@@ -1392,10 +1422,32 @@ uint8_t live_formatOverlay(char *row0, char *row1)
                 memcpy(&row0[4], "prb", 3);
                 live_put3(&row1[4], g->v[PAT_GEN_F_TM_PRB]);
             }
-            /* Pot 3: the NUM prime shared by the Pattern's NUM tracks. */
+            /* Pot 3: the NUM prime shared by the Pattern's NUM tracks;
+             * with the progression on, the label shows the phrase (L04..L16
+             * just after SHIFT + BAR >, then A01.. / B04.., hld when held)
+             * and the value the prime after the walk. */
             memcpy(&row0[8], "prm", 3);
-            live_putPrime(&row1[8], tgen_globalOn() ? tgen_globalPrime()
-                                                    : r->gen_prime);
+            if (tgen_progLength()) {
+                const uint8_t len = tgen_progLength();
+                const uint8_t pos = tgen_progPos();
+
+                if (tgen_progLenShown()) {
+                    row0[8] = 'L';
+                    row0[9] = (char)('0' + len / 10u);
+                    row0[10] = (char)('0' + len % 10u);
+                } else if (tgen_progHeld()) {
+                    memcpy(&row0[8], "hld", 3);
+                } else {
+                    row0[8] = (pos == len) ? 'B' : 'A';
+                    row0[9] = (char)('0' + pos / 10u);
+                    row0[10] = (char)('0' + pos % 10u);
+                }
+            } else if (tgen_progLenShown()) {
+                memcpy(&row0[8], "off", 3);
+            }
+            live_putPrime(&row1[8], tgen_progPrime(tgen_globalOn()
+                                                   ? tgen_globalPrime()
+                                                   : r->gen_prime));
             /* Pot 4: DJ filter, "off", L01..L64 (low-pass), H01..H64. */
             {
                 const int8_t f = djFilter_value();

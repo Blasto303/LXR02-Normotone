@@ -40,6 +40,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "AutosaveTrace.h"
+#include "TrackGen.h"
 
 /* -----------------------------------------------------------------------
 ** Held-state array (written from foreground scan, read from main loop)
@@ -3355,6 +3356,12 @@ static void processPress(uint8_t buttonNr)
              * momentary triplet modifier (x2/3). Loop starts never move.
              */
             bh_loopBarHeld |= 0x01u;
+            /* SHIFT + BAR <: hold / release the NUM progression. */
+            if (buttonHandler_getShift() && !seq_loopActive) {
+                tgen_progToggleHold();
+                menu_repaintAll();
+                break;
+            }
             if (seq_loopActive) {
                 bh_loopBarModifier = 2u;            /* triplet */
                 seq_loopUpdateDivision(bh_loopLastSelectButton,
@@ -3393,6 +3400,12 @@ static void processPress(uint8_t buttonNr)
              * dot modifier during a loop, else the right trigger-overlay
              * toggle (see BAR1 above). */
             bh_loopBarHeld |= 0x02u;
+            /* SHIFT + BAR >: NUM progression phrase off / 4 / 8 / 16. */
+            if (buttonHandler_getShift() && !seq_loopActive) {
+                tgen_progCycleLen();
+                menu_repaintAll();
+                break;
+            }
             if (seq_loopActive) {
                 bh_loopBarModifier = 1u;            /* dot */
                 seq_loopUpdateDivision(bh_loopLastSelectButton,
