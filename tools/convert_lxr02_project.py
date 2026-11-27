@@ -51,6 +51,12 @@ LEGACY_PARAMETER_ARRAY_H = Path(__file__).resolve().parent / "lxr_legacy" / "Par
 KIT_FILE_BYTES = 255
 KIT_NAME_BYTES = 8
 KIT_CONVERTED_BYTES = 228  # original LXR parameter block
+# Oscillator waveform parameters (same indexes in the LXR and LXR-02 lists):
+# OSC_WAVE_DRUM1..3, OSC_WAVE_SNARE, WAVE1_CYM, WAVE1_HH, MOD_WAVE_DRUM1..3,
+# WAVE2/3_CYM, WAVE2/3_HH.
+LXR02_WAVE_PARAMS = (1, 2, 3, 4, 6, 7, 20, 21, 22, 23, 24, 25, 26)
+LXR02_WAVE_PWM = 5
+HELICASE_WAVE_REC = 3
 
 PAT_V3_BYTES = 3663
 PAT_V2_BYTES = 3215
@@ -113,6 +119,7 @@ def probability_to_condition(percent: int) -> int:
 class Converter:
     def __init__(self) -> None:
         kits.PARAMETER_ARRAY_H = LEGACY_PARAMETER_ARRAY_H
+        self.pwm_waves = 0          # oscillators moved from PWM to REC
         self.param_values = kits.parse_param_enum()
         self.param_renames = kits.parse_param_renames()
         kits.validate_param_renames(self.param_renames)
@@ -140,7 +147,16 @@ class Converter:
     # ---- kits -----------------------------------------------------------
 
     def write_kit(self, data: bytes, kit_dir: Path, name: str) -> None:
-        payload = data[KIT_NAME_BYTES:]
+        payload = bytearray(data[KIT_NAME_BYTES:])
+        # LXR-02 waveform 5 is PWM (two offset saws, Erica firmware source:
+        # Oscillator.h OscWaveforms); here 5 is the built-in CRASH sample.
+        # PWM at 50 % is a square, so it becomes REC (3): an oscillator
+        # again, with the pulse width itself not carried over.
+        for index in LXR02_WAVE_PARAMS:
+            if payload[index] == LXR02_WAVE_PWM:
+                payload[index] = HELICASE_WAVE_REC
+                self.pwm_waves += 1
+        payload = bytes(payload)
         kit_dir.mkdir(parents=True, exist_ok=True)
         prefix = kits.filename_prefix(name, "lxrkit")
         files = [
@@ -435,6 +451,8 @@ def main() -> int:
             bank_slot += 1
 
     print("\n".join(report))
+    if conv.pwm_waves:
+        print(f"\n{conv.pwm_waves} oscillators on the LXR-02 PWM wave became REC (square)")
     if conv.notes:
         print("\nNotes:")
         print("\n".join(f"  {note}" for note in conv.notes))
