@@ -152,9 +152,25 @@ uint8_t tgen_progPos(void)
     return tgen_progLen ? (uint8_t)(tgen_progCnt % tgen_progLen) + 1u : 0u;
 }
 
+/*
+ * Break, the last 8 bars of every 32-bar cycle: bars 25..28 force the
+ * 0F0 mask on every NUM track (kick included), bars 29..32 the F03 mask;
+ * bar 33 comes back to each track's own mask with the bank swap. 0 = no
+ * break, 1 = 0F0, 2 = F03 (PAT_GEN_F_NUM_MSK values).
+ */
+uint8_t tgen_progBreak(void)
+{
+    uint8_t b;
+
+    if (!tgen_progLen || tgen_progHold)
+        return 0u;
+    b = (uint8_t)(tgen_progCnt & 31u);                /* 0 = bar 1 */
+    return (b >= 28u) ? 2u : ((b >= 24u) ? 1u : 0u);
+}
+
 uint8_t tgen_progInB(void)
 {
-    return (uint8_t)(tgen_progLen && !tgen_progHold &&
+    return (uint8_t)(tgen_progLen && !tgen_progHold && !tgen_progBreak() &&
                      tgen_progPos() == tgen_progLen);
 }
 
@@ -172,8 +188,9 @@ static uint16_t tgen_numPatternF(const pat_track_gen_t *g, uint8_t prime,
 {
     uint32_t r;
     uint8_t msk;
+    const uint8_t brk = tgen_progBreak();
 
-    msk = g->v[PAT_GEN_F_NUM_MSK];
+    msk = brk ? brk : g->v[PAT_GEN_F_NUM_MSK];         /* break mask */
     r = (uint32_t)(tgen_primes[prime % PAT_GEN_NUM_PRIMES] &
                    tgen_masks[(msk > 2u) ? 0u : msk]) *
         tgen_factors[fct & 15u];

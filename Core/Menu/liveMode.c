@@ -1549,6 +1549,8 @@ uint8_t live_formatOverlay(char *row0, char *row1)
                     row0[10] = (char)('0' + len % 10u);
                 } else if (tgen_progHeld()) {
                     memcpy(&row0[8], "hld", 3);
+                } else if (tgen_progBreak()) {        /* the break's mask */
+                    memcpy(&row0[8], (tgen_progBreak() == 1u) ? "0F0" : "F03", 3);
                 } else {
                     row0[8] = (pos == len) ? 'B' : 'A';
                     row0[9] = (char)('0' + pos / 10u);

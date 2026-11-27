@@ -64,6 +64,7 @@ uint8_t tgen_progLenShown(void);
 void tgen_progHideLen(void);
 uint8_t tgen_progPos(void);                     /* 1..len, 0 when off */
 uint8_t tgen_progInB(void);
+uint8_t tgen_progBreak(void);                   /* 0, 1 = 0F0, 2 = F03 (bars 25..32 of 32) */
 uint8_t tgen_progPrime(uint8_t prime);          /* prime after the walk */
 
 /*
