@@ -246,7 +246,7 @@ static void destroy_processBody(void *rt_void, effect_io_t *io)
          */
         static const float k_mix[DSM_ALG_COUNT] = {
             1.00f, 1.39f, 0.60f, 0.89f, 1.55f, 1.04f, 0.70f, 0.89f, 0.94f,
-            0.97f, 0.83f, 0.60f, 0.81f, 0.91f, 0.63f, 0.67f, 0.60f
+            1.24f, 0.83f, 0.60f, 0.81f, 0.91f, 0.63f, 0.67f, 0.60f
         };
 
         if (alg && mix1 > 0.0f && mix1 < 1.0f)

@@ -343,7 +343,7 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
         break;
     }
     case 9u:                                      /* saw */
-        m->k_g = 2.0f + 250.0f * a * a;           /* dist: up to ~+48 dB */
+        m->k_g = 2.0f + 600.0f * a * a;           /* dist: up to ~+56 dB */
         m->k_x = 4.0f * b;                        /* low boost, 0..x4    */
         m->k_q = 4.0f * c;                        /* high boost, 0..x4   */
         tune = -1.0f;
@@ -799,12 +799,20 @@ INITCM float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c,
     }
     case 9u: {                                    /* saw */
         /*
-         * High-pass (~150 Hz) so the clip bites the mids, then a hard
-         * clip with a soft knee. Two Chamberlin band-passes on the clipped
-         * signal, unity peak, centres ~100 Hz (Q 1.4) and ~1 kHz (Q 1.8),
-         * scaled by low/high and added to a thin direct part. A ~6 kHz
-         * low-pass takes the fizz off. No loop: nothing can drone.
+         * High-pass (~150 Hz) so the clip bites the mids, a treble lift
+         * before the clip (more upper harmonics: the scream), then a hard
+         * clip with a soft knee and a small bias, opposite on L and R (even
+         * harmonics). Two Chamberlin band-passes on the clipped signal, unity
+         * peak, scaled by low/high and added to a thin direct part; their
+         * centres differ between L and R (90 Hz / 900 Hz, 115 Hz /
+         * 1.4 kHz) so the two sides read as two takes (double-tracked
+         * width). A ~8.5 kHz low-pass keeps the fizz but not the hiss. No
+         * loop: nothing can drone. Written from the general principle of
+         * such pedals, not from any schematic.
          */
+        static const float f_lo[2] = { 0.012820f, 0.016382f };
+        static const float f_hi[2] = { 0.12823f, 0.19921f };
+        static const float bias[2] = { 0.12f, -0.12f };
         float h;
         float k;
         float hp;
@@ -812,23 +820,25 @@ INITCM float dsm_sample(DsModelState *m, int16_t *pool, uint32_t c,
         float bh;
 
         m->lp_a[c] += 0.021f * (x - m->lp_a[c]);         /* ~150 Hz */
-        h = m->k_g * (x - m->lp_a[c]);
-        k = dsm_clamp(h, 1.2f);
+        h = x - m->lp_a[c];
+        m->acc[c] += 0.11f * (h - m->acc[c]);            /* ~800 Hz */
+        h = m->k_g * (h + 1.2f * (h - m->acc[c]));       /* treble lift */
+        k = dsm_clamp(h + bias[c], 1.2f);
         k = k - 0.13f * k * k * k;                       /* knee, |k| <= 1 */
-        /* Low band: lp = lp_b, bp = lp_c, f = 2 sin(pi 100 / fs). */
-        m->lp_b[c] += 0.01425f * m->lp_c[c];
+        /* Low band: lp = lp_b, bp = lp_c, f = 2 sin(pi fc / fs). */
+        m->lp_b[c] += f_lo[c] * m->lp_c[c];
         hp = k - m->lp_b[c] - 0.71f * m->lp_c[c];
-        m->lp_c[c] += 0.01425f * hp;
+        m->lp_c[c] += f_lo[c] * hp;
         bl = 0.71f * m->lp_c[c];
-        /* High band: lp = hold_in, bp = hold_out, f = 2 sin(pi 1000 / fs). */
-        m->hold_in[c] += 0.1424f * m->hold_out[c];
+        /* High band: lp = hold_in, bp = hold_out. */
+        m->hold_in[c] += f_hi[c] * m->hold_out[c];
         hp = k - m->hold_in[c] - 0.55f * m->hold_out[c];
-        m->hold_out[c] += 0.1424f * hp;
+        m->hold_out[c] += f_hi[c] * hp;
         bh = 0.55f * m->hold_out[c];
         /* Direct part thins out as the boosts come up (0.85 -> 0.35). */
         y = (0.85f - 0.0625f * (m->k_x + m->k_q)) * k +
             m->k_x * bl + m->k_q * bh;
-        m->lp_d[c] += 0.58f * (y - m->lp_d[c]);          /* ~6 kHz */
+        m->lp_d[c] += 0.70f * (y - m->lp_d[c]);          /* ~8.5 kHz */
         /* Level follows the boosts so low/high do not just add volume. */
         y = dsm_dc(m, c, 0.45f * m->lp_d[c] /
                          (1.0f + 0.08f * (m->k_x + m->k_q)));
