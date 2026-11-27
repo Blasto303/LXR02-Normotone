@@ -50,6 +50,7 @@ typedef struct {
     uint8_t k_chain;                    /* fld chain order 0..2 */
     float k_doom;                       /* fld DOOM stage 0..1 */
     float ap_s[2][4];                   /* smo phase allpass states */
+    uint32_t k_key;                     /* dsm_block inputs of the k_* (0 = none) */
     uint8_t alg;
 } DsModelState;
 

@@ -219,11 +219,20 @@ static void destroy_processBody(void *rt_void, effect_io_t *io)
     folding = (uint32_t)(DS_ROW(rt, DESTROY_PARAM_FOLD) != 0u);
     kf = 1.0f + 4.0f * fold;
     {
+        /* Coefficients cached per pot value (CPU: the transcendental calls
+         * ran every block); same expressions, so the same values. */
+        static uint8_t c_last = 0xFFu;
+        static float split_last;
         const uint8_t c = DS_ROW(rt, DESTROY_PARAM_CROSS);
-        const float hz = 40.0f * expf((float)c * (1.0f / 127.0f) * 2.3026f);
 
+        if (c != c_last) {
+            const float hz = 40.0f * expf((float)c * (1.0f / 127.0f) * 2.3026f);
+
+            split_last = 1.0f - expf(-DS_TWO_PI * hz / DS_FS);
+            c_last = c;
+        }
         use_split = (c > 0u) ? 1.0f : 0.0f;
-        split_a = 1.0f - expf(-DS_TWO_PI * hz / DS_FS);
+        split_a = split_last;
     }
     sub_lvl = (float)DS_ROW(rt, DESTROY_PARAM_SUB) * (1.0f / 127.0f);
     if (alg)
@@ -231,10 +240,23 @@ static void destroy_processBody(void *rt_void, effect_io_t *io)
     sub_rm = (sub_lvl > 0.5f) ? 2.0f * (sub_lvl - 0.5f) : 0.0f;
     tone_t = ((float)DS_ROW(rt, DESTROY_PARAM_TONE) - 64.0f) * (1.0f / 63.0f);
     tone_t = (tone_t > 1.0f) ? 1.0f : ((tone_t < -1.0f) ? -1.0f : tone_t);
-    tone_a = 1.0f - expf(-DS_TWO_PI * 1200.0f / DS_FS);
-    sub_lp_a = 1.0f - expf(-DS_TWO_PI * 120.0f / DS_FS);
-    sub_out_a = 1.0f - expf(-DS_TWO_PI * 1000.0f / DS_FS);  /* keeps grit */
-    env_rel = expf(-1.0f / (0.05f * DS_FS));
+    {
+        /* Constant coefficients, computed once. */
+        static uint8_t k_ready;
+        static float k_tone, k_sub_lp, k_sub_out, k_env_rel;
+
+        if (!k_ready) {
+            k_tone = 1.0f - expf(-DS_TWO_PI * 1200.0f / DS_FS);
+            k_sub_lp = 1.0f - expf(-DS_TWO_PI * 120.0f / DS_FS);
+            k_sub_out = 1.0f - expf(-DS_TWO_PI * 1000.0f / DS_FS); /* grit */
+            k_env_rel = expf(-1.0f / (0.05f * DS_FS));
+            k_ready = 1u;
+        }
+        tone_a = k_tone;
+        sub_lp_a = k_sub_lp;
+        sub_out_a = k_sub_out;
+        env_rel = k_env_rel;
+    }
     mix1 = (float)DS_ROW(rt, DESTROY_PARAM_MIX) * (1.0f / 127.0f);
     {
         /*
@@ -249,10 +271,28 @@ static void destroy_processBody(void *rt_void, effect_io_t *io)
             1.24f, 0.83f, 0.60f, 0.81f, 0.91f, 0.63f, 0.67f, 0.60f
         };
 
-        if (alg && mix1 > 0.0f && mix1 < 1.0f)
-            mix1 = powf(mix1, k_mix[alg]);
+        static uint16_t mix_key = 0xFFFFu;
+        static float mix_last;
+        const uint16_t key = (uint16_t)((alg << 8) | DS_ROW(rt, DESTROY_PARAM_MIX));
+
+        if (key != mix_key) {
+            mix_last = (alg && mix1 > 0.0f && mix1 < 1.0f)
+                       ? powf(mix1, k_mix[alg]) : mix1;
+            mix_key = key;
+        }
+        mix1 = mix_last;
     }
-    drv1 = exp2f((float)DS_ROW(rt, DESTROY_PARAM_DRIVE) * (6.0f / 127.0f));
+    {
+        static uint8_t d_last = 0xFFu;
+        static float drv_last;
+        const uint8_t d = DS_ROW(rt, DESTROY_PARAM_DRIVE);
+
+        if (d != d_last) {
+            drv_last = exp2f((float)d * (6.0f / 127.0f));
+            d_last = d;
+        }
+        drv1 = drv_last;
+    }
     if (!st->primed) {
         st->mix = mix1;
         st->drive = drv1;
@@ -266,16 +306,43 @@ static void destroy_processBody(void *rt_void, effect_io_t *io)
     st->drive = drv1;
     /* Level compensation: 1/sqrt(drive), capped at +18 dB of drive where
      * the curve is saturated anyway; ramped like the drive. */
-    comp0 = 1.0f / sqrtf((drv0 < 8.0f) ? drv0 : 8.0f);
-    comp_inc = (1.0f / sqrtf((drv1 < 8.0f) ? drv1 : 8.0f) - comp0) /
-               (float)frames;
+    {
+        /* 1/sqrt per distinct drive value only (the ramp ends repeat). */
+        static float cd_in = -1.0f, cd_out;
+        static float cd_in2 = -1.0f, cd_out2;
+        const float d0 = (drv0 < 8.0f) ? drv0 : 8.0f;
+        const float d1 = (drv1 < 8.0f) ? drv1 : 8.0f;
+
+        if (d0 != cd_in) {
+            if (d0 == cd_in2) {
+                cd_in = cd_in2;
+                cd_out = cd_out2;
+            } else {
+                cd_in = d0;
+                cd_out = 1.0f / sqrtf(d0);
+            }
+        }
+        if (d1 != cd_in2) {
+            cd_in2 = d1;
+            cd_out2 = (d1 == cd_in) ? cd_out : 1.0f / sqrtf(d1);
+        }
+        comp0 = cd_out;
+        comp_inc = (cd_out2 - comp0) / (float)frames;
+    }
     pla = (float)DS_ROW(rt, DESTROY_PARAM_PLATE) * (1.0f / 127.0f);
     {
         const float r = (float)DS_ROW(rt, DESTROY_PARAM_PLATE_DECAY) *
                         (1.0f / 127.0f);
         const float damp = 0.05f + 0.85f * 0.75f;   /* fixed, fairly dark */
 
-        decay = 0.2f + 0.76f * sqrtf(r);
+        static uint8_t r_last = 0xFFu;
+        static float decay_last;
+
+        if (DS_ROW(rt, DESTROY_PARAM_PLATE_DECAY) != r_last) {
+            decay_last = 0.2f + 0.76f * sqrtf(r);
+            r_last = DS_ROW(rt, DESTROY_PARAM_PLATE_DECAY);
+        }
+        decay = decay_last;
         dd2 = decay + 0.15f;
         dd2 = (dd2 > 0.5f) ? 0.5f : ((dd2 < 0.25f) ? 0.25f : dd2);
         damp2 = damp * damp;

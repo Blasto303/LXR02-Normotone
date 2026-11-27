@@ -100,20 +100,16 @@ static inline float bufferTool_interpolatedGain(const uint8_t i,
 	return lastGain + frac*(gain - lastGain);
 }
 
+/* Signed 32-bit saturating add: one QADD on the M7 (CPU), the same result
+ * as the 64-bit compare it replaces. */
 static inline sample_mx_t bufferTool_satAdd32(sample_mx_t a, sample_mx_t b)
 {
-	int64_t acc = (int64_t)a + (int64_t)b;
-	if (acc > INT32_MAX) return INT32_MAX;
-	if (acc < INT32_MIN) return INT32_MIN;
-	return (sample_mx_t)acc;
+	return (sample_mx_t)__QADD((int32_t)a, (int32_t)b);
 }
 
 static inline sample_mx_t bufferTool_satSub32(sample_mx_t a, sample_mx_t b)
 {
-	int64_t acc = (int64_t)a - (int64_t)b;
-	if (acc > INT32_MAX) return INT32_MAX;
-	if (acc < INT32_MIN) return INT32_MIN;
-	return (sample_mx_t)acc;
+	return (sample_mx_t)__QSUB((int32_t)a, (int32_t)b);
 }
 //---------------------------------------------------
 void bufferTool_addBuffers(int16_t* buf1, int16_t* buf2, const uint8_t size);

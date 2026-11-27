@@ -207,7 +207,14 @@ void dsm_block(DsModelState *m, uint8_t alg, uint8_t p1, uint8_t p2,
     const float b = (float)p2 * (1.0f / 127.0f);
     const float c = (float)p3 * (1.0f / 127.0f);
     float tune = c;
+    /* The k_* depend only on these inputs: unchanged, nothing to redo (CPU).
+     * smo reads the voice triggers every block, so it always runs. */
+    const uint32_t key = 0x80000000ul | ((uint32_t)alg << 24) |
+                         ((uint32_t)p1 << 16) | ((uint32_t)p2 << 8) | p3;
 
+    if (alg != 16u && m->k_key == key)
+        return;
+    m->k_key = key;
     m->alg = alg;
     m->k_g = 1.0f;
     m->k_fb = 0.0f;
