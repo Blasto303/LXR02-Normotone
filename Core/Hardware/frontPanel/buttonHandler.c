@@ -2852,6 +2852,17 @@ static uint8_t buttonHandler_livePress(uint8_t b)
     int8_t seq = btn_to_seq(b);
     uint8_t shift = buttonHandler_getShift();
 
+    /* PERF held + step: Morph glide to that pattern (fill disarmed). */
+    if (seq >= 0 && !shift && btn_held[BUT_MODE2] &&
+        bh_state.selectButtonMode == SELECT_MODE_PERF &&
+        menu_activePage == PERFORMANCE_PAGE && !live_genPageActive() &&
+        live_glideStart((uint8_t)seq)) {
+        buttonHandler_liveConsume(b);
+        bh_fillArmed = 0u;
+        seq_fillActive = 0u;
+        return 1u;
+    }
+
     if (b == BUT_MODE3 && !shift) {
         bh_liveLoadHeld = 1u;
         bh_liveLoadSolo = 1u;

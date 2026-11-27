@@ -5696,6 +5696,24 @@ uint8_t menu_commitTargetEdit(uint16_t id, uint8_t value, uint8_t origin)
  * visible. Inputs: 7-bit value (translated
  * 0..126 -> x2, 127 -> 255). Accessor: midiControl_handleCc().
  */
+/* Global Morph 0..255 from the foreground (PERF + step glide), as the PERF
+ * `mrp` edit and CC1 (never recorded). */
+void menu_commitGlobalMorph(uint8_t value)
+{
+    menu_cell_t cell;
+    uint8_t slot;
+
+    memset(&cell, 0, sizeof(cell));
+    cell.kind = MENU_CELL_STATIC;
+    cell.static_param = PAR_MORPH;
+    (void)menu_cellCommitValueEx(&cell, value, 0u);
+    if (menu_paramVisible(PAR_MORPH))
+        menu_knobs_dirty = 1u;
+    for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++)
+        menu_notifyTargetChanged(sceneModTarget_voiceMorphId(slot));
+    menu_notifyTargetChanged(sceneModTarget_effectMorphId());
+}
+
 void menu_commitGlobalMorphFromMidi(uint8_t value)
 {
     menu_cell_t cell;

@@ -99,6 +99,25 @@ static kit_t    live_morphKit;
 static uint8_t  live_morphSrc = LIVE_MORPH_NONE;
 static uint8_t  live_morphLibLeds;
 static void live_morphApply(uint8_t scene);
+/*
+ * Morph glide (PERF held + step, transport running): the Morph target
+ * becomes the kit of pattern N and MRP rises on its own to 255 over the NUM
+ * phrase length (4 bars when the progression is off), ending on a bar line;
+ * the start of the last bar queues pattern N for that bar line, where MRP
+ * goes back to 0 on the same sound and the previous target returns. Turning
+ * MRP (pot 1, CC1) during the glide hands it back to the player.
+ */
+extern uint8_t seq_masterStepCnt;          /* sequencer.c: 16th clock */
+#define LIVE_GLIDE_NONE  0xFFu
+static uint8_t  live_glideTarget = LIVE_GLIDE_NONE;
+static uint8_t  live_glidePrevSrc = LIVE_MORPH_NONE;
+static uint8_t  live_glideFrom;
+static uint8_t  live_glideLast;
+static uint8_t  live_glideLen;
+static uint8_t  live_glideBar0;
+static uint8_t  live_glideStep0;
+static uint8_t  live_glideQueued;
+static uint16_t live_glideTick;
 static uint16_t live_rndBank = 0xFFFFu;
 static uint8_t  live_rndSavedAmt[INSTRUMENT_SLOT_COUNT];
 /*
@@ -435,6 +454,72 @@ void live_morphSelect(uint8_t step)
     live_morphApply(scene_getActiveIndex());
     live_morphLeds();
     menu_repaintAll();
+}
+
+uint8_t live_glideStart(uint8_t step)
+{
+    const uint8_t active = scene_getActiveIndex();
+
+    if (step >= 16u || active >= 16u || !live_sceneValid(step) ||
+        step == active || !seq_isRunning())
+        return 0u;                         /* plain change */
+    if (live_glideTarget == LIVE_GLIDE_NONE)
+        live_glidePrevSrc = live_morphSrc;
+    live_glideTarget = step;
+    live_morphSrc = step;
+    live_morphApply(active);
+    live_glideFrom = parameter_values[PAR_MORPH];
+    live_glideLast = live_glideFrom;
+    live_glideLen = tgen_progLength() ? tgen_progLength() : 4u;
+    live_glideBar0 = tgen_progBars();
+    live_glideStep0 = (uint8_t)(seq_masterStepCnt & 15u);
+    live_glideQueued = 0u;
+    live_glideTick = time_sysTick;
+    menu_repaintAll();
+    return 1u;
+}
+
+uint8_t live_glideActive(void)
+{
+    return (uint8_t)(live_glideTarget != LIVE_GLIDE_NONE);
+}
+
+static void live_glideService(void)
+{
+    uint16_t total;
+    uint16_t pos;
+    uint8_t bars;
+    uint8_t v;
+
+    if (live_glideTarget == LIVE_GLIDE_NONE)
+        return;
+    if (!seq_isRunning()) {                /* stop: the glide ends there */
+        live_glideTarget = LIVE_GLIDE_NONE;
+        return;
+    }
+    if (parameter_values[PAR_MORPH] != live_glideLast) {
+        live_glideTarget = LIVE_GLIDE_NONE; /* the player took MRP */
+        return;
+    }
+    if ((uint16_t)(time_sysTick - live_glideTick) < 8u)
+        return;
+    live_glideTick = time_sysTick;
+    bars = (uint8_t)(tgen_progBars() - live_glideBar0);
+    total = (uint16_t)(live_glideLen * 16u - live_glideStep0);
+    pos = (uint16_t)(bars * 16u + (seq_masterStepCnt & 15u));
+    pos = (pos > live_glideStep0) ? (uint16_t)(pos - live_glideStep0) : 0u;
+    if (pos > total)
+        pos = total;
+    v = (uint8_t)(live_glideFrom +
+                  ((uint32_t)(255u - live_glideFrom) * pos) / total);
+    if (v != live_glideLast) {
+        menu_commitGlobalMorph(v);
+        live_glideLast = parameter_values[PAR_MORPH];
+    }
+    if (!live_glideQueued && bars + 1u >= live_glideLen) {
+        live_glideQueued = 1u;             /* lands on the closing bar line */
+        seq_queueSceneChange(live_glideTarget, 4u /* 1b */);
+    }
 }
 
 /* A KitMrp load from the card just filled the playing kit's Morph side. */
@@ -1073,6 +1158,18 @@ void live_beforeSceneChange(uint8_t target)
         }
         /* MRP follows the player like the mix. */
         preset_morphScene(target, scene_getVoiceMorphAmount(active, 0u));
+        /* Glide end: the new pattern starts at MRP 0 (the same sound the
+         * glide reached) and the previous target comes back. */
+        if (live_glideTarget == target) {
+            live_glideTarget = LIVE_GLIDE_NONE;
+            live_morphSrc = live_glidePrevSrc;
+            live_morphApply(target);
+            preset_morphScene(target, 0u);
+        } else if (live_glideTarget != LIVE_GLIDE_NONE && !live_glideQueued) {
+            live_glideTarget = LIVE_GLIDE_NONE;   /* another pattern: cancel */
+            live_morphSrc = live_glidePrevSrc;
+            live_morphApply(target);
+        }
     }
 
     /* RANDOM on the kit follows the player: new draw for the new pattern. */
@@ -1261,6 +1358,7 @@ void live_service(void)
             live_morphLeds();
         }
     }
+    live_glideService();
     /* NUM progression: the PERF screen follows each bar line. */
     {
         static uint8_t ser;

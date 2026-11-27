@@ -327,8 +327,22 @@ int main(int argc, char **argv)
                 if (ms == 1510 || ms == 2010 || ms == 2510) ev_release(BUT_VOICE_1);
                 if (ms == 1600) printf("ovl screen |%.16s|%.16s|\n", editDisplayBuffer[0], editDisplayBuffer[1]);
             }
+            /* FG_GLIDE=n: PERF held + step n (1..16) at 1 s: Morph glide. */
+            if (getenv("FG_GLIDE")) {
+                static const uint8_t seqb[16] = { BUT_SEQ1, BUT_SEQ2, BUT_SEQ3, BUT_SEQ4,
+                    BUT_SEQ5, BUT_SEQ6, BUT_SEQ7, BUT_SEQ8, BUT_SEQ9, BUT_SEQ10,
+                    BUT_SEQ11, BUT_SEQ12, BUT_SEQ13, BUT_SEQ14, BUT_SEQ15, BUT_SEQ16 };
+                int n = atoi(getenv("FG_GLIDE")) - 1;
+                if (n >= 0 && n < 16) {
+                    if (ms == 1000) ev_press(BUT_MODE2);
+                    if (ms == 1100) ev_press(seqb[n]);
+                    if (ms == 1110) ev_release(seqb[n]);
+                    if (ms == 1150) ev_release(BUT_MODE2);
+                }
+            }
             if (getenv("FG_SCREEN") && ms % 1846 == 900)
-                printf("t=%5ld |%.16s|%.16s|\n", ms, editDisplayBuffer[0], editDisplayBuffer[1]);
+                printf("t=%5ld |%.16s|%.16s| scene %u\n", ms, editDisplayBuffer[0], editDisplayBuffer[1],
+                       (unsigned)scene_getActiveIndex() + 1u);
             svc_led(); svc_mnu(); svc_scr(); svc_btn();
             svc_prs(); svc_mrp(); svc_sd(); svc_bgl();
         }

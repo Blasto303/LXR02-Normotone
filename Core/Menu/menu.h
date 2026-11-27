@@ -758,6 +758,7 @@ void menu_parseKnobDelta(uint8_t knobNr, int8_t delta);
  * menu_cellCommitValueEx(), liveRec_paramIn(), effects_setParameter().
  */
 uint8_t menu_commitTargetEdit(uint16_t id, uint8_t value, uint8_t origin);
+void menu_commitGlobalMorph(uint8_t value);
 void menu_commitGlobalMorphFromMidi(uint8_t value);
 void menu_notifyTargetChanged(uint16_t id);
 /* S083 C5: Learn state changed; request a coalesced repaint (LRN/FUL). */

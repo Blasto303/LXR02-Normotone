@@ -138,6 +138,7 @@ void tgen_progRebase(void)
 uint8_t tgen_progLength(void) { return tgen_progLen; }
 uint8_t tgen_progHeld(void) { return tgen_progHold; }
 uint8_t tgen_progSerial(void) { return tgen_progSer; }
+uint8_t tgen_progBars(void) { return tgen_progCnt; }
 uint8_t tgen_progLenShown(void) { return tgen_progShowLen; }
 
 void tgen_progHideLen(void)

@@ -111,4 +111,9 @@ void live_service(void);
 /* LCD overlay for the KIT page (two 16-char rows), 1 when drawn. */
 uint8_t live_formatOverlay(char *row0, char *row1);
 
+/* PERF held + step: Morph glide to pattern `step` (1 = started, 0 = do a
+ * plain change: stopped, same or empty pattern). */
+uint8_t live_glideStart(uint8_t step);
+uint8_t live_glideActive(void);
+
 #endif /* LIVE_MODE_H_ */

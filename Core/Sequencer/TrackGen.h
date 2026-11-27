@@ -59,6 +59,7 @@ void tgen_progRebase(void);                     /* the prime pot moved */
 uint8_t tgen_progLength(void);
 uint8_t tgen_progHeld(void);
 uint8_t tgen_progSerial(void);
+uint8_t tgen_progBars(void);                    /* bar lines since start (wraps) */
 uint8_t tgen_progLenShown(void);
 void tgen_progHideLen(void);
 uint8_t tgen_progPos(void);                     /* 1..len, 0 when off */
