@@ -104,6 +104,12 @@ enum
 #define MIXER_FADER_XFD   3u
 #define MIXER_FADER_DW    4u
 
+/*
+ * dst ducking (DestroyEffect, every block it runs): src 0 off, 1..6 the
+ * voice slot + 1 whose envelope pulls the five others down; depth and rel
+ * 0..127. Unrefreshed for a few blocks (another Effect), it switches off.
+ */
+void mixer_setDuck(uint8_t src, uint8_t depth, uint8_t rel);
 void mixer_init();
 void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2);
 /* Silent-voice sleep: a trigger wakes the slot (mixer.c). */

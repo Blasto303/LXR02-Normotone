@@ -25,6 +25,7 @@
 #include "DlyVerbEffect.h"
 #include "DestroyModels.h"
 #include "cpuProfile.h"
+#include "mixer.h"
 #include <math.h>
 #include <string.h>
 
@@ -207,6 +208,10 @@ static void destroy_processBody(void *rt_void, effect_io_t *io)
         dsm_chain(&st->models, DS_ROW(rt, DESTROY_PARAM_CHAIN),
                   DS_ROW(rt, DESTROY_PARAM_DOOM));
     }
+    /* Ducking runs in the mixer, before this insert (one block behind). */
+    mixer_setDuck(DS_ROW(rt, DESTROY_PARAM_DUCK_SRC),
+                  DS_ROW(rt, DESTROY_PARAM_DUCK_DEPTH),
+                  DS_ROW(rt, DESTROY_PARAM_DUCK_REL));
     L = io->l;
     R = io->r;
     frames = io->frames;

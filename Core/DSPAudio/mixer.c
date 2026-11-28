@@ -970,6 +970,30 @@ void mixer_calcNextSampleBlockTest(sample_mx_t *output, sample_mx_t *output2)
 //     }
 // }
 //-----------------------------------------------------------------------
+/* dst ducking state (mixer_setDuck). */
+static uint8_t mixer_duckSrc;
+static uint8_t mixer_duckValid;
+static float mixer_duckDepth;
+static float mixer_duckCoef = 0.9f;
+static float mixer_duckEnv;
+
+void mixer_setDuck(uint8_t src, uint8_t depth, uint8_t rel)
+{
+	static uint8_t rel_last = 0xFFu;
+
+	mixer_duckSrc = (src <= 6u) ? src : 0u;
+	mixer_duckDepth = (float)depth * (1.0f / 127.0f);
+	if (rel != rel_last) {
+		/* Release 30 ms .. 600 ms: never shorter, or the follower would
+		 * track the kick's own cycles and buzz the other voices. */
+		const float tau = 0.03f * exp2f((float)rel * (4.32f / 127.0f));
+
+		mixer_duckCoef = expf(-((float)OUTPUT_DMA_SIZE / REAL_FS) / tau);
+		rel_last = rel;
+	}
+	mixer_duckValid = 4u;
+}
+
 void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2)
 {
 
@@ -1073,6 +1097,28 @@ void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2)
 	 * drums, one snare, one cymbal, and one hihat without changing mixer-owned
 	 * output behavior.
 	 */
+	/*
+	 * dst ducking: the gain of the five other voices for this block, from
+	 * the source voice's envelope (peak, instant attack, release coefficient).
+	 * -12 dBFS on the source gives the full depth.
+	 */
+	uint8_t duckSlot = 0xFFu;
+	float duckGain = 1.0f;
+
+	if (mixer_duckValid) {
+		mixer_duckValid--;
+		if (mixer_duckSrc)
+			duckSlot = (uint8_t)(mixer_duckSrc - 1u);
+	}
+	mixer_duckEnv *= mixer_duckCoef;
+	if (duckSlot < 6u) {
+		float x = mixer_duckEnv * (1.0f / 8192.0f);
+
+		x = (x > 1.0f) ? 1.0f : x;
+		duckGain = 1.0f - mixer_duckDepth * x;
+	} else {
+		mixer_duckEnv = 0.0f;
+	}
 	for(uint8_t slot=0u; slot<6u; slot++)
 	{
 		uint8_t pan;
@@ -1099,6 +1145,22 @@ void mixer_calcNextSampleBlock(sample_mx_t* output,sample_mx_t* output2)
 		 */
 		mixer_faderGains(slot, preset_getSlotPlayedScene(slot),
 				&voiceGain, &sendGain);
+		if (duckSlot < 6u) {
+			if (slot == duckSlot) {
+				int32_t pk = 0;
+
+				for (uint8_t i = 0u; i < OUTPUT_DMA_SIZE; i++) {
+					const int32_t a = (sampleData[i] < 0) ? -sampleData[i]
+					                                      : sampleData[i];
+					pk = (a > pk) ? a : pk;
+				}
+				if ((float)pk * voiceGain > mixer_duckEnv)
+					mixer_duckEnv = (float)pk * voiceGain;
+			} else {
+				voiceGain *= duckGain;
+				sendGain *= duckGain;
+			}
+		}
 		pan = instrumentManager_runtimePan(slot);
 		/*
 		 * One-pass dry + send when the send is active (S073 Step 5).

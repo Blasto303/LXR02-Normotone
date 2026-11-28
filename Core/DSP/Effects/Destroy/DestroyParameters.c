@@ -44,6 +44,12 @@ const effect_param_descriptor_t destroy_descriptors[] = {
                EFFECT_FLAGS_IMAGE, EFFECT_MOD_NONE, 0u, 2u),
     EFFECT_ROW("dst_doom", "Destroy", "Doom", "dom", DTYPE_0B127,
                EFFECT_FLAGS_IMAGE, EFFECT_MOD_0_127, 0u, 127u),
+    EFFECT_ROW("dst_duck_src", "Destroy", "DuckSrc", "dck", DTYPE_0B127,
+               EFFECT_FLAGS_IMAGE, EFFECT_MOD_NONE, 0u, 6u),
+    EFFECT_ROW("dst_duck_depth", "Destroy", "DuckDpt", "dpt", DTYPE_0B127,
+               EFFECT_FLAGS_IMAGE, EFFECT_MOD_0_127, 80u, 127u),
+    EFFECT_ROW("dst_duck_rel", "Destroy", "DuckRel", "rel", DTYPE_0B127,
+               EFFECT_FLAGS_IMAGE, EFFECT_MOD_0_127, 20u, 127u),
 };
 
 _Static_assert(sizeof(destroy_descriptors) / sizeof(destroy_descriptors[0]) ==
@@ -57,14 +63,16 @@ _Static_assert(DESTROY_PARAM_ENUM_COUNT == DESTROY_PARAM_COUNT,
  * ton mix pla pdc, FM = crs. The AEG names follow the model (painted).
  */
 const effect_select_layout_t destroy_layout = {
-    .screen_count = { 0u, 1u, 1u, 1u, 0u, 0u, 0u, 0u },
+    .screen_count = { 0u, 1u, 1u, 2u, 0u, 0u, 0u, 0u },
     .cells = {
         [1] = { { DESTROY_PARAM_ALG, DESTROY_PARAM_DRIVE,
                   DESTROY_PARAM_FOLD, DESTROY_PARAM_SUB } },
         [2] = { { DESTROY_PARAM_TONE, DESTROY_PARAM_MIX,
                   DESTROY_PARAM_PLATE, DESTROY_PARAM_PLATE_DECAY } },
         [3] = { { DESTROY_PARAM_CROSS, DESTROY_PARAM_CHAIN,
-                  DESTROY_PARAM_DOOM, EFFECT_LANE_NONE } },
+                  DESTROY_PARAM_DOOM, EFFECT_LANE_NONE },
+                { DESTROY_PARAM_DUCK_SRC, DESTROY_PARAM_DUCK_DEPTH,
+                  DESTROY_PARAM_DUCK_REL, EFFECT_LANE_NONE } },
     },
     .custom_row0 = { 0u, 0x01u, 0u, 0u, 0u, 0u, 0u, 0u },
     .home_sub_page = 1u,
@@ -100,6 +108,12 @@ static uint8_t destroy_uiFormatValue3(uint8_t index, uint8_t value, char *out)
 {
     if (index == DESTROY_PARAM_ALG) {
         memcpy(out, dsm_algName(value), 3);
+        return 1u;
+    }
+    if (index == DESTROY_PARAM_DUCK_SRC) {
+        static const char dck[7][4] = {
+            "off", "DR1", "DR2", "DR3", "SNR", "CYM", "HAT" };
+        memcpy(out, dck[(value > 6u) ? 0u : value], 3);
         return 1u;
     }
     if (index == DESTROY_PARAM_CHAIN) {

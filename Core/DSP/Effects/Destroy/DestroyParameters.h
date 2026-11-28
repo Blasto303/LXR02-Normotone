@@ -11,7 +11,7 @@
 
 #include "EffectsManager.h"
 
-#define DESTROY_PARAM_COUNT 14u
+#define DESTROY_PARAM_COUNT 17u
 
 /* Append only; never renumber (FX lanes, automation ids, `.fx` keys). */
 typedef enum {
@@ -40,6 +40,16 @@ typedef enum {
      */
     DESTROY_PARAM_CHAIN,
     DESTROY_PARAM_DOOM,
+    /*
+     * Ducking, second FM screen: dck = source voice (0 off, 1 DR1 .. 6 HAT),
+     * dpt = depth, rel = release (30..600 ms). The mixer follows the source
+     * voice's own envelope and pulls the five other voices down by its
+     * inverse, before the Effect: the source stays whole. Appended rows:
+     * older projects read 0 (off).
+     */
+    DESTROY_PARAM_DUCK_SRC,
+    DESTROY_PARAM_DUCK_DEPTH,
+    DESTROY_PARAM_DUCK_REL,
     DESTROY_PARAM_ENUM_COUNT
 } destroy_param_t;
 
