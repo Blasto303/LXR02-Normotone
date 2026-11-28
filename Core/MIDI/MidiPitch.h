@@ -29,7 +29,7 @@
  * midiParser_calcDetune() moves here because MidiParser is deleted and the
  * helper is pure pitch maths (Oscillator.c is its only user).
  * Affiliates: Oscillator.c (frequency, detune), sequencer.c, SceneData.c,
- * filesystem.c, SomGenerator.c, buttonHandler.c, MidiNoteMap.c (63 base).
+ * filesystem.c, buttonHandler.c, MidiNoteMap.c (63 base).
  */
 
 #include <stdint.h>

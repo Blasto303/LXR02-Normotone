@@ -16,6 +16,8 @@
 #include "BusCompressor.h"
 #include "config.h"
 #include "SceneData.h"
+#include "EffectsManager.h"
+#include "DestroyModels.h"
 #include <math.h>
 
 /*
@@ -42,6 +44,7 @@
 #define BUS_COMP_CHARGE_MS         300.0f
 #define BUS_COMP_MEMORY_SHARE      0.5f
 #define BUS_COMP_SAT_SPAN          1.5f
+#define BUS_COMP_DUCK_MS           3.0f   /* sidechain cut attack */
 
 /*
  * Band-split saturation and output ceiling constants (S074_COMP_SAT_UPDATE.md).
@@ -186,6 +189,9 @@ void busComp_sidechainTrigger(uint8_t track, uint8_t velocity)
     float v;
     float weight;
 
+    /* dst smo: every voice trigger, whatever the sidechain setting. */
+    dsm_noteTrigger(track, velocity);
+
     /*
      * Record only the largest matching trigger until the next block.
      *
@@ -198,6 +204,9 @@ void busComp_sidechainTrigger(uint8_t track, uint8_t velocity)
         return;
     v = (velocity >= 127u) ? 1.0f : (float)velocity * (1.0f / 127.0f);
     weight = v * v * v;
+    /* Normotone: with DlyVerb running, the cut dips the rumble alone (dck). */
+    if (effects_duckTrigger(weight))
+        return;
     if (weight > busComp.sc_pending)
         busComp.sc_pending = weight;
 }
@@ -312,11 +321,20 @@ void busComp_processBlock(sample_mx_t *st1, sample_mx_t *st2,
      * Velocity still scales it by (v/127)^3.
      */
     if (busComp.sc_pending > 0.0f) {
+        /*
+         * Normotone: the cut reaches its depth with a BUS_COMP_DUCK_MS
+         * one-pole instead of in one block. A 13 dB step inside 0.7 ms
+         * clicked on every kick through sustained bass (DRUM2, a Plaits
+         * kick, the rumble). sc_pending stays set until the cell is within
+         * 0.5 dB of the cut (or above the static target again).
+         */
         const float duck_db = target - (2.0f + 19.0f * a) * busComp.sc_pending;
 
-        if (duck_db < busComp.gr_fast_db)
-            busComp.gr_fast_db = duck_db;
-        busComp.sc_pending = 0.0f;
+        if (duck_db < busComp.gr_fast_db - 0.5f)
+            busComp.gr_fast_db += busComp_coef(BUS_COMP_DUCK_MS) *
+                                  (duck_db - busComp.gr_fast_db);
+        else
+            busComp.sc_pending = 0.0f;
     }
     memory_target = BUS_COMP_MEMORY_SHARE * busComp.gr_fast_db;
     k = (memory_target < busComp.gr_memory_db)

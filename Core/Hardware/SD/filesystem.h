@@ -730,6 +730,8 @@ bool filesystem_requestLoadKitForScenes(uint16_t slot, uint16_t scene_mask,
  * necessary for new, renamed, or removed numbered folders; patching only the
  * previously active cache row would leave stale index rows behind.
  */
+/* Whether the last Kit Load committed an `effect.fx` to its target Scenes. */
+uint8_t filesystem_kitLoadHadEffect(void);
 bool filesystem_requestSaveKitDirectory(uint16_t slot,
                                         uint8_t source_scene,
                                         const char display_name[8],

@@ -48,6 +48,7 @@
  * captures, sequencer owner decides" rule used for MIDI realtime.
  */
 
+#include "cpuProfile.h"
 #include "triggerJacks.h"
 #include "sequencer.h"
 #include "timebase.h"
@@ -264,7 +265,7 @@ static void trigger_handleResetEvent(const TriggerEvent *event)
 /* -----------------------------------------------------------------------
 ** EXTI4_IRQHandler - CLK IN on PD4, rising edge
 ** ----------------------------------------------------------------------- */
-void EXTI4_IRQHandler(void)
+void EXTI4_IRQHandler_body(void)
 {
 	if (EXTI_PR & PD4_CLK_MASK) {
 		uint32_t timestampUs = timebase_tim2Now();
@@ -281,7 +282,7 @@ void EXTI4_IRQHandler(void)
 ** Note: PD6/PD7 OUT1 detect is retained state, so it is polled by the
 ** 500Hz front-panel service rather than handled as EXTI edges.
 ** ----------------------------------------------------------------------- */
-void EXTI9_5_IRQHandler(void)
+void EXTI9_5_IRQHandler_body(void)
 {
 	uint32_t pending = EXTI_PR & PD5_RST_MASK;
 
@@ -458,3 +459,9 @@ void trigger_reset(uint8_t value)
 		trigger_havePulseTempo = 0;
 	}
 }
+
+/* Normotone CPU profile: timed wrapper (cpuProfile.h). */
+PROF_ISR_WRAP(EXTI4_IRQHandler, PROF_CLK)
+
+/* Normotone CPU profile: timed wrapper (cpuProfile.h). */
+PROF_ISR_WRAP(EXTI9_5_IRQHandler, PROF_RST)

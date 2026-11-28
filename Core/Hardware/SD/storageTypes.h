@@ -47,6 +47,8 @@
 #define STORAGE_ROOT_PATTERN          "Pattern"
 #define STORAGE_ROOT_INSTRUMENT       "Instrument"
 #define STORAGE_KITSET_FILENAME       "kitset.kcg"
+/* Optional Effect of a root Kit (`.fx` v2 content); absent = keep current. */
+#define STORAGE_KIT_EFFECT_FILENAME   "effect.fx"
 #define STORAGE_SCENESET_FILENAME     "sceneset.scg"
 #define STORAGE_BANKSET_FILENAME      "bankset.bcg"
 #define STORAGE_SETTINGS_FILENAME     "settings.cfg"
@@ -351,6 +353,9 @@ storage_status_t storage_instrumentFinalize(const storage_instrument_state_t *st
  * corresponding morph image value. Client:
  * filesystem_loadKitDirectory_tick() calls this when seen_morph_count is zero.
  */
+/* Normotone: a darker, longer Morph endpoint when it equals the normal sound. */
+void storage_instrumentStartMorph(storage_instrument_type_t type,
+                                  kit_instrument_slot_t *instrument);
 void storage_instrumentCopyMainToMorphFallback(storage_instrument_type_t type,
                                                uint8_t slot,
                                                kit_instrument_slot_t *instrument);

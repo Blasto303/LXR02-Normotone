@@ -2428,6 +2428,18 @@ storage_status_t storage_instrumentFinalize(const storage_instrument_state_t *st
      * cells are single-endpoint runtime values and Scene MIDI settings live
      * outside the kit, so neither class is touched here.
  */
+/*
+ * Normotone simple Morph: a loaded instrument's Morph endpoint is reset to
+ * its normal sound. The endpoints are the runtime Morph target buffer,
+ * filled only by LOAD + MORPH (liveMode.c); a stale [morph] section from a
+ * file must not sound.
+ */
+void storage_instrumentStartMorph(storage_instrument_type_t type,
+                                  kit_instrument_slot_t *instrument)
+{
+    storage_instrumentCopyMainToMorphFallback(type, 0u, instrument);
+}
+
 void storage_instrumentCopyMainToMorphFallback(storage_instrument_type_t type,
                                                uint8_t slot,
                                                kit_instrument_slot_t *instrument)

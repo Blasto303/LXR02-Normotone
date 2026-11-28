@@ -1,0 +1,63 @@
+/*
+ * Core/DSP/Effects/Destroy/DestroyParameters.h
+ *
+ * Normotone `dst` (Destroy): a multi-stage distortion inserted on MAIN, with
+ * dry/wet, a sub-octave, a tone tilt and a light plate on the whole mix.
+ * Original design; the stage list is inspired by multi-distortion modules.
+ * Choosing it replaces the rumble (one Effect per Scene).
+ */
+#ifndef DESTROY_PARAMETERS_H_
+#define DESTROY_PARAMETERS_H_
+
+#include "EffectsManager.h"
+
+#define DESTROY_PARAM_COUNT 17u
+
+/* Append only; never renumber (FX lanes, automation ids, `.fx` keys). */
+typedef enum {
+    DESTROY_PARAM_AUDIO_OUT = EFFECT_COMMON_PARAM_AUDIO_OUT,
+    DESTROY_PARAM_LEVEL     = EFFECT_COMMON_PARAM_LEVEL,
+    DESTROY_PARAM_PAN       = EFFECT_COMMON_PARAM_PAN,
+    DESTROY_PARAM_DRIVE     = 3,   /* dri: 0..+36 dB into the curve      */
+    DESTROY_PARAM_FOLD,            /* fld: soft clip -> wavefold          */
+    DESTROY_PARAM_SUB,             /* sub: sub-octave level               */
+    DESTROY_PARAM_CROSS,           /* crs: 0 full band, else clean lows   */
+    DESTROY_PARAM_TONE,            /* ton: 0 dark .. 64 flat .. 127 thin  */
+    DESTROY_PARAM_MIX,             /* mix: dry/wet on MAIN                */
+    DESTROY_PARAM_PLATE,           /* pla: plate on the whole mix         */
+    DESTROY_PARAM_PLATE_DECAY,     /* pdc: plate length                   */
+    /*
+     * alg: 0 cls (the curve above), 1..8 feedback-network models. For a
+     * model, dri/fld/sub are its three knobs (names on the Effect page
+     * follow the model).
+     */
+    DESTROY_PARAM_ALG,
+    /*
+     * fld (alg 4) only, on the FM screen beside crs: chn = chain order
+     * (0 UND fold-doom-rectify-saturate, 1 X fold-saturate-rectify-doom,
+     * 2 OVR UND plus a second fold), dom = its DOOM stage (0 = none).
+     * Appended rows: older projects read 0 (UND, no DOOM = the old fld).
+     */
+    DESTROY_PARAM_CHAIN,
+    DESTROY_PARAM_DOOM,
+    /*
+     * Ducking, second FM screen: dck = source voice (0 off, 1 DR1 .. 6 HAT),
+     * dpt = depth, rel = release (30..600 ms). The mixer follows the source
+     * voice's own envelope and pulls the five other voices down by its
+     * inverse, before the Effect: the source stays whole. Appended rows:
+     * older projects read 0 (off).
+     */
+    DESTROY_PARAM_DUCK_SRC,
+    DESTROY_PARAM_DUCK_DEPTH,
+    DESTROY_PARAM_DUCK_REL,
+    DESTROY_PARAM_ENUM_COUNT
+} destroy_param_t;
+
+extern const effect_param_descriptor_t destroy_descriptors[];
+extern const char destroy_token3[];
+extern const char destroy_abbrev5[];
+extern const char destroy_full8[];
+extern const effect_select_layout_t destroy_layout;
+extern const effect_ui_hooks_t destroy_ui;
+
+#endif /* DESTROY_PARAMETERS_H_ */

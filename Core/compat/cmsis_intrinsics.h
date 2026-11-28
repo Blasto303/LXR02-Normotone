@@ -66,7 +66,7 @@
  *               Same single-lane usage pattern as __QADD16.
  *   __SSAT    — signed saturate to N bits. Used by ResonantFilter.c.
  *               Macro because the bit-position arg must be an immediate.
- *   __CLZ     — count leading zeros (32-bit). Used by Oscillator.c, EuklidGenerator.c.
+ *   __CLZ     — count leading zeros (32-bit). Used by Oscillator.c.
  *               Maps to CLZ on ARMv7E-M — single-cycle, no software fallback.
  *   APSR_Type / __get_APSR
  *             — read the Application Program Status Register. Used by

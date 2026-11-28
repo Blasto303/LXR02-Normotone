@@ -1,4 +1,5 @@
 #include "SceneData.h"
+#include "liveMode.h"
 #include "Autosave.h"
 #include "BankData.h"
 #include "MidiPitch.h"
@@ -595,6 +596,12 @@ uint8_t scene_getVoiceFaderSetting(uint8_t scene_index, uint8_t slot)
      * retained 0..SCENE_FADER_SETTING_MAX mode (0..3, S074 adds xfd), or 0
      * for invalid coordinates/stale storage.
      */
+#if LIVE_MODE
+    /* LIVE: a fader always sets its voice level (stock LXR-02 behaviour). */
+    (void)scene;
+    (void)slot;
+    return 0u;
+#endif
     if (!scene || slot >= INSTRUMENT_SLOT_COUNT ||
         scene->settings.fader_setting[slot] > SCENE_FADER_SETTING_MAX) {
         return 0u;

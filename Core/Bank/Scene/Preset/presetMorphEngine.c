@@ -780,8 +780,9 @@ void presetMorph_setVoiceLfoModulation(uint8_t scene_index,
         target_pair > 1u) {
         return;
     }
-    if (direction > PRESET_MORPH_LFO_DIRECTION_MORPH)
-        direction = PRESET_MORPH_LFO_DIRECTION_NONE;
+    /* Normotone simple Morph: LFOs never move Morph (contribution off). */
+    direction = PRESET_MORPH_LFO_DIRECTION_NONE;
+    depth = 0u;
     morph_lfo_contributions[target_slot][source_slot][target_pair].direction =
         (uint8_t)direction;
     morph_lfo_contributions[target_slot][source_slot][target_pair].depth =
@@ -916,7 +917,9 @@ void presetMorph_setStepAutomationOverride(uint8_t scene_index,
      * retained values. LFO contributions are composed around this base.
      * Client: seq_applySceneAutomation(); restore: clearAll below.
      */
-    if (slot >= INSTRUMENT_SLOT_COUNT || !scene_getConst(scene_index))
+    /* Normotone simple Morph: Pattern automation never moves Morph. */
+    (void)amount;
+    if (slot >= INSTRUMENT_SLOT_COUNT || !scene_getConst(scene_index) || 1)
         return;
     morph_step_override[slot].active = 1u;
     morph_step_override[slot].amount = amount;
@@ -998,11 +1001,17 @@ static uint8_t presetMorph_trackSlot(uint8_t track)
  */
 static uint8_t presetMorph_trackAmount(uint8_t scene_index, uint8_t track)
 {
+    /* Normotone simple Morph: the sequencer (len/scl/shu) never morphs. */
+    (void)scene_index;
+    (void)track;
+    return 0u;
+#if 0
     const scene_t *scene = scene_getConst(scene_index);
 
     if (!scene)
         return 0u;
     return scene->settings.voice_morph_amount[presetMorph_trackSlot(track)];
+#endif
 }
 
 /*

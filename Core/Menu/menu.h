@@ -84,10 +84,10 @@ enum PageNames {
     SAVE_PAGE,
     PERFORMANCE_PAGE,
     SEQ_PAGE,
-    EUKLID_PAGE,
+    RESERVED_PAGE_12,      /* was EUKLID_PAGE: id kept, page removed */
     PATTERN_SETTINGS_PAGE,
     RECORDING_PAGE,
-    SOM_PAGE,
+    RESERVED_PAGE_15,      /* was SOM_PAGE: id kept, page removed */
     /*
      * Effect page (SHIFT+PERF, Session 072 step 7). Cells are resolved by
      * menuEffects.c, not by menuPages[][]; the table row exists only so the
@@ -423,6 +423,19 @@ void menu_init(void);
 void menu_start(void);
 void menu_parseEncoder(int8_t inc, uint8_t button);
 void menu_switchPage(uint8_t pageNr);
+typedef enum {
+    MENU_LIBRARY_DEFAULT,
+    MENU_LIBRARY_PROJECT,
+    MENU_LIBRARY_KIT,
+    MENU_LIBRARY_SAVE_PROJECT,  /* LIVE: SAVE alone      */
+    MENU_LIBRARY_SAVE_KIT,      /* LIVE: SAVE + KIT      */
+    MENU_LIBRARY_KIT_MORPH      /* LIVE: LOAD + MORPH    */
+} menu_library_target_t;
+void menu_openLibrary(menu_library_target_t target);
+uint8_t menu_liveKitLibraryActive(void);
+/* LIVE: the Load page browses KitMrp (LOAD + MORPH). */
+uint8_t menu_liveMorphLibraryActive(void);
+void menu_liveKitSaveAutoSlot(void);
 void menu_switchSubPage(uint8_t subPageNr);
 /*
  * Enter nested Instrument Load/Save for one physical voice.
@@ -444,6 +457,15 @@ void menu_switchSubPage(uint8_t subPageNr);
 uint8_t menu_loadInstrumentVoicePressed(uint8_t voiceNr);
 uint8_t menu_loadInstrumentIsActive(void);
 uint8_t menu_loadSaveBarButtonPressed(uint8_t advance);
+/*
+ * SELECT on the Load/Save page (LXR-02 direct navigation): SELECT 1..6 pick
+ * Kit, KitMrp, Scene, Bank, Pattern, Samples; inside a nested Instrument
+ * Load, SELECT 1..8 pick Drum, Snare, Cymbal, HiHat, PlKick, PlSnare, PlHat,
+ * PlModal. Returns nonzero when consumed. menu_loadSaveRefreshTypeLed()
+ * lights the SELECT LED of the shown type.
+ */
+uint8_t menu_loadSaveSelectButton(uint8_t selectNr);
+void menu_loadSaveRefreshTypeLed(void);
 /*
  * Report whether nested Instrument Load owns an immutable in-flight transaction.
  *
@@ -736,6 +758,7 @@ void menu_parseKnobDelta(uint8_t knobNr, int8_t delta);
  * menu_cellCommitValueEx(), liveRec_paramIn(), effects_setParameter().
  */
 uint8_t menu_commitTargetEdit(uint16_t id, uint8_t value, uint8_t origin);
+void menu_commitGlobalMorph(uint8_t value);
 void menu_commitGlobalMorphFromMidi(uint8_t value);
 void menu_notifyTargetChanged(uint16_t id);
 /* S083 C5: Learn state changed; request a coalesced repaint (LRN/FUL). */

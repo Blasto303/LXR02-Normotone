@@ -17,6 +17,7 @@
  * the `rng` model). Everything else runs on every sample.
  */
 
+#include "plaitsOut.h"
 #include "PlaitsHatVoice.h"
 #include "BufferTools.h"
 #include "modulationNode.h"
@@ -329,8 +330,7 @@ void PlaitsHat_calcVoiceSyncBlock(PlaitsHatVoice *voice, int16_t *buf,
 
 		(void)ph_svf(s, hp_g, hp_r, hp_h, &voice->hp_s1, &voice->hp_s2, &hp);
 		s = hp * PH_OUT_GAIN * 32767.0f;
-		s = (s > 32767.0f) ? 32767.0f : ((s < -32768.0f) ? -32768.0f : s);
-		buf[i] = (int16_t)s;
+		buf[i] = plaitsOut_toInt16(s);
 	}
 
 	voicePost_drum(buf, voice->ampFilterInput, voice->lastGain,

@@ -57,3 +57,9 @@
 
 # S073 golden harness build products (generated fragments and binaries)
 tools/dsp_test/build/
+build/fs_test/
+
+# host benches and Python caches
+build/cpu_bench/
+__pycache__/
+build/cpu_bench_fg/

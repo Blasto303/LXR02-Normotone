@@ -420,8 +420,16 @@ static void on_kit_load_complete(void)
             if ((pm_kit_request_scene_mask &
                  (uint16_t)(1u << scene_index)) != 0u) {
                 autosave_markKitDirty(scene_index);
+                if (filesystem_kitLoadHadEffect())
+                    autosave_markEffectDirty(scene_index);
             }
         }
+        /* A Kit saved with its Effect brings it back: rebuild the runtime. */
+        if (filesystem_kitLoadHadEffect() &&
+            scene_getActiveIndex() < 16u &&
+            (pm_kit_request_scene_mask &
+             (uint16_t)(1u << scene_getActiveIndex())) != 0u)
+            effects_activateScene(scene_getActiveIndex());
     }
     preset_completeFilesystemOp(PRESET_OP_KIT_LOAD);
 }
@@ -1322,7 +1330,8 @@ uint8_t preset_getEffectiveFxSendAmount(uint8_t scene_index, uint8_t slot)
         return fx_send_step_override[slot].amount;
     normal = scene_getVoiceFxSendAmount(scene_index, slot);
     morph = scene_getVoiceFxSendMorph(scene_index, slot);
-    if (normal == morph)
+    /* Normotone simple Morph: MRP never moves the FX sends. */
+    if (normal == morph || 1)
         return normal;
     amount = presetMorph_getResolvedVoiceAmount(scene_index, slot);
     /* 127 * 255 + 127 fits uint16_t. */
@@ -3020,9 +3029,46 @@ uint8_t preset_loadKitForScenes(uint16_t presetNr, uint16_t scene_mask)
     return 0u;
 }
 
+/*
+ * Never save an object without a name.
+ *
+ * What: control or non-ASCII cells in the eight-cell save name become
+ * spaces; an all-space name becomes "<tag><slot>" (Proj103, Scn012,
+ * Kit100, Pat050). Why: every loader treats an all-space name as an
+ * unresolved row and refuses it (Menu LSR-03, filesystem requests), so an
+ * unnamed Project could be written but never loaded again; at boot an
+ * unnamed active Project left every Scene empty. Inputs: tag (3-4 chars)
+ * and slot. Output: preset_currentName, which every save request copies.
+ */
+static void preset_ensureSaveName(const char *tag, uint16_t slot)
+{
+    uint8_t i;
+    uint8_t blank = 1u;
+    uint8_t n = 0u;
+
+    for (i = 0u; i < 8u; i++) {
+        const unsigned char c = (unsigned char)preset_currentName[i];
+
+        if (c < 0x20u || c > 0x7Eu)
+            preset_currentName[i] = ' ';
+        if (preset_currentName[i] != ' ')
+            blank = 0u;
+    }
+    if (!blank)
+        return;
+    while (tag[n] != '\0' && n < 5u) {
+        preset_currentName[n] = tag[n];
+        n++;
+    }
+    preset_currentName[n++] = (char)('0' + (slot / 100u) % 10u);
+    preset_currentName[n++] = (char)('0' + (slot / 10u) % 10u);
+    preset_currentName[n++] = (char)('0' + slot % 10u);
+}
+
 uint8_t preset_saveDrumset(uint16_t presetNr, uint8_t isMorph,
                            uint8_t source_scene)
 {
+    preset_ensureSaveName("Kit", presetNr);
     /*
      * Post normal Kit Save or KitMrp Save to the shared directory writer.
      *
@@ -3109,6 +3155,7 @@ uint8_t preset_loadSceneForScenes(uint16_t presetNr, uint16_t scene_mask)
 
 uint8_t preset_saveScene(uint16_t presetNr, uint8_t source_scene)
 {
+    preset_ensureSaveName("Scn", presetNr);
     /*
      * Post a root Scene Save request.
      *
@@ -3169,6 +3216,7 @@ uint8_t preset_loadBank(uint16_t presetNr, uint16_t act_mask,
 uint8_t preset_saveBank(uint16_t presetNr, uint16_t act_mask,
                         uint16_t empty_mask)
 {
+    preset_ensureSaveName("Proj", presetNr);
     uint8_t source_scene = scene_backgroundHomeIndex();
 
     /*
@@ -3321,6 +3369,7 @@ static uint8_t preset_copyBackgroundTrack(uint8_t track, uint8_t src_scene)
                                         (src->track_loop_exclude & bit));
     dst->track_auto_smooth = (uint8_t)((dst->track_auto_smooth & ~bit) |
                                        (src->track_auto_smooth & bit));
+    dst->track_gen[track] = src->track_gen[track];
     dst_scene->settings.midi_channel[track] =
         src_scene_data->settings.midi_channel[track];
     dst_scene->settings.midi_note[track] =
@@ -4371,6 +4420,7 @@ uint8_t preset_loadPatternForScenes(uint16_t presetNr, uint16_t scene_mask)
 
 uint8_t preset_savePattern(uint16_t presetNr)
 {
+    preset_ensureSaveName("Pat", presetNr);
     filesystem_ack();
     pm_status = PRESET_LOAD_IN_PROGRESS;
     pm_completed_op = PRESET_OP_NONE;
@@ -4470,7 +4520,7 @@ void preset_morphScene(uint8_t scene_index, uint8_t morph)
      * menu edit of this one Scene (Rule A override clear, menuHoldMorph on
      * the active Scene), never recorded, like the per-voice amounts below.
      */
-    (void)effects_setMorphAmountFromGlobal(scene_index, morph);
+    /* Normotone simple Morph: MRP moves the sound engine only. */
     /*
      * S076 Rule A: bulk Morph set from PERF / global MIDI CC1 supersedes
      * every active step-automation Morph override. Each slot is cleared
@@ -4505,7 +4555,12 @@ void preset_morphVoice(uint8_t slot, uint8_t morph)
      * operation while MIDI CC1 on a voice channel and PERF 1vm..6vm edits must
      * preserve the other five slot amounts.
      */
-    preset_morphVoiceScene(scene_getActiveIndex(), slot, morph);
+    /*
+     * Normotone simple Morph: one MRP for the whole kit. Per-voice sources
+     * (CC1 on a voice channel, velocity -> voice Morph, Nvm) do nothing.
+     */
+    (void)slot;
+    (void)morph;
 }
 
 void preset_morphVoiceScene(uint8_t scene_index, uint8_t slot, uint8_t morph)

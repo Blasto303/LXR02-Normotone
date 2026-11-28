@@ -3,8 +3,9 @@
  *
  *  Created on: 21.10.2026
  * -----------------------------------------------------------------------------
- *  The snare DSP is a C translation of Plaits' AnalogSnareDrum
- *  (plaits/dsp/drums/analog_snare_drum.h) and the stmlib parts it uses:
+ *  The snare DSP is a C translation of Plaits' AnalogSnareDrum and
+ *  SyntheticSnareDrum (plaits/dsp/drums/analog_snare_drum.h,
+ *  plaits/dsp/drums/synthetic_snare_drum.h) and the stmlib parts they use:
  *
  *  Copyright 2016 Emilie Gillet.
  *
@@ -51,9 +52,14 @@
  *
  * Rows write note, fine (raw), snappy, tone, decay (0..1, the Plaits
  * Harmonics/Timbre/Morph macros). Coefficients are derived once per block in
- * PlaitsSnare_calcVoiceAsync(). Accessors: PlaitsSnareVoice.c and the
- * InstrumentManager dispatchers.
+ * PlaitsSnare_calcVoiceAsync(). Row `syn` picks the model: off =
+ * AnalogSnareDrum (Plaits' OUT), on = SyntheticSnareDrum (Plaits' AUX, the
+ * 909-style snare). Accessors: PlaitsSnareVoice.c and the InstrumentManager
+ * dispatchers.
  */
+#define PLAITS_SNARE_MODEL_ANALOG 0u
+#define PLAITS_SNARE_MODEL_SYNTH  1u
+
 typedef struct {
 	/* Plaits AnalogSnareDrum state. */
 	int32_t pulse_remaining;
@@ -66,6 +72,29 @@ typedef struct {
 	float noise_s1;
 	float noise_s2;
 	uint32_t rng;
+	/* Plaits SyntheticSnareDrum state (model 1). */
+	int32_t ss_hold;
+	float ss_phase[2];
+	float ss_drum_amp;
+	float ss_snare_amp;
+	float ss_fm;
+	float ss_drum_lp;
+	float ss_snare_hp;
+	float ss_lp_s1;
+	float ss_lp_s2;
+	/* Per-block SyntheticSnareDrum coefficients. */
+	float ss_drum_decay;
+	float ss_snare_decay;
+	float ss_drum_level;
+	float ss_snare_level;
+	float ss_reset_amount;
+	float ss_fm_amount;
+	float ss_dlp_g;
+	float ss_hp_g;
+	float ss_lp_g;
+	float ss_lp_r;
+	float ss_lp_h;
+	float ss_f0;
 
 	/* Per-block coefficients (PlaitsSnare_calcVoiceAsync). */
 	float mode_g[PLAITS_SNARE_MODES];
@@ -88,6 +117,7 @@ typedef struct {
 	uint8_t fine;
 	uint8_t baseNote;
 	uint8_t trigger;
+	uint8_t model;      /* row `syn`: 0 analog (OUT), 1 synthetic (AUX) */
 
 	/* Shared LXR voice parts. */
 	float vol;

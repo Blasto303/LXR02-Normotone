@@ -8,6 +8,7 @@
  * startup_stm32f765xx.s points to this symbol by name.
  */
 
+#include "cpuProfile.h"
 #include "usb_bsp.h"
 #include "usb_dcd_int.h"
 #include "usb_manager.h"
@@ -27,7 +28,10 @@ void EXTI1_IRQHandler(void)     { EXTI_PR = (1UL << 1); }
 void EXTI2_IRQHandler(void)     { EXTI_PR = (1UL << 2); }
 void EXTI15_10_IRQHandler(void) { EXTI_PR = (0x3FUL << 10); } /* bits 10-15*/
 
-void OTG_FS_IRQHandler(void)
+void OTG_FS_IRQHandler_body(void)
 {
     USBD_OTG_ISR_Handler(&USB_OTG_dev);
 }
+
+/* Normotone CPU profile: timed wrapper (cpuProfile.h). */
+PROF_ISR_WRAP(OTG_FS_IRQHandler, PROF_USB)

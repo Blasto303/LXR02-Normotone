@@ -27,6 +27,7 @@
  * CrumpBit (`cbt`) is the first user.
  */
 #include "menuEffects.h"
+#include "DlyVerbParameters.h"
 #include "menu.h"
 #include "MenuText.h"
 #include "SceneData.h"
@@ -87,6 +88,29 @@ static const char *const menuEffects_runLong[EFFECT_SEQ_RUN_MODE_COUNT] = {
     "forward", "reverse", "pingpong", "random", "select"
 };
 
+/* Physical SELECT indexes: OSC, FILTER, LFO (plate bus) and MIX. */
+enum { RUMBLE_DELAY = 0, RUMBLE_REVERB = 5, RUMBLE_PLATE = 6, RUMBLE_COMP = 7 };
+static uint8_t rumbleEditor;
+static const uint8_t delayRows[][4] = {
+    {DLYVERB_PARAM_MODEL, DLYVERB_PARAM_DIVISION, DLYVERB_PARAM_FEEDBACK, DLYVERB_PARAM_DLY_LEVEL},
+    {DLYVERB_PARAM_DRIVE, DLYVERB_PARAM_LOWPASS, DLYVERB_PARAM_HIGHPASS, DLYVERB_PARAM_AGE},
+    {DLYVERB_PARAM_STEREO, DLYVERB_PARAM_WIDTH, DLYVERB_PARAM_MOD_DEPTH, DLYVERB_PARAM_MOD_RATE}
+};
+static const uint8_t reverbRows[4] = {
+    DLYVERB_PARAM_RVB_LEVEL, DLYVERB_PARAM_RVB_DECAY, DLYVERB_PARAM_RVB_DAMP, DLYVERB_PARAM_RVB_ROUTE
+};
+/* Plate bus: sends of DRUM2, DRUM3, SNARE, CLP/CYM, then HIHATS, level, tone. */
+static const uint8_t plateRows[2][4] = {
+    {DLYVERB_PARAM_PLATE_D2, DLYVERB_PARAM_PLATE_D3, DLYVERB_PARAM_PLATE_SN, DLYVERB_PARAM_PLATE_CY},
+    {DLYVERB_PARAM_PLATE_HH, DLYVERB_PARAM_PLATE_LEVEL, DLYVERB_PARAM_PLATE_TONE, EFFECT_LANE_NONE}
+};
+
+void menuEffects_openRumble(void)
+{
+    rumbleEditor = 1u;
+    menuEffects_screen[RUMBLE_DELAY] = 0u;
+}
+
 /* Active Scene's retained record and registry row (`off` fallback). */
 static const effect_record_t *menuEffects_record(void)
 {
@@ -128,8 +152,17 @@ static uint8_t menuEffects_screenCount(uint8_t sub_page)
 
     if (sub_page >= MENU_FX_SELECT_COUNT)
         return 0u;
+    if (rumbleEditor) {
+        if (sub_page == RUMBLE_DELAY)
+            return sizeof(delayRows) / sizeof(delayRows[0]);
+        if (sub_page == RUMBLE_PLATE)
+            return sizeof(plateRows) / sizeof(plateRows[0]);
+        if (sub_page == RUMBLE_COMP)
+            return 2u;                  /* compressor, then the duck */
+        return sub_page == RUMBLE_REVERB;
+    }
     if (sub_page == 0u)
-        return 2u;
+        return 1u;      /* Normotone: no FX sequencer screen (run len scl) */
     if (entry->select_layout) {
         screens = entry->select_layout->screen_count[sub_page];
         return (screens > MENU_FX_SCREENS_MAX) ? MENU_FX_SCREENS_MAX : screens;
@@ -157,12 +190,31 @@ static uint8_t menuEffects_cellAt(uint8_t sub_page, uint8_t screen,
     if (sub_page >= MENU_FX_SELECT_COUNT || column >= MENU_FX_CELLS ||
         screen >= menuEffects_screenCount(sub_page))
         return 0u;
-    if (sub_page == 0u) {
+    if (rumbleEditor) {
+        if (sub_page == RUMBLE_COMP && screen == 0u) {
+            out->kind = MENU_FX_CELL_BUS_COMP;
+            out->index = column;
+            return 1u;
+        }
+        if (sub_page == RUMBLE_COMP) {
+            static const uint8_t duckRows[4] = {
+                DLYVERB_PARAM_DUCK, DLYVERB_PARAM_DUCK_REL,
+                EFFECT_LANE_NONE, EFFECT_LANE_NONE
+            };
+            index = duckRows[column];
+        } else
+        index = sub_page == RUMBLE_DELAY ? delayRows[screen][column]
+              : sub_page == RUMBLE_PLATE ? plateRows[screen][column]
+              : reverbRows[column];
+    } else if (sub_page == 0u) {
         static const uint8_t second[MENU_FX_CELLS] = {
             MENU_FX_CELL_RUN, MENU_FX_CELL_LENGTH,
-            MENU_FX_CELL_SCALE, MENU_FX_CELL_MORPH_AMOUNT
+            MENU_FX_CELL_SCALE, MENU_FX_CELL_NONE
         };
         if (screen == 1u) {
+            /* Normotone simple Morph: no Effect Morph cell (`mrp`). */
+            if (second[column] == MENU_FX_CELL_NONE)
+                return 0u;
             out->kind = second[column];
             return 1u;
         }
@@ -218,6 +270,7 @@ void menuEffects_enter(uint8_t *sub_page, uint8_t *column)
 {
     const effect_record_t *record = menuEffects_record();
 
+    rumbleEditor = 0u;
     memset(menuEffects_screen, 0, sizeof(menuEffects_screen));
     menuEffects_typeEdit = 0u;
     menuEffects_showMorphFlag = 0u;
@@ -237,7 +290,8 @@ void menuEffects_enter(uint8_t *sub_page, uint8_t *column)
 void menuEffects_toggleFirstScreen(uint8_t *sub_page, uint8_t *column)
 {
     menuEffects_typeEdit = 0u;
-    menuEffects_screen[0] = (uint8_t)(menuEffects_screen[0] ? 0u : 1u);
+    /* Normotone: one first screen only (the FX sequencer screen is gone). */
+    menuEffects_screen[0] = 0u;
     *sub_page = 0u;
     *column = 0u;
 }
@@ -685,16 +739,31 @@ void menuEffects_typeBrowse(int8_t inc)
 
     if (!menuEffects_typeEdit || count == 0u)
         return;
-    if (inc > 0 && menuEffects_typeCandidate + 1u < count)
-        menuEffects_typeCandidate++;
-    else if (inc < 0 && menuEffects_typeCandidate > 0u)
-        menuEffects_typeCandidate--;
+    /*
+     * Normotone: StFilter and CrumpBit are left out of the choice (off, dvb,
+     * dst remain); a Scene saved with them still loads and plays them.
+     */
+    {
+        uint8_t c = menuEffects_typeCandidate;
+
+        do {
+            if (inc > 0 && c + 1u < count)
+                c++;
+            else if (inc < 0 && c > 0u)
+                c--;
+            else
+                return;
+        } while (c == EFFECT_TYPE_STEREO_FILTER || c == EFFECT_TYPE_CRUMPBIT);
+        menuEffects_typeCandidate = c;
+    }
 }
 
 /* Momentary SHIFT Morph view. */
 void menuEffects_setShowMorph(uint8_t on)
 {
-    menuEffects_showMorphFlag = (uint8_t)(on != 0u);
+    /* Normotone simple Morph: no Effect Morph view; SHIFT edits nothing. */
+    (void)on;
+    menuEffects_showMorphFlag = 0u;
 }
 
 uint8_t menuEffects_showMorph(void)
@@ -749,6 +818,8 @@ uint8_t menuEffects_service(void)
     effect_type_id_t type = record ? record->type : EFFECT_TYPE_OFF;
     uint8_t actions = 0u;
 
+    if (type != EFFECT_TYPE_DLYVERB)
+        rumbleEditor = 0u;
     if (scene_index != menuEffects_lastScene || type != menuEffects_lastType) {
         menuEffects_lastScene = scene_index;
         menuEffects_lastType = type;
@@ -1011,14 +1082,16 @@ void menuEffects_seqButtonPressed(uint8_t step)
 {
     const effect_record_t *record = menuEffects_record();
 
-    if (record && record->seq_run_mode == EFFECT_SEQ_RUN_SEL)
-        effects_seqSelect(step);
+    /* Normotone: no FX sequencer, no `sel` step. */
+    (void)record;
+    (void)step;
 }
 
 /* Open FX lock editing after the shared VOICE hold threshold (S074). */
 void menuEffects_seqHoldExpired(void)
 {
-    menuEffects_holdState = MENU_FX_HOLD_ACTIVE;
+    /* Normotone: the FX sequencer is gone; a held step locks nothing. */
+    menuEffects_holdState = 0u;
     menuEffects_holdMask = 0u;
 }
 

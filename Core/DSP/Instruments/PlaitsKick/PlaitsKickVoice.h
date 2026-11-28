@@ -3,8 +3,9 @@
  *
  *  Created on: 21.10.2026
  * -----------------------------------------------------------------------------
- *  The kick DSP is a C translation of Plaits' AnalogBassDrum and Overdrive
- *  (plaits/dsp/drums/analog_bass_drum.h, plaits/dsp/fx/overdrive.h):
+ *  The kick DSP is a C translation of Plaits' AnalogBassDrum,
+ *  SyntheticBassDrum and Overdrive (plaits/dsp/drums/analog_bass_drum.h,
+ *  plaits/dsp/drums/synthetic_bass_drum.h, plaits/dsp/fx/overdrive.h):
  *
  *  Copyright 2016 Emilie Gillet.
  *
@@ -52,8 +53,13 @@
  * tone, decay (0..1, the Plaits Harmonics/Timbre/Morph macros), and the shared
  * rows. Every DSP coefficient is derived once per block in
  * PlaitsKick_calcVoiceAsync(), so an LFO costs nothing extra.
+ * Row `syn` picks the model: off = AnalogBassDrum (Plaits' OUT), on =
+ * SyntheticBassDrum (Plaits' AUX), with the BassDrumEngine macro mapping.
  * Accessors: PlaitsKickVoice.c, InstrumentManager.c dispatchers.
  */
+#define PLAITS_KICK_MODEL_ANALOG 0u
+#define PLAITS_KICK_MODEL_SYNTH  1u
+
 typedef struct {
 	/* Plaits AnalogBassDrum state. */
 	int32_t pulse_remaining;
@@ -67,6 +73,30 @@ typedef struct {
 	float tone_lp;
 	float svf_s1;
 	float svf_s2;
+	/* Plaits SyntheticBassDrum state (model 1). */
+	int32_t s_body_pw;
+	int32_t s_fm_pw;
+	uint32_t rng;
+	float s_phase;
+	float s_phase_noise;
+	float s_fm;
+	float s_fm_lp;
+	float s_body_env;
+	float s_body_env_lp;
+	float s_transient_env;
+	float s_transient_env_lp;
+	float s_tone_lp;
+	float s_click_lp;
+	float s_click_hp;
+	float s_click_s1;
+	float s_click_s2;
+	float s_noise_lp;
+	float s_noise_hp;
+	/* Per-block SyntheticBassDrum coefficients. */
+	float s_fm_decay;
+	float s_body_decay;
+	float s_dirt;
+	float s_fm_amount;
 	/* Plaits Overdrive gain ramps. */
 	float od_pre;
 	float od_post;
@@ -90,6 +120,7 @@ typedef struct {
 	uint8_t fine;
 	uint8_t baseNote;
 	uint8_t trigger;
+	uint8_t model;      /* row `syn`: 0 analog (OUT), 1 synthetic (AUX) */
 
 	/* Shared LXR voice parts. */
 	float vol;

@@ -886,6 +886,9 @@ uint8_t ccSvc_runPatternPaste(const cc_job_t *job)
                 pat_setTrackAutoSmooth(job->scene, job->track,
                                        pat_trackAutoSmooth(src->scene,
                                                            src->track));
+                /* Generators travel with a track copy. */
+                pat_copyTrackGen(job->scene, job->track,
+                                 src->scene, src->track);
             }
         } else if (dst) {
             uint16_t last = (uint16_t)g.dst_first + g.count - 1u;
@@ -1065,6 +1068,10 @@ uint8_t ccSvc_runPatternClear(const cc_job_t *job)
             pat_setTrackLoopable(job->scene, job->track, 1u);
             /* S081 P2: a cleared track's automation ramps are off again. */
             pat_setTrackAutoSmooth(job->scene, job->track, 0u);
+            /* A cleared track returns to the standard sequencer. */
+            pat_setTrackGen(job->scene, job->track, PAT_GEN_F_MODE,
+                            PAT_GEN_STD);
+            pat_setTrackGen(job->scene, job->track, PAT_GEN_F_VDP, 0u);
         }
         ccSvc_release();
         ccSvc_patternChangedUi(job->scene,

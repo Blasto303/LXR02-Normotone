@@ -59,6 +59,7 @@
  * from filesystem_tick(), including synchronous boot polling.
  */
 
+#include "liveMode.h"
 #include "filesystem.h"
 #include "config.h"
 #include "asyncfatfs.h"
@@ -1322,6 +1323,19 @@ static char op_pattern_display_name[STORAGE_KIT_DISPLAY_NAME_LEN + 1u];
 static uint16_t op_pattern_source = FS_RESIDENT_SOURCE_UNKNOWN;
 static storage_sceneset_t op_sceneset_state;
 static storage_effect_state_t op_effect_state;
+/*
+ * Root Kit Effect (`effect.fx` in the Kit directory).
+ *
+ * What: Kit Save writes the source Scene's Effect next to kitset.kcg; Kit
+ * Load stages it here and commits it with the Kit to every target Scene.
+ * A Kit without the file (saved before) leaves the target Effects as they
+ * are; an unreadable file is ignored the same way, the Kit still loads.
+ * KitMrp neither writes nor reads it. Inputs/outputs: the flags below and
+ * filesystem_kitLoadHadEffect() for Preset's completion.
+ */
+static effect_record_t op_kit_effect;
+static uint8_t op_kit_effect_checked = 0u;
+static uint8_t op_kit_effect_valid = 0u;
 /*
  * Bank load/save scratch.
  *
@@ -2794,7 +2808,8 @@ static void filesystem_resetGlobalsToDefaults(void)
     parameter_values[PAR_PERF_VEL_LT] = 0u;
     parameter_values[PAR_PERF_VEL_RT] = 0u;
     parameter_values[PAR_SCENE_CHANGE_DIV] = 0u;
-    parameter_values[PAR_SCENE_QUEUE_DIV] = 0u;
+    /* LIVE: SHIFT+step patterns start at the end of the bar (qcd 1b). */
+    parameter_values[PAR_SCENE_QUEUE_DIV] = LIVE_MODE ? 4u : 0u;
     parameter_values[PAR_SCENE_QUEUE_ACTION] = 0u;
 }
 
@@ -2824,6 +2839,12 @@ static void filesystem_sanitizeLoadedGlobals(void)
      */
     if (parameter_values[PAR_SCENE_QUEUE_DIV] > 17u)
         parameter_values[PAR_SCENE_QUEUE_DIV] = 0u;
+    /* LIVE: the clock follows CLK IN, DIN or USB when one runs (aut). */
+    if (LIVE_MODE && parameter_values[PAR_EXT_SYNC] == SEQ_EXT_SYNC_OFF)
+        parameter_values[PAR_EXT_SYNC] = SEQ_EXT_SYNC_AUTO;
+    /* LIVE: an instant queue (older settings.cfg) becomes end of bar. */
+    if (LIVE_MODE && parameter_values[PAR_SCENE_QUEUE_DIV] == 0u)
+        parameter_values[PAR_SCENE_QUEUE_DIV] = 4u;
     if (parameter_values[PAR_SCENE_CHANGE_DIV] > 9u)
         parameter_values[PAR_SCENE_CHANGE_DIV] = 0u;
     /*
@@ -3330,6 +3351,7 @@ static void filesystem_patternBuildHeader(uint8_t *header,
     header[9] = (uint8_t)(PATTERN_FILE_HEADER_BYTES >> 8u);
     header[32] = region->pattern_change_bar;
     header[33] = region->pattern_next;
+    header[34] = region->gen_prime;          /* NUM mode prime (0 before) */
     for (track = 0u; track < NUM_TRACKS; track++) {
         uint16_t base = (uint16_t)(48u +
                                    track * PATTERN_FILE_TRACK_HEADER_BYTES);
@@ -3349,7 +3371,27 @@ static void filesystem_patternBuildHeader(uint8_t *header,
         /* S081 P2: byte 5 stores the automation ramp mode (1 = on). */
         header[base + 5u] =
             (uint8_t)((region->track_auto_smooth >> track) & 1u);
+        /* Bytes 6..13: track generators (pat_track_gen_t, zero = standard). */
+        memcpy(&header[base + 6u], region->track_gen[track].v,
+               PAT_TRACK_GEN_BYTES);
     }
+}
+
+/*
+ * Read one track's generator record from PAT4 track header bytes 6..13.
+ * Older files hold zeros there (standard sequencer); an unknown mode byte
+ * also falls back to standard so a newer file never plays garbage.
+ */
+static void filesystem_patternReadTrackGen(pat_scene_region_t *region,
+                                           uint8_t track, const uint8_t *src)
+{
+    pat_track_gen_t *g = &region->track_gen[track];
+
+    memcpy(g->v, src, PAT_TRACK_GEN_BYTES);
+    if (g->v[PAT_GEN_F_MODE] >= PAT_GEN_MODES)
+        g->v[PAT_GEN_F_MODE] = PAT_GEN_STD;
+    if (g->v[PAT_GEN_F_EUC_STEPS] > 64u)
+        g->v[PAT_GEN_F_EUC_STEPS] = 64u;
 }
 
 /* Validate v4 geometry and return the file header/pool/checksum fields. */
@@ -12301,6 +12343,8 @@ static void filesystem_loadKitDirectory_tick(void)
         return;
 
     case 11: /* OPEN kitset.kcg */
+        op_kit_effect_checked = 0u;
+        op_kit_effect_valid = 0u;
         storage_kitsetInit(&op_kitset);
         op_line_len = 0u;
         op_file_ready = false;
@@ -12393,6 +12437,12 @@ static void filesystem_loadKitDirectory_tick(void)
              * filesystem_loadedKit(), because Preset must preserve destination
              * slot identity and copy only same-type morphable endpoint values.
              */
+            if (current_op == FS_INTERNAL_OP_LOAD_KIT &&
+                !op_kit_effect_checked) {
+                op_kit_effect_checked = 1u;
+                op_phase = 40;          /* optional effect.fx first */
+                return;
+            }
             if (current_op == FS_INTERNAL_OP_LOAD_KIT) {
                 uint8_t identity_slot;
 
@@ -12447,6 +12497,8 @@ static void filesystem_loadKitDirectory_tick(void)
                         scene_t *target_scene = scene_get(scene_index);
                         if (target_scene) {
                             target_scene->kit = op_staged_kit;
+                            if (op_kit_effect_valid)
+                                target_scene->effect = op_kit_effect;
                             /*
                              * The validated normal Kit now owns the resident
                              * Kit payload. Mark only that Kit and its six
@@ -12579,10 +12631,65 @@ static void filesystem_loadKitDirectory_tick(void)
                         (uint8_t)(op_instrument_slot + 1u),
                         &op_staged_kit.instruments[op_instrument_slot]);
                 }
+                storage_instrumentStartMorph(op_kitset.instrument_type[op_instrument_slot], &op_staged_kit.instruments[op_instrument_slot]);
                 op_close_status = FS_STATUS_DONE;
             }
             op_phase = 20;
         }
+        return;
+
+    case 40: /* OPEN optional effect.fx */
+        storage_effectStateInit(&op_effect_state, &op_kit_effect);
+        op_line_len = 0u;
+        op_file_ready = false;
+        op_file = NULL;
+        if (!afatfs_fopen_lfn(STORAGE_KIT_EFFECT_FILENAME, "r",
+                              AFATFS_MATCH_CASE_INSENSITIVE, NULL,
+                              on_file_opened))
+            return;
+        op_phase = 41;
+        return;
+
+    case 41: /* WAIT effect.fx: absent keeps the current Effects */
+        if (!op_file_ready) return;
+        op_phase = op_file ? 42 : 16;
+        return;
+
+    case 42: /* READ effect.fx (a bad file is ignored, the Kit loads) */
+        st = filesystem_readTextLine(op_file, op_line_buf, &op_line_len,
+                                     sizeof(op_line_buf), &line_ready, &eof);
+        if (st == STORAGE_STATUS_WAIT)
+            return;
+        if (st != STORAGE_STATUS_OK) {
+            op_phase = 43;
+            return;
+        }
+        if (line_ready) {
+            if (storage_effectParseLine(&op_effect_state, op_line_buf,
+                                        &op_kit_effect) != STORAGE_STATUS_OK)
+                op_phase = 43;
+            return;
+        }
+        if (eof) {
+            /* During playback the running Effect stays (a Kit changed in
+             * performance keeps the sound); stopped, the Kit brings its own. */
+            op_kit_effect_valid = (uint8_t)(
+                storage_effectFinalize(&op_effect_state, &op_kit_effect) ==
+                STORAGE_STATUS_OK && !seq_isRunning());
+            op_phase = 43;
+        }
+        return;
+
+    case 43: /* CLOSE effect.fx */
+        op_close_done = false;
+        if (afatfs_fclose(op_file, on_file_closed))
+            op_phase = 44;
+        return;
+
+    case 44: /* WAIT CLOSE effect.fx, then commit the Kit (phase 16) */
+        if (!op_close_done) return;
+        op_file = NULL;
+        op_phase = 16;
         return;
 
     case 20: /* CLOSE INSTRUMENT */
@@ -13404,6 +13511,7 @@ static void filesystem_loadSceneDirectory_tick(void)
                         (uint8_t)(op_instrument_slot + 1u),
                         &fs_stage_workspace.scene_stage.kit.instruments[op_instrument_slot]);
                 }
+                storage_instrumentStartMorph(op_kitset.instrument_type[op_instrument_slot], &fs_stage_workspace.scene_stage.kit.instruments[op_instrument_slot]);
                 op_close_status = FS_STATUS_DONE;
             }
             op_phase = 30;
@@ -13678,6 +13786,8 @@ static void filesystem_loadSceneDirectory_tick(void)
             uint8_t track;
             region->pattern_change_bar = staging_buf[32];
             region->pattern_next = staging_buf[33];
+            region->gen_prime = (staging_buf[34u] < PAT_GEN_NUM_PRIMES)
+                ? staging_buf[34u] : 0u;
             region->track_loop_exclude = 0u;
             region->track_auto_smooth = 0u;
             for (track = 0u; track < NUM_TRACKS; track++) {
@@ -13694,6 +13804,8 @@ static void filesystem_loadSceneDirectory_tick(void)
                 /* S081 P2: byte 5 = automation ramp mode (files read 0). */
                 if (staging_buf[base + 5u] != 0u)
                     region->track_auto_smooth |= (uint8_t)(1u << track);
+                filesystem_patternReadTrackGen(region, track,
+                                           &staging_buf[base + 6u]);
             }
             op_stream_index = 0u;
             op_phase = 48u;
@@ -15915,6 +16027,8 @@ static void filesystem_loadPattern_tick(void)
             if (!region) { op_close_status = FS_STATUS_ERROR; op_phase = 13u; return; }
             region->pattern_change_bar = staging_buf[32u];
             region->pattern_next = staging_buf[33u];
+            region->gen_prime = (staging_buf[34u] < PAT_GEN_NUM_PRIMES)
+                ? staging_buf[34u] : 0u;
             region->track_loop_exclude = 0u;
             region->track_auto_smooth = 0u;
             for (track = 0u; track < NUM_TRACKS; track++) {
@@ -15931,6 +16045,8 @@ static void filesystem_loadPattern_tick(void)
                 /* S081 P2: byte 5 = automation ramp mode (files read 0). */
                 if (staging_buf[base + 5u] != 0u)
                     region->track_auto_smooth |= (uint8_t)(1u << track);
+                filesystem_patternReadTrackGen(region, track,
+                                           &staging_buf[base + 6u]);
             }
             op_stream_index = 0u; op_phase = 9u; return;
         }
@@ -17161,6 +17277,7 @@ static void filesystem_loadInstrument_tick(void)
                         (uint8_t)(op_instrument_load_destination_slot + 1u),
                         &op_staged_instrument);
                 }
+                storage_instrumentStartMorph(op_instrument_load_type, &op_staged_instrument);
                 /*
                  * Pair the validated Instrument with its one identity row.
                  *
@@ -19495,7 +19612,9 @@ static void filesystem_saveKitDirectory_tick(void)
 
     case 16:
         if (op_instrument_slot >= STORAGE_KIT_SLOT_COUNT) {
-            op_phase = 21u;
+            /* Normal Kit Save also writes the Scene's Effect (effect.fx). */
+            op_phase = (op_kit_save_mode == STORAGE_INSTRUMENT_SAVE_NORMAL)
+                ? 40u : 21u;
             return;
         }
         op_file_ready = false;
@@ -19552,6 +19671,49 @@ static void filesystem_saveKitDirectory_tick(void)
         op_file = NULL;
         op_instrument_slot++;
         op_phase = 16u;
+        return;
+
+    case 40: /* OPEN effect.fx */
+        op_file_ready = false;
+        op_file = NULL;
+        memset(op_root_open_name, 0, sizeof(op_root_open_name));
+        if (!afatfs_fopen_lfn(STORAGE_KIT_EFFECT_FILENAME, "w",
+                              AFATFS_MATCH_CASE_INSENSITIVE,
+                              op_root_open_name, on_file_opened))
+            return;
+        op_phase = 41u;
+        return;
+
+    case 41:
+        if (!op_file_ready)
+            return;
+        if (!op_file) {
+            filesystem_finish(FS_STATUS_ERROR);
+            return;
+        }
+        op_write_line_index = 0u;
+        op_write_line_len = 0u;
+        op_write_line_offset = 0u;
+        op_phase = 42u;
+        return;
+
+    case 42:
+        if (filesystem_writeTextLine(filesystem_nextEffectLine, (void *)scene))
+            return;
+        op_phase = 43u;
+        return;
+
+    case 43:
+        op_close_done = false;
+        if (afatfs_fclose(op_file, on_file_closed))
+            op_phase = 44u;
+        return;
+
+    case 44:
+        if (!op_close_done)
+            return;
+        op_file = NULL;
+        op_phase = 21u;
         return;
 
     case 21:
@@ -30196,6 +30358,8 @@ static uint8_t filesystem_bootReaderParseInstrumentFile(
                 storage_instrumentCopyMainToMorphFallback(
                     type, one_based_voice, destination);
             }
+            if (ok)
+                storage_instrumentStartMorph(type, destination);
             break;
         }
     }
@@ -30553,6 +30717,8 @@ static uint8_t filesystem_bootReaderReadPatternFile(const char *file_name,
     }
     region->pattern_change_bar = staging_buf[32u];
     region->pattern_next = staging_buf[33u];
+    region->gen_prime = (staging_buf[34u] < PAT_GEN_NUM_PRIMES)
+        ? staging_buf[34u] : 0u;
     region->track_loop_exclude = 0u;
     region->track_auto_smooth = 0u;
     for (track = 0u; track < NUM_TRACKS; track++) {
@@ -30569,6 +30735,8 @@ static uint8_t filesystem_bootReaderReadPatternFile(const char *file_name,
         /* S081 P2: byte 5 = automation ramp mode (files read 0). */
         if (staging_buf[base + 5u] != 0u)
             region->track_auto_smooth |= (uint8_t)(1u << track);
+        filesystem_patternReadTrackGen(region, track,
+                                   &staging_buf[base + 6u]);
     }
     if (filesystem_blockRead(file, (uint8_t *)region->address,
                              PATTERN_FILE_ADDRESS_BYTES) !=
@@ -31936,6 +32104,11 @@ bool filesystem_requestLoadKitForScenes(uint16_t slot, uint16_t scene_mask,
     op_kit_load_scene_mask = valid_mask;
     memset(&op_staged_kit, 0, sizeof(op_staged_kit));
     return true;
+}
+
+uint8_t filesystem_kitLoadHadEffect(void)
+{
+    return op_kit_effect_valid;
 }
 
 bool filesystem_requestSaveKitDirectory(uint16_t slot,

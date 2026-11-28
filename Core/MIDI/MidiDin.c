@@ -32,6 +32,7 @@
  * ------------------------------------------------------------------------------------------------------------------------
  */
 
+#include "cpuProfile.h"
 #include "MidiDin.h"
 #include "MidiBuffer.h"
 #include "MidiDefs.h"
@@ -136,7 +137,7 @@ static uint8_t midiDin_isRealtimeByte(uint8_t data)
 /* -----------------------------------------------------------------------
 ** USART3_IRQHandler
 ** ----------------------------------------------------------------------- */
-void USART3_IRQHandler(void)
+void USART3_IRQHandler_body(void)
 {
 	uint32_t isr = USART3_ISR;
 	uint8_t data;
@@ -272,3 +273,6 @@ uint32_t midiDin_realtimeTxDropCount(void)
 {
 	return midiDin_realtimeTxDrops;
 }
+
+/* Normotone CPU profile: timed wrapper (cpuProfile.h). */
+PROF_ISR_WRAP(USART3_IRQHandler, PROF_MDI)

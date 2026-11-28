@@ -40,6 +40,7 @@ typedef enum {
     MENU_FX_CELL_RUN,           /* sequence run mode                         */
     MENU_FX_CELL_LENGTH,        /* sequence length 1..16                     */
     MENU_FX_CELL_SCALE,         /* sequence step scale (shared table index)  */
+    MENU_FX_CELL_BUS_COMP,
     MENU_FX_CELL_MORPH_AMOUNT   /* Scene Effect Morph amount (`mrp`)         */
 } menuEffects_cell_kind_t;
 
@@ -82,6 +83,7 @@ typedef struct {
 void menuEffects_enter(uint8_t *sub_page, uint8_t *column);
 void menuEffects_toggleFirstScreen(uint8_t *sub_page, uint8_t *column);
 void menuEffects_leave(void);
+void menuEffects_openRumble(void);
 uint8_t menuEffects_resolveCell(uint8_t sub_page, uint8_t column,
                                 menuEffects_cell_t *out);
 uint8_t menuEffects_scrollSign(uint8_t sub_page);

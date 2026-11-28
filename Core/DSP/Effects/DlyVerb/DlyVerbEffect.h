@@ -30,7 +30,7 @@
  * two 4,096-sample delay rings.
  */
 #define DLYVERB_HALF_RATE_HZ      22054u
-#define DLYVERB_STATE_BYTES       256u
+#define DLYVERB_STATE_BYTES       320u
 #define DLYVERB_RVB_SAMPLES       16384u
 #define DLYVERB_RVB_BYTES         (DLYVERB_RVB_SAMPLES * 2u)
 #define DLYVERB_BUFFER_MIN_BYTES  (DLYVERB_STATE_BYTES + DLYVERB_RVB_BYTES + \
@@ -40,7 +40,7 @@
 #define DLYVERB_DIVISION_COUNT    14u
 
 /* Type rows 3..18 kept raw in the runtime. */
-#define DLYVERB_TYPE_ROWS         16u
+#define DLYVERB_TYPE_ROWS         25u
 
 /*
  * DlyVerb runtime (a member of EffectsManager's 76 B DTCM runtime union).
@@ -58,6 +58,7 @@
  */
 typedef struct {
     uint8_t raw[DLYVERB_TYPE_ROWS];
+    volatile float duck_pending;    /* (v/127)^3 of the latest csc hit */
     void *state;
     uint32_t seated_bytes;
     uint32_t seated_offset;
@@ -76,5 +77,10 @@ extern const effect_type_ops_t dlyVerb_ops;
  * Affiliates: stepScale_ticksQ8(), stepScale_formatShort().
  */
 uint8_t dlyVerb_divisionCc(uint8_t division);
+
+/* Quarter-rate plate reused by `dst` (state: bw, damp[2], tank[2]). */
+void dlyVerb_plateQuarter(float *pst, int16_t *rv, uint32_t ptr, float x,
+                          float decay, float dd2, float damp2, float mod,
+                          float *out_l, float *out_r);
 
 #endif /* DLY_VERB_EFFECT_H_ */

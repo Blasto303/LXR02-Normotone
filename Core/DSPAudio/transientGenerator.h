@@ -64,7 +64,8 @@ void transient_init(TransientGenerator* transient);
 void transient_trigger(TransientGenerator* transient);
 
 void transient_calc(TransientGenerator* transient);
-void transient_calcBlock(TransientGenerator* transient, int16_t* buf, const uint8_t size);
+/* Returns 1 when the block is all zero (the caller may skip mixing it). */
+uint8_t transient_calcBlock(TransientGenerator* transient, int16_t* buf, const uint8_t size);
 
 void transient_setWaveform(TransientGenerator* transient, const uint8_t waveform);
 #endif /* TRANSIENTGENERATOR_H_ */

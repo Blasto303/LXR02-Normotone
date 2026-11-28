@@ -29,6 +29,16 @@ static inline void voicePost_drum(int16_t *buf, const float gain,
 {
 	uint8_t i;
 	const float inv_size = 1.f/(size-1.f);
+	/* Drive 0 is the identity: skip the curve and its division (CPU). */
+	if (dist->shape == 0.0f) {
+		for(i=0;i<size;i++)
+		{
+			const int16_t eg = bufferTool_floatToInt16Store(
+				buf[i] * bufferTool_interpolatedGain(i, inv_size, gain, lastGain));
+			buf[i] = bufferTool_floatToInt16Store(eg * veloGain);
+		}
+		return;
+	}
 	for(i=0;i<size;i++)
 	{
 		const int16_t eg = bufferTool_floatToInt16Store(
@@ -49,6 +59,15 @@ static inline void voicePost_mixAddGainDist(int16_t *buf, const int16_t *add,
 		const Distortion *dist, const uint8_t size)
 {
 	uint8_t j;
+	if (dist->shape == 0.0f) {
+		for(j=0;j<size;j++)
+		{
+			const int16_t m = bufferTool_floatToInt16Store(buf[j] * mix);
+			const int16_t s = bufferTool_satAdd16(m, add[j]);
+			buf[j] = bufferTool_floatToInt16Store(s * ampGain);
+		}
+		return;
+	}
 	for(j=0;j<size;j++)
 	{
 		const int16_t m = bufferTool_floatToInt16Store(buf[j] * mix);
@@ -68,6 +87,12 @@ static inline void voicePost_addGainDist(int16_t *buf, const int16_t *add,
 		const float ampGain, const Distortion *dist, const uint8_t size)
 {
 	uint8_t j;
+	if (dist->shape == 0.0f) {
+		for(j=0;j<size;j++)
+			buf[j] = bufferTool_floatToInt16Store(
+				bufferTool_satAdd16(buf[j], add[j]) * ampGain);
+		return;
+	}
 	for(j=0;j<size;j++)
 	{
 		const int16_t s = bufferTool_satAdd16(buf[j], add[j]);

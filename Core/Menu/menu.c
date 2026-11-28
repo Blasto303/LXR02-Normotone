@@ -26,6 +26,7 @@
  */
 
 
+#include "liveMode.h"
 #include "menu.h"
 #include "CcNr2Text.h"
 #include "screensaver.h"
@@ -56,8 +57,6 @@
 #include "config.h"
 #include "Autosave.h"
 #include "AutosaveTrace.h"
-#include "EuklidGenerator.h"
-#include "SomGenerator.h"
 #include "menuEffects.h"
 #include "triggerJacks.h"
 #include "MidiIn.h"
@@ -109,6 +108,7 @@ static uint8_t menu_storageBusy = 0;
  */
 #define MENU_PENDING_PAGE_NONE 0u
 static uint8_t menu_pendingPageSwitch;
+static menu_library_target_t menu_pendingLibrary;
 /*
  * Accepted OK/OW presentation/ownership state (existing Menu byte; no S058
  * allocation). Inputs: only an accepted Load/Save confirmation request may set
@@ -753,6 +753,8 @@ static void menu_startInstrumentApply(uint8_t scene_index,
     bank_revalidateVoiceEditMasks();
 }
 
+static uint8_t menu_kitMorphApplyRunning;
+
 static void menu_startKitMorphApply(void)
 {
     /*
@@ -768,6 +770,7 @@ static void menu_startKitMorphApply(void)
     menu_instrumentApplyActive = 1u;
     menu_instrumentApplySlot = 0u;
     menu_storageBusy = 1u;
+    menu_kitMorphApplyRunning = 1u;
     preset_startKitMorphApply();
 }
 
@@ -806,6 +809,12 @@ static uint8_t menu_tickInstrumentApply(void)
     if (preset_tickInstrumentApply())
         return 1u;
     menu_instrumentApplyActive = 0u;
+#if LIVE_MODE
+    /* Simple Morph: a KitMrp load from the card becomes the Morph target. */
+    if (menu_kitMorphApplyRunning)
+        live_morphCaptured();
+#endif
+    menu_kitMorphApplyRunning = 0u;
     if (menu_requestAppliedInstrumentNameUpdate(menu_instrumentApplySlot))
         return 1u;
     menu_storageBusy = 0u;
@@ -1742,6 +1751,44 @@ static uint16_t menu_bankLoadPreviewMask = 0u;
 static uint16_t menu_bankLoadPreviewSlot = 0u;
 static uint8_t menu_bankLoadPreviewValid = 0u;
 /*
+ * LXR-02 direct Load/Save navigation (2026-11 field test: the field cursor,
+ * the edit toggle and the per-detent Kit loads made the page confusing and
+ * slow). The encoder always moves the slot, a click executes, SELECT picks
+ * the type (menu_loadSaveEncoder(), menu_loadSaveSelectButton()).
+ *
+ * menu_kitLoadArmed        a click asked for the shown Kit; deferred retries
+ *                          load it, a plain detent only refreshes the name.
+ * menu_bankPreviewPending  the Bank child preview waits until the encoder
+ *                          rests (MENU_BANK_PREVIEW_REST_MS) instead of
+ *                          scanning 16 child folders on every detent.
+ * menu_bankLoadAfterPreview / Ready  a click before the preview finished
+ *                          loads the Bank once it lands (main loop).
+ * menu_saveOverwriteArmed  the first click on an occupied Save slot shows
+ *                          `OW?`; a second click within 3 s writes.
+ * menu_loadSaveTypeOverride  SELECT's target for the shared type stepper.
+ */
+#define MENU_BANK_PREVIEW_REST_MS   250u
+#define MENU_SAVE_CONFIRM_MS        3000u
+static uint8_t  menu_kitLoadArmed = 0u;
+static uint8_t  menu_bankPreviewPending = 0u;
+static uint16_t menu_bankPreviewPendingSlot = 0u;
+static uint16_t menu_bankPreviewPendingTick = 0u;
+static uint8_t  menu_bankLoadAfterPreview = 0u;
+static uint8_t  menu_bankLoadAfterPreviewReady = 0u;
+static uint8_t  menu_saveOverwriteArmed = 0u;
+static uint16_t menu_saveOverwriteArmedTick = 0u;
+static uint8_t  menu_loadSaveTypeOverride = 0xFFu;
+/*
+ * menu_loadSaveClickPending  a click that arrived while storage was busy runs
+ *                          when it is idle (it was dropped before).
+ * menu_saveDraftName       the name Save writes to an empty slot: the
+ *                          resident name shown on entry, or the user's edit.
+ *                          Occupied slots still show their own name.
+ */
+static uint8_t  menu_loadSaveClickPending = 0u;
+static uint8_t  menu_saveDraftValid = 0u;
+static char     menu_saveDraftName[8];
+/*
  * Bank page state (+3 B SRAM1, S082 B2).
  *
  * What: the content mask (present and trigger steps) of the previewed Bank
@@ -2006,6 +2053,8 @@ static void menu_finishLoadSaveCommand(void);
 static void menu_paintLoadSaveConfirmation(uint8_t overwrite,
                                            uint8_t selected);
 static void menu_repaintGeneric(void);
+static void menu_saveRetryArm(uint8_t what, uint16_t slot,
+                              uint8_t source_scene);
 void sendDisplayBuffer(void);
 static void menu_moveToMenuItem(int8_t inc);
 static void menu_encoderChangeParameter(int8_t inc);
@@ -2014,6 +2063,7 @@ static void menu_handleLoadSaveKnobDelta(uint8_t knobNr, int8_t delta);
 static void menu_loadSaveClearInstrumentVoiceBlinks(void);
 static void menu_bankLoadPreviewComplete(void);
 static void menu_requestBankChildPreview(uint16_t slot);
+static void menu_scheduleBankChildPreview(uint16_t slot);
 static void menu_requestLibraryIndexLoad(uint8_t what);
 static void menu_requestSceneEntryName(void);
 static void menu_requestSceneIndexAfterName(void);
@@ -4639,6 +4689,9 @@ static menu_cell_t menu_resolveSceneSettingCell(uint8_t index)
     cell.descriptor_index = INSTRUMENT_MENU_EMPTY;
     if (index >= MENU_SCENE_SETTING_COUNT)
         return cell;
+    /* Normotone simple Morph: no per-voice Morph cell (Nvm); MRP only. */
+    if (index == MENU_SCENE_SETTING_VOICE_MORPH)
+        return cell;
     cell.kind = MENU_CELL_SCENE_SETTING;
     cell.scene_setting = index;
     cell.slot = menu_voicePageToSlot(menu_activePage);
@@ -4754,8 +4807,14 @@ static menu_cell_t menu_resolveCell(uint8_t subPage, uint8_t position)
         cell.text_id = TEXT_EMPTY;
         cell.descriptor_index = INSTRUMENT_MENU_EMPTY;
         if (menuEffects_resolveCell(subPage, position, &cell.fx)) {
-            cell.kind = MENU_CELL_EFFECT;
-            cell.descriptor = cell.fx.descriptor;
+            if (cell.fx.kind == MENU_FX_CELL_BUS_COMP) {
+                cell.kind = MENU_CELL_STATIC;
+                cell.static_param = PAR_BUS_COMP_MODE + cell.fx.index;
+                cell.text_id = TEXT_BUS_COMP_MODE + cell.fx.index;
+            } else {
+                cell.kind = MENU_CELL_EFFECT;
+                cell.descriptor = cell.fx.descriptor;
+            }
         }
         return cell;
     }
@@ -5637,6 +5696,24 @@ uint8_t menu_commitTargetEdit(uint16_t id, uint8_t value, uint8_t origin)
  * visible. Inputs: 7-bit value (translated
  * 0..126 -> x2, 127 -> 255). Accessor: midiControl_handleCc().
  */
+/* Global Morph 0..255 from the foreground (PERF + step glide), as the PERF
+ * `mrp` edit and CC1 (never recorded). */
+void menu_commitGlobalMorph(uint8_t value)
+{
+    menu_cell_t cell;
+    uint8_t slot;
+
+    memset(&cell, 0, sizeof(cell));
+    cell.kind = MENU_CELL_STATIC;
+    cell.static_param = PAR_MORPH;
+    (void)menu_cellCommitValueEx(&cell, value, 0u);
+    if (menu_paramVisible(PAR_MORPH))
+        menu_knobs_dirty = 1u;
+    for (slot = 0u; slot < INSTRUMENT_SLOT_COUNT; slot++)
+        menu_notifyTargetChanged(sceneModTarget_voiceMorphId(slot));
+    menu_notifyTargetChanged(sceneModTarget_effectMorphId());
+}
+
 void menu_commitGlobalMorphFromMidi(uint8_t value)
 {
     menu_cell_t cell;
@@ -6863,8 +6940,11 @@ static uint8_t menu_nextRestoredLoadSaveType(uint8_t current, int8_t inc)
      * Inputs: current SAVE_TYPE_* and signed encoder direction. Output: the
      * next reachable type with wraparound. Keeping this as a small whitelist
      * prevents stale compiled branches from becoming panel-reachable just
-     * because enum order happens to place them near Kit.
+     * because enum order happens to place them near Kit. A SELECT press
+     * names its target directly through menu_loadSaveTypeOverride.
      */
+    if (menu_loadSaveTypeOverride != 0xFFu)
+        return menu_loadSaveTypeOverride;
     for (i = 0u; i < count; i++) {
         if (restored_types[i] == current) {
             index = i;
@@ -7187,11 +7267,31 @@ static uint8_t menu_requestLoadCommandFinalIndexRestore(void)
  * page entry. Kit uses preset_loadKitForScenes() because the menu owns Scene
  * selection, while Settings/Samples retain their existing name/modal paths.
  */
+/*
+ * Whether a library slot holds an object, from the in-RAM name cache (no card
+ * access). Unknown while the type's cache is not loaded: reported absent.
+ */
+static uint8_t menu_loadSaveSlotExists(uint8_t what, uint16_t slot)
+{
+    switch (what) {
+    case SAVE_TYPE_KIT:
+    case SAVE_TYPE_KIT_MORPH: return filesystem_kitSlotExists(slot);
+    case SAVE_TYPE_SCENE:     return filesystem_sceneSlotExists(slot);
+    case SAVE_TYPE_BANK:      return filesystem_bankSlotExists(slot);
+    case SAVE_TYPE_PATTERN:   return filesystem_patternSlotExists(slot);
+    default:                  return 0u;
+    }
+}
+
 static void menu_requestCurrentLoadSaveSelection(uint8_t loadKitOnLoadPage)
 {
     uint8_t what = menu_saveOptions.what;
     uint16_t slot = (what < SAVE_TYPE_GLO) ? menu_currentPresetNr[what] : 0u;
 
+    /* Direct navigation: a Kit is loaded only after a click asked for it. */
+    if (!menu_kitLoadArmed &&
+        (what == SAVE_TYPE_KIT || what == SAVE_TYPE_KIT_MORPH))
+        loadKitOnLoadPage = 0u;
     menu_deferSelectionRequest = 0;
     menu_deferSelectionLoadKit = loadKitOnLoadPage;
     /*
@@ -7336,6 +7436,7 @@ static void menu_requestCurrentLoadSaveSelection(uint8_t loadKitOnLoadPage)
         memcpy(preset_currentName, filesystem_kitSlotName(slot), 8u);
         menu_repaintAll();
         if (preset_loadKitForScenes(slot, menu_kitLoadSceneMask)) {
+            menu_kitLoadArmed = 0u;
             /*
              * Keep the encoder responsive while the immutable full-Kit request
              * drains. Number-only turns update the separate desired slot, but
@@ -7355,6 +7456,7 @@ static void menu_requestCurrentLoadSaveSelection(uint8_t loadKitOnLoadPage)
         memcpy(preset_currentName, filesystem_kitSlotName(slot), 8u);
         menu_repaintAll();
         if (preset_loadKitMorphForScenes(slot, menu_kitLoadSceneMask)) {
+            menu_kitLoadArmed = 0u;
             /* KitMrp uses the same immutable request boundary, while the
              * encoder remains free to choose the latest desired slot. */
             menu_selectionGenerationSnapshot = menu_selectionGeneration;
@@ -7372,7 +7474,10 @@ static void menu_requestCurrentLoadSaveSelection(uint8_t loadKitOnLoadPage)
          * also posts a read-only child scan so the SEQ LEDs represent only
          * Scene folders present inside the highlighted Bank slot.
          */
-        if (what == SAVE_TYPE_BANK)
+        if (menu_activePage == SAVE_PAGE && menu_saveDraftValid &&
+            !menu_loadSaveSlotExists(what, slot))
+            memcpy(preset_currentName, menu_saveDraftName, 8u);
+        else if (what == SAVE_TYPE_BANK)
             memcpy(preset_currentName, filesystem_bankSlotName(slot), 8u);
         else if (what == SAVE_TYPE_SCENE)
             memcpy(preset_currentName, filesystem_sceneSlotName(slot), 8u);
@@ -7380,8 +7485,14 @@ static void menu_requestCurrentLoadSaveSelection(uint8_t loadKitOnLoadPage)
             memcpy(preset_currentName, filesystem_patternSlotName(slot), 8u);
         /* Save:[Bank] previews the selected slot for the COPY-held view (B6). */
         if (what == SAVE_TYPE_BANK)
-            menu_requestBankChildPreview(slot);
+            menu_scheduleBankChildPreview(slot);
     } else {
+        if (menu_activePage == SAVE_PAGE && menu_saveDraftValid &&
+            what < SAVE_TYPE_GLO && !menu_loadSaveSlotExists(what, slot)) {
+            memcpy(preset_currentName, menu_saveDraftName, 8u);
+            menu_repaintAll();
+            return;
+        }
         preset_loadName(slot, what);
         if (preset_getStatus() != PRESET_LOAD_IN_PROGRESS)
             menu_deferSelectionRequest = 1;
@@ -8827,14 +8938,30 @@ static void menu_bankLoadPreviewComplete(void)
     if ((menu_activePage != LOAD_PAGE && menu_activePage != SAVE_PAGE) ||
         menu_instrumentLoadActive ||
         menu_saveOptions.what != SAVE_TYPE_BANK ||
-        menu_bankLoadPreviewSlot != slot ||
-        !preview_ok) {
+        menu_bankLoadPreviewSlot != slot) {
+        menu_repaintAll();
+        return;
+    }
+    if (!preview_ok) {
+        /* A cancelled scan is retried for the latest selection by its owner. */
+        if (!menu_deferSelectionRequest && menu_bankLoadAfterPreview) {
+            menu_bankLoadAfterPreview = 0u;
+            if (!menu_storageBusy) {
+                menu_showFilesystemErrorOverlay();
+                return;
+            }
+        }
         menu_repaintAll();
         return;
     }
     menu_bankLoadPreviewMask = filesystem_bankChildSceneMask();
     menu_bankPreviewContentMask = filesystem_bankChildContentMask();
     menu_bankLoadPreviewValid = 1u;
+    /* A click that arrived before the preview loads from the main loop. */
+    if (menu_bankLoadAfterPreview) {
+        menu_bankLoadAfterPreview = 0u;
+        menu_bankLoadAfterPreviewReady = 1u;
+    }
     menu_refreshLoadSceneLeds();
     menu_repaintAll();
 }
@@ -8891,6 +9018,40 @@ static void menu_requestBankChildPreview(uint16_t slot)
     if (!filesystem_requestScanBankScenes(slot,
                                           menu_bankLoadPreviewComplete))
         menu_deferSelectionRequest = 1u;
+    menu_refreshLoadSceneLeds();
+}
+
+/*
+ * Ask for the Bank child preview once the encoder rests.
+ *
+ * Inputs: the Bank slot just shown. Output: the preview is invalidated at
+ * once (LEDs and masks follow the new slot) and the 16-folder scan starts
+ * from menu_serviceRuntimeWidgets() after MENU_BANK_PREVIEW_REST_MS without
+ * a newer slot, so spinning through Banks costs no card access.
+ */
+static void menu_scheduleBankChildPreview(uint16_t slot)
+{
+    /*
+     * Re-asking for the slot already previewed, pending or being scanned is
+     * a no-op: the deferred-selection retry calls back here, and cancelling
+     * the running scan from it would restart the preview forever.
+     */
+    if (slot == menu_bankLoadPreviewSlot &&
+        (menu_bankLoadPreviewValid || menu_bankPreviewPending ||
+         filesystem_scanBankScenesRunning()))
+        return;
+    if (menu_activePage == LOAD_PAGE &&
+        menu_bankLoadPreviewSlot != slot)
+        menu_resetLoadSaveSceneSelection();
+    menu_bankLoadPreviewSlot = slot;
+    menu_bankLoadPreviewMask = 0u;
+    menu_bankPreviewContentMask = 0u;
+    menu_bankLoadPreviewValid = 0u;
+    menu_bankPreviewPending = 1u;
+    menu_bankPreviewPendingSlot = slot;
+    menu_bankPreviewPendingTick = time_sysTick;
+    if (filesystem_scanBankScenesRunning())
+        filesystem_cancelScanBankScenes();
     menu_refreshLoadSceneLeds();
 }
 
@@ -9409,6 +9570,17 @@ static uint8_t menu_commitChainParam(uint16_t paramNr, uint8_t value)
 void menu_refreshPerfSceneLeds(void)
 {
     uint8_t scene_index;
+#if LIVE_MODE
+    /* LIVE: the KIT page owns the step row while it is open. */
+    if (live_kitPageActive()) {
+        live_kitPageLeds();
+        return;
+    }
+    if (live_rndPageActive()) {
+        live_rndPageLeds();
+        return;
+    }
+#endif
     uint8_t active_scene = scene_getActiveIndex();
     uint8_t viewed = menu_getViewedPattern();
     uint16_t present_mask = menu_residentPresentSceneMask();
@@ -9523,6 +9695,11 @@ static void menu_perfSceneChangeExecute(uint8_t scene_index, uint8_t restart)
         !bank_sceneAvailable(scene_index)) {
         return;
     }
+#if LIVE_MODE
+    /* LIVE: the mix and rumble follow the player; the leaving pattern
+     * gets its own kit back. */
+    live_beforeSceneChange(scene_index);
+#endif
     scene_selectActive(scene_index);
     bank_selectActiveSceneForEditMask(scene_index);
     /*
@@ -9680,7 +9857,9 @@ void menu_serviceDeferredSceneChange(void)
              * bank_sceneAvailable(). Affiliates: menu_applyQueuedSceneAction(),
              * menu_perfSceneChangeExecute() (which already drops the change).
              */
-            if (scene < 16u && bank_sceneAvailable(scene)) {
+            if (LIVE_MODE && live_queuedFire(scene)) {
+                /* LIVE: the queue only carried a kit change. */
+            } else if (scene < 16u && bank_sceneAvailable(scene)) {
                 uint8_t flags = menu_applyQueuedSceneAction(scene);
 
                 menu_perfSceneChangeExecute(
@@ -9692,6 +9871,9 @@ void menu_serviceDeferredSceneChange(void)
             menu_perfSceneChangeExecute(scene, pcr);
         }
     }
+#if LIVE_MODE
+    live_service();
+#endif
     menu_syncQueuedSceneLed();
 }
 
@@ -10467,7 +10649,10 @@ uint8_t menu_loadInstrumentVoicePressed(uint8_t voiceNr)
         ? (uint16_t)(1u << menu_instrumentLoadScene) : 0u;
     menu_instrumentLoadSource = MENU_INSTRUMENT_SOURCE_KIT;
     menu_saveOptions.what = SAVE_TYPE_KIT;
-    menu_saveOptions.state = SAVE_STATE_EDIT_TYPE;
+    /* Direct navigation: Load enters on the preset row (the encoder browses
+     * presets, SELECT picks the type); Save keeps the type row. */
+    menu_saveOptions.state = menu_instrumentSaveMode ? SAVE_STATE_EDIT_TYPE
+                                                     : SAVE_STATE_EDIT_PRESET_NR;
     /*
      * Instrument Load/Save entry always starts on the selected top type row.
      *
@@ -10709,6 +10894,18 @@ static void menu_loadSaveClearInstrumentVoiceBlinks(void)
         led_setBlinkLed((uint8_t)(LED_VOICE1 + blink_voice), 0u);
 }
 
+/*
+ * Field the Load/Save page starts on. Library types and Samples start on the
+ * slot (direct navigation: the encoder moves it, a click executes); the test
+ * types and Settings keep the original type-field start.
+ */
+static uint8_t menu_loadSaveHomeState(uint8_t what)
+{
+    return (what == SAVE_TYPE_FILE || what == SAVE_TYPE_DIR ||
+            what == SAVE_TYPE_SIMPLE_DIR || what == SAVE_TYPE_GLO)
+        ? SAVE_STATE_EDIT_TYPE : SAVE_STATE_EDIT_PRESET_NR;
+}
+
 static void menu_loadSaveEnterTopAt(uint8_t page, uint8_t what,
                                     uint16_t bank_slot)
 {
@@ -10721,7 +10918,7 @@ static void menu_loadSaveEnterTopAt(uint8_t page, uint8_t what,
     menu_instrumentSaveMode = 0u;
     menu_loadSaveClearInstrumentVoiceBlinks();
     menu_saveOptions.what = what;
-    menu_saveOptions.state = SAVE_STATE_EDIT_TYPE;
+    menu_saveOptions.state = menu_loadSaveHomeState(menu_saveOptions.what);
     editModeActive = 1u;
     if (what == SAVE_TYPE_BANK)
         menu_currentPresetNr[SAVE_TYPE_BANK] = bank_slot;
@@ -10983,7 +11180,8 @@ static void menu_loadSaveEnterInstrumentLoad(uint8_t voice, uint8_t option)
         ? (uint16_t)(1u << menu_instrumentLoadScene) : 0u;
     menu_instrumentLoadSource = MENU_INSTRUMENT_SOURCE_KIT;
     menu_saveOptions.what = SAVE_TYPE_KIT;
-    menu_saveOptions.state = SAVE_STATE_EDIT_TYPE;
+    /* Direct navigation: Load enters on the preset row. */
+    menu_saveOptions.state = SAVE_STATE_EDIT_PRESET_NR;
     editModeActive = 1u;
     menu_instrumentLoadRefreshBaseType(0u);
     if (menu_instrumentLoadOptionAt(voice, option, &type, &morph)) {
@@ -12281,6 +12479,16 @@ void menu_repaint(void)
      */
     if (copyClear_menuVisible())
         copyClear_formatMenu(editDisplayBuffer[0], editDisplayBuffer[1]);
+#if LIVE_MODE
+    else
+        (void)live_formatOverlay(editDisplayBuffer[0], editDisplayBuffer[1]);
+    /*
+     * PLAITS indicator: a 'P' in the bottom-right corner, a cell every page
+     * leaves blank (value rows are 15 characters wide), whatever the page.
+     */
+    if (live_plaitsActive() && editDisplayBuffer[1][15] == ' ')
+        editDisplayBuffer[1][15] = 'P';
+#endif
     if ((menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
         !menu_loadSaveCursorVisible()) {
         uint8_t row;
@@ -12421,6 +12629,7 @@ static void menu_repaintLoadSavePage(void)
     ** Without this, old indicators persist when using incremental repaint. */
     memset(&editDisplayBuffer[0][0], ' ', 16);
     memset(&editDisplayBuffer[1][0], ' ', 16);
+    menu_loadSaveRefreshTypeLed();
 
     if (menu_testResultActive) {
         menu_showTestResult();
@@ -12669,7 +12878,7 @@ static void menu_repaintLoadSavePage(void)
     case SAVE_TYPE_KIT:         toptxt = "Kit     "; break;
     case SAVE_TYPE_KIT_MORPH:   toptxt = "KitMrp  "; break;
     case SAVE_TYPE_SCENE:       toptxt = "Scene   "; break;
-    case SAVE_TYPE_BANK:        toptxt = "Bank    "; break;
+    case SAVE_TYPE_BANK:        toptxt = LIVE_MODE ? "Project " : "Bank    "; break;
     case SAVE_TYPE_PATTERN:     toptxt = "Pattern "; break;
     case SAVE_TYPE_GLO:         toptxt = "Settings"; break;
     case SAVE_TYPE_SAMPLES:     toptxt = "Samples "; break;
@@ -12785,14 +12994,8 @@ static void menu_repaintLoadSavePage(void)
         }
 
         menu_formatPresetNumber3(&editDisplayBuffer[1][1], displayPreset);
-        if (menu_saveOptions.state == SAVE_STATE_EDIT_PRESET_NR) {
-            if (editModeActive) {
-                editDisplayBuffer[1][0] = '[';
-                editDisplayBuffer[1][4] = ']';
-            } else {
-                editDisplayBuffer[1][0] = ARROW_SIGN;
-            }
-        }
+        /* Direct navigation: the encoder always moves this number, so it
+         * carries no field marker. */
         memcpy(&editDisplayBuffer[1][5], displayName, 8);
     }
 
@@ -12821,6 +13024,13 @@ static void menu_repaintLoadSavePage(void)
             memcpy(&editDisplayBuffer[1][14], "OW", 2);
         else
             memcpy(&editDisplayBuffer[1][14], menuText_ok, 2);
+        /* First click on an occupied slot: a second click writes. */
+        if (menu_saveOverwriteArmed && menu_saveOptions.what < SAVE_TYPE_GLO) {
+            memcpy(&editDisplayBuffer[1][13],
+                   (menu_bankPageActive() && menu_bankMergeOn()) ? "MR?" : "OW?",
+                   3);
+            return;
+        }
         if ((menu_saveOptions.state == SAVE_STATE_OK) ||
             (menu_saveOptions.what >= SAVE_TYPE_GLO && menu_saveOptions.state > SAVE_STATE_EDIT_TYPE)) {
             editDisplayBuffer[1][13] = ARROW_SIGN;
@@ -12838,18 +13048,30 @@ static void menu_repaintLoadSavePage(void)
              * OK text. Scene and Bank do not live-load; their row must show OK
              * so the user can move to it and click to perform the load.
              */
+#if LIVE_MODE
+            /* Keep the action visible and mark the resident project separately. */
+            if (menu_saveOptions.what == SAVE_TYPE_BANK &&
+                menu_currentPresetNr[SAVE_TYPE_BANK] == bank_restoreBankSlot())
+                editDisplayBuffer[0][15] = '*';
+            memcpy(&editDisplayBuffer[1][14], menuText_ok, 2);
+#else
             memcpy(&editDisplayBuffer[1][14],
                    (menu_bankPageActive() && menu_bankMergeOn()) ? "mr"
                                                                  : menuText_ok,
                    2);
+#endif
             if ((menu_saveOptions.state == SAVE_STATE_OK) ||
                 (menu_saveOptions.what >= SAVE_TYPE_GLO && menu_saveOptions.state > SAVE_STATE_EDIT_TYPE)) {
                 editDisplayBuffer[1][13] = ARROW_SIGN;
             }
         } else {
-            editDisplayBuffer[1][14] = 0;
-            editDisplayBuffer[1][15] = 0;
+            /* Kit and KitMrp load on a click too (direct navigation). */
+            memcpy(&editDisplayBuffer[1][14], menuText_ok, 2);
         }
+        /* A Bank click waits for its child preview. */
+        if (menu_bankLoadAfterPreview &&
+            menu_saveOptions.what == SAVE_TYPE_BANK)
+            memcpy(&editDisplayBuffer[1][14], "..", 2);
     }
 }
 
@@ -15049,18 +15271,30 @@ static void menu_handleLoadSaveMenu(int8_t inc, uint8_t btnClicked)
                             menu_currentPresetNr[SAVE_TYPE_KIT], 0u,
                             menu_loadSaveSourceScene))
                         commandAccepted = 1u;
+                    else
+                        menu_saveRetryArm(SAVE_TYPE_KIT,
+                                          menu_currentPresetNr[SAVE_TYPE_KIT],
+                                          menu_loadSaveSourceScene);
                     break;
                 case SAVE_TYPE_KIT_MORPH:
                     if (preset_saveDrumset(
                             menu_currentPresetNr[SAVE_TYPE_KIT_MORPH], 1u,
                             menu_loadSaveSourceScene))
                         commandAccepted = 1u;
+                    else
+                        menu_saveRetryArm(SAVE_TYPE_KIT_MORPH,
+                                          menu_currentPresetNr[SAVE_TYPE_KIT_MORPH],
+                                          menu_loadSaveSourceScene);
                     break;
                 case SAVE_TYPE_SCENE:
                     if (preset_saveScene(
                             menu_currentPresetNr[SAVE_TYPE_SCENE],
                             menu_loadSaveSourceScene))
                         commandAccepted = 1u;
+                    else
+                        menu_saveRetryArm(SAVE_TYPE_SCENE,
+                                          menu_currentPresetNr[SAVE_TYPE_SCENE],
+                                          menu_loadSaveSourceScene);
                     break;
                 /*
                  * Bank OK: compute the outcome masks and post the operation
@@ -15093,10 +15327,18 @@ static void menu_handleLoadSaveMenu(int8_t inc, uint8_t btnClicked)
                         AUTOSAVE_TRACE_SAVE_LIFECYCLE_TYPE_BANK,
                         (uint32_t)menu_currentPresetNr[SAVE_TYPE_BANK] <<
                         AUTOSAVE_TRACE_SAVE_LIFECYCLE_SLOT_SHIFT);
+#if LIVE_MODE
+                    /* A project keeps its own kits, never PLAITS or lent kits. */
+                    live_beforeProjectSave();
+#endif
                     if (preset_saveBank(
                             menu_currentPresetNr[SAVE_TYPE_BANK],
                             act, empty))
                         commandAccepted = 1u;
+#if LIVE_MODE
+                    else
+                        live_afterProjectSave();
+#endif
                     break; }
                 case SAVE_TYPE_PATTERN:
                     /* Pattern Save exports the active resident Scene's v4
@@ -15104,6 +15346,10 @@ static void menu_handleLoadSaveMenu(int8_t inc, uint8_t btnClicked)
                     if (preset_savePattern(
                             menu_currentPresetNr[SAVE_TYPE_PATTERN]))
                         commandAccepted = 1u;
+                    else
+                        menu_saveRetryArm(SAVE_TYPE_PATTERN,
+                                          menu_currentPresetNr[SAVE_TYPE_PATTERN],
+                                          0u);
                     break;
                 case SAVE_TYPE_GLO:     commandAccepted = preset_saveGlobals(); break;
                 default: break;
@@ -15417,6 +15663,295 @@ static void menu_handleLoadSaveMenu(int8_t inc, uint8_t btnClicked)
     }
 }
 
+/*
+ * Direct Load/Save navigation: slot step that skips empty library slots.
+ *
+ * Inputs: SAVE_TYPE_* and the signed detent count. Output: the target slot,
+ * |inc| occupied slots away on the Load page (the name cache answers without
+ * a card access), or the plain neighbour when the cache is not loaded yet.
+ * The current slot is kept when no occupied slot lies further on.
+ */
+static uint16_t menu_loadSaveStepSlot(uint8_t what, int8_t inc)
+{
+    int16_t slot = (int16_t)menu_currentPresetNr[what];
+    int16_t step = (inc < 0) ? -1 : 1;
+    uint8_t left = (uint8_t)((inc < 0) ? -inc : inc);
+    uint8_t index;
+    uint8_t (*exists)(uint16_t);
+
+    switch (what) {
+    case SAVE_TYPE_KIT:
+    case SAVE_TYPE_KIT_MORPH:
+        index = FS_LIBRARY_INDEX_KIT; exists = filesystem_kitSlotExists; break;
+    case SAVE_TYPE_SCENE:
+        index = FS_LIBRARY_INDEX_SCENE; exists = filesystem_sceneSlotExists; break;
+    case SAVE_TYPE_BANK:
+        index = FS_LIBRARY_INDEX_BANK; exists = filesystem_bankSlotExists; break;
+    case SAVE_TYPE_PATTERN:
+        index = FS_LIBRARY_INDEX_PATTERN; exists = filesystem_patternSlotExists; break;
+    default:
+        return menu_currentPresetNr[what];
+    }
+    if (menu_activePage != LOAD_PAGE ||
+        !filesystem_libraryNameCacheLoaded(index)) {
+        slot = (int16_t)(slot + inc);
+        return (uint16_t)((slot < 0) ? 0 : (slot > 999) ? 999 : slot);
+    }
+    while (left > 0u) {
+        int16_t s = (int16_t)(slot + step);
+
+        while (s >= 0 && s <= 999 && !exists((uint16_t)s))
+            s = (int16_t)(s + step);
+        if (s < 0 || s > 999)
+            break;
+        slot = s;
+        left--;
+    }
+    return (uint16_t)slot;
+}
+
+/*
+ * Execute the shown Load/Save selection (encoder click).
+ *
+ * Load: Kit/KitMrp arm the existing Kit request path; a Bank whose child
+ * preview has not landed yet loads as soon as it does; every other type runs
+ * the existing OK branch of menu_handleLoadSaveMenu(). Save: an occupied slot
+ * needs a second click within MENU_SAVE_CONFIRM_MS (`OW?`).
+ */
+static void menu_loadSaveExecute(void)
+{
+    uint8_t what = menu_saveOptions.what;
+    uint16_t slot = (what < SAVE_TYPE_GLO) ? menu_currentPresetNr[what] : 0u;
+
+    if (menu_activePage == SAVE_PAGE) {
+        if (what < SAVE_TYPE_GLO && menu_currentSaveWouldOverwrite() &&
+            !(menu_saveOverwriteArmed &&
+              (uint16_t)(time_sysTick - menu_saveOverwriteArmedTick) <
+                  MENU_SAVE_CONFIRM_MS)) {
+            menu_saveOverwriteArmed = 1u;
+            menu_saveOverwriteArmedTick = time_sysTick;
+            menu_repaintAll();
+            return;
+        }
+        menu_saveOverwriteArmed = 0u;
+    } else if (what == SAVE_TYPE_KIT || what == SAVE_TYPE_KIT_MORPH) {
+        if (!filesystem_kitSlotExists(slot))
+            return;
+        menu_kitLoadArmed = 1u;
+        menu_selectionGeneration++;
+        menu_requestCurrentLoadSaveSelection(1u);
+        return;
+    } else if (what == SAVE_TYPE_BANK &&
+               !(menu_bankLoadPreviewValid &&
+                 menu_bankLoadPreviewSlot == slot)) {
+        if (!filesystem_bankSlotExists(slot))
+            return;
+        menu_bankLoadAfterPreview = 1u;
+        /* An earlier scan may have failed before or after the first click. */
+        menu_scheduleBankChildPreview(slot);
+        if (menu_bankPreviewPending && !menu_storageBusy &&
+            filesystem_status() == FS_STATUS_IDLE) {
+            menu_bankPreviewPending = 0u;
+            menu_requestBankChildPreview(slot);
+        }
+        menu_repaintAll();
+        return;
+    }
+    menu_saveOptions.state = SAVE_STATE_OK;
+    editModeActive = 1u;
+    menu_handleLoadSaveMenu(0, 1u);
+    if (menu_saveOptions.state == SAVE_STATE_OK)
+        menu_saveOptions.state = SAVE_STATE_EDIT_PRESET_NR;
+    menu_repaintAll();
+}
+
+/*
+ * Encoder on the Load/Save page (LXR-02 direct navigation).
+ *
+ * Top level: a detent moves the slot (skipping empty slots on Load), a click
+ * executes; there is no field cursor and no edit toggle. Instrument Load:
+ * a detent browses the type's presets (each one is auditioned, as before),
+ * a click commits a pending type change. Instrument Save, the test types and
+ * Settings keep the original field navigation.
+ */
+static void menu_loadSaveEncoder(int8_t inc, uint8_t btnClicked)
+{
+    uint8_t what = menu_saveOptions.what;
+
+    if (menu_loadSaveCommandActive) {
+        menu_handleLoadSaveMenu(inc, btnClicked);
+        return;
+    }
+    if (menu_instrumentLoadActive) {
+        if (!menu_instrumentSaveMode) {
+            editModeActive = 1u;
+            if (btnClicked) {
+                if (menu_saveOptions.state == SAVE_STATE_EDIT_PRESET_NR &&
+                    menu_instrumentLoadSource == MENU_INSTRUMENT_SOURCE_CHANGE)
+                    menu_handleLoadSaveMenu(0, 1u);
+                return;
+            }
+        }
+        menu_handleLoadSaveMenu(inc, btnClicked);
+        return;
+    }
+    if (what == SAVE_TYPE_FILE || what == SAVE_TYPE_DIR ||
+        what == SAVE_TYPE_SIMPLE_DIR || what == SAVE_TYPE_GLO) {
+        menu_handleLoadSaveMenu(inc, btnClicked);
+        return;
+    }
+    editModeActive = 1u;
+    if (btnClicked) {
+        menu_loadSaveExecute();
+        return;
+    }
+    if (inc == 0 || what == SAVE_TYPE_SAMPLES)
+        return;
+    menu_loadSaveClickPending = 0u;
+    if (menu_activePage == SAVE_PAGE &&
+        (!menu_saveDraftValid ||
+         !menu_loadSaveSlotExists(what, menu_currentPresetNr[what]))) {
+        /* The name shown on an empty slot (resident name or the user's
+         * edit) is what an empty slot further on will be saved with. */
+        memcpy(menu_saveDraftName, preset_currentName, 8u);
+        menu_saveDraftValid = 1u;
+    }
+    menu_saveOverwriteArmed = 0u;
+    menu_kitLoadArmed = 0u;
+    menu_bankLoadAfterPreview = 0u;
+    menu_saveOptions.state = SAVE_STATE_EDIT_PRESET_NR;
+    {
+        uint16_t target = menu_loadSaveStepSlot(what, inc);
+        int8_t step = (inc < 0) ? -1 : 1;
+
+        if (target == menu_currentPresetNr[what])
+            return;
+        /* The shared number branch adds one detent to the slot before it. */
+        menu_currentPresetNr[what] = (uint16_t)(target - step);
+        menu_handleLoadSaveMenu(step, 0u);
+    }
+}
+
+/*
+ * Pick an Instrument type for the nested Load from its SELECT button.
+ *
+ * Inputs: zero-based SELECT index = registry position (Drum, Snare, Cymbal,
+ * HiHat, PlKick, PlSnare, PlHat, PlModal). Output: the type change is
+ * committed at once (its preset 000 loads into the voice), like a turn onto
+ * the file row after choosing the type. A type the slot cannot take (the
+ * two-Advanced limit) is ignored.
+ */
+static uint8_t menu_instrumentLoadSelectType(uint8_t selectNr)
+{
+    const instrument_registry_entry_t *entry =
+        instrumentManager_registryEntryAt(selectNr);
+
+    if (!entry || menu_instrumentSaveMode ||
+        !menu_instrumentTypeSelectableForMask(entry->type))
+        return 1u;
+    if (entry->type == menu_instrumentLoadType &&
+        !menu_instrumentLoadMorphMode)
+        return 1u;
+    menu_saveOptions.state = SAVE_STATE_EDIT_TYPE;
+    editModeActive = 1u;
+    while (menu_instrumentLoadType != entry->type ||
+           menu_instrumentLoadMorphMode) {
+        uint8_t before = menu_instrumentLoadType;
+        uint8_t before_morph = menu_instrumentLoadMorphMode;
+
+        menu_instrumentLoadStepType(1);
+        if (menu_instrumentLoadType == before &&
+            menu_instrumentLoadMorphMode == before_morph)
+            break; /* storage busy: the stepper refused */
+    }
+    menu_saveOptions.state = SAVE_STATE_EDIT_PRESET_NR;
+    if (menu_instrumentLoadSource == MENU_INSTRUMENT_SOURCE_CHANGE)
+        menu_instrumentLoadCommitChange();
+    menu_repaintAll();
+    return 1u;
+}
+
+/*
+ * SELECT on the Load/Save page picks what to load or save.
+ *
+ * Top level: SELECT 1..6 = Kit, KitMrp, Scene, Bank, Pattern, Samples (Save
+ * has no Samples). Nested Instrument Load: SELECT 1..8 = instrument type.
+ * Returns nonzero when the press was consumed. Client: buttonHandler.
+ */
+uint8_t menu_loadSaveSelectButton(uint8_t selectNr)
+{
+    const uint8_t *types = (menu_activePage == LOAD_PAGE)
+        ? menu_loadSaveLoadTypes : menu_loadSaveSaveTypes;
+    uint8_t count = (menu_activePage == LOAD_PAGE)
+        ? (uint8_t)(sizeof(menu_loadSaveLoadTypes) /
+                    sizeof(menu_loadSaveLoadTypes[0]))
+        : (uint8_t)(sizeof(menu_loadSaveSaveTypes) /
+                    sizeof(menu_loadSaveSaveTypes[0]));
+
+    if (menu_activePage != LOAD_PAGE && menu_activePage != SAVE_PAGE)
+        return 0u;
+    if (menu_loadSaveCommandActive || menu_storageBusy ||
+        preset_getStatus() != PRESET_IDLE)
+        return 1u;
+    if (menu_instrumentLoadActive) {
+        (void)menu_instrumentLoadSelectType(selectNr);
+        led_setActiveSelectButton(selectNr);
+        return 1u;
+    }
+    if (selectNr >= count)
+        return 1u;
+    if (types[selectNr] != menu_saveOptions.what) {
+        menu_saveOverwriteArmed = 0u;
+        menu_kitLoadArmed = 0u;
+        menu_bankLoadAfterPreview = 0u;
+        menu_saveDraftValid = 0u;
+        menu_loadSaveClickPending = 0u;
+        menu_loadSaveTypeOverride = types[selectNr];
+        menu_saveOptions.state = SAVE_STATE_EDIT_TYPE;
+        editModeActive = 1u;
+        menu_handleLoadSaveMenu(1, 0u);
+        menu_loadSaveTypeOverride = 0xFFu;
+        menu_saveOptions.state = SAVE_STATE_EDIT_PRESET_NR;
+    }
+    menu_loadSaveRefreshTypeLed();
+    menu_repaintAll();
+    return 1u;
+}
+
+/* Light the SELECT LED of the shown Load/Save type (or Instrument type). */
+void menu_loadSaveRefreshTypeLed(void)
+{
+    const uint8_t *types = (menu_activePage == LOAD_PAGE)
+        ? menu_loadSaveLoadTypes : menu_loadSaveSaveTypes;
+    uint8_t count = (menu_activePage == LOAD_PAGE)
+        ? (uint8_t)(sizeof(menu_loadSaveLoadTypes) /
+                    sizeof(menu_loadSaveLoadTypes[0]))
+        : (uint8_t)(sizeof(menu_loadSaveSaveTypes) /
+                    sizeof(menu_loadSaveSaveTypes[0]));
+    uint8_t i;
+
+    if (menu_activePage != LOAD_PAGE && menu_activePage != SAVE_PAGE)
+        return;
+    if (menu_instrumentLoadActive) {
+        for (i = 0u; i < 8u; i++) {
+            const instrument_registry_entry_t *entry =
+                instrumentManager_registryEntryAt(i);
+            if (entry && entry->type == menu_instrumentLoadType) {
+                led_setActiveSelectButton(i);
+                return;
+            }
+        }
+        return;
+    }
+    for (i = 0u; i < count; i++) {
+        if (types[i] == menu_saveOptions.what) {
+            led_setActiveSelectButton(i);
+            return;
+        }
+    }
+}
+
+
 /* -----------------------------------------------------------------------
 ** menu_parseEncoder — exact port of original
 ** ----------------------------------------------------------------------- */
@@ -15430,16 +15965,30 @@ void menu_parseEncoder(int8_t inc, uint8_t button)
      * pages take the encoder (menu_backgroundLoadReleasesPanel()). */
     if ((menu_storageBusy || preset_getStatus() != PRESET_IDLE) &&
         !menu_backgroundLoadReleasesPanel()) {
+        uint8_t top_level_library = (uint8_t)(
+            (menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
+            !menu_instrumentLoadActive && !menu_loadSaveCommandActive &&
+            menu_saveOptions.what < SAVE_TYPE_GLO &&
+            menu_saveOptions.what != SAVE_TYPE_FILE &&
+            menu_saveOptions.what != SAVE_TYPE_DIR &&
+            menu_saveOptions.what != SAVE_TYPE_SIMPLE_DIR);
         uint8_t allow_load_number_scroll = (uint8_t)(
             inc != 0 &&
             button == lastEncoderButton &&
-            menu_activePage == LOAD_PAGE &&
-            editModeActive &&
-            menu_saveOptions.state == SAVE_STATE_EDIT_PRESET_NR &&
-            ((menu_instrumentLoadActive && !menu_instrumentSaveMode) ||
-             (!menu_instrumentLoadActive &&
-              (menu_saveOptions.what == SAVE_TYPE_KIT ||
-               menu_saveOptions.what == SAVE_TYPE_KIT_MORPH))));
+            ((menu_activePage == LOAD_PAGE &&
+              editModeActive &&
+              menu_saveOptions.state == SAVE_STATE_EDIT_PRESET_NR &&
+              menu_instrumentLoadActive && !menu_instrumentSaveMode) ||
+             top_level_library));
+
+        /*
+         * Direct navigation (2026-11): every Load/Save library number moves
+         * while storage drains; the name repaints when the deferred selection
+         * runs. A click is kept and runs once storage is idle
+         * (menu_serviceRuntimeWidgets()) instead of being dropped.
+         */
+        if (top_level_library && button != lastEncoderButton && button)
+            menu_loadSaveClickPending = 1u;
 
         /*
          * Storage exclusivity blocks every control except Load-number turns.
@@ -15487,6 +16036,21 @@ void menu_parseEncoder(int8_t inc, uint8_t button)
             copyClear_encoderTurned(inc);
         return;
     }
+#if LIVE_MODE
+    /* Kit library: SHIFT + DATA click = kit option suit / fixe. */
+    if (menu_liveKitLibraryActive() && buttonHandler_getShift()) {
+        if (btnClicked)
+            live_kitHoldToggle();
+        return;
+    }
+    if (live_patternPageActive())
+        return;
+    if (live_kitPageActive() || live_rndPageActive() || live_cpuPageActive() ||
+        live_genPageActive()) {
+        live_encoder(inc, btnClicked);
+        return;
+    }
+#endif
 
     /*
      * STEP automation owns encoder clicks while its custom page is active.
@@ -15555,7 +16119,7 @@ void menu_parseEncoder(int8_t inc, uint8_t button)
     ** so the inversion is NOT needed. */
 
     if (menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) {
-        menu_handleLoadSaveMenu(inc, btnClicked);
+        menu_loadSaveEncoder(inc, btnClicked);
     } else if (inc != 0) {
         if (editModeActive) {
             menu_encoderChangeParameter(inc);
@@ -16091,6 +16655,26 @@ static void menu_liveRecRecordCell(uint8_t subPage, uint8_t position)
 
 void menu_parseKnobDelta(uint8_t knobNr, int8_t delta)
 {
+#if LIVE_MODE
+    if (live_genPageActive()) {
+        live_genKnob(knobNr, delta);
+        return;
+    }
+    /* PERF pot 2: the active track's generator (hit or prb). */
+    if (knobNr >= 1u && knobNr <= 3u &&
+        menu_activePage == PERFORMANCE_PAGE &&
+        menu_getSubPage() == 0u && live_cpuPageActive() == 0u &&
+        live_rndPageActive() == 0u && live_patternPageActive() == 0u &&
+        live_kitPageActive() == 0u) {
+        if (knobNr == 1u)
+            live_genMacro(delta);
+        else if (knobNr == 2u)
+            live_genPrimeMacro(delta);      /* pot 3: NUM prime */
+        else
+            live_djFilter(delta);           /* pot 4: DJ filter */
+        return;
+    }
+#endif
     /* S082 P3: pots stay locked only on Load/Save during an unlocked load. */
     if (menu_storageBusy && !menu_backgroundLoadReleasesPanel()) return;
 
@@ -16359,8 +16943,9 @@ void menu_serviceKnobRepaint(void)
             menu_repaint();
             return;
         }
-        menu_repaintGeneric();
-        sendDisplayBuffer();
+        /* Full repaint: the live overlays (PERF fct/prm/flt cells, GEN
+         * page, Plaits 'P') must survive a knob turn too. */
+        menu_repaint();
     }
 }
 
@@ -16413,6 +16998,45 @@ void menu_serviceRuntimeWidgets(void)
      * (menu_backgroundLoadReleasesPanel()). */
     if (menu_storageBusy && !menu_backgroundLoadReleasesPanel())
         return;
+
+    /*
+     * Direct Load/Save navigation services (menu_scheduleBankChildPreview(),
+     * menu_loadSaveExecute()): start the Bank child preview once the encoder
+     * has rested, and run a Bank Load that a click asked for before the
+     * preview landed. Both wait for idle storage.
+     */
+    if (menu_loadSaveClickPending &&
+        !menu_storageBusy && preset_getStatus() == PRESET_IDLE &&
+        filesystem_status() == FS_STATUS_IDLE) {
+        menu_loadSaveClickPending = 0u;
+        if ((menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
+            !menu_instrumentLoadActive && !menu_loadSaveCommandActive)
+            menu_loadSaveExecute();
+    }
+    if ((menu_bankPreviewPending || menu_bankLoadAfterPreviewReady) &&
+        !menu_storageBusy && preset_getStatus() == PRESET_IDLE &&
+        filesystem_status() == FS_STATUS_IDLE) {
+        uint8_t bank_shown = (uint8_t)(
+            (menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
+            !menu_instrumentLoadActive &&
+            menu_saveOptions.what == SAVE_TYPE_BANK);
+
+        if (menu_bankLoadAfterPreviewReady) {
+            menu_bankLoadAfterPreviewReady = 0u;
+            if (bank_shown && menu_activePage == LOAD_PAGE &&
+                menu_bankLoadPreviewValid &&
+                menu_bankLoadPreviewSlot ==
+                    menu_currentPresetNr[SAVE_TYPE_BANK])
+                menu_loadSaveExecute();
+        } else if ((uint16_t)(now - menu_bankPreviewPendingTick) >=
+                   MENU_BANK_PREVIEW_REST_MS) {
+            menu_bankPreviewPending = 0u;
+            if (bank_shown &&
+                menu_bankPreviewPendingSlot ==
+                    menu_currentPresetNr[SAVE_TYPE_BANK])
+                menu_requestBankChildPreview(menu_bankPreviewPendingSlot);
+        }
+    }
 
     /*
      * VOICE overlay services run every foreground pass, independently of the
@@ -16601,6 +17225,76 @@ void menu_serviceRuntimeWidgets(void)
 ** provided: parameters arrive after the SD transfer completes, not
 ** before the function returns.
 ** ----------------------------------------------------------------------- */
+/*
+ * Save OK during playback: retry instead of dropping the press.
+ *
+ * What: a top-level Kit/KitMrp/Scene/Pattern Save whose request is refused
+ * because the card is busy (AutoSave drains and other background work run
+ * often while the sequencer plays) is remembered and posted again from the
+ * Menu poll as soon as the facade is free, for up to MENU_SAVE_RETRY_MS.
+ * AutoSave is asked to yield meanwhile so it does not take the card back
+ * between two polls. Why: the press used to vanish with no message, so Save
+ * seemed to work only with the transport stopped. Inputs: the Save page
+ * type/slot/source Scene at press time. Outputs: one accepted command (the
+ * ordinary menu_beginLoadSaveCommand() path) or a silent expiry.
+ */
+#define MENU_SAVE_RETRY_MS 8000u
+static uint8_t menu_saveRetryWhat = 0xFFu;
+static uint16_t menu_saveRetrySlot;
+static uint8_t menu_saveRetryScene;
+static uint16_t menu_saveRetryT0;
+
+static uint8_t menu_postSaveRequest(uint8_t what, uint16_t slot,
+                                    uint8_t source_scene)
+{
+    switch (what) {
+    case SAVE_TYPE_KIT:       return preset_saveDrumset(slot, 0u, source_scene);
+    case SAVE_TYPE_KIT_MORPH: return preset_saveDrumset(slot, 1u, source_scene);
+    case SAVE_TYPE_SCENE:     return preset_saveScene(slot, source_scene);
+    case SAVE_TYPE_PATTERN:   return preset_savePattern(slot);
+    default:                  return 1u;
+    }
+}
+
+static void menu_saveRetryStop(void)
+{
+    if (menu_saveRetryWhat == 0xFFu)
+        return;
+    menu_saveRetryWhat = 0xFFu;
+    filesystem_setAutosaveYield(0u);
+}
+
+static void menu_saveRetryArm(uint8_t what, uint16_t slot,
+                              uint8_t source_scene)
+{
+    menu_saveRetryWhat = what;
+    menu_saveRetrySlot = slot;
+    menu_saveRetryScene = source_scene;
+    menu_saveRetryT0 = time_sysTick;
+    filesystem_setAutosaveYield(1u);
+}
+
+static void menu_serviceSaveRetry(void)
+{
+    if (menu_saveRetryWhat == 0xFFu)
+        return;
+    if (menu_activePage != SAVE_PAGE ||
+        menu_saveOptions.what != menu_saveRetryWhat ||
+        (uint16_t)(time_sysTick - menu_saveRetryT0) > MENU_SAVE_RETRY_MS) {
+        menu_saveRetryStop();
+        return;
+    }
+    if (menu_storageBusy || preset_getStatus() != PRESET_IDLE)
+        return;
+    if (!menu_postSaveRequest(menu_saveRetryWhat, menu_saveRetrySlot,
+                              menu_saveRetryScene))
+        return;
+    menu_saveRetryStop();
+    menu_selectionGeneration++;
+    menu_selectionGenerationSnapshot = menu_selectionGeneration;
+    menu_beginLoadSaveCommand();
+}
+
 void menu_pollPresetStatus(void)
 {
     uint8_t retrySelectionAfterAck = 0;
@@ -16629,6 +17323,7 @@ void menu_pollPresetStatus(void)
      * Affiliates: transport owners and menu_updateNoPlaybackStorage().
     */
     menu_updateNoPlaybackStorage();
+    menu_serviceSaveRetry();
 
     /*
      * Publish Bank child progress before any worker below can return early.
@@ -16824,6 +17519,10 @@ void menu_pollPresetStatus(void)
         return;
     }
 
+#if LIVE_MODE
+    if (preset_getCompletedOp() == PRESET_OP_BANK_SAVE)
+        live_afterProjectSave();
+#endif
     if (!preset_getCompletedOk() &&
         !menu_completedOpIsTest(preset_getCompletedOp())) {
         /*
@@ -16900,6 +17599,9 @@ void menu_pollPresetStatus(void)
     {
         uint8_t selection_stale = (uint8_t)(
             menu_selectionGenerationSnapshot != menu_selectionGeneration);
+#if LIVE_MODE
+        live_kitLoadCommitted(preset_getKitRequestSceneMask());
+#endif
 
         if ((menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
             (!menu_isLoadSaveSelectionCurrent() || selection_stale)) {
@@ -17756,7 +18458,7 @@ static void menu_enterFrozenBankLoadPage(void)
 /* -----------------------------------------------------------------------
 ** menu_switchPage — exact port (sequencer/LED calls stubbed where needed)
 ** ----------------------------------------------------------------------- */
-void menu_switchPage(uint8_t pageNr)
+static void menu_switchPageTarget(uint8_t pageNr, menu_library_target_t library)
 {
     uint8_t end_resident_name_session;
     uint8_t old_page = menu_activePage;
@@ -17787,9 +18489,30 @@ void menu_switchPage(uint8_t pageNr)
      */
     if (pageNr != menu_activePage)
         midiLearn_cancel();
+    if ((menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
+        pageNr != LOAD_PAGE) {
+        menu_bankLoadAfterPreview = 0u;
+        menu_bankLoadAfterPreviewReady = 0u;
+        menu_loadSaveClickPending = 0u;
+    }
     if (preset_backgroundBankLoadUnlocked() && pageNr == LOAD_PAGE &&
         menu_activePage == LOAD_PAGE)
         return;
+    /*
+     * Config (SHIFT+SAVE: BPM, sync...) opens at once, even while a Preset
+     * or card operation runs, unless Load/Save owns that operation.
+     *
+     * What: the busy gate below dropped every page request outside
+     * Load/Save, so during playback (background Preset/card work is
+     * frequent) SHIFT+SAVE often did nothing. The Config page only edits
+     * global settings and owns no storage state. Other pages requested
+     * outside Load/Save are now queued (served when the work ends) instead
+     * of dropped. Inputs: pageNr, menu_activePage, library.
+     */
+    if (pageNr == MENU_MIDI_PAGE && library == MENU_LIBRARY_DEFAULT &&
+        menu_activePage != LOAD_PAGE && menu_activePage != SAVE_PAGE) {
+        /* fall through to the ordinary switch */
+    } else
     if ((menu_storageBusy || preset_getStatus() != PRESET_IDLE) &&
         !preset_backgroundBankLoadUnlocked()) {
         /*
@@ -17804,12 +18527,22 @@ void menu_switchPage(uint8_t pageNr)
          * exit, and deliberately remains unavailable until the owner releases.
          * Affiliate: menu_processPendingPageSwitch() at the next safe poll.
          */
-        if ((menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
-            pageNr != LOAD_PAGE) {
+        if (((menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE) &&
+             pageNr != LOAD_PAGE) ||
+            (library != MENU_LIBRARY_DEFAULT && !menu_loadSaveCommandActive) ||
+            (library == MENU_LIBRARY_DEFAULT && pageNr != LOAD_PAGE &&
+             pageNr != SAVE_PAGE && pageNr != menu_activePage)) {
             /* Invalidate any live browser completion before the queued exit. */
             if (menu_pendingPageSwitch == MENU_PENDING_PAGE_NONE)
                 menu_selectionGeneration++;
             menu_pendingPageSwitch = (uint8_t)(pageNr + 1u);
+            menu_pendingLibrary = library;
+            if (library != MENU_LIBRARY_DEFAULT) {
+                menu_bankLoadAfterPreview = 0u;
+                menu_bankLoadAfterPreviewReady = 0u;
+                menu_loadSaveClickPending = 0u;
+                menu_kitLoadArmed = 0u;
+            }
         }
         return;
     }
@@ -18051,7 +18784,12 @@ void menu_switchPage(uint8_t pageNr)
             menu_enterFrozenBankLoadPage();
             break;
         }
-        if (menu_activePage == LOAD_PAGE) {
+        if (LIVE_MODE && (library == MENU_LIBRARY_SAVE_PROJECT ||
+                          library == MENU_LIBRARY_SAVE_KIT)) {
+            /* LIVE: explicit Save page (SAVE alone or SAVE + KIT). */
+            menu_activePage = SAVE_PAGE;
+            menu_instrumentLoadActive = 0u;
+        } else if (menu_activePage == LOAD_PAGE && !LIVE_MODE) {
             menu_activePage = SAVE_PAGE;
             menu_instrumentLoadActive = 0u;
         } else {
@@ -18070,6 +18808,15 @@ void menu_switchPage(uint8_t pageNr)
         /* Load/Save page toggles are type transitions, so reload on entry.
          * Bank pages override the Kit scene mask above to 0xFFFF (B2.4). */
         filesystem_clearNameCache();
+#if LIVE_MODE
+        /* A physical SAVE press still opens the project library. */
+        menu_instrumentLoadActive = 0u;
+        menu_saveOptions.what = (library == MENU_LIBRARY_KIT ||
+                                 library == MENU_LIBRARY_SAVE_KIT)
+            ? SAVE_TYPE_KIT
+            : (library == MENU_LIBRARY_KIT_MORPH) ? SAVE_TYPE_KIT_MORPH
+            : SAVE_TYPE_BANK;
+#endif
         menu_resetSaveParameters();
         menu_requestCurrentLoadSaveSelection(0);
         menu_refreshLoadSceneLeds();
@@ -18205,6 +18952,95 @@ void menu_switchPage(uint8_t pageNr)
         menu_repaintAll();
 }
 
+void menu_switchPage(uint8_t pageNr)
+{
+    menu_switchPageTarget(pageNr, MENU_LIBRARY_DEFAULT);
+}
+
+void menu_openLibrary(menu_library_target_t target)
+{
+    menu_switchPageTarget(LOAD_PAGE, target);
+}
+
+/*
+ * LIVE Save: Kit starts on the first free kit number, and the kit library
+ * opens on a real kit instead of an empty number. Run from the
+ * foreground service; acts once per page entry, as soon as the kit names
+ * are known, so a used number chosen afterwards (to overwrite) stays.
+ */
+void menu_liveKitSaveAutoSlot(void)
+{
+#if LIVE_MODE
+    static uint8_t done;
+    uint16_t slot;
+    const char *name;
+    uint8_t i;
+    uint8_t blank = 1u;
+
+    if ((menu_activePage != SAVE_PAGE && menu_activePage != LOAD_PAGE) ||
+        menu_saveOptions.what != SAVE_TYPE_KIT || menu_instrumentLoadActive) {
+        done = 0u;
+        return;
+    }
+    if (done || menu_storageBusy)
+        return;
+    slot = menu_currentPresetNr[SAVE_TYPE_KIT];
+    name = filesystem_kitSlotName(slot);
+    for (i = 0u; i < 8u && name; i++)
+        if (name[i] != ' ')
+            blank = 0u;
+    if (!name || blank)
+        return;                 /* names not known yet */
+    done = 1u;
+    if (menu_activePage == LOAD_PAGE) {
+        /* Kit library: open on a real kit (the first one) if this is empty. */
+        if (filesystem_kitSlotExists(slot))
+            return;
+        slot = 0u;
+        while (slot < 999u && !filesystem_kitSlotExists(slot))
+            slot++;
+        if (slot >= 999u)
+            return;
+        menu_currentPresetNr[SAVE_TYPE_KIT] = slot;
+        menu_requestCurrentLoadSaveSelection(0);
+        menu_repaintAll();
+        return;
+    }
+    if (slot == 0u)
+        slot = 1u;              /* numbers start at 001, as the projects */
+    while (slot < 999u && filesystem_kitSlotExists(slot))
+        slot++;
+    if (slot != menu_currentPresetNr[SAVE_TYPE_KIT]) {
+        /* Only the number moves: the name stays the playing kit's. */
+        menu_currentPresetNr[SAVE_TYPE_KIT] = slot;
+        menu_repaintAll();
+    }
+#endif
+}
+
+/* LIVE: the SD kit library (LOAD + KIT) is on screen. */
+uint8_t menu_liveMorphLibraryActive(void)
+{
+#if LIVE_MODE
+    return (uint8_t)(menu_activePage == LOAD_PAGE &&
+                     menu_saveOptions.what == SAVE_TYPE_KIT_MORPH &&
+                     !menu_instrumentLoadActive);
+#else
+    return 0u;
+#endif
+}
+
+uint8_t menu_liveKitLibraryActive(void)
+{
+#if LIVE_MODE
+    return (uint8_t)(menu_activePage == LOAD_PAGE &&
+                     menu_saveOptions.what == SAVE_TYPE_KIT &&
+                     !menu_instrumentLoadActive);
+#else
+    return 0u;
+#endif
+}
+
 static void menu_processPendingPageSwitch(void)
 {
     uint8_t pending = menu_pendingPageSwitch;
@@ -18226,7 +19062,7 @@ static void menu_processPendingPageSwitch(void)
         return;
     menu_pendingPageSwitch = MENU_PENDING_PAGE_NONE;
     pageNr = (uint8_t)(pending - 1u);
-    menu_switchPage(pageNr);
+    menu_switchPageTarget(pageNr, menu_pendingLibrary);
 }
 
 /* -----------------------------------------------------------------------
@@ -18269,8 +19105,16 @@ static void menu_resetSaveParametersEx(uint8_t after_command)
     menu_instrumentLoadActive = 0u;
     menu_instrumentSaveMode = 0u;
     menu_loadSaveClearInstrumentVoiceBlinks();
-    editModeActive = 1;
-    menu_saveOptions.state = SAVE_STATE_EDIT_TYPE;
+    /* Edit mode belongs to Load/Save: a completion that lands after the
+     * user left for another page (Config opens during busy work) must not
+     * switch that page into its full-screen editor. */
+    if (menu_activePage == LOAD_PAGE || menu_activePage == SAVE_PAGE)
+        editModeActive = 1;
+    menu_saveOptions.state = menu_loadSaveHomeState(menu_saveOptions.what);
+    menu_saveDraftValid = 0u;
+    menu_loadSaveClickPending = 0u;
+    menu_bankLoadAfterPreview = 0u;
+    menu_bankLoadAfterPreviewReady = 0u;
     if (menu_saveOptions.what == SAVE_TYPE_BANK)
         menu_currentPresetNr[SAVE_TYPE_BANK] = bank_restoreBankSlot();
     if (!(after_command && menu_activePage == LOAD_PAGE &&
@@ -18327,35 +19171,6 @@ void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
          * midiIn_setGlobalChannel(), filesystem_sanitizeLoadedGlobals().
          */
         midiIn_setGlobalChannel(value);
-        break;
-
-    case PAR_POS_X:
-        /*
-         * SOM parameters now call the SOM generator directly. These are
-         * generator controls under Core/Bank/Scene/Pattern, not sequencer transport
-         * messages. Inputs are menu-scaled 0..127 values.
-         */
-        som_setX(value);
-        break;
-
-    case PAR_POS_Y:
-        som_setY(value);
-        break;
-
-    case PAR_FLUX:
-        /*
-         * Flux is stored by SOM as 0.0..1.0, while the menu exposes 0..127.
-         * Menu performs that UI-scale conversion at the direct call site.
-         */
-        som_setFlux((float)value / 127.0f);
-        break;
-
-    case PAR_SOM_FREQ:
-        /*
-         * SOM frequency is per active voice/track, so Menu supplies the active
-         * voice and SOM owns the generator state mutation.
-         */
-        som_setFreq(value, menu_getActiveVoice());
         break;
 
     case PAR_TRACK_LENGTH:
@@ -18557,12 +19372,10 @@ void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
         uint8_t scene_index;
         uint8_t slot = (uint8_t)(paramNr - PAR_VOICE1_MORPH);
 
-        for (scene_index = 0u;
-             scene_index < SCENE_SLOT_TOTAL;
-             scene_index++) {
-            if ((edit_mask & (1ul << scene_index)) != 0u)
-                preset_morphVoiceScene(scene_index, slot, value);
-        }
+        /* Normotone simple Morph: no per-voice amounts (MRP only). */
+        (void)edit_mask;
+        (void)scene_index;
+        (void)slot;
         break;
     }
 
@@ -18587,59 +19400,6 @@ void menu_parseGlobalParam(uint16_t paramNr, uint8_t value)
          */
         preset_syncBusCompMirrors();
         break;
-
-    case PAR_EUKLID_LENGTH:
-    {
-        /*
-         * Euclidean generator length is generator state under Pattern.
-         *
-         * Length changes can constrain the effective number of steps, so this
-         * preserves the old behavior by re-applying the current steps value
-         * after length changes, then repainting the visible pattern track.
-         *
-         * Risk: LED repaint reads PatternData generated by Euklid. If Euklid
-         * later stops writing directly to pattern steps, this repaint target
-         * must follow that new interface.
-         */
-        uint8_t length = value;
-        uint8_t pattern = menu_shownPattern;
-        uint8_t steps;
-
-        euklid_setLength(menu_getActiveVoice(), length);
-
-        steps = parameter_values[PAR_EUKLID_STEPS];
-        euklid_setSteps(menu_getActiveVoice(), steps, pattern);
-        led_updatePatternTrack(menu_getActiveVoice(), pattern, buttonHandler_selectedStep);
-        break;
-    }
-
-    case PAR_EUKLID_STEPS:
-    {
-        /*
-         * Euclidean steps regenerate the active voice in the shown pattern.
-         * Menu supplies active voice/shown pattern, EuklidGenerator mutates the
-         * pattern, and ledHandler repaints the currently selected track view.
-         */
-        uint8_t steps = value;
-        uint8_t pattern = menu_shownPattern;
-        euklid_setSteps(menu_getActiveVoice(), steps, pattern);
-        led_updatePatternTrack(menu_getActiveVoice(), pattern, buttonHandler_selectedStep);
-        break;
-    }
-
-    case PAR_EUKLID_ROTATION:
-    {
-        /*
-         * Euclidean rotation regenerates the active voice in the shown pattern.
-         * This belongs in EuklidGenerator because it is generator logic, with
-         * the LED repaint kept here as UI feedback.
-         */
-        uint8_t rotation = value;
-        uint8_t pattern = menu_shownPattern;
-        euklid_setRotation(menu_getActiveVoice(), rotation, pattern);
-        led_updatePatternTrack(menu_getActiveVoice(), pattern, buttonHandler_selectedStep);
-        break;
-    }
 
     case PAR_PATTERN_BEAT:
         /*
@@ -18902,7 +19662,10 @@ void menu_setVoiceModeShowMorph(uint8_t onOff)
      * include VOICE SHIFT and the Effect-page voice mix overlay (S075 F2-F/G).
      * buttonHandler also owns the MODE1 blink feedback for the latch.
     */
-    voiceModeShowMorph = (uint8_t)(onOff != 0u);
+    /* Normotone simple Morph: no Morph endpoint view (SHIFT + VOICE, SHIFT
+     * held); the target is chosen with LOAD + MORPH. */
+    (void)onOff;
+    voiceModeShowMorph = 0u;
     menu_endlessPotMappingChanged();
     /* Morph changes endpoint display only; target identity/search results and
      * held-step values remain valid. Repaint the current VOICE frame so a

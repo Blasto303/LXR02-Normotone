@@ -326,10 +326,9 @@ void Drum_calcVoiceSyncBlock(DrumVoice *voice, int16_t* buf, const uint8_t size)
 	}
 
 	//calc transient sample
-	transient_calcBlock(&voice->transGen,modBuf,size);
-
-	//Mix with transient buffer
-	bufferTool_addBuffersSaturating(buf,modBuf,size);
+	//Mix with transient buffer (skipped when it is silent: adding 0 is exact)
+	if (!transient_calcBlock(&voice->transGen,modBuf,size))
+		bufferTool_addBuffersSaturating(buf,modBuf,size);
 
 	//calc filter block
 	SVF_calcBlockZDF(&voice->filter,voice->filterType,buf,size);
